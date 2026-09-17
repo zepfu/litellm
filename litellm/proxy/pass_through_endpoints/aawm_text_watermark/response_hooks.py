@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Any, Optional
@@ -24,6 +25,13 @@ from litellm.proxy.pass_through_endpoints.aawm_text_watermark.policy import (
 from litellm.proxy.pass_through_endpoints.aawm_text_watermark.unicode_detector import (
     detect_unicode_carriers,
     sanitize_unicode_carriers,
+)
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+    ParsedResponsesEvent,
+    ResponsesEventPipeline,
+    attach_responses_events,
+    render_responses_event_wire,
+    responses_events_from_chunk,
 )
 
 _OUTPUT_AUDIT_KEY = "watermark_output_audit"
@@ -116,26 +124,52 @@ def _visible_texts_from_event(payload: Mapping[str, Any], event_type: str) -> li
     return texts
 
 
+def _event_payload_and_type(event: Any) -> tuple[Optional[Mapping[str, Any]], str]:
+    if isinstance(event, ParsedResponsesEvent):
+        return event.payload, event.event_type or ""
+    if isinstance(event, Mapping):
+        event_type = event.get("type")
+        return event, event_type if isinstance(event_type, str) else ""
+    payload = getattr(event, "payload", None)
+    event_type = getattr(event, "event_type", None) or getattr(event, "type", None)
+    if isinstance(payload, Mapping):
+        return payload, event_type if isinstance(event_type, str) else ""
+    return None, ""
+
+
 def _visible_texts_from_sse_block(
-    block: str,
+    block: Any,
     *,
     parse_sse_block: Optional[Callable[[str], list[Any]]] = None,
 ) -> list[str]:
     texts: list[str] = []
+    associated_events = responses_events_from_chunk(block)
+    if associated_events is None:
+        associated_events = getattr(block, "aawm_parsed_responses_events", None)
+    if associated_events is not None:
+        for event in associated_events:
+            payload, event_type = _event_payload_and_type(event)
+            if (
+                not isinstance(payload, Mapping)
+                or not event_type
+                or event_type not in _VISIBLE_DELTA_TYPES
+            ):
+                continue
+            texts.extend(_visible_texts_from_event(payload, event_type))
+        return texts
     parser = parse_sse_block or _parse_responses_sse_block
     for parsed_event in parser(block):
+        payload, event_type = _event_payload_and_type(parsed_event)
         if (
-            parsed_event.is_malformed
-            or parsed_event.is_done_marker
-            or parsed_event.event_type not in _VISIBLE_DELTA_TYPES
+            not isinstance(payload, Mapping)
+            or event_type not in _VISIBLE_DELTA_TYPES
+            or (
+                isinstance(parsed_event, ParsedResponsesEvent)
+                and (parsed_event.is_malformed or parsed_event.is_done_marker)
+            )
         ):
             continue
-        texts.extend(
-            _visible_texts_from_event(
-                parsed_event.payload,
-                parsed_event.event_type,
-            )
-        )
+        texts.extend(_visible_texts_from_event(payload, event_type))
     return texts
 
 
@@ -192,57 +226,54 @@ def _rewrite_visible_sse_payload(
     return payload
 
 
+def _rewrite_visible_sse_event_wire(
+    event: ParsedResponsesEvent,
+    config: OpenAIPassthroughTextWatermarkSettings,
+    *,
+    wire: Optional[bytes] = None,
+) -> bytes:
+    payload = event.payload
+    event_type = event.event_type or ""
+    source_wire = wire or event.forward_event or event.raw_event or b""
+    if not source_wire or not isinstance(payload, dict) or event_type not in _VISIBLE_DELTA_TYPES:
+        return source_wire
+    rewritten_payload = _rewrite_visible_sse_payload(
+        copy.deepcopy(payload),
+        event_type,
+        config,
+    )
+    if rewritten_payload == payload:
+        return source_wire
+    return render_responses_event_wire(event, rewritten_payload)
+
+
 def _rewrite_visible_sse_block(
-    event_block: str, config: OpenAIPassthroughTextWatermarkSettings
-) -> str:
-    lines = event_block.splitlines(keepends=True)
-    event_type = ""
-    rewritten: list[str] = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("event:"):
-            event_type = stripped[6:].strip()
-            rewritten.append(line)
+    event_block: Any, config: OpenAIPassthroughTextWatermarkSettings
+) -> Any:
+    associated_events = responses_events_from_chunk(event_block)
+    if associated_events is None:
+        associated_events = getattr(event_block, "aawm_parsed_responses_events", None)
+    if not isinstance(associated_events, list) or not associated_events:
+        return event_block
+    pieces: list[bytes] = []
+    changed = False
+    for event in associated_events:
+        if not isinstance(event, ParsedResponsesEvent):
             continue
-        if not stripped.startswith("data:"):
-            rewritten.append(line)
-            continue
-        prefix_len = line.find("data:") + 5
-        remainder = line[prefix_len:]
-        payload_text = remainder.strip()
-        newline = remainder[len(remainder.rstrip("\r\n")) :]
-        if not payload_text or payload_text == "[DONE]":
-            rewritten.append(line)
-            continue
-        try:
-            payload = json.loads(payload_text)
-        except (TypeError, ValueError):
-            rewritten.append(line)
-            continue
-        if not isinstance(payload, dict):
-            rewritten.append(line)
-            continue
-        parsed_type = payload.get("type")
-        if isinstance(parsed_type, str) and parsed_type:
-            event_type = parsed_type
-        if event_type in _VISIBLE_DELTA_TYPES:
-            payload = _rewrite_visible_sse_payload(payload, event_type, config)
-        rewritten.append(
-            line[:prefix_len]
-            + " "
-            + json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-            + newline
-        )
-    return "".join(rewritten)
+        source_wire = event.forward_event or event.raw_event or b""
+        rewritten = _rewrite_visible_sse_event_wire(event, config)
+        pieces.append(rewritten)
+        changed = changed or rewritten != source_wire
+    if not changed or not pieces:
+        return event_block
+    return attach_responses_events(b"".join(pieces), associated_events)
 
 
 def _parse_responses_sse_block(block: str) -> list[Any]:
     """Parse one complete SSE block with configured event bounds."""
-    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
-        _PARSED_RESPONSES_EVENTS_ATTR,
-    )
-
-    parsed_events = getattr(block, _PARSED_RESPONSES_EVENTS_ATTR, None)
+    parsed_events = responses_events_from_chunk(block)
+    if parsed_events is None:
+        parsed_events = getattr(block, "aawm_parsed_responses_events", None)
     if isinstance(parsed_events, list):
         return parsed_events
 
@@ -255,17 +286,27 @@ def _parse_responses_sse_block(block: str) -> list[Any]:
         max_event_bytes=resolve_responses_event_limits()[0],
         max_raw_events=0,
     )
-    encoded = block.encode("utf-8")
-    if not encoded.endswith(b"\n\n"):
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
+        _sse_block_wire_bytes,
+    )
+
+    encoded = _sse_block_wire_bytes(block)
+    if not encoded.endswith((b"\r\n\r\n", b"\n\n", b"\r\r")):
         encoded += b"\n\n"
     return pipeline.feed(encoded)
 
 
-def _encode_sse_block(event_block: str, had_separator: bool) -> bytes:
-    text = event_block
-    if had_separator and not text.endswith("\n\n"):
-        text = f"{event_block}\n\n"
-    return text.encode("utf-8")
+def _encode_sse_block(event_block: Any, had_separator: bool) -> bytes:
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
+        _sse_block_wire_bytes,
+        _sse_block_events,
+    )
+
+    wire = _sse_block_wire_bytes(event_block, had_separator)
+    associated_events = _sse_block_events(event_block)
+    if associated_events is None:
+        return wire
+    return attach_responses_events(wire, associated_events)
 
 
 def _append_bounded_visible_text(
@@ -284,6 +325,22 @@ def _append_bounded_visible_text(
         except UnicodeDecodeError:
             truncated = truncated[1:]
     return ""
+
+
+def _append_required_visible_text(
+    retained: str,
+    visible: str,
+    max_bytes: int,
+) -> str:
+    """Append required validation text or fail closed at the configured bound."""
+    if not visible:
+        return retained
+    combined = retained + visible
+    if max_bytes <= 0 or len(combined.encode("utf-8")) > max_bytes:
+        raise ValueError(
+            "Responses watermark visible-text validation exceeded configured bound"
+        )
+    return combined
 
 
 def _synthetic_visible_body(text: str) -> dict[str, Any]:
@@ -437,7 +494,7 @@ async def _wrap_passthrough_watermark_responses_stream_buffer_response(
 ) -> AsyncIterator[Any]:
     """Buffer the complete SSE stream, sanitize/verify, then emit."""
 
-    buffered: list[tuple[str, bool]] = []
+    buffered: list[tuple[Any, bool]] = []
     retained = ""
     max_bytes = config.limits.max_text_bytes_per_direction
     buffered_bytes = 0
@@ -452,7 +509,7 @@ async def _wrap_passthrough_watermark_responses_stream_buffer_response(
             event_block,
             parse_sse_block=parse_sse_block,
         ):
-            retained = _append_bounded_visible_text(retained, visible, max_bytes)
+            retained = _append_required_visible_text(retained, visible, max_bytes)
 
     audit = _audit_retained_visible_text(retained, config, endpoint)
     if audit is not None:
@@ -485,6 +542,7 @@ def maybe_wrap_passthrough_watermark_responses_stream(
     config: Any = None,
     success_handler_kwargs: Any = None,
     endpoint: str = "responses",
+    event_pipeline: Optional[ResponsesEventPipeline] = None,
     **kwargs: Any,
 ) -> Any:
     """Wrap a Responses SSE iterator for detect/audit and buffered sanitize.
@@ -496,7 +554,7 @@ def maybe_wrap_passthrough_watermark_responses_stream(
     policies fail closed instead of silently becoming audit-only.
     """
 
-    del kwargs
+    del kwargs, event_pipeline
     loaded = _coerce_config(config)
     if not _policy_applies(loaded, "response", endpoint):
         return iterator

@@ -4,6 +4,7 @@ OpenAI Passthrough Logging Handler
 Handles cost tracking and logging for OpenAI passthrough endpoints, specifically /chat/completions.
 """
 
+import copy
 import hashlib
 import json
 from datetime import datetime
@@ -48,6 +49,9 @@ from litellm.types.utils import (
     Usage,
 )
 from litellm.utils import ModelResponse, TextCompletionResponse
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+    bounded_identity_key,
+)
 
 
 # Process-lifetime caches for on-disk model price fallback.
@@ -173,14 +177,12 @@ class _ResponsesSSEStateTracker:
         return None
 
     def _bounded_string(self, value: Any) -> Optional[str]:
-        normalized = self._coerce_non_empty_str(value)
-        if normalized is None:
+        bounded = bounded_identity_key(value, limit=self._IDENTITY_BYTES_LIMIT)
+        if bounded is None:
             return None
-        encoded = normalized.encode("utf-8")
-        if len(encoded) <= self._IDENTITY_BYTES_LIMIT:
-            return normalized
-        self._state_omitted = True
-        return encoded[: self._IDENTITY_BYTES_LIMIT].decode("utf-8", "ignore")
+        if bounded.startswith("sha256:"):
+            self._state_omitted = True
+        return bounded
 
     @staticmethod
     def _stream_item_key(
@@ -192,10 +194,16 @@ class _ResponsesSSEStateTracker:
     ) -> str:
         if isinstance(item, dict):
             for key in ("id", "call_id"):
-                value = _ResponsesSSEStateTracker._coerce_non_empty_str(item.get(key))
+                value = bounded_identity_key(
+                    item.get(key),
+                    limit=_ResponsesSSEStateTracker._IDENTITY_BYTES_LIMIT,
+                )
                 if value:
                     return value
-        value = _ResponsesSSEStateTracker._coerce_non_empty_str(item_id)
+        value = bounded_identity_key(
+            item_id,
+            limit=_ResponsesSSEStateTracker._IDENTITY_BYTES_LIMIT,
+        )
         if value:
             return value
         if isinstance(output_index, int):
@@ -844,7 +852,7 @@ class _ResponsesSSEStateTracker:
             self._usage_payload = None
             self._usage_omitted = True
             return
-        self._usage_payload = json.loads(serialized_usage)
+        self._usage_payload = copy.deepcopy(usage)
         self._usage_omitted = False
 
     def consume(self, decoded_event: Any) -> None:  # noqa: PLR0915
@@ -1936,7 +1944,27 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         return max(1, (len(text) + 3) // 4)
 
     @staticmethod
-    def _extract_responses_api_stream_text(all_chunks: List[str]) -> str:
+    def _extract_responses_api_stream_text(
+        all_chunks: List[str],
+        responses_event_pipeline: Optional[Any] = None,
+    ) -> str:
+        return OpenAIPassthroughLoggingHandler._extract_responses_api_stream_text_with_pipeline(
+            all_chunks,
+            responses_event_pipeline=responses_event_pipeline,
+        )
+
+    @staticmethod
+    def _extract_responses_api_stream_text_with_pipeline(
+        all_chunks: List[str],
+        responses_event_pipeline: Optional[Any] = None,
+    ) -> str:
+        if responses_event_pipeline is not None:
+            summary = responses_event_pipeline.summary_snapshot()
+            if isinstance(summary, dict) and isinstance(
+                summary.get("stream_text"), str
+            ):
+                return summary["stream_text"]
+            return ""
         from litellm.llms.base_llm.base_model_iterator import (
             BaseModelResponseIterator,
         )
@@ -2022,7 +2050,25 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
     @staticmethod
     def _extract_responses_api_incomplete_reason_from_stream(
         all_chunks: List[str],
+        responses_event_pipeline: Optional[Any] = None,
     ) -> Optional[str]:
+        if responses_event_pipeline is not None:
+            summary = responses_event_pipeline.summary_snapshot()
+            terminal_payload = (
+                summary.get("terminal_response_payload")
+                if isinstance(summary, dict)
+                else None
+            )
+            reason = (
+                OpenAIPassthroughLoggingHandler._extract_responses_api_incomplete_reason_from_payload(
+                    terminal_payload
+                )
+                if isinstance(terminal_payload, dict)
+                else None
+            )
+            if reason is not None:
+                return reason
+            return None
         from litellm.llms.base_llm.base_model_iterator import (
             BaseModelResponseIterator,
         )
@@ -2053,7 +2099,16 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         return None
 
     @staticmethod
-    def _extract_responses_api_usage_from_stream(all_chunks: List[str]) -> Optional[dict]:
+    def _extract_responses_api_usage_from_stream(
+        all_chunks: List[str],
+        responses_event_pipeline: Optional[Any] = None,
+    ) -> Optional[dict]:
+        if responses_event_pipeline is not None:
+            summary = responses_event_pipeline.summary_snapshot()
+            usage = summary.get("usage") if isinstance(summary, dict) else None
+            if isinstance(usage, dict):
+                return usage
+            return None
         from litellm.llms.base_llm.base_model_iterator import (
             BaseModelResponseIterator,
         )
@@ -2081,7 +2136,16 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         return observed_usage
 
     @staticmethod
-    def _extract_responses_api_response_id_from_stream(all_chunks: List[str]) -> Optional[str]:
+    def _extract_responses_api_response_id_from_stream(
+        all_chunks: List[str],
+        responses_event_pipeline: Optional[Any] = None,
+    ) -> Optional[str]:
+        if responses_event_pipeline is not None:
+            summary = responses_event_pipeline.summary_snapshot()
+            response_id = summary.get("response_id") if isinstance(summary, dict) else None
+            if isinstance(response_id, str) and response_id:
+                return response_id
+            return None
         from litellm.llms.base_llm.base_model_iterator import (
             BaseModelResponseIterator,
         )
@@ -2173,7 +2237,14 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         )
 
     @staticmethod
-    def _responses_stream_has_terminal_event(all_chunks: List[str]) -> bool:
+    def _responses_stream_has_terminal_event(
+        all_chunks: List[str],
+        responses_event_pipeline: Optional[Any] = None,
+    ) -> bool:
+        if responses_event_pipeline is not None:
+            summary = responses_event_pipeline.summary_snapshot()
+            if isinstance(summary, dict):
+                return summary.get("terminal_event_type") is not None
         from litellm.llms.base_llm.base_model_iterator import (
             BaseModelResponseIterator,
         )
@@ -2189,13 +2260,33 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         return False
 
     @staticmethod
-    def _stream_qualifies_for_output_text_done_synthesis(all_chunks: List[str]) -> bool:
+    def _stream_qualifies_for_output_text_done_synthesis(
+        all_chunks: List[str],
+        responses_event_pipeline: Optional[Any] = None,
+    ) -> bool:
+        if responses_event_pipeline is not None:
+            summary = responses_event_pipeline.summary_snapshot()
+            if not isinstance(summary, dict):
+                return False
+            event_counts = summary.get("event_counts")
+            stream_text = summary.get("stream_text")
+            done_marker_count = getattr(responses_event_pipeline, "done_marker_count", 0)
+            return (
+                isinstance(event_counts, dict)
+                and event_counts.get("response.output_text.done", 0) > 0
+                and isinstance(stream_text, str)
+                and bool(stream_text)
+                and isinstance(done_marker_count, int)
+                and done_marker_count > 0
+            )
+
         from litellm.llms.base_llm.base_model_iterator import (
             BaseModelResponseIterator,
         )
 
         if OpenAIPassthroughLoggingHandler._responses_stream_has_terminal_event(
-            all_chunks
+            all_chunks,
+            responses_event_pipeline=responses_event_pipeline,
         ):
             return False
 
@@ -2219,7 +2310,19 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
     @staticmethod
     def _extract_terminal_response_payload_from_stream(
         all_chunks: List[str],
+        responses_event_pipeline: Optional[Any] = None,
     ) -> tuple[Optional[str], Optional[dict]]:
+        if responses_event_pipeline is not None:
+            summary = responses_event_pipeline.summary_snapshot()
+            if isinstance(summary, dict):
+                terminal_event_type = summary.get("terminal_event_type")
+                terminal_payload = summary.get("terminal_response_payload")
+                if not isinstance(terminal_event_type, str):
+                    terminal_event_type = None
+                if not isinstance(terminal_payload, dict):
+                    terminal_payload = None
+                return terminal_event_type, terminal_payload
+            return None, None
         from litellm.llms.base_llm.base_model_iterator import (
             BaseModelResponseIterator,
         )
@@ -2265,10 +2368,12 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         all_chunks: List[str],
         terminal_event_type: str,
         assistant_content: str = "",
+        responses_event_pipeline: Optional[Any] = None,
     ) -> ModelResponse:
         reconstructed_output = (
             OpenAIPassthroughLoggingHandler._reconstruct_responses_output_items_from_stream(
-                all_chunks
+                all_chunks,
+                responses_event_pipeline=responses_event_pipeline,
             )
         )
         responses_output = response_body.get("output")
@@ -2299,10 +2404,12 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         *,
         all_chunks: List[str],
         model: str,
+        responses_event_pipeline: Optional[Any] = None,
     ) -> Optional[ModelResponse]:
         incomplete_reason = (
             OpenAIPassthroughLoggingHandler._extract_responses_api_incomplete_reason_from_stream(
-                all_chunks
+                all_chunks,
+                responses_event_pipeline=responses_event_pipeline,
             )
         )
         if incomplete_reason != "upstream_stream_ended_without_terminal_event":
@@ -2310,12 +2417,14 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
 
         reconstructed_output = (
             OpenAIPassthroughLoggingHandler._reconstruct_responses_output_items_from_stream(
-                all_chunks
+                all_chunks,
+                responses_event_pipeline=responses_event_pipeline,
             )
         )
         stream_output_text = (
             OpenAIPassthroughLoggingHandler._extract_responses_api_stream_text(
-                all_chunks
+                all_chunks,
+                responses_event_pipeline=responses_event_pipeline,
             )
         )
         synthetic_terminal_payload = {
@@ -2327,7 +2436,8 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         }
         terminal_response_id = (
             OpenAIPassthroughLoggingHandler._extract_responses_api_response_id_from_stream(
-                all_chunks
+                all_chunks,
+                responses_event_pipeline=responses_event_pipeline,
             )
         )
         if terminal_response_id is not None:
@@ -2335,7 +2445,8 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
 
         observed_usage = (
             OpenAIPassthroughLoggingHandler._extract_responses_api_usage_from_stream(
-                all_chunks
+                all_chunks,
+                responses_event_pipeline=responses_event_pipeline,
             )
         )
         if observed_usage is not None:
@@ -2347,6 +2458,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             all_chunks=all_chunks,
             terminal_event_type="response.incomplete",
             assistant_content=stream_output_text,
+            responses_event_pipeline=responses_event_pipeline,
         )
 
     @staticmethod
@@ -2355,10 +2467,12 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         all_chunks: List[str],
         request_body: dict,
         fallback_model: str,
+        responses_event_pipeline: Optional[Any] = None,
     ) -> ModelResponse:
         assistant_content = (
             OpenAIPassthroughLoggingHandler._extract_responses_api_stream_text(
-                all_chunks
+                all_chunks,
+                responses_event_pipeline=responses_event_pipeline,
             )
         )
         prompt_tokens = (
@@ -2541,7 +2655,14 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
     @staticmethod
     def _reconstruct_responses_output_items_from_stream(
         all_chunks: List[str],
+        responses_event_pipeline: Optional[Any] = None,
     ) -> List[dict]:
+        if responses_event_pipeline is not None:
+            summary = responses_event_pipeline.summary_snapshot()
+            if isinstance(summary, dict):
+                output = summary.get("output")
+                return list(output) if isinstance(output, list) else []
+            return []
         from litellm.llms.base_llm.base_model_iterator import (
             BaseModelResponseIterator,
         )
@@ -2622,7 +2743,62 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
     @staticmethod
     def _summarize_responses_stream_tool_state(
         all_chunks: List[str],
+        responses_event_pipeline: Optional[Any] = None,
     ) -> Dict[str, Any]:
+        if responses_event_pipeline is not None:
+            summary = responses_event_pipeline.summary_snapshot()
+            if isinstance(summary, dict):
+                event_types = list(summary.get("event_types") or [])
+                event_counts = dict(summary.get("event_counts") or {})
+                tool_state: List[Dict[str, Any]] = []
+                output_items = summary.get("output")
+                if isinstance(output_items, list):
+                    for item in output_items:
+                        if not isinstance(item, dict):
+                            continue
+                        item_type = item.get("type")
+                        if item_type not in {
+                            "function_call",
+                            "local_shell_call",
+                            "apply_patch_call",
+                            "custom_tool_call",
+                            "mcp_call",
+                        }:
+                            continue
+                        tool_name = item.get("name")
+                        if not isinstance(tool_name, str) or not tool_name.strip():
+                            tool_name = item_type
+                        argument_summary = (
+                            OpenAIPassthroughLoggingHandler._responses_stream_tool_argument_summary(
+                                item
+                            )
+                        )
+                        tool_state.append(
+                            {
+                                "type": item_type,
+                                "name": tool_name,
+                                "call_id": item.get("call_id") or item.get("id"),
+                                **argument_summary,
+                            }
+                        )
+                return {
+                    "event_types": event_types,
+                    "event_counts": event_counts,
+                    "tool_call_count": len(tool_state),
+                    "tool_names": [
+                        item["name"]
+                        for item in tool_state
+                        if isinstance(item.get("name"), str) and item.get("name")
+                    ],
+                    "tool_state": tool_state,
+                }
+            return {
+                "event_types": [],
+                "event_counts": {},
+                "tool_call_count": 0,
+                "tool_names": [],
+                "tool_state": [],
+            }
         from litellm.llms.base_llm.base_model_iterator import (
             BaseModelResponseIterator,
         )
@@ -2699,9 +2875,11 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
     def _record_responses_stream_tool_state_metadata(
         kwargs: dict,
         all_chunks: List[str],
+        responses_event_pipeline: Optional[Any] = None,
     ) -> None:
         summary = OpenAIPassthroughLoggingHandler._summarize_responses_stream_tool_state(
-            all_chunks
+            all_chunks,
+            responses_event_pipeline=responses_event_pipeline,
         )
         litellm_params = kwargs.get("litellm_params")
         if not isinstance(litellm_params, dict):
@@ -2721,7 +2899,16 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
     @staticmethod
     def _extract_responses_stream_codex_token_count_event(
         all_chunks: List[str],
+        responses_event_pipeline: Optional[Any] = None,
     ) -> Optional[Dict[str, Any]]:
+        if responses_event_pipeline is not None:
+            summary = responses_event_pipeline.summary_snapshot()
+            token_count = (
+                summary.get("token_count") if isinstance(summary, dict) else None
+            )
+            if isinstance(token_count, dict):
+                return token_count
+            return None
         from litellm.llms.base_llm.base_model_iterator import (
             BaseModelResponseIterator,
         )
@@ -2806,10 +2993,12 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
     def _record_responses_stream_rate_limit_metadata(
         kwargs: dict,
         all_chunks: List[str],
+        responses_event_pipeline: Optional[Any] = None,
     ) -> None:
         token_count_event = (
             OpenAIPassthroughLoggingHandler._extract_responses_stream_codex_token_count_event(
-                all_chunks
+                all_chunks,
+                responses_event_pipeline=responses_event_pipeline,
             )
         )
         if not token_count_event:
@@ -3222,6 +3411,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         url_route: str,
         request_body: Optional[dict] = None,
         litellm_params: Optional[dict] = None,
+        responses_event_pipeline: Optional[Any] = None,
     ) -> Optional[Union[ModelResponse, TextCompletionResponse]]:
         """
         Builds complete response from raw chunks for OpenAI streaming responses.
@@ -3238,6 +3428,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                     model=model,
                     request_body=request_body or {},
                     litellm_params=litellm_params or {},
+                    responses_event_pipeline=responses_event_pipeline,
                 )
             # OpenAI's response iterator to parse chunks
             from litellm.llms.openai.openai import OpenAIChatCompletionResponseIterator
@@ -3300,6 +3491,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         model: str,
         request_body: dict,
         litellm_params: dict,
+        responses_event_pipeline: Optional[Any] = None,
     ) -> Optional[ModelResponse]:
         """
         Rebuild a complete response from Responses API streaming events.
@@ -3316,28 +3508,33 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             responses_transformer = LiteLLMResponsesTransformationHandler()
             streamed_output_text = (
                 OpenAIPassthroughLoggingHandler._extract_responses_api_stream_text(
-                    all_chunks
+                    all_chunks,
+                    responses_event_pipeline=responses_event_pipeline,
                 )
             )
             terminal_event_type, terminal_response_payload = (
                 OpenAIPassthroughLoggingHandler._extract_terminal_response_payload_from_stream(
-                    all_chunks
+                    all_chunks,
+                    responses_event_pipeline=responses_event_pipeline,
                 )
             )
 
             if terminal_response_payload is None:
                 if OpenAIPassthroughLoggingHandler._stream_qualifies_for_output_text_done_synthesis(
-                    all_chunks
+                    all_chunks,
+                    responses_event_pipeline=responses_event_pipeline,
                 ):
                     return OpenAIPassthroughLoggingHandler._build_responses_api_fallback_model_response_from_stream(
                         all_chunks=all_chunks,
                         request_body=request_body,
                         fallback_model=model,
+                        responses_event_pipeline=responses_event_pipeline,
                     )
                 no_terminal_incomplete_response = (
                     OpenAIPassthroughLoggingHandler._build_responses_api_no_terminal_incomplete_model_response(
                         all_chunks=all_chunks,
                         model=model,
+                        responses_event_pipeline=responses_event_pipeline,
                     )
                 )
                 if no_terminal_incomplete_response is not None:
@@ -3358,6 +3555,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                         all_chunks=all_chunks,
                         terminal_event_type=terminal_event_type
                         or str(terminal_response_payload.get("status")),
+                        responses_event_pipeline=responses_event_pipeline,
                     )
                 )
                 return terminal_model_response
@@ -3376,7 +3574,8 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             )
             reconstructed_output = (
                 OpenAIPassthroughLoggingHandler._reconstruct_responses_output_items_from_stream(
-                    all_chunks
+                    all_chunks,
+                    responses_event_pipeline=responses_event_pipeline,
                 )
             )
             merged_output = OpenAIPassthroughLoggingHandler._merge_responses_output_lists(
@@ -3472,6 +3671,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         all_chunks: List[str],
         end_time: datetime,
         kwargs: Optional[dict] = None,
+        responses_event_pipeline: Optional[Any] = None,
     ) -> PassThroughEndpointLoggingTypedDict:
         """
         Handle logging for collected OpenAI streaming chunks with cost tracking.
@@ -3497,10 +3697,12 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 handler._record_responses_stream_tool_state_metadata(
                     logging_kwargs,
                     all_chunks,
+                    responses_event_pipeline=responses_event_pipeline,
                 )
                 handler._record_responses_stream_rate_limit_metadata(
                     logging_kwargs,
                     all_chunks,
+                    responses_event_pipeline=responses_event_pipeline,
                 )
             complete_response = handler._build_complete_streaming_response(
                 all_chunks=all_chunks,
@@ -3509,6 +3711,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 url_route=url_route,
                 request_body=request_body,
                 litellm_params=existing_litellm_params,
+                responses_event_pipeline=responses_event_pipeline,
             )
 
             if complete_response is None:
@@ -3583,7 +3786,8 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             terminal_response_payload = None
             terminal_event_type, terminal_response_payload = (
                 OpenAIPassthroughLoggingHandler._extract_terminal_response_payload_from_stream(
-                    all_chunks
+                    all_chunks,
+                    responses_event_pipeline=responses_event_pipeline,
                 )
             )
             if terminal_event_type is None and isinstance(hidden_params, dict):
