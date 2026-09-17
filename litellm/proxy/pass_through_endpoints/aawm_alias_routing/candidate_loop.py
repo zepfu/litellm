@@ -107,6 +107,7 @@ from .admission import resolve_candidate_account_hash
 from .state import (
     ClaimOutcome,
     alias_routing_state,
+    inspect_cooldown_absence,
     validate_alias_family,
 )
 
@@ -3091,12 +3092,30 @@ async def handle_alias_route(  # noqa: PLR0915
                     )
 
                 family_state = alias_routing_state.family(alias_family)
-                # Healthy traffic is currently cool with no in-flight probe
-                # intent. Sticky cooldown generation is not half-open state.
+                # Healthy traffic is currently cool with no leftover
+                # cooldown/evidence. Expired cooldown, negative cache, or
+                # failure evidence is a half-open/recovery probe and must
+                # stay single-flight. Sticky generation is not that state.
+                cooldown_absence = inspect_cooldown_absence(
+                    alias_routing_state,
+                    alias_family=alias_family,
+                    canonical_aliases=(alias_model,),
+                    cooldown_key=cooldown_key,
+                )
+                half_open_or_recovery_probe = (
+                    cooldown_absence.negative_cached
+                    or cooldown_absence.evidence_present
+                    or cooldown_absence.codex_failure_evidence_present
+                    or (
+                        cooldown_key in family_state.cooldown_until_monotonic_by_key
+                        and active_seconds <= 0
+                    )
+                )
                 healthy_same_key_traffic = (
                     probe_failure_exc is None
                     and not skip_after_probe_wait
                     and active_seconds <= 0
+                    and not half_open_or_recovery_probe
                 )
 
                 existing_probe_intent = (

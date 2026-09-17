@@ -22,6 +22,8 @@ from fastapi import Request
 from starlette.responses import Response
 
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import candidate_loop
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import durable
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
     AliasRoutingStateManager,
     alias_routing_state,
@@ -117,12 +119,60 @@ def _reset_alias_routing_state() -> None:
 
 
 @pytest.fixture(autouse=True)
-def _clear_singleflight_state() -> Any:
+def _clear_singleflight_state(monkeypatch: pytest.MonkeyPatch) -> Any:
     _reset_alias_routing_state()
+    # Isolate session-owner Redis at the durable-cache boundary and skip the
+    # owner guard so concurrent healthy I/O is not 409'd before provider send.
+    monkeypatch.setattr(durable, "get_aawm_alias_routing_dual_cache", lambda: None)
+    monkeypatch.setattr(candidate_loop, "_session_affinity_mod", _session_owner_seam)
     yield
     _reset_alias_routing_state()
     alias_routing_state.anthropic.cooldown_until_monotonic_by_key.clear()
     alias_routing_state.anthropic.session_affinity_by_key.clear()
+
+
+def _session_owner_seam() -> SimpleNamespace:
+    async def _owner_guard(**_kwargs: Any) -> object:
+        return SimpleNamespace(
+            decision=SimpleNamespace(value="no_session"),
+            reservation_token=None,
+            held_reservation=False,
+            provenance=None,
+        )
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    return SimpleNamespace(
+        DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS=0,
+        is_replay_safe_session_owner_redispatch_body=lambda _body: False,
+        set_competing_reservation_log_deferred=lambda *_a, **_k: None,
+        competing_reservation_retry_attempts=lambda *_a, **_k: 0,
+        classify_session_owner_replay_safety_body=lambda _body: SimpleNamespace(
+            safe=False
+        ),
+        resolve_canonical_session_identity=lambda *_a, **_k: None,
+        get_request_codex_auto_review_parent_session_identity=lambda *_a, **_k: None,
+        build_session_owner_attributes=lambda **_k: {},
+        ensure_session_owner_guard_for_request=_owner_guard,
+        get_request_session_owner_lease=lambda *_a, **_k: None,
+        SessionOwnerGuardDecision=SimpleNamespace(UNOWNED_RESERVED="unowned_reserved"),
+        SessionOwnerMutationOutcome=SimpleNamespace(
+            CONFLICT="conflict",
+            ERROR="error",
+            NOT_HELD="not_held",
+            PROMOTED="promoted",
+            ALREADY_OWNED="already_owned",
+            RELEASED="released",
+        ),
+        request_has_effective_session_identity=lambda _request: False,
+        validate_cursor_replay_matches_body=lambda *_a, **_k: False,
+        finalize_session_owner_lease_on_success=_noop_async,
+        finalize_session_owner_lease_on_failure=_noop_async,
+        get_session_owner_continuity_receipt=lambda _request: None,
+        record_session_owner_continuity_receipt=lambda *_a, **_k: None,
+        bind_deferred_session_owner_lease_to_streaming_response=lambda *_a, **_k: False,
+    )
 
 
 class _ProbeCounter:
@@ -274,9 +324,10 @@ async def test_rr054_31_process_singleton_probe_lock_matches_alias_routing_state
 
 @pytest.mark.asyncio
 async def test_rr054_31_same_candidate_lane_serializes_concurrent_cold_probes() -> None:
-    """While a cold probe is in flight, siblings must not also enter upstream.
+    """Never-cooled same-key traffic is healthy and may overlap in provider I/O.
 
-    Peak concurrent probe entries for one cooldown_key must stay at 1.
+    Post-expiry half-open recovery stays single-flight in
+    ``test_half_open_post_expiry_probes_single_flight_provider_io``.
     """
     primary = _candidate()
     cooldown_key = "openrouter:openrouter/cohere/north-mini-code:free:openrouter"
@@ -356,28 +407,11 @@ async def test_rr054_31_same_candidate_lane_serializes_concurrent_cold_probes() 
         return_exceptions=True,
     )
 
-    # Serialization invariant: never more than one concurrent same-lane probe.
-    assert probe.max_current == 1, (
-        "RR-054 #31 gap: concurrent cold probes for the same candidate/lane "
-        f"entered upstream together (max_current={probe.max_current}, "
-        f"total={probe.total}). Expected process-local single-flight."
-    )
-
-    # Full single-flight invariant: only the leader probes before cooldown is
-    # visible; followers wait, observe failure/cooldown, and do not re-probe.
-    assert probe.total == 1, (
-        "RR-054 #31 gap: more than one upstream probe ran for the same cold "
-        f"candidate/lane before success/failure/cooldown was visible "
-        f"(total={probe.total}, max_current={probe.max_current}). "
-        "Lock must cover probe + cooldown publish, or waiters must re-check "
-        "state before probing."
-    )
-
-    # At least the followers should recover onto the alternate candidate once
-    # the primary cold-probe outcome is published.
-    successes = [r for r in results if isinstance(r, Response)]
-    assert len(successes) >= 1, (
-        "expected at least one request to recover after single-flight cooldown; " f"results={results!r}"
+    # Never-cooled first attempts are healthy same-key traffic (CURSOR-017):
+    # they must not be serialized under the probe lock.
+    assert probe.max_current > 1, (
+        "CURSOR-017 gap: never-cooled same-key first attempts stayed "
+        f"serialized (max_current={probe.max_current}, total={probe.total})."
     )
 
 
@@ -440,10 +474,14 @@ async def test_rr054_31_same_candidate_lane_success_probe_is_not_concurrent() ->
     )
 
     assert all(r is success for r in results)
-    assert probe.max_current == 1, (
-        "RR-054 #31 gap: concurrent cold success probes for one candidate/lane "
-        f"ran in parallel (max_current={probe.max_current}, total={probe.total})."
+    # Healthy currently-cool successes overlap in provider I/O. Peak
+    # concurrency of 1 here would mean the probe lock still serializes
+    # ordinary traffic (CURSOR-017).
+    assert probe.max_current > 1, (
+        "CURSOR-017 gap: concurrent currently-cool same-key successes stayed "
+        f"serialized (max_current={probe.max_current}, total={probe.total})."
     )
+    assert probe.total == 3
 
 
 @pytest.mark.asyncio

@@ -50,6 +50,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry im
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
     AliasRoutingStateManager,
+    alias_routing_state,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
@@ -983,7 +984,124 @@ async def test_candidate_loop_native_xai_admission_denial_continues_to_managed(
     assert exclusion_calls[0]["candidate"] is native
 
 
-def test_healthy_same_key_traffic_skips_probe_lock_acquire() -> None:
+def _session_owner_no_redis_seam() -> SimpleNamespace:
+    async def _owner_guard(**_kwargs: Any) -> object:
+        return SimpleNamespace(
+            decision=SimpleNamespace(value="no_session"),
+            reservation_token=None,
+            held_reservation=False,
+            provenance=None,
+        )
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    return SimpleNamespace(
+        DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS=0,
+        is_replay_safe_session_owner_redispatch_body=lambda _body: False,
+        set_competing_reservation_log_deferred=lambda *_a, **_k: None,
+        competing_reservation_retry_attempts=lambda *_a, **_k: 0,
+        classify_session_owner_replay_safety_body=lambda _body: SimpleNamespace(
+            safe=False
+        ),
+        resolve_canonical_session_identity=lambda *_a, **_k: None,
+        get_request_codex_auto_review_parent_session_identity=lambda *_a, **_k: None,
+        build_session_owner_attributes=lambda **_k: {},
+        ensure_session_owner_guard_for_request=_owner_guard,
+        get_request_session_owner_lease=lambda *_a, **_k: None,
+        SessionOwnerGuardDecision=SimpleNamespace(UNOWNED_RESERVED="unowned_reserved"),
+        SessionOwnerMutationOutcome=SimpleNamespace(
+            CONFLICT="conflict",
+            ERROR="error",
+            NOT_HELD="not_held",
+            PROMOTED="promoted",
+            ALREADY_OWNED="already_owned",
+            RELEASED="released",
+        ),
+        request_has_effective_session_identity=lambda _request: False,
+        validate_cursor_replay_matches_body=lambda *_a, **_k: False,
+        finalize_session_owner_lease_on_success=_noop_async,
+        finalize_session_owner_lease_on_failure=_noop_async,
+        get_session_owner_continuity_receipt=lambda _request: None,
+        record_session_owner_continuity_receipt=lambda *_a, **_k: None,
+        bind_deferred_session_owner_lease_to_streaming_response=lambda *_a, **_k: False,
+    )
+
+
+class _ConcurrentProviderProbe:
+    def __init__(self) -> None:
+        self.total = 0
+        self.current = 0
+        self.max_current = 0
+        self.lock_acquires = 0
+        self._guard = asyncio.Lock()
+        self._entered = asyncio.Event()
+        self._release = asyncio.Event()
+
+    async def perform(self, *, candidate: dict[str, Any], **_kwargs: Any) -> object:
+        from starlette.responses import Response
+
+        async with self._guard:
+            self.total += 1
+            self.current += 1
+            self.max_current = max(self.max_current, self.current)
+            if self.total == 1:
+                self._entered.set()
+        try:
+            if self.total == 1:
+                await self._entered.wait()
+                await asyncio.sleep(0.05)
+                self._release.set()
+            else:
+                await self._release.wait()
+            return Response(content=b'{"ok":true}', media_type="application/json")
+        finally:
+            async with self._guard:
+                self.current -= 1
+
+
+def _wrap_probe_lock(state: AliasRoutingStateManager, counter: _ConcurrentProviderProbe):
+    class _CountingLock:
+        def __init__(self, inner: asyncio.Lock) -> None:
+            self._inner = inner
+
+        def locked(self) -> bool:
+            return self._inner.locked()
+
+        async def acquire(self) -> None:
+            counter.lock_acquires += 1
+            await self._inner.acquire()
+
+        def release(self) -> None:
+            self._inner.release()
+
+    async def _candidate_probe_lock(*, alias_family: str, cooldown_key: str):
+        inner = await AliasRoutingStateManager.candidate_probe_lock(
+            state,
+            alias_family=alias_family,
+            cooldown_key=cooldown_key,
+        )
+        return _CountingLock(inner)
+
+    return _candidate_probe_lock
+
+
+def _starlette_request() -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/openai_passthrough/v1/responses",
+            "headers": [(b"user-agent", b"codex-cli/1.0")],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("testclient", 123),
+            "scheme": "http",
+        }
+    )
+
+
+def test_admission_remaining_lane_peek_skips_cooled_leftovers() -> None:
     denied = SimpleNamespace(
         account_hash="acct-a",
         lane_fingerprint="lane-a",
@@ -1073,6 +1191,188 @@ def test_healthy_same_key_traffic_skips_probe_lock_acquire() -> None:
     )
     assert remaining is remaining_managed
 
+
+@pytest.mark.asyncio
+async def test_healthy_same_key_traffic_skips_probe_lock_acquire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two currently-cool same-key successes overlap and never acquire the probe lock."""
+    candidate = {
+        "provider": "openrouter",
+        "model": "openrouter/owl-alpha",
+        "route_family": "codex_openrouter_completion_adapter",
+    }
+    selection = {
+        "candidate": candidate,
+        "cooldown_key": "openrouter:openrouter/owl-alpha:openrouter",
+        "lane_key": "openrouter",
+        "selection_reason": "first_available",
+    }
+    probe = _ConcurrentProviderProbe()
+    state = AliasRoutingStateManager()
+    monkeypatch.setattr(candidate_loop, "alias_routing_state", state)
+    monkeypatch.setattr(
+        candidate_loop,
+        "_session_affinity_mod",
+        _session_owner_no_redis_seam,
+    )
+
+    class _Admission:
+        async def admit_selected_candidate(self, **_kwargs: Any) -> object:
+            return SimpleNamespace(allowed=True, lease=None)
+
+        async def release_provider_lane_admission(self, *_a: Any, **_k: Any) -> None:
+            return None
+
+    monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    monkeypatch.setattr(
+        state,
+        "candidate_probe_lock",
+        _wrap_probe_lock(state, probe),
+    )
+    monkeypatch.setattr(lpe, "_plan_codex_oauth_account_failover", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_started",
+        lambda **_k: _k["prepared_request_body"],
+    )
+    monkeypatch.setattr(lpe, "_record_auto_agent_alias_attempt_success", lambda **_k: None)
+    monkeypatch.setattr(lpe, "_record_auto_agent_alias_attempt_failure", lambda **_k: None)
+    monkeypatch.setattr(lpe, "_emit_auto_agent_alias_route_event", lambda *_a, **_k: None)
+
+    async def _select(**_kwargs: Any) -> dict[str, Any]:
+        return selection
+
+    async def _no_cooldown(_key: str) -> tuple[float, str]:
+        return 0.0, "local_fallback"
+
+    async def _noop_async(*_a: Any, **_k: Any) -> None:
+        return None
+
+    async def _one(session_id: str) -> object:
+        request = _starlette_request()
+        return await candidate_loop.handle_alias_route(
+            SimpleNamespace(
+                select_candidate_fn=_select,
+                perform_candidate_request_fn=probe.perform,
+                resolve_cooldown_publication_fn=None,
+                publish_cooldown_memory_fn=None,
+                persist_cooldown_fn=None,
+                set_session_affinity_fn=_noop_async,
+                add_alias_metadata_fn=lambda request_body, **_kwargs: request_body,
+                raise_redispatch_fn=None,
+            ),
+            alias_family="codex_auto_agent",
+            alias_model="basic",
+            request=request,
+            prepared_request_body={"model": "basic", "input": session_id},
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_no_cooldown,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidates",
+            log_label="Codex",
+        )
+
+    responses = await asyncio.gather(_one("ok-1"), _one("ok-2"))
+    assert all(getattr(r, "body", None) == b'{"ok":true}' for r in responses)
+    assert probe.total == 2
+    assert probe.max_current > 1
+    assert probe.lock_acquires == 0
+
+
+@pytest.mark.asyncio
+async def test_half_open_post_expiry_probes_single_flight_provider_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two post-expiry same-key probes must not both enter provider I/O."""
+    candidate = {
+        "provider": "openrouter",
+        "model": "openrouter/owl-alpha",
+        "route_family": "codex_openrouter_completion_adapter",
+    }
+    cooldown_key = "openrouter:openrouter/owl-alpha:openrouter"
+    selection = {
+        "candidate": candidate,
+        "cooldown_key": cooldown_key,
+        "lane_key": "openrouter",
+        "selection_reason": "first_available",
+    }
+    probe = _ConcurrentProviderProbe()
+    state = AliasRoutingStateManager()
+    # Expired leftover cooldown: currently cool, but still a recovery probe.
+    state.family("codex").cooldown_until_monotonic_by_key[cooldown_key] = (
+        __import__("time").monotonic() - 1.0
+    )
+    monkeypatch.setattr(candidate_loop, "alias_routing_state", state)
+    monkeypatch.setattr(
+        candidate_loop,
+        "_session_affinity_mod",
+        _session_owner_no_redis_seam,
+    )
+
+    class _Admission:
+        async def admit_selected_candidate(self, **_kwargs: Any) -> object:
+            return SimpleNamespace(allowed=True, lease=None)
+
+        async def release_provider_lane_admission(self, *_a: Any, **_k: Any) -> None:
+            return None
+
+    monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    monkeypatch.setattr(
+        state,
+        "candidate_probe_lock",
+        _wrap_probe_lock(state, probe),
+    )
+    monkeypatch.setattr(lpe, "_plan_codex_oauth_account_failover", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_started",
+        lambda **_k: _k["prepared_request_body"],
+    )
+    monkeypatch.setattr(lpe, "_record_auto_agent_alias_attempt_success", lambda **_k: None)
+    monkeypatch.setattr(lpe, "_record_auto_agent_alias_attempt_failure", lambda **_k: None)
+    monkeypatch.setattr(lpe, "_emit_auto_agent_alias_route_event", lambda *_a, **_k: None)
+
+    async def _select(**_kwargs: Any) -> dict[str, Any]:
+        return selection
+
+    async def _no_cooldown(_key: str) -> tuple[float, str]:
+        return 0.0, "local_fallback"
+
+    async def _noop_async(*_a: Any, **_k: Any) -> None:
+        return None
+
+    async def _one(session_id: str) -> object:
+        request = _starlette_request()
+        return await candidate_loop.handle_alias_route(
+            SimpleNamespace(
+                select_candidate_fn=_select,
+                perform_candidate_request_fn=probe.perform,
+                resolve_cooldown_publication_fn=None,
+                publish_cooldown_memory_fn=None,
+                persist_cooldown_fn=None,
+                set_session_affinity_fn=_noop_async,
+                add_alias_metadata_fn=lambda request_body, **_kwargs: request_body,
+                raise_redispatch_fn=None,
+            ),
+            alias_family="codex_auto_agent",
+            alias_model="basic",
+            request=request,
+            prepared_request_body={"model": "basic", "input": session_id},
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_no_cooldown,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidates",
+            log_label="Codex",
+        )
+
+    responses = await asyncio.gather(_one("probe-1"), _one("probe-2"), return_exceptions=True)
+    successes = [r for r in responses if getattr(r, "body", None) == b'{"ok":true}']
+    assert len(successes) >= 1
+    assert probe.max_current == 1
+    assert probe.lock_acquires >= 1
 
 
 def test_no_io_skipped_selection_records_named_reason_once() -> None:
