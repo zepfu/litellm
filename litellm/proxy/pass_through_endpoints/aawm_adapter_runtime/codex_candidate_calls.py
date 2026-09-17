@@ -5174,24 +5174,25 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             "Cursor auto-review returned executable tool calls; "
             "review decisions must be text-only."
         )
-    _validate_cursor_result_and_consume_replay_state(
-        result=result,
-        previous_response_id=previous_response_id,
-        replay_state=replay_state,
-    )
+    # CURSOR-035 leftover handoff (distinct from archived CURSOR-016).
+    # Connect already moved the live session onto result.retained_session.
+    transferred = False
+    retained_result_session = result.retained_session
     try:
+        _validate_cursor_result_and_consume_replay_state(
+            result=result,
+            previous_response_id=previous_response_id,
+            replay_state=replay_state,
+        )
         _validate_cursor_returned_tool_calls(result.tool_calls)
         model = adapter_model
         response_body = _cursor_responses_response_body(model=model, result=result)
-    except _CursorPostEgressOutputError as exc:
-        _raise_cursor_agent_alias_error(exc=exc, candidate=candidate)
-    response_body, _ = _restore_adapted_namespace_tool_calls_in_response_body(
-        response_body,
-        request_body=restoration_request_body,
-        adapter_model=adapter_model,
-    )
-    if result.tool_calls:
-        try:
+        response_body, _ = _restore_adapted_namespace_tool_calls_in_response_body(
+            response_body,
+            request_body=restoration_request_body,
+            adapter_model=adapter_model,
+        )
+        if result.tool_calls:
             replay_messages = _cursor_messages_with_result_tool_calls(
                 messages,
                 [
@@ -5200,16 +5201,33 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
                 ],
                 result.text,
             )
-        except _CursorPostEgressOutputError as exc:
+            next_session = result.retained_session
+            transferred = await transfer_or_close_retained_session(
+                session=retained_result_session,
+                next_session=next_session,
+                store=lambda: _store_cursor_replay_state(
+                    response_body["id"],
+                    messages=replay_messages,
+                    tools=(
+                        request_tools
+                        if isinstance(request_tools, list)
+                        else []
+                    ),
+                    retained_session=next_session,
+                    owner_scope=owner_scope,
+                    pending_call_ids=[
+                        call["call_id"] for call in result.tool_calls
+                    ],
+                ),
+            )
+        else:
+            await close_retained_session_once(retained_result_session)
+    except BaseException as exc:
+        if not transferred:
+            await close_retained_session_once(retained_result_session)
+        if isinstance(exc, _CursorPostEgressOutputError):
             _raise_cursor_agent_alias_error(exc=exc, candidate=candidate)
-        _store_cursor_replay_state(
-            response_body["id"],
-            messages=replay_messages,
-            tools=request_tools if isinstance(request_tools, list) else [],
-            retained_session=result.retained_session,
-            owner_scope=owner_scope,
-            pending_call_ids=[call["call_id"] for call in result.tool_calls],
-        )
+        raise
     _record_adapted_completed_route_rollup_turn(
         rollup_kwargs,
         adapter_label="Cursor Agent",

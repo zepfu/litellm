@@ -3342,6 +3342,84 @@ def test_cursor_continuation_success_keeps_one_registry_owner() -> None:
     assert live_owners == [session]
 
 
+def test_cursor_fresh_result_validation_failure_closes_retained_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _CountingRetainedSession()
+
+    class FakeCursorClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def run(
+            self,
+            _payload: dict[str, Any],
+            **_kwargs: Any,
+        ) -> CursorAgentRunResult:
+            return CursorAgentRunResult(retained_session=session)
+
+    monkeypatch.setattr(
+        "litellm.llms.cursor_agent.connect.CursorAgentConnectClient",
+        FakeCursorClient,
+    )
+
+    with pytest.raises(CursorConnectProtocolError):
+        _call({"model": "work", "input": "run pwd"})
+
+    assert session.close_calls == 1
+    _assert_no_live_retained_registry_owner(session)
+
+
+def test_cursor_fresh_result_registry_store_failure_closes_retained_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _CountingRetainedSession()
+
+    class FakeCursorClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def run(
+            self,
+            _payload: dict[str, Any],
+            **_kwargs: Any,
+        ) -> CursorAgentRunResult:
+            return CursorAgentRunResult(
+                tool_calls=[
+                    {
+                        "id": "cursor-item-1",
+                        "call_id": "call-1",
+                        "name": "exec_command",
+                        "arguments": '{"cmd":"pwd"}',
+                    }
+                ],
+                retained_session=session,
+            )
+
+    monkeypatch.setattr(
+        "litellm.llms.cursor_agent.connect.CursorAgentConnectClient",
+        FakeCursorClient,
+    )
+    real_store = codex_candidate_calls._store_cursor_replay_state
+
+    def _fail_live_store(*args: Any, **kwargs: Any) -> None:
+        if kwargs.get("retained_session") is not None:
+            raise RuntimeError("registry store failed")
+        return real_store(*args, **kwargs)
+
+    monkeypatch.setattr(
+        codex_candidate_calls,
+        "_store_cursor_replay_state",
+        _fail_live_store,
+    )
+
+    with pytest.raises(RuntimeError, match="registry store failed"):
+        _call({"model": "work", "input": "run pwd"})
+
+    assert session.close_calls == 1
+    _assert_no_live_retained_registry_owner(session)
+
+
 def test_cursor_stream_uses_responses_event_schema(
     monkeypatch: pytest.MonkeyPatch,
     _route_rollup_state: None,
