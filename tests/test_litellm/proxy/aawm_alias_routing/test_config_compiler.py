@@ -115,6 +115,58 @@ def test_canonical_sota_zai_compiles_coding_plan_ahead_of_alibaba() -> None:
     assert sota.dispatch is not None
     assert all(rule.target_alias != "sota-zai" for rule in sota.dispatch.by_tui)
     assert sota.dispatch.default != "sota-zai"
+    assert all(rule.tui_family != "ohmypi" for rule in sota.dispatch.by_tui)
+
+
+def test_ohmypi_tui_family_does_not_remap_logical_sota_or_concrete_sota_aliases() -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_schema import (
+        REGISTERED_TUI_FAMILIES,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        DEFAULT_CONFIG_DIR,
+        compile_directory,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.request_metadata import (
+        _normalize_tui_family,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
+        _resolve_dispatch_target,
+    )
+
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    assert "ohmypi" in REGISTERED_TUI_FAMILIES
+    assert _normalize_tui_family("Ohmypi/18.2.4") == "ohmypi"
+    assert _normalize_tui_family("Codex/0.154.0") == "codex"
+    sota = snapshot.aliases["sota"]
+    assert sota.dispatch is not None
+    assert sota.dispatch.default == "sota-openai"
+    assert {rule.tui_family for rule in sota.dispatch.by_tui} == {
+        "codex",
+        "grok",
+        "qwen",
+        "kimi",
+    }
+    assert _resolve_dispatch_target(
+        "sota", client_product_label="Codex/0.154.0", snapshot=snapshot
+    ) == "sota-openai"
+    assert _resolve_dispatch_target(
+        "sota", client_product_label="Ohmypi/18.2.4", snapshot=snapshot
+    ) == "sota-openai"
+    for alias in ("sota-xai", "sota-moonshot", "sota-zai", "basic", "work", "expert"):
+        compiled = snapshot.aliases[alias]
+        assert compiled.dispatch is None
+        assert (
+            _resolve_dispatch_target(
+                alias, client_product_label="Ohmypi/18.2.4", snapshot=snapshot
+            )
+            is None
+        )
+        assert (
+            _resolve_dispatch_target(
+                alias, client_product_label="Codex/0.154.0", snapshot=snapshot
+            )
+            is None
+        )
 
 
 def test_sota_zai_coding_plan_candidate_rejects_anthropic_route_family() -> None:

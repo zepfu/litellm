@@ -365,14 +365,17 @@ def _extract_auto_agent_alias_client_product_label(
 def _normalize_tui_family(client_product_label: Optional[str]) -> str:
     """Normalize client product label to stable TUI family (CFG-007).
 
-    Returns one of: codex, claude, grok, qwen, kimi, or unknown.
+    Returns one of: codex, claude, grok, qwen, kimi, ohmypi, or unknown.
     Versions are stripped; only the product family matters for dispatch.
+    Ohmypi (Oh My Pi / ompla / omp) is its own family and must not collapse
+    to Codex. Logical ``sota`` still uses the unknown/default branch unless
+    ``sota.yaml`` grows an explicit ``ohmypi`` rule.
     """
     if not client_product_label:
         return "unknown"
 
     product = client_product_label.split("/", 1)[0].strip().lower()
-    product = product.replace("-", "").replace("_", "")
+    product = product.replace("-", "").replace("_", "").replace(" ", "")
 
     if product in ("codex", "codexcli", "codextui"):
         return "codex"
@@ -384,6 +387,8 @@ def _normalize_tui_family(client_product_label: Optional[str]) -> str:
         return "qwen"
     if product in ("kimi", "kimichat", "kimicode", "kimicodecli"):
         return "kimi"
+    if product in ("ohmypi", "omp", "ompla"):
+        return "ohmypi"
     return "unknown"
 
 

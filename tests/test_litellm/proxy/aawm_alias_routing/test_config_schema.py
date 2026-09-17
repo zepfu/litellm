@@ -34,6 +34,19 @@ def _base_alias(**overrides: object) -> dict:
     return alias
 
 
+def test_registered_tui_families_include_ohmypi_without_accepting_arbitrary_names() -> None:
+    assert "ohmypi" in schema.REGISTERED_TUI_FAMILIES
+    assert "codex" in schema.REGISTERED_TUI_FAMILIES
+    accepted = schema.DispatchRuleConfig.model_validate(
+        {"tui_family": "ohmypi", "target_alias": "sota-xai"}
+    )
+    assert accepted.tui_family == "ohmypi"
+    with pytest.raises(ValidationError):
+        schema.DispatchRuleConfig.model_validate(
+            {"tui_family": "not-a-tui", "target_alias": "sota-xai"}
+        )
+
+
 def test_rejects_unknown_keys_and_malformed() -> None:
     """Unknown fields, missing required fields, and non-typed values are rejected."""
     with pytest.raises(ValidationError):
