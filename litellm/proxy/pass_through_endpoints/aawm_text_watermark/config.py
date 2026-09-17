@@ -57,6 +57,7 @@ class TextWatermarkLimitsSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     max_text_bytes_per_direction: int = 1_048_576
+    max_sse_stream_bytes: int = 128 * 1024 * 1024
     max_text_nodes_per_direction: int = 256
     max_reported_paths: int = 32
     max_reported_hits_per_path: int = 16

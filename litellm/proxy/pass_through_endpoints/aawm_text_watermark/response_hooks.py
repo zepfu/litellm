@@ -118,29 +118,30 @@ def _visible_texts_from_event(payload: Mapping[str, Any], event_type: str) -> li
 
 def _visible_texts_from_sse_block(block: str) -> list[str]:
     texts: list[str] = []
-    event_type = ""
-    for raw_line in block.splitlines():
-        line = raw_line.strip()
-        if line.startswith("event:"):
-            event_type = line[6:].strip()
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+        ResponsesEventPipeline,
+    )
+
+    pipeline = ResponsesEventPipeline(
+        max_event_bytes=max(2 * 1024 * 1024, len(block.encode("utf-8"))),
+        max_raw_events=0,
+    )
+    encoded = block.encode("utf-8")
+    if not encoded.endswith(b"\n\n"):
+        encoded += b"\n\n"
+    for parsed_event in pipeline.feed(encoded):
+        if (
+            parsed_event.is_malformed
+            or parsed_event.is_done_marker
+            or parsed_event.event_type not in _VISIBLE_DELTA_TYPES
+        ):
             continue
-        if not line.startswith("data:"):
-            continue
-        payload_text = line[5:].strip()
-        if not payload_text or payload_text == "[DONE]":
-            continue
-        try:
-            payload = json.loads(payload_text)
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        parsed_type = payload.get("type")
-        if isinstance(parsed_type, str) and parsed_type:
-            event_type = parsed_type
-        if event_type not in _VISIBLE_DELTA_TYPES:
-            continue
-        texts.extend(_visible_texts_from_event(payload, event_type))
+        texts.extend(
+            _visible_texts_from_event(
+                parsed_event.payload,
+                parsed_event.event_type,
+            )
+        )
     return texts
 
 
@@ -415,7 +416,13 @@ async def _wrap_passthrough_watermark_responses_stream_buffer_response(
     buffered: list[tuple[str, bool]] = []
     retained = ""
     max_bytes = config.limits.max_text_bytes_per_direction
+    buffered_bytes = 0
+    max_stream_bytes = config.limits.max_sse_stream_bytes
     async for event_block, had_separator in sse_iter(iterator):
+        encoded_block = _encode_sse_block(event_block, had_separator)
+        buffered_bytes += len(encoded_block)
+        if buffered_bytes > max_stream_bytes:
+            raise ValueError("Responses watermark stream exceeded configured bound")
         buffered.append((event_block, had_separator))
         for visible in _visible_texts_from_sse_block(event_block):
             retained = _append_bounded_visible_text(retained, visible, max_bytes)

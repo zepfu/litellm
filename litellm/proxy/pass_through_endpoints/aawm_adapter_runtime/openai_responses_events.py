@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -11,6 +12,40 @@ from typing import Any, Deque, Dict, Optional
 
 DEFAULT_MAX_EVENT_BYTES = 2 * 1024 * 1024
 DEFAULT_MAX_RAW_EVENTS = 64
+DEFAULT_MAX_STREAM_BYTES = 128 * 1024 * 1024
+DEFAULT_MAX_STREAM_EVENTS = 100_000
+EVENT_BYTES_ENV = "AAWM_RESPONSES_MAX_EVENT_BYTES"
+RAW_EVENTS_ENV = "AAWM_RESPONSES_MAX_RAW_EVENTS"
+STREAM_BYTES_ENV = "AAWM_RESPONSES_MAX_STREAM_BYTES"
+STREAM_EVENTS_ENV = "AAWM_RESPONSES_MAX_STREAM_EVENTS"
+
+
+def _env_int(name: str, default: int, *, minimum: int) -> int:
+    """Read an integer limit, rejecting values below the supported minimum."""
+    raw_value = os.environ.get(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    try:
+        value = int(raw_value.strip())
+    except ValueError:
+        return default
+    return value if value >= minimum else default
+
+
+def resolve_responses_event_limits() -> tuple[int, int]:
+    """Resolve configured per-event and raw-retention bounds."""
+    return (
+        _env_int(EVENT_BYTES_ENV, DEFAULT_MAX_EVENT_BYTES, minimum=1),
+        _env_int(RAW_EVENTS_ENV, DEFAULT_MAX_RAW_EVENTS, minimum=0),
+    )
+
+
+def resolve_responses_stream_limits() -> tuple[int, int]:
+    """Resolve configured aggregate stream and event-count bounds."""
+    return (
+        _env_int(STREAM_BYTES_ENV, DEFAULT_MAX_STREAM_BYTES, minimum=1),
+        _env_int(STREAM_EVENTS_ENV, DEFAULT_MAX_STREAM_EVENTS, minimum=1),
+    )
 
 
 @dataclass(frozen=True)
@@ -24,6 +59,7 @@ class ParsedResponsesEvent:
     is_malformed: bool
     byte_count: int
     observed_at: datetime
+    forward_event: Optional[bytes] = None
     raw_event: Optional[bytes] = None
 
     @property
@@ -53,12 +89,18 @@ class ResponsesEventTooLarge(ValueError):
     """An SSE event exceeded the configured event bound."""
 
 
+class ResponsesStreamTooLarge(ValueError):
+    """A Responses stream exceeded an aggregate configured bound."""
+
+
 @dataclass
 class ResponsesEventPipeline:
     """Incremental SSE parser with explicit event and raw-retention bounds."""
 
     max_event_bytes: int = DEFAULT_MAX_EVENT_BYTES
     max_raw_events: int = DEFAULT_MAX_RAW_EVENTS
+    max_stream_bytes: int = DEFAULT_MAX_STREAM_BYTES
+    max_stream_events: int = DEFAULT_MAX_STREAM_EVENTS
     retain_raw_events: bool = False
 
     _buffer: bytearray = field(default_factory=bytearray, init=False)
@@ -69,6 +111,8 @@ class ResponsesEventPipeline:
     malformed_event_count: int = 0
     done_marker_count: int = 0
     dropped_raw_event_count: int = 0
+    total_stream_bytes: int = 0
+    total_event_count: int = 0
     last_event_observed_at: Optional[datetime] = None
 
     def __post_init__(self) -> None:
@@ -76,6 +120,10 @@ class ResponsesEventPipeline:
             raise ValueError("max_event_bytes must be positive")
         if self.max_raw_events < 0:
             raise ValueError("max_raw_events must not be negative")
+        if self.max_stream_bytes <= 0:
+            raise ValueError("max_stream_bytes must be positive")
+        if self.max_stream_events <= 0:
+            raise ValueError("max_stream_events must be positive")
 
     @property
     def buffered_event_bytes(self) -> int:
@@ -83,14 +131,14 @@ class ResponsesEventPipeline:
 
     @staticmethod
     def _event_boundary(buffer: bytes) -> Optional[tuple[int, int]]:
-        crlf_boundary = buffer.rfind(b"\r\n\r\n")
-        lf_boundary = buffer.rfind(b"\n\n")
-        if crlf_boundary >= lf_boundary:
-            boundary_start, boundary_length = crlf_boundary, 4
-        else:
-            boundary_start, boundary_length = lf_boundary, 2
-        if boundary_start < 0:
+        crlf_boundary = buffer.find(b"\r\n\r\n")
+        lf_boundary = buffer.find(b"\n\n")
+        if crlf_boundary < 0 and lf_boundary < 0:
             return None
+        if crlf_boundary < 0 or (lf_boundary >= 0 and lf_boundary < crlf_boundary):
+            boundary_start, boundary_length = lf_boundary, 2
+        else:
+            boundary_start, boundary_length = crlf_boundary, 4
         return boundary_start + boundary_length, boundary_length
 
     def feed(self, chunk: bytes) -> list[ParsedResponsesEvent]:
@@ -98,6 +146,11 @@ class ResponsesEventPipeline:
         if not chunk:
             return []
         self._buffer.extend(chunk)
+        self.total_stream_bytes += len(chunk)
+        if self.total_stream_bytes > self.max_stream_bytes:
+            raise ResponsesStreamTooLarge(
+                f"Responses SSE stream exceeded {self.max_stream_bytes} bytes"
+            )
         if len(self._buffer) > self.max_event_bytes:
             raise ResponsesEventTooLarge(
                 f"Responses SSE event exceeded {self.max_event_bytes} bytes"
@@ -109,9 +162,18 @@ class ResponsesEventPipeline:
             if boundary is None:
                 break
             boundary_end, _ = boundary
+            if boundary_end > self.max_event_bytes:
+                raise ResponsesEventTooLarge(
+                    f"Responses SSE event exceeded {self.max_event_bytes} bytes"
+                )
             raw_event = bytes(self._buffer[:boundary_end])
             del self._buffer[:boundary_end]
             events.append(self._parse_event(raw_event))
+
+        if self.total_event_count > self.max_stream_events:
+            raise ResponsesStreamTooLarge(
+                f"Responses SSE stream exceeded {self.max_stream_events} events"
+            )
 
         if len(self._buffer) > self.max_event_bytes:
             raise ResponsesEventTooLarge(
@@ -126,6 +188,10 @@ class ResponsesEventPipeline:
         if not tail:
             return []
         return [self._parse_event(tail, malformed_tail=True)]
+
+    def parse_event(self, raw_event: bytes) -> ParsedResponsesEvent:
+        """Parse one already-framed event for bounded pre-commit inspection."""
+        return self._parse_event(raw_event)
 
     def _parse_event_lines(self, raw_event: bytes, *, malformed_tail: bool) -> tuple[
         Optional[str],
@@ -181,6 +247,7 @@ class ResponsesEventPipeline:
         sequence_number = self._next_sequence_number
         self._next_sequence_number += 1
         self.event_count += 1
+        self.total_event_count += 1
         self.last_event_observed_at = observed_at
 
         event_type, payload, is_done_marker, is_malformed = (
@@ -211,6 +278,7 @@ class ResponsesEventPipeline:
             is_malformed=is_malformed,
             byte_count=len(raw_event),
             observed_at=observed_at,
+            forward_event=raw_event,
             raw_event=retained_raw,
         )
 
@@ -225,4 +293,8 @@ class ResponsesEventPipeline:
             "max_raw_events": self.max_raw_events,
             "dropped_raw_event_count": self.dropped_raw_event_count,
             "retains_raw_events": self.retain_raw_events,
+            "total_stream_bytes": self.total_stream_bytes,
+            "max_stream_bytes": self.max_stream_bytes,
+            "total_event_count": self.total_event_count,
+            "max_stream_events": self.max_stream_events,
         }

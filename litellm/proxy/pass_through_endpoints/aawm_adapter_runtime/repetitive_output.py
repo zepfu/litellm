@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Mappi
 from fastapi import HTTPException
 
 from litellm._logging import verbose_proxy_logger
-from litellm.llms.base_llm.base_model_iterator import BaseModelResponseIterator
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
     _iter_sse_event_blocks_with_separator,
     _mapping_or_attr_get,
@@ -417,12 +416,22 @@ class VisibleTextRepetitionDetector:
 
 
 def _parse_sse_event_block(event_block: str) -> list[Any]:
-    events: list[Any] = []
-    for line in event_block.splitlines():
-        parsed = BaseModelResponseIterator._string_to_dict_parser(line)
-        if parsed is not None:
-            events.append(parsed)
-    return events
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+        ResponsesEventPipeline,
+    )
+
+    pipeline = ResponsesEventPipeline(
+        max_event_bytes=max(2 * 1024 * 1024, len(event_block.encode("utf-8"))),
+        max_raw_events=0,
+    )
+    encoded = event_block.encode("utf-8")
+    if not encoded.endswith(b"\n\n"):
+        encoded += b"\n\n"
+    return [
+        parsed_event.payload
+        for parsed_event in pipeline.feed(encoded)
+        if parsed_event.payload is not None
+    ]
 
 
 def _encode_sse_block(event_block: str, had_separator: bool) -> bytes:

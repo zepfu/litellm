@@ -58,11 +58,12 @@ from .llm_provider_handlers.vertex_passthrough_logging_handler import (
 from .aawm_alias_routing.audit_persist import _emit_aawm_terminal_error
 from .aawm_adapter_runtime.deferred_success import DeferredPassthroughSuccess
 from .aawm_adapter_runtime.openai_responses_events import (
-    DEFAULT_MAX_EVENT_BYTES,
-    DEFAULT_MAX_RAW_EVENTS,
     ParsedResponsesEvent,
     ResponsesEventPipeline,
     ResponsesEventTooLarge,
+    ResponsesStreamTooLarge,
+    resolve_responses_event_limits,
+    resolve_responses_stream_limits,
 )
 from .success_handler import PassThroughEndpointLogging
 
@@ -314,6 +315,10 @@ class _ResponsesPreCommitSSEParser:
 
     def __init__(self, prefix: _ResponsesPreCommitPrefixStore) -> None:
         self._prefix = prefix
+        self._pipeline = ResponsesEventPipeline(
+            max_event_bytes=_RESPONSES_PRE_COMMIT_MAX_BUFFER_BYTES,
+            max_raw_events=0,
+        )
         self._frame_start = 0
         self._position = 0
         self._search_tail = b""
@@ -338,7 +343,9 @@ class _ResponsesPreCommitSSEParser:
 
     def _consume_frame(self, frame: bytes) -> None:
         decision, error_payload, event_type = (
-            PassThroughStreamingHandler._inspect_responses_pre_commit_chunks([frame])
+            PassThroughStreamingHandler._inspect_responses_events(
+                self._pipeline.parse_event(frame)
+            )
         )
         if decision == "substantive":
             self._saw_substantive = True
@@ -1001,48 +1008,114 @@ class PassThroughStreamingHandler:
         chunks: List[bytes],
     ) -> tuple[str, Optional[Dict[str, Any]], Optional[str]]:
         buffered = b"".join(chunks)
-        complete_chunk, _partial_chunk = (
-            PassThroughStreamingHandler._split_responses_sse_event_buffer(buffered)
+        pipeline = ResponsesEventPipeline(
+            max_event_bytes=max(_RESPONSES_PRE_COMMIT_MAX_BUFFER_BYTES, len(buffered)),
+            max_raw_events=0,
         )
-        lines = PassThroughStreamingHandler._chunk_lines([complete_chunk])
-        events = PassThroughStreamingHandler._iter_responses_sse_events(lines)
+        events = pipeline.feed(buffered)
+        if pipeline.buffered_event_bytes:
+            events.extend(pipeline.finish())
         if not events:
             return "empty", None, None
-        first_error_payload: Optional[Dict[str, Any]] = None
-        first_error_event: Optional[str] = None
-        saw_lifecycle = False
-        for event_type, payload in events:
-            if event_type == "[DONE]":
+        decision = "empty"
+        decision_payload: Optional[Dict[str, Any]] = None
+        decision_event: Optional[str] = None
+        for event in events:
+            event_decision = (
+                PassThroughStreamingHandler._inspect_responses_events(event)
+            )
+            if event_decision[0] == "substantive":
+                return event_decision
+            if event_decision[0] == "failed" and decision != "failed":
+                decision = "failed"
+                decision_payload = event_decision[1]
+                decision_event = event_decision[2]
+            elif event_decision[0] == "lifecycle" and decision == "empty":
+                decision = "lifecycle"
+        if decision == "failed":
+            return decision, decision_payload, decision_event
+        return decision, None, None
+
+    @staticmethod
+    def _inspect_responses_events(
+        parsed_event: ParsedResponsesEvent,
+    ) -> tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+        if parsed_event.is_malformed or parsed_event.is_done_marker:
+            return "empty", None, None
+        event_type = parsed_event.event_type
+        payload = parsed_event.payload
+        error_payload = (
+            PassThroughStreamingHandler._extract_responses_stream_error_payload(
+                event_type,
+                payload,
+            )
+        )
+        if error_payload is not None or event_type in (
+            _RESPONSES_PRE_COMMIT_FAILURE_EVENTS
+        ):
+            return "failed", error_payload or payload, event_type
+        if (
+            PassThroughStreamingHandler._is_responses_non_substantive_lifecycle_event(
+                event_type,
+                payload,
+            )
+        ):
+            return "lifecycle", None, None
+        if PassThroughStreamingHandler._is_responses_substantive_event(
+            event_type,
+            payload,
+        ):
+            return "substantive", None, event_type
+        if event_type not in {None, ""}:
+            return "substantive", None, event_type
+        return "empty", None, None
+
+    @staticmethod
+    def _iter_responses_sse_events(
+        lines: List[str],
+    ) -> List[tuple[Optional[str], Optional[Dict[str, Any]]]]:
+        pipeline = ResponsesEventPipeline()
+        text = "\n\n".join(lines)
+        encoded = text.encode("utf-8") if text else b""
+        if not text.endswith("\n\n"):
+            encoded += b"\n\n"
+        events = pipeline.feed(encoded)
+        events.extend(pipeline.finish())
+        converted: List[tuple[Optional[str], Optional[Dict[str, Any]]]] = []
+        for parsed_event in events:
+            if parsed_event.is_malformed or parsed_event.is_done_marker:
+                event_type: Optional[str] = None
+                payload: Optional[Dict[str, Any]] = None
+            else:
+                event_type = parsed_event.event_type
+                payload = parsed_event.payload
+            if event_type is None and payload is None:
                 continue
+            converted.append((event_type, payload))
+        return converted
+
+    @staticmethod
+    def _find_responses_stream_recovery_failure(
+        lines: List[str],
+    ) -> Optional[ResponsesStreamPreCommitFailure]:
+        for event_type, payload in PassThroughStreamingHandler._iter_responses_sse_events(
+            lines
+        ):
             error_payload = (
                 PassThroughStreamingHandler._extract_responses_stream_error_payload(
                     event_type,
                     payload,
                 )
             )
-            if error_payload is not None or event_type in _RESPONSES_PRE_COMMIT_FAILURE_EVENTS:
-                if first_error_payload is None:
-                    first_error_payload = error_payload or payload
-                    first_error_event = event_type
+            if error_payload is None:
                 continue
-            if PassThroughStreamingHandler._is_responses_non_substantive_lifecycle_event(
-                event_type,
-                payload,
-            ):
-                saw_lifecycle = True
-                continue
-            if PassThroughStreamingHandler._is_responses_substantive_event(
-                event_type,
-                payload,
-            ):
-                return "substantive", None, event_type
-            if event_type not in {None, ""}:
-                return "substantive", None, event_type
-        if first_error_payload is not None or first_error_event is not None:
-            return "failed", first_error_payload, first_error_event
-        if saw_lifecycle:
-            return "lifecycle", None, None
-        return "empty", None, None
+            failure = PassThroughStreamingHandler._build_responses_pre_commit_failure(
+                error_payload=error_payload,
+                event_type=event_type,
+            )
+            if failure.error_class in _RESPONSES_STREAM_REDISPATCH_CLASSES:
+                return failure
+        return None
 
     @staticmethod
     def _build_responses_pre_commit_failure(
@@ -1150,35 +1223,6 @@ class PassThroughStreamingHandler:
             if failure.error_class in _RESPONSES_STREAM_REDISPATCH_CLASSES:
                 return failure
         return None
-
-    @staticmethod
-    def _remove_responses_stream_recovery_failure_events(
-        chunk: bytes,
-    ) -> tuple[bytes, bool]:
-        """Remove native recovery errors while retaining same-chunk output."""
-        if not chunk:
-            return chunk, False
-        try:
-            decoded = chunk.decode("utf-8")
-        except (AttributeError, UnicodeDecodeError):
-            return b"", False
-
-        normalized = decoded.replace("\r\n", "\n")
-        blocks = normalized.split("\n\n")
-        filtered_blocks: List[str] = []
-        removed = False
-        for block in blocks:
-            if block:
-                failure = PassThroughStreamingHandler._find_responses_stream_recovery_failure(
-                    block.splitlines()
-                )
-                if failure is not None:
-                    removed = True
-                    continue
-            filtered_blocks.append(block)
-        if not removed:
-            return chunk, False
-        return "\n\n".join(filtered_blocks).encode("utf-8"), True
 
     @staticmethod
     async def peek_responses_pre_commit_stream(
@@ -1820,8 +1864,18 @@ class PassThroughStreamingHandler:
             )
             responses_event_pipeline = (
                 ResponsesEventPipeline(
-                    max_event_bytes=DEFAULT_MAX_EVENT_BYTES,
-                    max_raw_events=DEFAULT_MAX_RAW_EVENTS,
+                    **dict(
+                        zip(
+                            ("max_event_bytes", "max_raw_events"),
+                            resolve_responses_event_limits(),
+                        )
+                    ),
+                    **dict(
+                        zip(
+                            ("max_stream_bytes", "max_stream_events"),
+                            resolve_responses_stream_limits(),
+                        )
+                    ),
                     retain_raw_events=_truthy_env_flag(
                         "AAWM_RESPONSES_EVENT_RAW_DIAGNOSTICS"
                     ),
@@ -1863,6 +1917,7 @@ class PassThroughStreamingHandler:
                 custom_llm_provider=custom_llm_provider,
             )
             metadata["aawm_stream_raw_bytes_buffered"] = buffer_raw_bytes
+            raw_bytes_budget = resolve_responses_stream_limits()[0]
             transfer_identity = extract_transfer_identity(
                 request_body=request_body if isinstance(request_body, dict) else None,
                 logging_obj=litellm_logging_obj,
@@ -1914,8 +1969,16 @@ class PassThroughStreamingHandler:
 
             def _record_responses_wire_chunk(chunk: bytes) -> None:
                 nonlocal downstream_chunk_count, downstream_byte_count
+                nonlocal raw_bytes_budget
                 if buffer_raw_bytes:
                     raw_bytes.append(chunk)
+                    raw_bytes_budget -= len(chunk)
+                    if raw_bytes_budget < 0:
+                        del raw_bytes[: len(raw_bytes) // 2]
+                        raw_bytes_budget = (
+                            raw_bytes_budget + sum(len(item) for item in raw_bytes)
+                        )
+                        metadata["aawm_stream_raw_bytes_dropped"] = True
                 if line_accumulator is not None:
                     line_accumulator.feed(chunk)
                 downstream_chunk_count += 1
@@ -1967,7 +2030,7 @@ class PassThroughStreamingHandler:
                 OpenAIPassthroughLoggingHandler._consume_responses_sse_event(
                     responses_sse_tracker,
                     decoded_event,
-                    )
+                )
                 return recovery_failure
 
             def _finalize_responses_tracking() -> Optional[Dict[str, Any]]:
@@ -2206,7 +2269,10 @@ class PassThroughStreamingHandler:
                 if responses_event_pipeline is not None:
                     try:
                         parsed_events = responses_event_pipeline.feed(chunk)
-                    except ResponsesEventTooLarge:
+                    except (
+                        ResponsesEventTooLarge,
+                        ResponsesStreamTooLarge,
+                    ) as exception:
                         responses_sse_event_buffer = b""
                         held_responses_done_suffix = b""
                         if responses_sse_tracker is not None:
@@ -2217,7 +2283,14 @@ class PassThroughStreamingHandler:
                         failure_context.update(
                             {
                                 "failure_kind": (
-                                    "streaming_upstream_event_too_large"
+                                    (
+                                        "streaming_upstream_event_too_large"
+                                        if isinstance(
+                                            exception,
+                                            ResponsesEventTooLarge,
+                                        )
+                                        else "streaming_upstream_too_large"
+                                    )
                                 ),
                                 "stream_failure_stage": (
                                     "stream_interrupted_after_first_byte"
@@ -2226,7 +2299,14 @@ class PassThroughStreamingHandler:
                                 "stream_bytes_seen": total_stream_bytes,
                                 "stream_hidden_retry_safe": False,
                                 "aawm_stream_incomplete_reason": (
-                                    "upstream_stream_event_too_large"
+                                    (
+                                        "upstream_stream_event_too_large"
+                                        if isinstance(
+                                            exception,
+                                            ResponsesEventTooLarge,
+                                        )
+                                        else "upstream_stream_too_large"
+                                    )
                                 ),
                             }
                         )
@@ -2253,11 +2333,14 @@ class PassThroughStreamingHandler:
                     recovery_failure: Optional[ResponsesStreamPreCommitFailure] = None
                     delivered_event_chunks: list[bytes] = []
                     for parsed_event in parsed_events:
-                        event_failure = _consume_responses_event(parsed_event)
-                        if event_failure is not None:
-                            recovery_failure = event_failure
-                        if parsed_event.raw_event is not None:
-                            delivered_event_chunks.append(parsed_event.raw_event)
+                        if recovery_failure is not None:
+                            break
+                        recovery_failure = _consume_responses_event(parsed_event)
+                        if (
+                            recovery_failure is None
+                            and parsed_event.forward_event is not None
+                        ):
+                            delivered_event_chunks.append(parsed_event.forward_event)
 
                     if delivered_event_chunks:
                         complete_chunk = b"".join(delivered_event_chunks)
@@ -2355,6 +2438,14 @@ class PassThroughStreamingHandler:
 
                 if buffer_raw_bytes:
                     raw_bytes.append(chunk)
+                    raw_bytes_budget -= len(chunk)
+                    if raw_bytes_budget < 0:
+                        del raw_bytes[: len(raw_bytes) // 2]
+                        raw_bytes_budget = (
+                            raw_bytes_budget
+                            + sum(len(item) for item in raw_bytes)
+                        )
+                        metadata["aawm_stream_raw_bytes_dropped"] = True
                 if line_accumulator is not None:
                     line_accumulator.feed(chunk)
                 if (
