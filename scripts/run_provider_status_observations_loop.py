@@ -18868,8 +18868,29 @@ def _codex_oauth_generation_maintenance_status(  # noqa: PLR0915 - bounded one-s
         )
         inventory_state = marker.get("inventory_state")
         if inventory_state == "valid" and safe_generation is not None:
-            status = "healthy"
-            reason = "codex_generation_valid"
+            if marker.get("auth_observation_persisted") is True:
+                status = "healthy"
+                reason = "codex_generation_valid"
+            else:
+                status = "unknown"
+                skip_reason = marker.get("auth_observation_skip_reason")
+                skip_error_class = marker.get(
+                    "auth_observation_skip_error_class"
+                )
+                if skip_reason == "apply_disabled":
+                    reason = "codex_generation_publication_not_performed"
+                elif (
+                    skip_error_class == "RuntimeError"
+                    and isinstance(skip_reason, str)
+                    and skip_reason.startswith("No database DSN found")
+                ):
+                    reason = "codex_generation_publication_dsn_unavailable"
+                elif skip_error_class in {"LockNotAvailable", "QueryCanceled"}:
+                    reason = "codex_generation_publication_database_write_skipped"
+                elif skip_error_class:
+                    reason = "codex_generation_publication_database_write_failed"
+                else:
+                    reason = "codex_generation_publication_failed"
         elif inventory_state == "unconfigured":
             status = "unknown"
             reason = "codex_inventory_unconfigured"
