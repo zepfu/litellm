@@ -63,6 +63,7 @@ _HOST_FUNCTION_NAMES = (
     "_event_sequence_number",
     "_ensure_reasoning_item_summary",
     "_ensure_response_text_format",
+    "_ensure_response_usage_details",
     "_ensure_responses_event_indexes",
     "_ensure_grok_responses_sse_compat",
     "_reattach_sequence_number_json",
@@ -245,6 +246,35 @@ def _ensure_response_text_format(response: Any) -> bool:
     return True
 
 
+def _ensure_response_usage_details(response: Any) -> bool:
+    """Grok Build requires `usage.input_tokens_details` on Responses envelopes."""
+
+    if not isinstance(response, dict):
+        return False
+    usage = response.get("usage")
+    if not isinstance(usage, dict):
+        return False
+    changed = False
+    details = usage.get("input_tokens_details")
+    if not isinstance(details, dict):
+        usage["input_tokens_details"] = {"cached_tokens": 0}
+        changed = True
+    elif "cached_tokens" not in details:
+        details["cached_tokens"] = 0
+        usage["input_tokens_details"] = details
+        changed = True
+    output_details = usage.get("output_tokens_details")
+    if not isinstance(output_details, dict):
+        usage["output_tokens_details"] = {"reasoning_tokens": 0}
+        changed = True
+    elif "reasoning_tokens" not in output_details:
+        output_details["reasoning_tokens"] = 0
+        usage["output_tokens_details"] = output_details
+        changed = True
+    response["usage"] = usage
+    return changed
+
+
 def _ensure_responses_event_indexes(payload: dict[str, Any]) -> bool:
     """Stamp missing integer indexes Grok Build requires on Responses SSE events."""
 
@@ -271,6 +301,7 @@ def _ensure_grok_responses_sse_compat(payload: dict[str, Any]) -> dict[str, Any]
     response = payload.get("response")
     if isinstance(response, dict):
         _ensure_response_text_format(response)
+        _ensure_response_usage_details(response)
         output = response.get("output")
         if isinstance(output, list):
             for entry in output:

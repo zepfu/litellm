@@ -62,6 +62,7 @@ W6B_OWNED_SYMBOLS: set[str] = {
     "_event_sequence_number",
     "_ensure_reasoning_item_summary",
     "_ensure_response_text_format",
+    "_ensure_response_usage_details",
     "_ensure_responses_event_indexes",
     "_ensure_grok_responses_sse_compat",
     "_reattach_sequence_number_json",
@@ -430,6 +431,29 @@ class TestSerializeResponsesAdapterResponse:
         )
         assert result["summary_index"] == 0
         assert result["delta"] == "The"
+
+    def test_stamps_input_tokens_details_on_completed_usage(self):
+        result = json.loads(
+            sse_mod._serialize_responses_adapter_response(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "status": "completed",
+                        "output": [],
+                        "usage": {
+                            "input_tokens": 10,
+                            "output_tokens": 2,
+                            "output_tokens_details": {"reasoning_tokens": 1},
+                            "total_tokens": 12,
+                        },
+                    },
+                }
+            )
+        )
+        assert result["response"]["usage"]["input_tokens_details"] == {
+            "cached_tokens": 0
+        }
 
 
 # ===========================================================================
