@@ -3077,6 +3077,21 @@ async def handle_alias_route(  # noqa: PLR0915
                 # cooldown reader acquires the family lock; holding the probe
                 # lock here would invert the canonical lock order (family ->
                 # probe) used by execute_cooldown_publication_transaction.
+                # Snapshot leftover cooldown/evidence BEFORE that reader:
+                # Codex/Anthropic active-cooldown getters pop expired leftover
+                # timestamps, which would otherwise make post-expiry recovery
+                # look like never-cooled healthy traffic.
+                family_state = alias_routing_state.family(alias_family)
+                leftover_recovery_snapshot = inspect_cooldown_absence(
+                    alias_routing_state,
+                    alias_family=alias_family,
+                    canonical_aliases=(alias_model,),
+                    cooldown_key=cooldown_key,
+                )
+                leftover_expired_cooldown = (
+                    leftover_recovery_snapshot.leftover_cooldown_present
+                    and leftover_recovery_snapshot.remaining_seconds <= 0
+                )
                 try:
                     active_seconds, _active_source = await get_active_cooldown_state_fn(selection["cooldown_key"])
                 except Exception as pre_exc:  # noqa: PERF203
@@ -3091,19 +3106,14 @@ async def handle_alias_route(  # noqa: PLR0915
                         reason=_NO_IO_SKIP_PRECHECK_COOLDOWN,
                     )
 
-                family_state = alias_routing_state.family(alias_family)
                 # Healthy traffic is currently cool with no leftover
                 # cooldown/evidence. Expired cooldown, negative cache, or
                 # failure evidence is a half-open/recovery probe and must
                 # stay single-flight. Sticky generation is not that state.
-                cooldown_absence = inspect_cooldown_absence(
-                    alias_routing_state,
-                    alias_family=alias_family,
-                    canonical_aliases=(alias_model,),
-                    cooldown_key=cooldown_key,
-                )
+                cooldown_absence = leftover_recovery_snapshot
                 half_open_or_recovery_probe = (
-                    cooldown_absence.negative_cached
+                    leftover_expired_cooldown
+                    or cooldown_absence.negative_cached
                     or cooldown_absence.evidence_present
                     or cooldown_absence.codex_failure_evidence_present
                     or (

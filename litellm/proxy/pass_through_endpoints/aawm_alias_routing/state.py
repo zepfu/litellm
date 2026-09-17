@@ -458,6 +458,16 @@ class AliasFamilyState:
         now = time.monotonic()
         return max(0.0, until - now) if until > now else 0.0
 
+    def has_leftover_cooldown_key(self, cooldown_key: str) -> bool:
+        """True when a leftover cooldown timestamp is still mapped, even if expired.
+
+        ``peek_cooldown_remaining`` reports 0.0 for both never-cooled and
+        post-expiry leftover keys. The candidate loop uses leftover presence
+        to keep half-open recovery single-flight after the active-cooldown
+        reader pops expired timestamps.
+        """
+        return cooldown_key in self.cooldown_until_monotonic_by_key
+
     def is_negative_cached(self, cooldown_key: str) -> bool:
         now = time.monotonic()
         neg_until = self.cooldown_negative_until_monotonic_by_key.get(cooldown_key, 0.0)
@@ -1471,6 +1481,7 @@ class CooldownInspectionResult:
     exists: bool
     remaining_seconds: float
     generation: int
+    leftover_cooldown_present: bool = False
     negative_cached: bool = False
     evidence_present: bool = False
     codex_failure_evidence_present: bool = False
@@ -1492,6 +1503,7 @@ def inspect_cooldown_absence(
     """
     family = mgr.family(alias_family)
     remaining = family.peek_cooldown_remaining(cooldown_key)
+    leftover_cooldown_present = family.has_leftover_cooldown_key(cooldown_key)
     negative_cached = family.is_negative_cached(cooldown_key)
     evidence_present = cooldown_key in family.evidence_events_by_key
     canonical = canonicalize_alias_family(alias_family)
@@ -1515,6 +1527,7 @@ def inspect_cooldown_absence(
         ),
         remaining_seconds=remaining,
         generation=family.get_generation(cooldown_key),
+        leftover_cooldown_present=leftover_cooldown_present,
         negative_cached=negative_cached,
         evidence_present=evidence_present,
         codex_failure_evidence_present=codex_failure_evidence_present,

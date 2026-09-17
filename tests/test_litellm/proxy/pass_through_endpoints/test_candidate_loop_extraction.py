@@ -48,9 +48,12 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry im
     _build_openai_capacity_target_identity,
     get_or_create_openai_alpha_capacity_retry_coordinator,
 )
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import cooldown_state as cooldown_state_mod
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_state import (
+    configure_cooldown_state_runtime,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
     AliasRoutingStateManager,
-    alias_routing_state,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
@@ -1304,7 +1307,14 @@ async def test_half_open_post_expiry_probes_single_flight_provider_io(
     state.family("codex").cooldown_until_monotonic_by_key[cooldown_key] = (
         __import__("time").monotonic() - 1.0
     )
+    previous_manager = cooldown_state_mod._manager
+    configure_cooldown_state_runtime(manager=state)
     monkeypatch.setattr(candidate_loop, "alias_routing_state", state)
+    monkeypatch.setattr(
+        cooldown_state_mod,
+        "get_aawm_alias_routing_dual_cache",
+        lambda: None,
+    )
     monkeypatch.setattr(
         candidate_loop,
         "_session_affinity_mod",
@@ -1337,9 +1347,6 @@ async def test_half_open_post_expiry_probes_single_flight_provider_io(
     async def _select(**_kwargs: Any) -> dict[str, Any]:
         return selection
 
-    async def _no_cooldown(_key: str) -> tuple[float, str]:
-        return 0.0, "local_fallback"
-
     async def _noop_async(*_a: Any, **_k: Any) -> None:
         return None
 
@@ -1361,18 +1368,26 @@ async def test_half_open_post_expiry_probes_single_flight_provider_io(
             request=request,
             prepared_request_body={"model": "basic", "input": session_id},
             max_candidate_attempts=1,
-            get_active_cooldown_state_fn=_no_cooldown,
+            get_active_cooldown_state_fn=(
+                cooldown_state_mod._get_codex_auto_agent_active_cooldown_state
+            ),
             attempts_metadata_key="codex_auto_agent_attempts",
             skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
             no_candidate_detail="no candidates",
             log_label="Codex",
         )
 
-    responses = await asyncio.gather(_one("probe-1"), _one("probe-2"), return_exceptions=True)
-    successes = [r for r in responses if getattr(r, "body", None) == b'{"ok":true}']
-    assert len(successes) >= 1
-    assert probe.max_current == 1
-    assert probe.lock_acquires >= 1
+    try:
+        responses = await asyncio.gather(
+            _one("probe-1"), _one("probe-2"), return_exceptions=True
+        )
+        successes = [r for r in responses if getattr(r, "body", None) == b'{"ok":true}']
+        assert len(successes) >= 1
+        assert cooldown_key not in state.family("codex").cooldown_until_monotonic_by_key
+        assert probe.max_current == 1
+        assert probe.lock_acquires >= 1
+    finally:
+        cooldown_state_mod._manager = previous_manager
 
 
 def test_no_io_skipped_selection_records_named_reason_once() -> None:

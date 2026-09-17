@@ -324,8 +324,23 @@ def test_inspect_cooldown_absence_reports_correctly(fresh_manager: AliasRoutingS
     )
     assert result.exists is False
     assert result.remaining_seconds == 0.0
+    assert result.leftover_cooldown_present is False
     assert result.generation == mgr.codex.get_generation("absent-key")
     assert result.alias_family == "codex"
+
+    # Expired leftover: remaining is 0, but the timestamp is still mapped.
+    mgr.codex.cooldown_until_monotonic_by_key["leftover-key"] = (
+        __import__("time").monotonic() - 1.0
+    )
+    leftover = inspect_cooldown_absence(
+        mgr,
+        alias_family="codex",
+        canonical_aliases=[],
+        cooldown_key="leftover-key",
+    )
+    assert leftover.exists is False
+    assert leftover.remaining_seconds == 0.0
+    assert leftover.leftover_cooldown_present is True
 
     # Present key
     mgr.codex.set_cooldown_memory("present-key", 120.0)
