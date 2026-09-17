@@ -636,6 +636,7 @@ async def test_candidate_loop_shared_account_hash_admission_denial_does_not_cont
         "route_family": "codex_responses",
         "codex_oauth_account_hash": "shared-hash",
         "codex_oauth_lane_key": "codex-oauth:other",
+        "cooldown_identity_tag": "alias:basic:openai:gpt-5.4:codex_responses",
     }
     cursor_leftover = {
         "provider": "cursor_agent",

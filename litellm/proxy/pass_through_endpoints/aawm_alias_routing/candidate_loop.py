@@ -435,6 +435,17 @@ def _peek_remaining_admission_candidate(
             if _xai_admission_lane_kind(remaining) == opposite:
                 return remaining
         return None
+    denied_hash = resolve_candidate_account_hash(
+        denied_candidate, selection=denied_selection
+    )
+    if isinstance(denied_hash, str) and denied_hash.strip():
+        for remaining in eligible:
+            remaining_hash = resolve_candidate_account_hash(remaining)
+            if (
+                isinstance(remaining_hash, str)
+                and remaining_hash.strip() == denied_hash.strip()
+            ):
+                return remaining
     return eligible[0] if eligible else None
 
 
