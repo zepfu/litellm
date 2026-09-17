@@ -61,6 +61,7 @@ W6B_OWNED_SYMBOLS: set[str] = {
     "_ensure_responses_sse_sequence_number",
     "_event_sequence_number",
     "_ensure_reasoning_item_summary",
+    "_ensure_response_text_format",
     "_ensure_grok_responses_sse_compat",
     "_reattach_sequence_number_json",
     "_responses_event_text_key",
@@ -395,6 +396,24 @@ class TestSerializeResponsesAdapterResponse:
             )
         )
         assert result["item"]["summary"] == [{"type": "summary_text", "text": "hi"}]
+
+    def test_stamps_text_format_on_completed_response(self):
+        result = json.loads(
+            sse_mod._serialize_responses_adapter_response(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "status": "completed",
+                        "output": [],
+                        "text": {},
+                    },
+                    "sequence_number": 9,
+                }
+            )
+        )
+        assert result["response"]["text"] == {"format": {"type": "text"}}
+        assert result["sequence_number"] == 9
 
 
 # ===========================================================================

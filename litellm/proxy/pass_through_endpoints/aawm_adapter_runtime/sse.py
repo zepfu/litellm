@@ -62,6 +62,7 @@ _HOST_FUNCTION_NAMES = (
     "_ensure_responses_sse_sequence_number",
     "_event_sequence_number",
     "_ensure_reasoning_item_summary",
+    "_ensure_response_text_format",
     "_ensure_grok_responses_sse_compat",
     "_reattach_sequence_number_json",
     "_responses_event_text_key",
@@ -206,6 +207,28 @@ def _ensure_reasoning_item_summary(item: Any) -> bool:
     return True
 
 
+def _ensure_response_text_format(response: Any) -> bool:
+    """Grok Build requires `text.format` on Responses envelopes.
+
+    Adapter `response.completed` events often emit `"text": {}`. Stamp the
+    OpenAI default `{type: text}` format without overwriting an existing one.
+    """
+
+    if not isinstance(response, dict):
+        return False
+    text = response.get("text")
+    if text is None:
+        response["text"] = {"format": {"type": "text"}}
+        return True
+    if not isinstance(text, dict):
+        return False
+    if "format" in text:
+        return False
+    text["format"] = {"type": "text"}
+    response["text"] = text
+    return True
+
+
 def _ensure_grok_responses_sse_compat(payload: dict[str, Any]) -> dict[str, Any]:
     item = payload.get("item")
     if isinstance(item, dict):
@@ -213,6 +236,7 @@ def _ensure_grok_responses_sse_compat(payload: dict[str, Any]) -> dict[str, Any]
         payload["item"] = item
     response = payload.get("response")
     if isinstance(response, dict):
+        _ensure_response_text_format(response)
         output = response.get("output")
         if isinstance(output, list):
             for entry in output:
