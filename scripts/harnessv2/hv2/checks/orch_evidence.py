@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from hv2.pane import _pane_scan_start
+from hv2.pane import _DATE_STDOUT_LINE, _ISO_DATE_STDOUT_LINE, _pane_scan_start
 
 
 _UNKNOWN_AGENT_MARKERS = (
@@ -21,6 +21,7 @@ _TASK_RESULT_AGENT = re.compile(
     r'<task-result\b[^>]*\bagent="([^"]+)"[^>]*\bstatus="completed"',
     re.IGNORECASE,
 )
+_ABORTED_THINKING_ERRORS = frozenset({"request was aborted", "aborted"})
 _PANE_CHILD_DATE = re.compile(
     r"(?m)^[ \t]*-[ \t]+([\w-]+)\n[ \t]+-[ \t]+date:",
 )
@@ -321,6 +322,8 @@ def _nested_child_route_row(path: Path, wanted: Sequence[str]) -> dict[str, Any]
     fallback = False
     error = ""
     completed = False
+    saw_pong = False
+    saw_date = False
     bounded_read = _iter_jsonl_objects(path)
     for obj in bounded_read:
         records.append(obj)
@@ -328,6 +331,13 @@ def _nested_child_route_row(path: Path, wanted: Sequence[str]) -> dict[str, Any]
         obj_type = str(obj.get("type") or "")
         tool_name = str(payload.get("toolName") or obj.get("toolName") or "")
         text = _content_text(payload)
+        if "PONG" in text.split():
+            saw_pong = True
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if _DATE_STDOUT_LINE.match(line) or _ISO_DATE_STDOUT_LINE.match(line):
+                saw_date = True
+                break
         if obj_type in {"session_init", "model_change"} or payload.get("agent"):
             candidate = _wanted_from_model(
                 payload.get("agent") or obj.get("agent") or "",
@@ -356,15 +366,31 @@ def _nested_child_route_row(path: Path, wanted: Sequence[str]) -> dict[str, Any]
             tools.add(str(data.get("toolName")))
         err = payload.get("errorMessage")
         if isinstance(err, str) and err.strip() and not error:
-            error = err.strip()
+            lowered = err.strip().lower()
+            aborted_thinking = (
+                obj_type == "model_usage"
+                and str(obj.get("stopReason") or "").lower() == "aborted"
+                and lowered in _ABORTED_THINKING_ERRORS
+            )
+            post_success_owner_409 = (
+                saw_pong
+                and saw_date
+                and "aawm_session_owner_redispatch_required" in lowered
+            )
+            if not aborted_thinking and not post_success_owner_409:
+                error = err.strip()
         # Nested bash while the parent is still waiting is not a completed
-        # child. Count the nested transcript only after a successful yield
-        # or a completed task-result.
+        # child. Count the nested transcript after a successful yield, a
+        # completed task-result, or observed PONG plus date stdout.
         if (
-            tool_name == "yield"
-            and str(payload.get("role") or "") == "toolResult"
-            and payload.get("isError") is not True
-        ) or _TASK_RESULT_AGENT.search(text):
+            (
+                tool_name == "yield"
+                and str(payload.get("role") or "") == "toolResult"
+                and payload.get("isError") is not True
+            )
+            or _TASK_RESULT_AGENT.search(text)
+            or (saw_pong and saw_date)
+        ):
             completed = True
     if not requested and path.stem in wanted_set:
         requested = path.stem

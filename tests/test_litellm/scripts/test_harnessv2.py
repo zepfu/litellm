@@ -4578,6 +4578,135 @@ def test_should_fail_provider_child_that_falls_back_to_operational_sota(
     assert "operational alias" in joined
 
 
+def test_should_count_nested_pong_and_date_when_ohmypi_task_result_exits_1(
+    tmp_path: Path,
+) -> None:
+    from hv2.checks.orch_evidence import child_spawn_evidence
+
+    children = ("basic", "work", "expert")
+    session_dir = tmp_path / "omp-sessions"
+    nested = session_dir / "parent-id"
+    nested.mkdir(parents=True)
+    parent_rows = [
+        json.dumps(
+            {
+                "message": {
+                    "role": "toolResult",
+                    "toolName": "task",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Spawned 3 background agents using basic, work, expert."
+                            ),
+                        }
+                    ],
+                    "details": {"results": [], "async": {"state": "running"}},
+                }
+            }
+        )
+    ]
+    for name in children:
+        parent_rows.append(
+            json.dumps(
+                {
+                    "type": "custom_message",
+                    "customType": "async-result",
+                    "content": (
+                        f'<task-result id="{name.title()}Child" agent="{name}" '
+                        'status="failed (exit 1)" duration="9.6s">\n'
+                        "<output>\nPONG\n</output>\n</task-result>"
+                    ),
+                }
+            )
+        )
+        (nested / f"{name.title()}Child.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "session_init",
+                            "agent": name,
+                            "resolvedModel": f"litellm-alpha-passthrough/{name}",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "model_usage",
+                            "purpose": "auto-thinking",
+                            "role": "tiny",
+                            "model": name,
+                            "stopReason": "aborted",
+                            "errorMessage": "Request was aborted",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": "PONG"}],
+                            }
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "message": {
+                                "role": "toolResult",
+                                "toolName": "bash",
+                                "isError": False,
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": (
+                                            "Thu 17 Sep 2026 07:20:50 PM EDT\n"
+                                            "\n\nWall time: 0.09 seconds"
+                                        ),
+                                    }
+                                ],
+                            }
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "errorMessage": (
+                                    '409 {"detail":{"error":{"code":'
+                                    '"aawm_session_owner_redispatch_required"}}}'
+                                ),
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": "Session ownership requires a fresh dispatch.",
+                                    }
+                                ],
+                            }
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    (session_dir / "parent.jsonl").write_text(
+        "\n".join(parent_rows) + "\n", encoding="utf-8"
+    )
+    evidence = child_spawn_evidence(
+        children=children,
+        pane="╭── π > ◕ AAWM alias sota-xai >\n",
+        session_dir=str(session_dir),
+    )
+    assert evidence["ok"] is True
+    assert evidence["failures"] == []
+    assert evidence["successful_agents"] == sorted(children)
+    assert evidence["failed_agents"] == []
+    for name in children:
+        route = evidence["routes"][name]
+        assert route["ok"] is True
+        assert route["terminal_disposition"] == "completed"
+        assert route["error"] == ""
+
+
 def test_should_not_infer_provider_route_identity_from_alias_prefix(
     tmp_path: Path,
 ) -> None:

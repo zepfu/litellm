@@ -12,6 +12,10 @@ _TRAILING_BLOCK_CHAR_RE = re.compile(r"[█▌]+$")
 _TREE_PREFIX = re.compile(r"^[└├│]\s*")
 _DATE_STDOUT_LINE = re.compile(
     r"^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) "
+    r"\d{1,2} "
+    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+    r"\d{4} \d{2}:\d{2}:\d{2}(?: [AP]M)?(?: [A-Z]{2,5})?$"
+    r"|^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) "
     r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
     r"\d{1,2} \d{2}:\d{2}:\d{2}(?: [A-Z]{2,5})? \d{4}$"
 )
