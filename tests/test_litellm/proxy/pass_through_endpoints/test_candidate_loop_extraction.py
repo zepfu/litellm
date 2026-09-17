@@ -637,8 +637,16 @@ async def test_candidate_loop_shared_account_hash_admission_denial_does_not_cont
         "codex_oauth_account_hash": "shared-hash",
         "codex_oauth_lane_key": "codex-oauth:other",
     }
+    cursor_leftover = {
+        "provider": "cursor_agent",
+        "model": "cursor_agent/cursor-grok-4.6-high",
+        "route_family": "codex_cursor_agent_aiserver_adapter",
+        "cooldown_identity_tag": "alias:basic:cursor_agent:cursor_agent/cursor-grok-4.6-high:codex_cursor_agent_aiserver_adapter",
+    }
     request.state.aawm_alias_selection_context = {
-        ("codex", "basic"): SimpleNamespace(candidates=(candidate, remaining)),
+        ("codex", "basic"): SimpleNamespace(
+            candidates=(cursor_leftover, candidate, remaining)
+        ),
     }
     admission_decision = SimpleNamespace(
         allowed=False,
@@ -762,9 +770,7 @@ async def test_candidate_loop_native_xai_admission_denial_continues_to_managed(
         "provider": "cursor_agent",
         "model": "cursor_agent/cursor-grok-4.6-high",
         "route_family": "codex_cursor_agent_aiserver_adapter",
-        "skip_reason": "cooled",
-        "cooldown_seconds": 30.0,
-        "codex_oauth_lane_key": "cursor-grok",
+        "cooldown_identity_tag": "alias:basic:cursor_agent:cursor_agent/cursor-grok-4.6-high:codex_cursor_agent_aiserver_adapter",
     }
     cooled_openai = {
         "provider": "openai",
@@ -772,8 +778,7 @@ async def test_candidate_loop_native_xai_admission_denial_continues_to_managed(
         "route_family": "codex_responses",
         "codex_oauth_account_hash": "native-hash",
         "codex_oauth_lane_key": "codex-oauth:account",
-        "skip_reason": "request_local_transient_failure",
-        "cooldown_seconds": 12.0,
+        "cooldown_identity_tag": "alias:basic:openai:gpt-5.5-codex:codex_responses",
     }
     native_selection = {
         "candidate": native,
@@ -792,6 +797,28 @@ async def test_candidate_loop_native_xai_admission_denial_continues_to_managed(
             candidates=(cursor_leftover, native, cooled_openai, managed)
         ),
     }
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.lane_keys import (
+        _codex_auto_agent_candidate_key,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+        CODEX_AUTO_AGENT_CURSOR_AGENT_LANE_KEY,
+    )
+
+    family = candidate_loop.alias_routing_state.family("codex")
+    family.cooldown_until_monotonic_by_key[
+        _codex_auto_agent_candidate_key(
+            cursor_leftover,
+            CODEX_AUTO_AGENT_CURSOR_AGENT_LANE_KEY,
+            cooldown_identity_tag=cursor_leftover["cooldown_identity_tag"],
+        )
+    ] = __import__("time").monotonic() + 30.0
+    family.cooldown_until_monotonic_by_key[
+        _codex_auto_agent_candidate_key(
+            cooled_openai,
+            cooled_openai["codex_oauth_lane_key"],
+            cooldown_identity_tag=cooled_openai["cooldown_identity_tag"],
+        )
+    ] = __import__("time").monotonic() + 12.0
     native_denial = SimpleNamespace(
         allowed=False,
         reason="capacity_unavailable",
@@ -983,8 +1010,10 @@ def test_healthy_same_key_traffic_skips_probe_lock_acquire() -> None:
     )
     remaining_managed = {
         "provider": "xai",
+        "model": "oa_xai/grok-4",
         "xai_oauth_account_hash": "managed-hash",
         "route_family": "codex_xai_oauth_responses_adapter",
+        "cooldown_identity_tag": "alias:basic:xai:oa_xai/grok-4:codex_xai_oauth_responses_adapter",
     }
     assert candidate_loop._admission_identities_are_independent(
         native_denied,
@@ -1013,14 +1042,27 @@ def test_healthy_same_key_traffic_skips_probe_lock_acquire() -> None:
         "provider": "cursor_agent",
         "model": "cursor_agent/cursor-grok-4.6-high",
         "route_family": "codex_cursor_agent_aiserver_adapter",
-        "skip_reason": "cooled",
-        "cooldown_seconds": 30.0,
+        "cooldown_identity_tag": "alias:basic:cursor_agent:cursor_agent/cursor-grok-4.6-high:codex_cursor_agent_aiserver_adapter",
     }
     request.state.aawm_alias_selection_context = {
         ("codex", "basic"): SimpleNamespace(
             candidates=(cursor_leftover, native, remaining_managed)
         ),
     }
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.lane_keys import (
+        _codex_auto_agent_candidate_key,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+        CODEX_AUTO_AGENT_CURSOR_AGENT_LANE_KEY,
+    )
+
+    candidate_loop.alias_routing_state.family("codex").cooldown_until_monotonic_by_key[
+        _codex_auto_agent_candidate_key(
+            cursor_leftover,
+            CODEX_AUTO_AGENT_CURSOR_AGENT_LANE_KEY,
+            cooldown_identity_tag=cursor_leftover["cooldown_identity_tag"],
+        )
+    ] = __import__("time").monotonic() + 30.0
     remaining = candidate_loop._peek_remaining_admission_candidate(
         request,
         alias_model="basic",

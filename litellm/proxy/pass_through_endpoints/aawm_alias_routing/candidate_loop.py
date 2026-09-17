@@ -305,22 +305,66 @@ def _peek_request_local_excluded_keys(request: Any) -> set[str]:
         return set(excluded) if isinstance(excluded, (set, frozenset, list, tuple)) else set()
 
 
+def _remaining_admission_canonical_lane_key(
+    remaining: Mapping[str, Any],
+) -> Optional[str]:
+    """Selector-canonical leftover lane, never a missing-field ``__default__``."""
+    explicit = (
+        remaining.get("codex_oauth_lane_key")
+        or remaining.get("xai_oauth_lane_key")
+        or remaining.get("lane_key")
+    )
+    if isinstance(explicit, str) and explicit.strip() and explicit.strip() != "__default__":
+        return explicit.strip()
+    try:
+        from .policy import (
+            CODEX_AUTO_AGENT_CURSOR_AGENT_LANE_KEY,
+            CODEX_AUTO_AGENT_CURSOR_AGENT_PROVIDER,
+            CODEX_AUTO_AGENT_XAI_LANE_KEY,
+            CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY,
+            CODEX_AUTO_AGENT_XAI_PROVIDER,
+        )
+        from .lane_keys import _resolve_codex_auto_agent_xai_lane_key
+    except Exception:
+        return None
+    provider = str(remaining.get("provider") or "").strip().lower()
+    if provider == CODEX_AUTO_AGENT_CURSOR_AGENT_PROVIDER:
+        return CODEX_AUTO_AGENT_CURSOR_AGENT_LANE_KEY
+    if provider == CODEX_AUTO_AGENT_XAI_PROVIDER:
+        try:
+            return _resolve_codex_auto_agent_xai_lane_key(dict(remaining))
+        except Exception:
+            route_family = str(remaining.get("route_family") or "")
+            if "xai_oauth" in route_family:
+                return CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY
+            return CODEX_AUTO_AGENT_XAI_LANE_KEY
+    return None
+
+
 def _remaining_admission_candidate_key(
     remaining: Mapping[str, Any],
 ) -> Optional[str]:
+    lane_key = _remaining_admission_canonical_lane_key(remaining)
+    if lane_key is None:
+        return None
     try:
         from .selection import _get_codex_auto_agent_request_local_cooldown_key
 
         return _get_codex_auto_agent_request_local_cooldown_key(
             candidate=dict(remaining),
-            lane_key=(
-                remaining.get("codex_oauth_lane_key")
-                or remaining.get("xai_oauth_lane_key")
-                or remaining.get("lane_key")
-            ),
+            lane_key=lane_key,
         )
     except Exception:
-        return None
+        try:
+            from .lane_keys import _codex_auto_agent_candidate_key
+
+            return _codex_auto_agent_candidate_key(
+                dict(remaining),
+                lane_key,
+                cooldown_identity_tag=remaining.get("cooldown_identity_tag"),
+            )
+        except Exception:
+            return None
 
 
 def _remaining_admission_candidate_is_eligible(
@@ -336,10 +380,10 @@ def _remaining_admission_candidate_is_eligible(
     if isinstance(cooldown_seconds, (int, float)) and cooldown_seconds > 0:
         return False
     remaining_key = _remaining_admission_candidate_key(remaining)
-    if remaining_key is not None and remaining_key in excluded:
-        return False
     if remaining_key is None:
-        return True
+        return False
+    if remaining_key in excluded:
+        return False
     try:
         remaining_cool = alias_routing_state.family(
             validate_alias_family(alias_family)
