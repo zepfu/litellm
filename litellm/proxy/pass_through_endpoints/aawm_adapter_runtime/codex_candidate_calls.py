@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -18,6 +19,7 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from types import FunctionType
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
@@ -46,7 +48,21 @@ _OPENCODE_GO_ALIAS_CANDIDATE_TIMEOUT_SECONDS = 30.0
 _NOUS_TOOL_CHOICE_ENUMS = frozenset({"auto", "none", "required"})
 _CURSOR_REPLAY_TTL_SECONDS = 600.0
 _CURSOR_REPLAY_MAX_SIZE = 256
+_CURSOR_REPLAY_MAX_ENTRY_BYTES = 1 * 1024 * 1024
+_CURSOR_REPLAY_MAX_TOTAL_BYTES = 16 * 1024 * 1024
+_CURSOR_REPLAY_MAX_STOCK_FUNCTION_CALLS = 32
+_CURSOR_REPLAY_MAX_STOCK_INPUT_ITEMS = 256
+_CURSOR_REPLAY_ACLOSE_TIMEOUT_SECONDS = 1.0
+_CURSOR_REPLAY_SHUTDOWN_TIMEOUT_SECONDS = 2.0
 _CURSOR_REPLAY_REGISTRY: OrderedDict[str, dict[str, Any]] = OrderedDict()
+_CURSOR_REPLAY_TOTAL_BYTES = 0
+_CURSOR_REPLAY_DISPOSAL_TASKS: set[asyncio.Task[Any]] = set()
+_CURSOR_REPLAY_SHUTDOWN_STARTED = False
+_CURSOR_REPLAY_VALIDATION_RUN_COUNT = 0
+_CURSOR_REPLAY_RECEIPT_REUSE_COUNT = 0
+_CURSOR_REPLAY_REQUEST_RECEIPT: ContextVar[
+    Optional["_CursorReplayRequestReceipt"]
+] = ContextVar("cursor_replay_request_receipt", default=None)
 _CURSOR_TOOL_CONTINUATION_CUE = (
     "Finish the original user request using the completed tool result above. "
     "Do not repeat completed tool calls."
@@ -245,6 +261,8 @@ _CURSOR_REPLAY_FRESH_DISPATCH_REJECTION_REASONS = frozenset(
         "explicit_item_reference",
         "invalid_body_shape",
         "cursor_continuation_identifier",
+        "replay_entry_too_large",
+        "replay_registry_capacity",
     }
 )
 _CURSOR_CONTINUATION_FIELDS = frozenset(
@@ -504,9 +522,23 @@ class _CursorReplayValidationResult:
 
 
 @dataclass(frozen=True)
+class _CursorReplayRequestReceipt:
+    """Request-local fail-closed replay validation bound to one body identity."""
+
+    body_ref: Any
+    body_id: int
+    body_fingerprint: str
+    history: Any
+    tools: Any
+    call_graph: Any
+    opaque_state_rejected: bool = True
+
+
+@dataclass(frozen=True)
 class _CursorReplayFreshDispatchBuildResult:
     body: Optional[dict[str, Any]]
     rejection: Optional[_CursorReplayFreshDispatchReject] = None
+    receipt: Optional[_CursorReplayRequestReceipt] = None
 
 
 def _cursor_replay_safe_diagnostic_token(value: Any) -> Optional[str]:
@@ -819,6 +851,93 @@ def _cursor_replay_build_rejected(
     )
 
 
+def _cursor_replay_body_identity_fingerprint(body: Any) -> Optional[str]:
+    if not isinstance(body, dict):
+        return None
+    try:
+        encoded = json.dumps(
+            body,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _cursor_replay_receipt_matches_body(
+    receipt: Optional[_CursorReplayRequestReceipt],
+    body: Any,
+) -> bool:
+    if receipt is None or not isinstance(body, dict):
+        return False
+    if receipt.body_ref is not body or receipt.body_id != id(body):
+        return False
+    fingerprint = _cursor_replay_body_identity_fingerprint(body)
+    return fingerprint is not None and receipt.body_fingerprint == fingerprint
+
+
+def _get_cursor_replay_request_receipt(
+    body: Any,
+) -> Optional[_CursorReplayRequestReceipt]:
+    receipt = _CURSOR_REPLAY_REQUEST_RECEIPT.get()
+    if not _cursor_replay_receipt_matches_body(receipt, body):
+        return None
+    return receipt
+
+
+def _bind_cursor_replay_request_receipt(
+    body: Any,
+    *,
+    history: Any,
+    tools: Any,
+    call_graph: Any,
+) -> Optional[_CursorReplayRequestReceipt]:
+    if not isinstance(body, dict):
+        _CURSOR_REPLAY_REQUEST_RECEIPT.set(None)
+        return None
+    fingerprint = _cursor_replay_body_identity_fingerprint(body)
+    if fingerprint is None:
+        _CURSOR_REPLAY_REQUEST_RECEIPT.set(None)
+        return None
+    receipt = _CursorReplayRequestReceipt(
+        body_ref=body,
+        body_id=id(body),
+        body_fingerprint=fingerprint,
+        history=history,
+        tools=tools,
+        call_graph=call_graph,
+        opaque_state_rejected=True,
+    )
+    _CURSOR_REPLAY_REQUEST_RECEIPT.set(receipt)
+    return receipt
+
+
+def _invalidate_cursor_replay_request_receipt(body: Any = None) -> None:
+    receipt = _CURSOR_REPLAY_REQUEST_RECEIPT.get()
+    if receipt is None:
+        return
+    if body is None or receipt.body_ref is body:
+        _CURSOR_REPLAY_REQUEST_RECEIPT.set(None)
+
+
+def _adopt_cursor_replay_request_receipt(
+    source_body: Any,
+    dest_body: Any,
+) -> Optional[_CursorReplayRequestReceipt]:
+    source_receipt = _get_cursor_replay_request_receipt(source_body)
+    if source_receipt is None:
+        return None
+    return _bind_cursor_replay_request_receipt(
+        dest_body,
+        history=source_receipt.history,
+        tools=source_receipt.tools,
+        call_graph=source_receipt.call_graph,
+    )
+
+
 def _cursor_replay_fresh_dispatch_reject_for_replay_safety(
     replay_safety: Any,
 ) -> Optional[dict[str, Any]]:
@@ -908,13 +1027,105 @@ def _sanitize_cursor_proto_structure_for_telemetry(
     return {"fields": sanitized_fields}
 
 
+def _cursor_replay_json_payload_bytes(value: Any) -> Optional[int]:
+    try:
+        encoded = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+            default=str,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    return len(encoded)
+
+
+def _cursor_replay_entry_payload_bytes(
+    *,
+    messages: Any,
+    tools: Any,
+    pending_call_ids: Any,
+    continuation_outcome: Any,
+    owner_scope: Any,
+) -> Optional[int]:
+    return _cursor_replay_json_payload_bytes(
+        {
+            "messages": messages,
+            "tools": tools,
+            "pending_call_ids": pending_call_ids,
+            "continuation_outcome": continuation_outcome,
+            "owner_scope": owner_scope,
+        }
+    )
+
+
+def _cursor_replay_registry_total_bytes() -> int:
+    return _CURSOR_REPLAY_TOTAL_BYTES
+
+
+def _cursor_replay_account_registry_bytes(delta: int) -> None:
+    global _CURSOR_REPLAY_TOTAL_BYTES
+    _CURSOR_REPLAY_TOTAL_BYTES = max(0, _CURSOR_REPLAY_TOTAL_BYTES + delta)
+
+
+def _cursor_replay_forget_disposal_task(task: asyncio.Task[Any]) -> None:
+    _CURSOR_REPLAY_DISPOSAL_TASKS.discard(task)
+
+
+def _cursor_replay_track_disposal_task(task: asyncio.Task[Any]) -> None:
+    _CURSOR_REPLAY_DISPOSAL_TASKS.add(task)
+    task.add_done_callback(_cursor_replay_forget_disposal_task)
+
+
+async def _aclose_cursor_retained_session(
+    session: Any,
+    *,
+    timeout: float = _CURSOR_REPLAY_ACLOSE_TIMEOUT_SECONDS,
+) -> None:
+    if session is None:
+        return
+    aclose = getattr(session, "aclose", None)
+    close = getattr(session, "close", None)
+    closer = aclose if callable(aclose) else close
+    if not callable(closer):
+        return
+    try:
+        result = closer()
+        if inspect.isawaitable(result):
+            await asyncio.wait_for(result, timeout=max(0.0, timeout))
+    except Exception:
+        return
+
+
 def _close_cursor_retained_session(state: Optional[dict[str, Any]]) -> None:
     if not isinstance(state, dict):
         return
     session = state.get("retained_session")
+    state["retained_session"] = None
+    if session is None:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    aclose = getattr(session, "aclose", None)
+    if loop is not None and not loop.is_closed() and callable(aclose):
+        _cursor_replay_track_disposal_task(
+            loop.create_task(_aclose_cursor_retained_session(session))
+        )
+        return
     close = getattr(session, "close", None)
-    if callable(close):
-        close()
+    closer = close if callable(close) else aclose
+    if not callable(closer):
+        return
+    try:
+        result = closer()
+        if inspect.isawaitable(result):
+            result.close()
+    except Exception:
+        return
 
 
 def _cancel_cursor_replay_expiry(state: Optional[dict[str, Any]]) -> None:
@@ -927,12 +1138,24 @@ def _cancel_cursor_replay_expiry(state: Optional[dict[str, Any]]) -> None:
         cancel()
 
 
+def _unregister_cursor_replay_state(
+    state: Optional[dict[str, Any]],
+) -> None:
+    if not isinstance(state, dict):
+        return
+    payload_bytes = state.get("payload_bytes")
+    if isinstance(payload_bytes, int) and payload_bytes > 0:
+        _cursor_replay_account_registry_bytes(-payload_bytes)
+        state["payload_bytes"] = 0
+
+
 def _dispose_cursor_replay_state(
     state: Optional[dict[str, Any]],
     *,
     close_retained_session: bool = True,
 ) -> None:
     _cancel_cursor_replay_expiry(state)
+    _unregister_cursor_replay_state(state)
     if close_retained_session:
         _close_cursor_retained_session(state)
 
@@ -946,6 +1169,7 @@ def _expire_cursor_replay_state(
         return
     _CURSOR_REPLAY_REGISTRY.pop(response_id, None)
     expected_state["expiry_handle"] = None
+    _unregister_cursor_replay_state(expected_state)
     _close_cursor_retained_session(expected_state)
 
 
@@ -978,6 +1202,53 @@ def _prune_cursor_replay_registry(now: Optional[float] = None) -> None:
         _dispose_cursor_replay_state(state)
 
 
+def _cursor_replay_reject_uncommitted_session(
+    *,
+    retained_session: Any,
+    previous: Optional[dict[str, Any]],
+) -> None:
+    if retained_session is None:
+        return
+    if (
+        isinstance(previous, dict)
+        and previous.get("retained_session") is retained_session
+    ):
+        return
+    _close_cursor_retained_session({"retained_session": retained_session})
+
+
+def _cursor_replay_restore_previous_entry(
+    *,
+    response_id: str,
+    state: dict[str, Any],
+    previous: Optional[dict[str, Any]],
+    accounted_delta: int,
+) -> None:
+    if _CURSOR_REPLAY_REGISTRY.get(response_id) is not state:
+        return
+    if previous is not None:
+        _CURSOR_REPLAY_REGISTRY[response_id] = previous
+    else:
+        _CURSOR_REPLAY_REGISTRY.pop(response_id, None)
+    _cursor_replay_account_registry_bytes(-accounted_delta)
+    _cancel_cursor_replay_expiry(state)
+
+
+def _cursor_replay_evict_until_within_bounds(response_id: str) -> bool:
+    while (
+        len(_CURSOR_REPLAY_REGISTRY) > _CURSOR_REPLAY_MAX_SIZE
+        or _CURSOR_REPLAY_TOTAL_BYTES > _CURSOR_REPLAY_MAX_TOTAL_BYTES
+    ):
+        if not _CURSOR_REPLAY_REGISTRY:
+            return True
+        evicted_id, evicted_state = next(iter(_CURSOR_REPLAY_REGISTRY.items()))
+        if evicted_id == response_id:
+            return False
+        _CURSOR_REPLAY_REGISTRY.pop(evicted_id, None)
+        _dispose_cursor_replay_state(evicted_state)
+    return True
+
+
 def _store_cursor_replay_state(
     response_id: str,
     *,
@@ -988,26 +1259,99 @@ def _store_cursor_replay_state(
     pending_call_ids: Optional[list[str]] = None,
     continuation_outcome: Optional[str] = None,
 ) -> None:
+    from litellm.llms.cursor_agent.connect import CursorConnectError
+
     now = time.monotonic()
     _prune_cursor_replay_registry(now)
-    previous = _CURSOR_REPLAY_REGISTRY.pop(response_id, None)
-    _dispose_cursor_replay_state(previous)
+    copied_messages = copy.deepcopy(messages)
+    copied_tools = copy.deepcopy(tools)
+    copied_pending_call_ids = list(pending_call_ids or [])
+    payload_bytes = _cursor_replay_entry_payload_bytes(
+        messages=copied_messages,
+        tools=copied_tools,
+        pending_call_ids=copied_pending_call_ids,
+        continuation_outcome=continuation_outcome,
+        owner_scope=owner_scope,
+    )
+    previous = _CURSOR_REPLAY_REGISTRY.get(response_id)
+    if (
+        payload_bytes is None
+        or payload_bytes > _CURSOR_REPLAY_MAX_ENTRY_BYTES
+        or payload_bytes > _CURSOR_REPLAY_MAX_TOTAL_BYTES
+    ):
+        _cursor_replay_reject_uncommitted_session(
+            retained_session=retained_session,
+            previous=previous if isinstance(previous, dict) else None,
+        )
+        raise CursorConnectError(
+            "Cursor Agent continuation state exceeds the per-entry replay bound.",
+            status_code=409,
+        )
+    previous_bytes = (
+        int(previous.get("payload_bytes") or 0)
+        if isinstance(previous, dict)
+        else 0
+    )
+    accounted_delta = payload_bytes - previous_bytes
     state = {
         "expires_at": now + _CURSOR_REPLAY_TTL_SECONDS,
         "expiry_handle": None,
-        "messages": copy.deepcopy(messages),
-        "tools": copy.deepcopy(tools),
+        "messages": copied_messages,
+        "tools": copied_tools,
         "retained_session": retained_session,
         "owner_scope": owner_scope,
-        "pending_call_ids": list(pending_call_ids or []),
+        "pending_call_ids": copied_pending_call_ids,
         "continuation_outcome": continuation_outcome,
+        "payload_bytes": payload_bytes,
     }
-    _CURSOR_REPLAY_REGISTRY[response_id] = state
-    _schedule_cursor_replay_expiry(response_id, state)
-    _CURSOR_REPLAY_REGISTRY.move_to_end(response_id)
-    while len(_CURSOR_REPLAY_REGISTRY) > _CURSOR_REPLAY_MAX_SIZE:
-        _evicted_id, evicted_state = _CURSOR_REPLAY_REGISTRY.popitem(last=False)
-        _dispose_cursor_replay_state(evicted_state)
+    inserted = False
+    accounted = False
+    try:
+        _CURSOR_REPLAY_REGISTRY[response_id] = state
+        inserted = True
+        _cursor_replay_account_registry_bytes(accounted_delta)
+        accounted = True
+        _schedule_cursor_replay_expiry(response_id, state)
+        _CURSOR_REPLAY_REGISTRY.move_to_end(response_id)
+        if not _cursor_replay_evict_until_within_bounds(response_id):
+            _cursor_replay_restore_previous_entry(
+                response_id=response_id,
+                state=state,
+                previous=previous,
+                accounted_delta=accounted_delta,
+            )
+            _cursor_replay_reject_uncommitted_session(
+                retained_session=retained_session,
+                previous=previous if isinstance(previous, dict) else None,
+            )
+            raise CursorConnectError(
+                "Cursor Agent continuation registry is at capacity.",
+                status_code=409,
+            )
+    except CursorConnectError:
+        raise
+    except Exception:
+        if inserted and _CURSOR_REPLAY_REGISTRY.get(response_id) is state:
+            if accounted:
+                _cursor_replay_restore_previous_entry(
+                    response_id=response_id,
+                    state=state,
+                    previous=previous,
+                    accounted_delta=accounted_delta,
+                )
+            elif previous is not None:
+                _CURSOR_REPLAY_REGISTRY[response_id] = previous
+            else:
+                _CURSOR_REPLAY_REGISTRY.pop(response_id, None)
+            _cancel_cursor_replay_expiry(state)
+        _cursor_replay_reject_uncommitted_session(
+            retained_session=retained_session,
+            previous=previous if isinstance(previous, dict) else None,
+        )
+        raise
+    if previous is not None:
+        previous["payload_bytes"] = 0
+        _dispose_cursor_replay_state(previous)
 
 
 def _record_cursor_replay_outcome(
@@ -1198,10 +1542,75 @@ def _mark_cursor_retained_transport_failure(
 
 
 def _clear_cursor_replay_registry() -> None:
+    global _CURSOR_REPLAY_TOTAL_BYTES
+    global _CURSOR_REPLAY_SHUTDOWN_STARTED
+    global _CURSOR_REPLAY_VALIDATION_RUN_COUNT
+    global _CURSOR_REPLAY_RECEIPT_REUSE_COUNT
     states = list(_CURSOR_REPLAY_REGISTRY.values())
     _CURSOR_REPLAY_REGISTRY.clear()
+    _CURSOR_REPLAY_TOTAL_BYTES = 0
+    _CURSOR_REPLAY_SHUTDOWN_STARTED = False
+    _CURSOR_REPLAY_VALIDATION_RUN_COUNT = 0
+    _CURSOR_REPLAY_RECEIPT_REUSE_COUNT = 0
+    _CURSOR_REPLAY_REQUEST_RECEIPT.set(None)
     for state in states:
+        state["payload_bytes"] = 0
         _dispose_cursor_replay_state(state)
+
+
+async def aclose_cursor_replay_registry(
+    *,
+    timeout: float = _CURSOR_REPLAY_SHUTDOWN_TIMEOUT_SECONDS,
+) -> None:
+    """Dispose remaining replay sessions during process teardown."""
+    global _CURSOR_REPLAY_SHUTDOWN_STARTED
+    global _CURSOR_REPLAY_TOTAL_BYTES
+    if _CURSOR_REPLAY_SHUTDOWN_STARTED:
+        return
+    _CURSOR_REPLAY_SHUTDOWN_STARTED = True
+    sessions: list[Any] = []
+    states = list(_CURSOR_REPLAY_REGISTRY.values())
+    _CURSOR_REPLAY_REGISTRY.clear()
+    _CURSOR_REPLAY_TOTAL_BYTES = 0
+    for state in states:
+        _cancel_cursor_replay_expiry(state)
+        state["payload_bytes"] = 0
+        session = state.get("retained_session") if isinstance(state, dict) else None
+        if isinstance(state, dict):
+            state["retained_session"] = None
+        if session is not None:
+            sessions.append(session)
+    pending = list(_CURSOR_REPLAY_DISPOSAL_TASKS)
+    _CURSOR_REPLAY_DISPOSAL_TASKS.clear()
+    close_timeout = max(0.0, timeout)
+    try:
+        if sessions:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    *[
+                        _aclose_cursor_retained_session(
+                            session,
+                            timeout=close_timeout,
+                        )
+                        for session in sessions
+                    ],
+                    return_exceptions=True,
+                ),
+                timeout=close_timeout,
+            )
+        if pending:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True),
+                timeout=close_timeout,
+            )
+    except Exception:
+        return
+
+
+async def _await_cursor_replay_disposal_tasks() -> None:
+    pending = list(_CURSOR_REPLAY_DISPOSAL_TASKS)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 def _watermark_endpoint_from_path(*parts: Any) -> str:
@@ -1839,7 +2248,7 @@ def _responses_output_contains_encrypted_reasoning_arguments(
     return findings
 
 
-async def _perform_codex_auto_agent_alias_candidate_request(
+async def _perform_codex_auto_agent_alias_candidate_request(  # noqa: PLR0915
     *,
     endpoint: str,
     request: Request,
@@ -2948,8 +3357,8 @@ def _find_cursor_full_history_retained_state(
             item_present=False,
             validator_reason="input_container",
         )
-    # Live continuation validates the trusted prefix, not the single-pair
-    # grammar used to authorize a provider-neutral fallback.
+    # Live continuation validates the trusted prefix, not the bounded
+    # call-graph grammar used to authorize a provider-neutral fallback.
     for item_index, item in enumerate(input_items):
         item_type = item.get("type") if isinstance(item, Mapping) else None
         if item_type == "message":
@@ -3529,9 +3938,11 @@ def _cursor_replay_stock_codex_full_history_input(  # noqa: PLR0915
 ) -> _CursorReplayValidationResult:
     """Accept only the bounded stock full-history replay grammar.
 
-    The supported shape is one user-bearing history with exactly one
-    ``function_call`` immediately followed by exactly one completed
-    ``function_call_output``. Other stock history variants fail closed.
+    The supported shape is one user-bearing history plus a bounded ordered
+    set of known ``function_call`` items and matching completed
+    ``function_call_output`` items with unique call IDs. The single-pair
+    trailing call/output form remains accepted. Other stock history
+    variants fail closed.
     """
     input_items = request_body.get("input")
     continuation_rejection = _cursor_replay_continuation_identifier_rejection(
@@ -3548,7 +3959,10 @@ def _cursor_replay_stock_codex_full_history_input(  # noqa: PLR0915
             "stock_full_history",
             "input_container",
         )
-    if len(input_items) < 3:
+    if (
+        len(input_items) < 3
+        or len(input_items) > _CURSOR_REPLAY_MAX_STOCK_INPUT_ITEMS
+    ):
         return _cursor_replay_rejected(
             "stock_full_history",
             "input_item_count",
@@ -3591,14 +4005,7 @@ def _cursor_replay_stock_codex_full_history_input(  # noqa: PLR0915
             replayed_input.append(message_item)
             continue
         if item_type == "function_call":
-            if item_index != len(input_items) - 2:
-                return _cursor_replay_rejected(
-                    "stock_full_history",
-                    "function_call_position",
-                    item_index=item_index,
-                    item=raw_item,
-                )
-            if function_call_count:
+            if function_call_count >= _CURSOR_REPLAY_MAX_STOCK_FUNCTION_CALLS:
                 return _cursor_replay_rejected(
                     "stock_full_history",
                     "function_call_count",
@@ -3625,27 +4032,6 @@ def _cursor_replay_stock_codex_full_history_input(  # noqa: PLR0915
             replayed_input.append(function_call_item)
             continue
         if item_type == "function_call_output":
-            if item_index != len(input_items) - 1:
-                return _cursor_replay_rejected(
-                    "stock_full_history",
-                    "function_call_output_position",
-                    item_index=item_index,
-                    item=raw_item,
-                )
-            if function_call_count != 1:
-                return _cursor_replay_rejected(
-                    "stock_full_history",
-                    "function_call_count",
-                    item_index=item_index,
-                    item=raw_item,
-                )
-            if output_count:
-                return _cursor_replay_rejected(
-                    "stock_full_history",
-                    "function_call_output_count",
-                    item_index=item_index,
-                    item=raw_item,
-                )
             if set(raw_item) not in (
                 {
                     "type",
@@ -3705,15 +4091,10 @@ def _cursor_replay_stock_codex_full_history_input(  # noqa: PLR0915
             "stock_full_history",
             "empty_user_text",
         )
-    if function_call_count != 1:
+    if function_call_count < 1:
         return _cursor_replay_rejected(
             "stock_full_history",
             "function_call_count",
-        )
-    if output_count != 1:
-        return _cursor_replay_rejected(
-            "stock_full_history",
-            "function_call_output_count",
         )
     unresolved_result = _cursor_replay_unresolved_function_call_ids(
         replayed_input,
@@ -3725,6 +4106,11 @@ def _cursor_replay_stock_codex_full_history_input(  # noqa: PLR0915
         return _cursor_replay_rejected(
             "stock_full_history",
             "unresolved_call_id",
+        )
+    if output_count != function_call_count:
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "function_call_output_count",
         )
     continuation_key = _cursor_replay_input_contains_cursor_continuation_identifier(
         replayed_input
@@ -4318,11 +4704,22 @@ def _build_cursor_replay_safe_fresh_dispatch_body_result(  # noqa: PLR0915
     *,
     continuation_exc: Optional[BaseException] = None,
 ) -> _CursorReplayFreshDispatchBuildResult:
+    global _CURSOR_REPLAY_VALIDATION_RUN_COUNT
+    global _CURSOR_REPLAY_RECEIPT_REUSE_COUNT
     if not isinstance(request_body, dict):
+        _invalidate_cursor_replay_request_receipt()
         return _cursor_replay_build_rejected(
             "fresh_body_copy",
             "request_body_shape",
         )
+    existing_receipt = _get_cursor_replay_request_receipt(request_body)
+    if existing_receipt is not None:
+        _CURSOR_REPLAY_RECEIPT_REUSE_COUNT += 1
+        return _CursorReplayFreshDispatchBuildResult(
+            body=request_body,
+            receipt=existing_receipt,
+        )
+    _CURSOR_REPLAY_VALIDATION_RUN_COUNT += 1
 
     input_continuation_rejection = (
         _cursor_replay_continuation_identifier_rejection(
@@ -4471,7 +4868,13 @@ def _build_cursor_replay_safe_fresh_dispatch_body_result(  # noqa: PLR0915
                 expected_state=registry_state,
                 close_retained_session=False,
             )
-    return _CursorReplayFreshDispatchBuildResult(body=fresh_body)
+    receipt = _bind_cursor_replay_request_receipt(
+        fresh_body,
+        history=replayed_input,
+        tools=replay_tools,
+        call_graph=final_graph_result.value,
+    )
+    return _CursorReplayFreshDispatchBuildResult(body=fresh_body, receipt=receipt)
 
 
 def _build_cursor_replay_safe_fresh_dispatch_body(

@@ -65,9 +65,7 @@ async def close_litellm_async_clients():
         if failures:
             sample = failures[:MAX_CLEANUP_FAILURE_LOGS]
             if len(failures) > MAX_CLEANUP_FAILURE_LOGS:
-                sample.append(
-                    f"... {len(failures) - MAX_CLEANUP_FAILURE_LOGS} more"
-                )
+                sample.append(f"... {len(failures) - MAX_CLEANUP_FAILURE_LOGS} more")
             verbose_logger.warning(
                 "close_litellm_async_clients completed with %s failures: %s",
                 len(failures),
@@ -75,7 +73,8 @@ async def close_litellm_async_clients():
             )
         elif close_count:
             verbose_logger.debug(
-                "close_litellm_async_clients cleaned %s async client entries", close_count
+                "close_litellm_async_clients cleaned %s async client entries",
+                close_count,
             )
         else:
             verbose_logger.debug(
@@ -110,6 +109,15 @@ async def close_litellm_async_clients():
                 "global base_llm_aiohttp_handler.close",
             )
             close_count += 1
+
+    try:
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
+            aclose_cursor_replay_registry,
+        )
+
+        await aclose_cursor_replay_registry()
+    except Exception as e:
+        failures.append(f"cursor_replay_registry: {type(e).__name__}: {e}")
 
     _log_summary()
 
