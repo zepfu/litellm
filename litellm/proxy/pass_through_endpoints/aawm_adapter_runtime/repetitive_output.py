@@ -31,7 +31,9 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_
     ResponsesEventPipeline,
     ResponsesEventTooLarge,
     ResponsesStreamTooLarge,
+    attach_responses_emissions,
     attach_responses_events,
+    responses_emissions_from_chunk,
     responses_event_pipeline_from_response,
 )
 from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
@@ -337,37 +339,25 @@ class VisibleTextRepetitionDetector:
         if self._match is not None:
             return self._match
         pending_bytes = len(f"{self._pending}{text}".encode("utf-8"))
-        if self._pending and pending_bytes > self._MAX_PENDING_BYTES:
-            # Required token state is bounded.  Force a boundary rather than
-            # retaining an arbitrarily long provider token between deltas.
-            flush = True
+        if pending_bytes > self._MAX_PENDING_BYTES:
+            raise ValueError(
+                "Repetitive-output token state exceeded the supported bound"
+            )
         words, self._pending = _normalize_visible_text_with_remainder(
             text, pending=self._pending, flush=flush
         )
         pending_encoded = self._pending.encode("utf-8")
         if len(pending_encoded) > self._MAX_PENDING_BYTES:
-            pending_encoded = pending_encoded[-self._MAX_PENDING_BYTES :]
-            while pending_encoded:
-                try:
-                    self._pending = pending_encoded.decode("utf-8")
-                    break
-                except UnicodeDecodeError:
-                    pending_encoded = pending_encoded[1:]
-            else:
-                self._pending = ""
+            raise ValueError(
+                "Repetitive-output pending token exceeded the supported bound"
+            )
         added_ngrams: list[tuple[str, ...]] = []
         for word in words:
             encoded_word = word.encode("utf-8")
             if len(encoded_word) > self._MAX_PENDING_BYTES:
-                encoded_word = encoded_word[: self._MAX_PENDING_BYTES]
-                while encoded_word:
-                    try:
-                        word = encoded_word.decode("utf-8")
-                        break
-                    except UnicodeDecodeError:
-                        encoded_word = encoded_word[:-1]
-                else:
-                    continue
+                raise ValueError(
+                    "Repetitive-output complete token exceeded the supported bound"
+                )
             evicted_ngram = self._ngram_at(0)
             window_was_full = (
                 self._window.maxlen is not None
@@ -498,10 +488,10 @@ def _parse_sse_event_block(event_block: str) -> list[Any]:
 
 def _encode_sse_block(event_block: str, had_separator: bool) -> bytes:
     wire = _sse_block_wire_bytes(event_block, had_separator)
-    associated_events = _sse_block_events(event_block)
-    if associated_events is None:
+    associated_emissions = responses_emissions_from_chunk(event_block)
+    if associated_emissions is None:
         return wire
-    return attach_responses_events(wire, associated_events)
+    return attach_responses_emissions(wire, associated_emissions)
 
 
 def _as_bytes(chunk: Any) -> bytes:
@@ -868,15 +858,25 @@ def _build_repetitive_output_failed_chunks(
             local_payload,
             event_type="response.failed",
             wire_event=carried[0],
+            control=True,
         )
-        carried[0] = attach_responses_events(carried[0], [terminal_event])
+        carried[0] = attach_responses_events(
+            carried[0],
+            [terminal_event],
+            replace=True,
+        )
         if len(carried) > 1:
             done_event = event_pipeline.adopt_event(
                 None,
                 is_done_marker=True,
                 wire_event=carried[1],
+                control=True,
             )
-            carried[1] = attach_responses_events(carried[1], [done_event])
+            carried[1] = attach_responses_events(
+                carried[1],
+                [done_event],
+                replace=True,
+            )
         return carried
     except (
         ResponsesEventRetentionTooLarge,

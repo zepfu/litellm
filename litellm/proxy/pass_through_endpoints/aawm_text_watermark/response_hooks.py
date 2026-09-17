@@ -29,8 +29,9 @@ from litellm.proxy.pass_through_endpoints.aawm_text_watermark.unicode_detector i
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
     ParsedResponsesEvent,
     ResponsesEventPipeline,
+    attach_responses_emissions,
     attach_responses_events,
-    render_responses_event_wire,
+    responses_emissions_from_chunk,
     responses_events_from_chunk,
 )
 
@@ -143,12 +144,11 @@ def _visible_texts_from_sse_block(
     parse_sse_block: Optional[Callable[[str], list[Any]]] = None,
 ) -> list[str]:
     texts: list[str] = []
-    associated_events = responses_events_from_chunk(block)
-    if associated_events is None:
-        associated_events = getattr(block, "aawm_parsed_responses_events", None)
-    if associated_events is not None:
-        for event in associated_events:
-            payload, event_type = _event_payload_and_type(event)
+    associated_emissions = responses_emissions_from_chunk(block)
+    if associated_emissions is not None:
+        for emission in associated_emissions:
+            payload = emission.effective_payload
+            event_type = emission.source_event.event_type or ""
             if (
                 not isinstance(payload, Mapping)
                 or not event_type
@@ -226,47 +226,37 @@ def _rewrite_visible_sse_payload(
     return payload
 
 
-def _rewrite_visible_sse_event_wire(
-    event: ParsedResponsesEvent,
+def _rewrite_visible_sse_emission(
+    emission: Any,
     config: OpenAIPassthroughTextWatermarkSettings,
-    *,
-    wire: Optional[bytes] = None,
-) -> bytes:
-    payload = event.payload
-    event_type = event.event_type or ""
-    source_wire = wire or event.forward_event or event.raw_event or b""
-    if not source_wire or not isinstance(payload, dict) or event_type not in _VISIBLE_DELTA_TYPES:
-        return source_wire
+) -> Any:
+    payload = emission.effective_payload
+    event_type = emission.source_event.event_type or ""
+    if not isinstance(payload, dict) or event_type not in _VISIBLE_DELTA_TYPES:
+        return emission
     rewritten_payload = _rewrite_visible_sse_payload(
         copy.deepcopy(payload),
         event_type,
         config,
     )
     if rewritten_payload == payload:
-        return source_wire
-    return render_responses_event_wire(event, rewritten_payload)
+        return emission
+    return emission.transformed(rewritten_payload)
 
 
 def _rewrite_visible_sse_block(
     event_block: Any, config: OpenAIPassthroughTextWatermarkSettings
 ) -> Any:
-    associated_events = responses_events_from_chunk(event_block)
-    if associated_events is None:
-        associated_events = getattr(event_block, "aawm_parsed_responses_events", None)
-    if not isinstance(associated_events, list) or not associated_events:
+    associated_emissions = responses_emissions_from_chunk(event_block)
+    if associated_emissions is None:
         return event_block
-    pieces: list[bytes] = []
-    changed = False
-    for event in associated_events:
-        if not isinstance(event, ParsedResponsesEvent):
-            continue
-        source_wire = event.forward_event or event.raw_event or b""
-        rewritten = _rewrite_visible_sse_event_wire(event, config)
-        pieces.append(rewritten)
-        changed = changed or rewritten != source_wire
-    if not changed or not pieces:
+    rewritten = [
+        _rewrite_visible_sse_emission(emission, config)
+        for emission in associated_emissions
+    ]
+    if rewritten == associated_emissions:
         return event_block
-    return attach_responses_events(b"".join(pieces), associated_events)
+    return attach_responses_emissions(b"", rewritten)
 
 
 def _parse_responses_sse_block(block: str) -> list[Any]:
@@ -296,17 +286,61 @@ def _parse_responses_sse_block(block: str) -> list[Any]:
     return pipeline.feed(encoded)
 
 
+async def _associate_unassociated_watermark_iterator(
+    iterator: Any,
+    *,
+    event_pipeline: Optional[ResponsesEventPipeline],
+) -> Any:
+    """Require one parsing/association boundary before buffered mutation."""
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+        responses_events_from_chunk,
+    )
+
+    pipeline = event_pipeline
+
+    def _associated_frames(events: list[ParsedResponsesEvent]) -> bytes:
+        return attach_responses_events(
+            b"".join(
+                event.forward_event or event.raw_event or b""
+                for event in events
+            ),
+            events,
+        )
+
+    async def _wrapped():
+        nonlocal pipeline
+        async for chunk in iterator:
+            if responses_events_from_chunk(chunk) is not None:
+                yield chunk
+                continue
+            if pipeline is None:
+                pipeline = ResponsesEventPipeline(max_raw_events=0)
+            data = (
+                chunk
+                if isinstance(chunk, (bytes, bytearray))
+                else str(chunk).encode("utf-8")
+            )
+            events = pipeline.feed(bytes(data))
+            if events:
+                yield _associated_frames(events)
+        if pipeline is not None:
+            leftover = pipeline.finish()
+            if leftover:
+                yield _associated_frames(leftover)
+
+    return _wrapped()
+
+
 def _encode_sse_block(event_block: Any, had_separator: bool) -> bytes:
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
         _sse_block_wire_bytes,
-        _sse_block_events,
     )
 
     wire = _sse_block_wire_bytes(event_block, had_separator)
-    associated_events = _sse_block_events(event_block)
-    if associated_events is None:
+    associated_emissions = responses_emissions_from_chunk(event_block)
+    if associated_emissions is None:
         return wire
-    return attach_responses_events(wire, associated_events)
+    return attach_responses_emissions(wire, associated_emissions)
 
 
 def _append_bounded_visible_text(
@@ -515,9 +549,32 @@ async def _wrap_passthrough_watermark_responses_stream_buffer_response(
     if audit is not None:
         _attach_output_audit(success_handler_kwargs, audit)
 
+    rewrite = _policy_mutates(config)
+    emitted_blocks: list[tuple[Any, bool]] = []
+    emitted_visible = ""
+    for event_block, had_separator in buffered:
+        emitted = (
+            _rewrite_visible_sse_block(event_block, config)
+            if rewrite
+            else event_block
+        )
+        for visible in _visible_texts_from_sse_block(
+            emitted,
+            parse_sse_block=parse_sse_block,
+        ):
+            emitted_visible = _append_required_visible_text(
+                emitted_visible, visible, max_bytes
+            )
+        emitted_blocks.append((emitted, had_separator))
+
     post_hits = 0
-    if retained and config.unicode.enabled:
-        cleaned = _sanitize_visible_payload_text(retained, config)
+    verification_text = emitted_visible if rewrite else retained
+    if verification_text and config.unicode.enabled:
+        cleaned = (
+            verification_text
+            if rewrite
+            else _sanitize_visible_payload_text(verification_text, config)
+        )
         post_hits = detect_unicode_carriers(
             cleaned,
             policy=config.unicode.policy,
@@ -527,13 +584,7 @@ async def _wrap_passthrough_watermark_responses_stream_buffer_response(
     if config.mode == "enforce" and post_hits > 0:
         _raise_unremovable_stream(audit)
 
-    rewrite = _policy_mutates(config)
-    for event_block, had_separator in buffered:
-        emitted = (
-            _rewrite_visible_sse_block(event_block, config)
-            if rewrite
-            else event_block
-        )
+    for emitted, had_separator in emitted_blocks:
         yield _encode_sse_block(emitted, had_separator)
 
 
@@ -554,7 +605,7 @@ def maybe_wrap_passthrough_watermark_responses_stream(
     policies fail closed instead of silently becoming audit-only.
     """
 
-    del kwargs, event_pipeline
+    del kwargs
     loaded = _coerce_config(config)
     if not _policy_applies(loaded, "response", endpoint):
         return iterator
@@ -571,6 +622,10 @@ def maybe_wrap_passthrough_watermark_responses_stream(
         _iter_sse_event_blocks_with_separator,
     )
     if mutating and stream_policy == "buffer_response":
+        iterator = _associate_unassociated_watermark_iterator(
+            iterator,
+            event_pipeline=event_pipeline,
+        )
         return _wrap_passthrough_watermark_responses_stream_buffer_response(
             iterator,
             config=loaded,

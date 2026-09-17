@@ -192,8 +192,9 @@ from .aawm_adapter_runtime.deferred_success import (
 from .aawm_adapter_runtime.openai_responses_events import (
     ParsedResponsesEvent,
     ResponsesEventPipeline,
-    attach_responses_events,
+    attach_responses_emissions,
     create_responses_event_pipeline,
+    responses_emissions_from_chunk,
 )
 from .streaming_handler import (
     RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS,
@@ -444,6 +445,7 @@ def _restore_responses_sse_frame(
     rewrite: ResponsesFunctionNameRewrite,
     *,
     parsed_event: Optional[ParsedResponsesEvent] = None,
+    payload: Any = None,
 ) -> bytes:
     data_lines: list[tuple[int, bytes, bytes, bytes]] = []
     saw_done = False
@@ -472,7 +474,9 @@ def _restore_responses_sse_frame(
     if not data_lines or saw_done:
         return frame
 
-    if parsed_event is not None and isinstance(parsed_event.payload, dict):
+    if isinstance(payload, dict):
+        payload = copy.deepcopy(payload)
+    elif parsed_event is not None and isinstance(parsed_event.payload, dict):
         payload = copy.deepcopy(parsed_event.payload)
     else:
         try:
@@ -511,12 +515,9 @@ def _restore_responses_sse_frame(
 
 
 def _next_sse_frame_boundary(buffer: bytes) -> Optional[tuple[int, int]]:
-    boundaries = [
-        (index, len(delimiter))
-        for delimiter in (b"\r\n\r\n", b"\n\n", b"\r\r")
-        if (index := buffer.find(delimiter)) >= 0
-    ]
-    return min(boundaries) if boundaries else None
+    from .aawm_adapter_runtime.openai_responses_events import _find_event_boundary
+
+    return _find_event_boundary(buffer)
 
 
 async def _restore_responses_function_names_in_sse_chunks(
@@ -525,31 +526,30 @@ async def _restore_responses_function_names_in_sse_chunks(
 ) -> AsyncIterator[bytes]:
     from .aawm_adapter_runtime.sse import (
         _iter_sse_event_blocks_with_separator,
-        _sse_block_events,
         _sse_block_wire_bytes,
     )
 
     async for event_block, had_separator in _iter_sse_event_blocks_with_separator(
         chunks
     ):
-        associated_events = _sse_block_events(event_block)
+        associated_emissions = responses_emissions_from_chunk(event_block)
         wire = _sse_block_wire_bytes(event_block, had_separator)
-        if associated_events is None:
+        if associated_emissions is None:
             yield _restore_responses_sse_frame(wire, rewrite)
             continue
-        pieces: list[bytes] = []
-        for parsed_event in associated_events:
-            if not isinstance(parsed_event, ParsedResponsesEvent):
-                continue
-            frame = parsed_event.forward_event or parsed_event.raw_event or b""
-            restored = _restore_responses_sse_frame(
-                frame or wire,
+        restored_emissions = []
+        for emission in associated_emissions:
+            restored_payload = _restore_responses_sse_payload(
+                copy.deepcopy(emission.effective_payload)
+                if isinstance(emission.effective_payload, dict)
+                else emission.effective_payload,
                 rewrite,
-                parsed_event=parsed_event,
             )
-            pieces.append(restored)
-        restored_wire = b"".join(pieces) if pieces else wire
-        yield attach_responses_events(restored_wire, associated_events)
+            if restored_payload is emission.effective_payload:
+                restored_emissions.append(emission)
+                continue
+            restored_emissions.append(emission.transformed(restored_payload))
+        yield attach_responses_emissions(b"", restored_emissions)
 
 
 # Global registry to track registered pass-through routes and prevent memory leaks

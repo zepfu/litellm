@@ -64,8 +64,10 @@ from .aawm_adapter_runtime.openai_responses_events import (
     ResponsesEventPipeline,
     ResponsesEventTooLarge,
     ResponsesStreamTooLarge,
+    attach_responses_emissions,
     attach_responses_events,
     create_responses_event_pipeline,
+    responses_emissions_from_chunk,
     responses_event_pipeline_from_response,
     responses_events_from_chunk,
 )
@@ -699,23 +701,24 @@ class PassThroughStreamingHandler:
         return chunk[:boundary_end], chunk[boundary_end:]
 
     @staticmethod
-    def _partition_responses_events_by_wire(
+    def _partition_responses_emissions_by_count(
         prefix: bytes,
         suffix: bytes,
-        events: List[ParsedResponsesEvent],
-    ) -> tuple[List[ParsedResponsesEvent], List[ParsedResponsesEvent]]:
-        """Keep typed event associations aligned with a done-marker split."""
-        prefix_events: List[ParsedResponsesEvent] = []
-        suffix_events: List[ParsedResponsesEvent] = []
-        for event in events:
-            source = event.forward_event or event.raw_event or b""
-            if not source:
-                continue
-            if prefix.find(source) >= 0:
-                prefix_events.append(event)
-            elif suffix.find(source) >= 0:
-                suffix_events.append(event)
-        return prefix_events, suffix_events
+        emissions: List[Any],
+    ) -> tuple[List[Any], List[Any]]:
+        """Keep one ordered emission per frame after a done-marker split."""
+        del suffix
+        if not emissions:
+            return [], []
+        prefix_count = 0
+        remaining = bytes(prefix)
+        for emission in emissions:
+            wire = getattr(emission, "wire_bytes", b"") or b""
+            if not wire or not remaining.startswith(wire):
+                break
+            remaining = remaining[len(wire):]
+            prefix_count += 1
+        return emissions[:prefix_count], emissions[prefix_count:]
 
     @staticmethod
     def _chunk_lines(chunks: List[bytes]) -> List[str]:
@@ -2016,6 +2019,16 @@ class PassThroughStreamingHandler:
                     first_downstream=first_downstream,
                 )
 
+            def _final_wire_committed() -> bool:
+                if openai_wire_trace is None:
+                    return first_emitted_at is not None
+                return bool(
+                    getattr(openai_wire_trace, "first_body_sent", False)
+                    or getattr(openai_wire_trace, "terminal_wire_committed", False)
+                    or getattr(openai_wire_trace, "done_wire_committed", False)
+                    or getattr(openai_wire_trace, "asgi_delivery_complete", False)
+                )
+
             def _mark_first_emitted_chunk() -> None:
                 nonlocal first_emitted_at
                 if first_emitted_at is not None:
@@ -2121,7 +2134,7 @@ class PassThroughStreamingHandler:
                     held_responses_done_suffix = b""
 
                 synthetic_terminal: Optional[Dict[str, Any]] = None
-                if first_emitted_at is not None and not responses_terminal_seen:
+                if _final_wire_committed() and not responses_terminal_seen:
                     synthetic_terminal = (
                         OpenAIPassthroughLoggingHandler._classify_responses_sse_clean_eof(
                             responses_sse_tracker
@@ -2391,8 +2404,8 @@ class PassThroughStreamingHandler:
                         complete_chunk = b""
 
                     if complete_chunk:
-                        stamped_chunk = PassThroughStreamingHandler._stamp_encrypted_reasoning_in_responses_sse_chunk(
-                            bytes(complete_chunk),
+                        complete_chunk = PassThroughStreamingHandler._stamp_encrypted_reasoning_in_responses_sse_chunk(
+                            complete_chunk,
                             request_body=(
                                 request_body
                                 if isinstance(request_body, dict)
@@ -2400,10 +2413,6 @@ class PassThroughStreamingHandler:
                             ),
                             custom_llm_provider=custom_llm_provider,
                             events=delivered_events,
-                        )
-                        complete_chunk = attach_responses_events(
-                            stamped_chunk,
-                            delivered_events,
                         )
 
                     if recovery_failure is not None and (
@@ -2467,7 +2476,7 @@ class PassThroughStreamingHandler:
                             if limit_exception.kind == "event_too_large"
                             else "streaming_upstream_too_large"
                         )
-                        committed_downstream = first_emitted_at is not None
+                        committed_downstream = _final_wire_committed()
                         failure_context = dict(error_log_context or {})
                         failure_context.update(
                             {
@@ -2544,13 +2553,16 @@ class PassThroughStreamingHandler:
                         # completion bookkeeping path below.
                         break
 
-                    prior_held_events = responses_events_from_chunk(
+                    prior_held = responses_emissions_from_chunk(
                         held_responses_done_suffix
                     ) or []
-                    combined_events = [*prior_held_events, *delivered_events]
-                    combined_chunk = attach_responses_events(
-                        held_responses_done_suffix + bytes(complete_chunk),
-                        combined_events,
+                    current_emissions = responses_emissions_from_chunk(
+                        complete_chunk
+                    ) or [event.emission() for event in delivered_events]
+                    combined_emissions = [*prior_held, *current_emissions]
+                    combined_chunk = attach_responses_emissions(
+                        b"",
+                        combined_emissions,
                     )
                     (
                         chunk_without_done,
@@ -2558,22 +2570,22 @@ class PassThroughStreamingHandler:
                     ) = PassThroughStreamingHandler._split_trailing_done_chunk(
                         combined_chunk
                     )
-                    prefix_events, suffix_events = (
-                        PassThroughStreamingHandler._partition_responses_events_by_wire(
+                    prefix_emissions, suffix_emissions = (
+                        PassThroughStreamingHandler._partition_responses_emissions_by_count(
                             chunk_without_done,
                             held_responses_done_suffix,
-                            combined_events,
+                            combined_emissions,
                         )
                     )
-                    if chunk_without_done and prefix_events:
-                        chunk_without_done = attach_responses_events(
-                            chunk_without_done,
-                            prefix_events,
+                    if chunk_without_done and prefix_emissions:
+                        chunk_without_done = attach_responses_emissions(
+                            b"",
+                            prefix_emissions,
                         )
-                    if held_responses_done_suffix and suffix_events:
-                        held_responses_done_suffix = attach_responses_events(
-                            held_responses_done_suffix,
-                            suffix_events,
+                    if held_responses_done_suffix and suffix_emissions:
+                        held_responses_done_suffix = attach_responses_emissions(
+                            b"",
+                            suffix_emissions,
                         )
                     if chunk_without_done:
                         _record_responses_wire_chunk(chunk_without_done)
@@ -2852,7 +2864,26 @@ class PassThroughStreamingHandler:
                         "terminal_error_payload": dict(bound_failure.error_payload),
                         "stream_failure_stage": (
                             "stream_interrupted_after_first_byte"
-                            if local_first_emitted_at is not None
+                            if (
+                                openai_wire_trace is not None
+                                and (
+                                    getattr(openai_wire_trace, "first_body_sent", False)
+                                    or getattr(
+                                        openai_wire_trace,
+                                        "terminal_wire_committed",
+                                        False,
+                                    )
+                                    or getattr(
+                                        openai_wire_trace,
+                                        "asgi_delivery_complete",
+                                        False,
+                                    )
+                                )
+                            )
+                            or (
+                                openai_wire_trace is None
+                                and local_first_emitted_at is not None
+                            )
                             else "stream_interrupted_before_emit"
                         ),
                         "stream_chunks_seen": local_chunk_count,
@@ -3536,10 +3567,12 @@ class PassThroughStreamingHandler:
                 payload,
                 event_type=event_type,
                 wire_event=carried[0],
+                control=True,
             )
             carried[0] = attach_responses_events(
                 carried[0],
                 [terminal_event],
+                replace=True,
             )
             if len(carried) > 1 and PassThroughStreamingHandler._is_done_chunk(
                 carried[1]
@@ -3548,18 +3581,20 @@ class PassThroughStreamingHandler:
                     None,
                     is_done_marker=True,
                     wire_event=carried[1],
+                    control=True,
                 )
                 carried[1] = attach_responses_events(
                     carried[1],
                     [done_event],
+                    replace=True,
                 )
         except (
             ResponsesEventRetentionTooLarge,
             ResponsesEventTooLarge,
             ResponsesStreamTooLarge,
         ):
-            # A bound failure must still reach the client even if the pipeline
-            # cannot retain one more generated event.
+            # Generated terminals use reserved control capacity. If even that
+            # bound is exhausted, keep the already-associated prefix.
             return carried
         return carried
 

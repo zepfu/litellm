@@ -58,9 +58,8 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaborati
 )
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
     ParsedResponsesEvent,
-    attach_responses_events,
-    render_responses_event_wire,
-    responses_events_from_chunk,
+    attach_responses_emissions,
+    responses_emissions_from_chunk,
 )
 
 # Exact compatibility source used by the guard and tests.
@@ -1758,26 +1757,27 @@ def stamp_encrypted_reasoning_in_responses_sse_chunk(  # noqa: PLR0915
     if not chunk:
         return chunk
 
-    associated_events = events
-    if associated_events is None:
-        associated_events = responses_events_from_chunk(chunk)
-    if associated_events:
+    associated_emissions = responses_emissions_from_chunk(chunk)
+    if associated_emissions is None and events:
+        associated_emissions = [
+            event.emission()
+            for event in events
+            if isinstance(event, ParsedResponsesEvent)
+        ]
+    if associated_emissions:
         provenance = build_producer_provenance_from_egress_context(
             custom_llm_provider=custom_llm_provider,
             egress_credential_family=egress_credential_family,
             expected_target_family=expected_target_family,
             request_body=request_body if isinstance(request_body, Mapping) else None,
         )
-        pieces: list[bytes] = []
+        updated: list[Any] = []
         changed = False
-        for event in associated_events:
-            if not isinstance(event, ParsedResponsesEvent):
-                continue
-            payload = event.payload
-            source_wire = event.forward_event or event.raw_event or b""
+        for emission in associated_emissions:
+            payload = emission.effective_payload
+            source_wire = emission.wire_bytes
             if not isinstance(payload, dict) or not source_wire:
-                if source_wire:
-                    pieces.append(source_wire)
+                updated.append(emission)
                 continue
             working = copy.deepcopy(payload)
             line_changed = _stamp_encrypted_reasoning_in_sse_event(
@@ -1787,13 +1787,13 @@ def stamp_encrypted_reasoning_in_responses_sse_chunk(  # noqa: PLR0915
                 working, provenance
             )
             if not line_changed and not identity_changed:
-                pieces.append(source_wire)
+                updated.append(emission)
                 continue
             changed = True
-            pieces.append(render_responses_event_wire(event, working))
+            updated.append(emission.transformed(working))
         if not changed:
             return chunk
-        return attach_responses_events(b"".join(pieces), associated_events)
+        return attach_responses_emissions(b"", updated)
 
     try:
         decoded = chunk.decode("utf-8")

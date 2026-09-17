@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 # Replicated constant from god module (line 345).
 _AAWM_REQUEST_BODY_WALK_MAX_DEPTH = 64
 _PARSED_RESPONSES_EVENTS_ATTR = "aawm_parsed_responses_events"
+_RESPONSES_WIRE_EMISSIONS_ATTR = "aawm_responses_wire_emissions"
 _RESPONSES_EVENT_WIRE_BYTES_ATTR = "aawm_responses_event_wire_bytes"
 _RESPONSES_EVENT_SEPARATOR_ATTR = "aawm_responses_event_separator"
 
@@ -109,11 +110,18 @@ class _ParsedResponsesSSEText(str):
         wire_bytes: Optional[bytes] = None,
         separator: bytes = b"",
         events: Any = (),
+        emissions: Any = (),
     ) -> "_ParsedResponsesSSEText":
         instance = str.__new__(cls, value)
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+            RESPONSES_EVENTS_ADMITTED_ATTR,
+        )
+
         setattr(instance, _RESPONSES_EVENT_WIRE_BYTES_ATTR, wire_bytes)
         setattr(instance, _RESPONSES_EVENT_SEPARATOR_ATTR, separator)
         setattr(instance, _PARSED_RESPONSES_EVENTS_ATTR, list(events))
+        setattr(instance, _RESPONSES_WIRE_EMISSIONS_ATTR, list(emissions))
+        setattr(instance, RESPONSES_EVENTS_ADMITTED_ATTR, True)
         return instance
 
 
@@ -130,6 +138,7 @@ def _preserve_parsed_responses_events(
         parsed_events = getattr(source, _PARSED_RESPONSES_EVENTS_ATTR, None)
     if not isinstance(parsed_events, list):
         return value
+    emissions = getattr(source, _RESPONSES_WIRE_EMISSIONS_ATTR, None)
     if isinstance(source, _ParsedResponsesSSEText):
         wire_bytes = getattr(source, _RESPONSES_EVENT_WIRE_BYTES_ATTR, None)
         separator = getattr(source, _RESPONSES_EVENT_SEPARATOR_ATTR, b"")
@@ -148,14 +157,17 @@ def _preserve_parsed_responses_events(
         wire_bytes=wire_bytes,
         separator=separator,
         events=parsed_events,
+        emissions=emissions if isinstance(emissions, list) else (),
     )
 
 
 def _separator_from_wire_bytes(value: bytes) -> bytes:
-    for separator in (b"\r\n\r\n", b"\n\n", b"\r\r"):
-        if value.endswith(separator):
-            return separator
-    return b""
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+        _separator_length_at_end,
+    )
+
+    separator_length = _separator_length_at_end(value)
+    return value[-separator_length:] if separator_length else b""
 
 
 def _sse_block_events(value: Any) -> Optional[list[Any]]:
@@ -460,10 +472,11 @@ async def _iter_sse_event_blocks_with_separator(body_iterator: Any):  # noqa: PL
     """
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
         ResponsesEventPipeline,
+        responses_emissions_from_chunk,
     )
 
     typed_buffered = bytearray()
-    pending_events: list[Any] = []
+    pending_emissions: list[Any] = []
     decoder = codecs.getincrementaldecoder("utf-8")()
     text_buffer = ""
     trailing_cr = False
@@ -471,11 +484,16 @@ async def _iter_sse_event_blocks_with_separator(body_iterator: Any):  # noqa: PL
 
     def _block_from_wire(
         wire: bytes,
-        event: Any = None,
+        emission: Any = None,
     ):
+        event = (
+            emission.source_event
+            if emission is not None and hasattr(emission, "source_event")
+            else emission
+        )
         separator = (
             event.separator
-            if event is not None and event.separator
+            if event is not None and getattr(event, "separator", b"")
             else _separator_from_wire_bytes(wire)
         )
         body = wire[:-len(separator)] if separator else wire
@@ -485,6 +503,7 @@ async def _iter_sse_event_blocks_with_separator(body_iterator: Any):  # noqa: PL
                 wire_bytes=wire,
                 separator=separator,
                 events=[event] if event is not None else [],
+                emissions=[emission] if emission is not None else [],
             ),
             bool(separator),
         )
@@ -497,8 +516,8 @@ async def _iter_sse_event_blocks_with_separator(body_iterator: Any):  # noqa: PL
             complete_end, _ = boundary
             frame = bytes(typed_buffered[:complete_end])
             del typed_buffered[:complete_end]
-            event = pending_events.pop(0) if pending_events else None
-            yield _block_from_wire(frame, event)
+            emission = pending_emissions.pop(0) if pending_emissions else None
+            yield _block_from_wire(frame, emission)
 
     def _drain_text_buffer():
         nonlocal text_buffer
@@ -521,7 +540,13 @@ async def _iter_sse_event_blocks_with_separator(body_iterator: Any):  # noqa: PL
                     "Owned Responses SSE path lost its typed event association"
                 )
             typed_buffered.extend(data)
-            pending_events.extend(associated_events)
+            associated_emissions = responses_emissions_from_chunk(raw_chunk)
+            if associated_emissions is None:
+                associated_emissions = [
+                    event.emission() if hasattr(event, "emission") else event
+                    for event in associated_events
+                ]
+            pending_emissions.extend(associated_emissions)
             for event_block, has_separator in _drain_complete_blocks():
                 yield event_block, has_separator
             continue
@@ -548,8 +573,8 @@ async def _iter_sse_event_blocks_with_separator(body_iterator: Any):  # noqa: PL
         for event_block, has_separator in _drain_complete_blocks():
             yield event_block, has_separator
         if typed_buffered:
-            event = pending_events.pop(0) if pending_events else None
-            yield _block_from_wire(bytes(typed_buffered), event)
+            emission = pending_emissions.pop(0) if pending_emissions else None
+            yield _block_from_wire(bytes(typed_buffered), emission)
         return
 
     tail = decoder.decode(b"", final=True)

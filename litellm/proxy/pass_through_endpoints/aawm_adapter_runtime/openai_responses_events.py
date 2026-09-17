@@ -29,6 +29,9 @@ DEFAULT_MAX_HELD_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_OUTPUT_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_OUTPUT_ITEMS = 128
 DEFAULT_MAX_EVENT_TYPES = 64
+DEFAULT_MAX_CONTROL_EVENTS = 8
+DEFAULT_MAX_CONTROL_BYTES = 256 * 1024
+DEFAULT_MAX_DELTA_KEYS = 256
 
 EVENT_BYTES_ENV = "AAWM_RESPONSES_MAX_EVENT_BYTES"
 RAW_EVENTS_ENV = "AAWM_RESPONSES_MAX_RAW_EVENTS"
@@ -41,6 +44,7 @@ OUTPUT_BYTES_ENV = "AAWM_RESPONSES_MAX_OUTPUT_BYTES"
 OUTPUT_ITEMS_ENV = "AAWM_RESPONSES_MAX_OUTPUT_ITEMS"
 PARSED_RESPONSES_EVENTS_ATTR = "aawm_parsed_responses_events"
 RESPONSES_EVENTS_ADMITTED_ATTR = "aawm_responses_events_admitted"
+RESPONSES_WIRE_EMISSIONS_ATTR = "aawm_responses_wire_emissions"
 RESPONSES_EVENT_PIPELINE_ATTR = "aawm_responses_event_pipeline"
 
 
@@ -102,42 +106,85 @@ def _coerce_bytes(value: Any) -> bytes:
     return bytes(value)
 
 
-def _line_ending_lengths() -> tuple[bytes, ...]:
-    return (b"\r\n", b"\n", b"\r")
+def _line_ending_at(buffer: bytes, index: int) -> Optional[bytes]:
+    """Return the one line ending starting at ``index``, treating CRLF as atomic."""
+    if index < 0 or index >= len(buffer):
+        return None
+    if buffer.startswith(b"\r\n", index):
+        return b"\r\n"
+    if buffer[index : index + 1] in {b"\n", b"\r"}:
+        return buffer[index : index + 1]
+    return None
+
+
+def _line_ending_ending_at(buffer: bytes) -> Optional[bytes]:
+    """Return the one line ending that terminates ``buffer``, if present."""
+    if buffer.endswith(b"\r\n"):
+        return b"\r\n"
+    if buffer.endswith(b"\n") or buffer.endswith(b"\r"):
+        return buffer[-1:]
+    return None
+
+
+def _scan_event_separator(
+    buffer: bytes,
+    *,
+    start: int = 0,
+    pending_line_ending: bytes = b"",
+) -> Optional[tuple[int, int, bytes]]:
+    """Find the first two consecutive line endings without splitting CRLF.
+
+    A pending CR from a prior read is completed as CRLF when the next byte is
+    LF. That completed CRLF is one line ending, not a blank-line separator.
+    """
+    index = max(0, int(start))
+    first_ending = pending_line_ending if pending_line_ending in {b"\r", b"\n"} else b""
+    if first_ending == b"\r" and buffer.startswith(b"\n"):
+        first_ending = b"\r\n"
+        index = 1
+    while index < len(buffer):
+        ending = _line_ending_at(buffer, index)
+        if ending is None:
+            first_ending = b""
+            index += 1
+            continue
+        if not first_ending:
+            first_ending = ending
+            index += len(ending)
+            continue
+        complete_end = index + len(ending)
+        return complete_end, complete_end - (index - len(first_ending)), first_ending + ending
+    return None
 
 
 def _separator_length_at_end(buffer: bytes) -> int:
     """Return the exact two-line-ending separator ending ``buffer``."""
-    candidates = {
-        first + second
-        for first in _line_ending_lengths()
-        for second in _line_ending_lengths()
-    }
-    for candidate in sorted(candidates, key=len, reverse=True):
-        if buffer.endswith(candidate):
-            return len(candidate)
-    return 0
+    if not buffer:
+        return 0
+    second = _line_ending_ending_at(buffer)
+    if second is None:
+        return 0
+    first = _line_ending_ending_at(buffer[: -len(second)])
+    if first is None:
+        return 0
+    return len(first) + len(second)
 
 
 def _find_event_boundary(buffer: bytes) -> Optional[tuple[int, int]]:
-    """Find the first blank SSE line without normalizing its framing."""
-    if not buffer:
+    """Find the first blank SSE line without treating CRLF as two endings."""
+    match = _scan_event_separator(buffer)
+    if match is None:
         return None
-    candidates: list[tuple[int, int]] = []
-    for first in _line_ending_lengths():
-        start = 0
-        while True:
-            index = buffer.find(first, start)
-            if index < 0:
-                break
-            after_first = index + len(first)
-            for second in _line_ending_lengths():
-                if buffer.startswith(second, after_first):
-                    candidates.append((after_first + len(second), len(first) + len(second)))
-            start = index + 1
-    if not candidates:
+    complete_end, separator_length, separator = match
+    # A trailing CR may still form one CRLF with the next read. Wait rather
+    # than treating that CR as a completed second line ending.
+    if (
+        complete_end == len(buffer)
+        and separator.endswith(b"\r")
+        and not separator.endswith(b"\r\n")
+    ):
         return None
-    return min(candidates, key=lambda item: item[0])
+    return complete_end, separator_length
 
 
 def _json_size(value: Any) -> Optional[int]:
@@ -237,15 +284,22 @@ def render_responses_event_wire(
 
 
 class ResponsesEventChunk(bytes):
-    """Bytes-compatible chunk carrying events admitted from that chunk."""
+    """Bytes-compatible chunk carrying one ordered association per frame."""
 
     def __new__(
         cls,
         value: bytes,
         events: Iterable["ParsedResponsesEvent"] = (),
+        emissions: Iterable["ResponsesWireEmission"] = (),
     ) -> "ResponsesEventChunk":
         instance = bytes.__new__(cls, value)
-        setattr(instance, PARSED_RESPONSES_EVENTS_ATTR, list(events))
+        emission_list = list(emissions)
+        event_list = [
+            emission.source_event if isinstance(emission, ResponsesWireEmission) else emission
+            for emission in (emission_list or list(events))
+        ]
+        setattr(instance, PARSED_RESPONSES_EVENTS_ATTR, event_list)
+        setattr(instance, RESPONSES_WIRE_EMISSIONS_ATTR, emission_list)
         setattr(instance, RESPONSES_EVENTS_ADMITTED_ATTR, True)
         return instance
 
@@ -254,23 +308,104 @@ class ResponsesEventChunk(bytes):
         value = getattr(self, PARSED_RESPONSES_EVENTS_ATTR, None)
         return value if isinstance(value, list) else []
 
+    @property
+    def responses_wire_emissions(self) -> list["ResponsesWireEmission"]:
+        value = getattr(self, RESPONSES_WIRE_EMISSIONS_ATTR, None)
+        return value if isinstance(value, list) else []
+
+
+def _unique_source_events(
+    events: Iterable["ParsedResponsesEvent"],
+) -> list["ParsedResponsesEvent"]:
+    unique: list[ParsedResponsesEvent] = []
+    seen: set[int] = set()
+    for event in events:
+        if not isinstance(event, ParsedResponsesEvent):
+            continue
+        marker = id(event)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unique.append(event)
+    return unique
+
+
+def _emissions_from_events(
+    events: Iterable["ParsedResponsesEvent"],
+) -> list["ResponsesWireEmission"]:
+    return [
+        event.emission()
+        for event in _unique_source_events(events)
+    ]
+
+
+def _normalize_wire_emissions(
+    events: Iterable[Any] = (),
+    emissions: Iterable["ResponsesWireEmission"] = (),
+) -> list["ResponsesWireEmission"]:
+    normalized: list[ResponsesWireEmission] = []
+    seen: set[int] = set()
+    for item in (*emissions, *events):
+        if isinstance(item, ResponsesWireEmission):
+            emission = item
+        elif isinstance(item, ParsedResponsesEvent):
+            emission = item.emission()
+        else:
+            continue
+        marker = id(emission.source_event)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        normalized.append(emission)
+    return normalized
+
 
 def attach_responses_events(
     chunk: bytes,
-    events: Iterable["ParsedResponsesEvent"],
+    events: Iterable["ParsedResponsesEvent"] = (),
+    *,
+    emissions: Iterable["ResponsesWireEmission"] = (),
+    replace: bool = False,
 ) -> bytes:
-    """Attach typed event associations without changing wire bytes."""
-    event_list = list(events)
-    existing = getattr(chunk, PARSED_RESPONSES_EVENTS_ATTR, None)
-    if isinstance(existing, list):
-        event_list = [*existing, *event_list]
+    """Attach one ordered association per emitted frame without changing bytes."""
+    existing_emissions = getattr(chunk, RESPONSES_WIRE_EMISSIONS_ATTR, None)
+    existing_events = getattr(chunk, PARSED_RESPONSES_EVENTS_ATTR, None)
+    if replace:
+        emission_list = _normalize_wire_emissions(events, emissions)
+    else:
+        prior_events = existing_events if isinstance(existing_events, list) else []
+        prior_emissions = (
+            existing_emissions if isinstance(existing_emissions, list) else ()
+        )
+        emission_list = _normalize_wire_emissions(
+            events,
+            (*prior_emissions, *emissions),
+        )
+        if not emission_list and prior_events:
+            emission_list = _normalize_wire_emissions(prior_events)
     if (
         getattr(chunk, RESPONSES_EVENTS_ADMITTED_ATTR, False) is True
-        and isinstance(existing, list)
-        and not event_list
+        and isinstance(existing_events, list)
+        and not emission_list
+        and not events
+        and not emissions
     ):
         return chunk
-    return ResponsesEventChunk(bytes(chunk), event_list)
+    return ResponsesEventChunk(
+        bytes(chunk),
+        [emission.source_event for emission in emission_list],
+        emission_list,
+    )
+
+
+def attach_responses_emissions(
+    chunk: bytes,
+    emissions: Iterable["ResponsesWireEmission"],
+) -> bytes:
+    """Replace the carrier with the current effective emissions."""
+    emission_list = _normalize_wire_emissions(emissions=emissions)
+    wire = b"".join(emission.wire_bytes for emission in emission_list)
+    return attach_responses_events(wire, emissions=emission_list, replace=True)
 
 
 def responses_events_from_chunk(
@@ -281,6 +416,21 @@ def responses_events_from_chunk(
         return None
     events = getattr(chunk, PARSED_RESPONSES_EVENTS_ATTR, None)
     return list(events) if isinstance(events, list) else []
+
+
+def responses_emissions_from_chunk(
+    chunk: Any,
+) -> Optional[list["ResponsesWireEmission"]]:
+    """Return the current effective emissions associated with a carrier."""
+    if getattr(chunk, RESPONSES_EVENTS_ADMITTED_ATTR, False) is not True:
+        return None
+    emissions = getattr(chunk, RESPONSES_WIRE_EMISSIONS_ATTR, None)
+    if isinstance(emissions, list) and emissions:
+        return list(emissions)
+    events = responses_events_from_chunk(chunk)
+    if events is None:
+        return None
+    return _emissions_from_events(events)
 
 
 def responses_event_pipeline_from_response(
@@ -414,6 +564,27 @@ class ResponsesWireEmission:
     effective_payload: Optional[Dict[str, Any]]
     wire_bytes: bytes
 
+    def transformed(
+        self,
+        payload: Optional[Dict[str, Any]] = None,
+        *,
+        wire_bytes: Optional[bytes] = None,
+    ) -> "ResponsesWireEmission":
+        """Keep the original source event and replace the current effective wire."""
+        effective_payload = (
+            self.effective_payload if payload is None else payload
+        )
+        if wire_bytes is None:
+            wire_bytes = render_responses_event_wire(
+                self.source_event,
+                effective_payload,
+            )
+        return ResponsesWireEmission(
+            source_event=self.source_event,
+            effective_payload=effective_payload,
+            wire_bytes=wire_bytes,
+        )
+
 
 class ResponsesEventPipeline:
     """The single bounded admission and replay owner for one stream attempt."""
@@ -428,6 +599,8 @@ class ResponsesEventPipeline:
         max_stream_events: int = DEFAULT_MAX_STREAM_EVENTS,
         max_held_events: int = DEFAULT_MAX_HELD_EVENTS,
         max_held_bytes: int = DEFAULT_MAX_HELD_BYTES,
+        max_control_events: int = DEFAULT_MAX_CONTROL_EVENTS,
+        max_control_bytes: int = DEFAULT_MAX_CONTROL_BYTES,
         retain_raw_events: bool = False,
         retain_events: bool = False,
         summary_reducer: Optional["ResponsesEventSummaryReducer"] = None,
@@ -446,19 +619,27 @@ class ResponsesEventPipeline:
             raise ValueError("max_held_events must not be negative")
         if max_held_bytes < 0:
             raise ValueError("max_held_bytes must not be negative")
-
-        self.max_event_bytes = int(max_event_bytes)
-        self.max_raw_events = int(max_raw_events)
-        self.max_raw_bytes = int(max_raw_bytes)
-        self.max_stream_bytes = int(max_stream_bytes)
-        self.max_stream_events = int(max_stream_events)
-        self.max_held_events = int(max_held_events)
-        self.max_held_bytes = int(max_held_bytes)
-        self.retain_raw_events = bool(retain_raw_events)
-        self.retain_events = bool(retain_events)
-        self.summary_reducer = summary_reducer
+        if max_control_events < 0:
+            raise ValueError("max_control_events must not be negative")
+        if max_control_bytes < 0:
+            raise ValueError("max_control_bytes must not be negative")
+        self._assign_limits(
+            max_event_bytes=max_event_bytes,
+            max_raw_events=max_raw_events,
+            max_raw_bytes=max_raw_bytes,
+            max_stream_bytes=max_stream_bytes,
+            max_stream_events=max_stream_events,
+            max_held_events=max_held_events,
+            max_held_bytes=max_held_bytes,
+            max_control_events=max_control_events,
+            max_control_bytes=max_control_bytes,
+            retain_raw_events=retain_raw_events,
+            retain_events=retain_events,
+            summary_reducer=summary_reducer,
+        )
 
         self._buffer = bytearray()
+        self._pending_cr = False
         self._next_sequence_number = 1
         self._raw_events: Deque[bytes] = deque()
         self._raw_event_bytes = 0
@@ -477,11 +658,42 @@ class ResponsesEventPipeline:
         self.dropped_raw_event_count = 0
         self.dropped_raw_event_bytes = 0
         self.omitted_held_event_count = 0
+        self.control_event_count = 0
+        self.control_event_bytes = 0
         self.total_stream_bytes = 0
         self.total_event_count = 0
         self.last_event_observed_at: Optional[datetime] = None
         if summary_reducer is not None:
             self.add_observer(summary_reducer.consume)
+
+    def _assign_limits(
+        self,
+        *,
+        max_event_bytes: int,
+        max_raw_events: int,
+        max_raw_bytes: int,
+        max_stream_bytes: int,
+        max_stream_events: int,
+        max_held_events: int,
+        max_held_bytes: int,
+        max_control_events: int,
+        max_control_bytes: int,
+        retain_raw_events: bool,
+        retain_events: bool,
+        summary_reducer: Optional["ResponsesEventSummaryReducer"],
+    ) -> None:
+        self.max_event_bytes = int(max_event_bytes)
+        self.max_raw_events = int(max_raw_events)
+        self.max_raw_bytes = int(max_raw_bytes)
+        self.max_stream_bytes = int(max_stream_bytes)
+        self.max_stream_events = int(max_stream_events)
+        self.max_held_events = int(max_held_events)
+        self.max_held_bytes = int(max_held_bytes)
+        self.max_control_events = int(max_control_events)
+        self.max_control_bytes = int(max_control_bytes)
+        self.retain_raw_events = bool(retain_raw_events)
+        self.retain_events = bool(retain_events)
+        self.summary_reducer = summary_reducer
 
     @property
     def buffered_event_bytes(self) -> int:
@@ -550,10 +762,24 @@ class ResponsesEventPipeline:
             self.dropped_raw_event_bytes += len(dropped)
         return raw_event
 
+    def _held_representation_bytes(self, event: ParsedResponsesEvent) -> int:
+        """Charge the retained decoded payload and carrier, not just raw bytes."""
+        total = 0
+        if event.forward_event:
+            total += len(event.forward_event)
+        elif event.raw_event:
+            total += len(event.raw_event)
+        else:
+            total += max(0, int(event.byte_count))
+        payload_size = _json_size(event.payload) if event.payload is not None else 0
+        if payload_size:
+            total += payload_size
+        return total
+
     def _hold_event(self, event: ParsedResponsesEvent) -> None:
         if not self.retain_events:
             return
-        event_bytes = event.byte_count
+        event_bytes = self._held_representation_bytes(event)
         if (
             self.max_held_events == 0
             or self.max_held_bytes == 0
@@ -675,6 +901,29 @@ class ResponsesEventPipeline:
             )
         return event
 
+    def _emit_if_separator_at_end(self) -> Optional[ParsedResponsesEvent]:
+        if self._pending_cr:
+            return None
+        separator_length = _separator_length_at_end(bytes(self._buffer[-4:]))
+        if not separator_length:
+            return None
+        raw_event = bytes(self._buffer)
+        self._buffer.clear()
+        return self._parse_event(raw_event)
+
+    def _admit_byte(self, value: int, *, count_stream_bytes: bool) -> None:
+        if count_stream_bytes:
+            if self.total_stream_bytes >= self.max_stream_bytes:
+                raise ResponsesStreamTooLarge(
+                    f"Responses SSE stream exceeded {self.max_stream_bytes} bytes"
+                )
+            self.total_stream_bytes += 1
+        if len(self._buffer) >= self.max_event_bytes:
+            raise ResponsesEventTooLarge(
+                f"Responses SSE event exceeded {self.max_event_bytes} bytes"
+            )
+        self._buffer.append(value)
+
     def _consume_buffered_bytes(
         self,
         chunk: bytes,
@@ -689,28 +938,27 @@ class ResponsesEventPipeline:
         self._last_feed_admitted_bytes = 0
         try:
             for value in chunk:
-                if count_stream_bytes:
-                    if self.total_stream_bytes >= self.max_stream_bytes:
-                        raise ResponsesStreamTooLarge(
-                            f"Responses SSE stream exceeded {self.max_stream_bytes} bytes"
-                        )
-                    self.total_stream_bytes += 1
-                if len(self._buffer) >= self.max_event_bytes:
-                    raise ResponsesEventTooLarge(
-                        f"Responses SSE event exceeded {self.max_event_bytes} bytes"
-                    )
-                self._buffer.append(value)
-                admitted_bytes += 1
-                # A separator is at most four bytes. Checking the suffix avoids
-                # copying the complete in-progress event for every byte.
-                separator_length = _separator_length_at_end(
-                    bytes(self._buffer[-4:])
-                )
-                if not separator_length:
+                if self._pending_cr and value == 10:
+                    self._admit_byte(value, count_stream_bytes=count_stream_bytes)
+                    admitted_bytes += 1
+                    self._pending_cr = False
+                    completed = self._emit_if_separator_at_end()
+                    if completed is not None:
+                        events.append(completed)
                     continue
-                raw_event = bytes(self._buffer)
-                self._buffer.clear()
-                events.append(self._parse_event(raw_event))
+                if self._pending_cr:
+                    self._pending_cr = False
+                    completed = self._emit_if_separator_at_end()
+                    if completed is not None:
+                        events.append(completed)
+                self._admit_byte(value, count_stream_bytes=count_stream_bytes)
+                admitted_bytes += 1
+                self._pending_cr = value == 13
+                if self._pending_cr:
+                    continue
+                completed = self._emit_if_separator_at_end()
+                if completed is not None:
+                    events.append(completed)
         except (
             ResponsesBoundFailure,
             ResponsesEventTooLarge,
@@ -740,6 +988,12 @@ class ResponsesEventPipeline:
         split, not a Responses event. Drop it instead of emitting a
         replacement-decoded malformed frame.
         """
+        if self._pending_cr:
+            self._pending_cr = False
+            completed = self._emit_if_separator_at_end()
+            if completed is not None:
+                leftover = self.finish()
+                return [completed, *leftover]
         if not self._buffer:
             return []
         tail = bytes(self._buffer)
@@ -771,6 +1025,7 @@ class ResponsesEventPipeline:
         wire_event: Optional[bytes] = None,
         is_done_marker: bool = False,
         is_malformed: bool = False,
+        control: bool = False,
     ) -> ParsedResponsesEvent:
         """Register a structured/generated event without decoding JSON again.
 
@@ -782,21 +1037,45 @@ class ResponsesEventPipeline:
         """
         if payload is not None and not isinstance(payload, dict):
             raise TypeError("payload must be a mapping or None")
-        if self.total_event_count >= self.max_stream_events:
-            raise ResponsesStreamTooLarge(
-                f"Responses SSE stream exceeded {self.max_stream_events} events"
-            )
+        data = _coerce_bytes(wire_event) if wire_event is not None else b""
+        if control:
+            if self.control_event_count >= self.max_control_events:
+                raise ResponsesStreamTooLarge(
+                    "Responses generated control-event capacity exceeded"
+                )
+            if (
+                self.control_event_bytes + len(data) > self.max_control_bytes
+                or (data and len(data) > self.max_event_bytes)
+            ):
+                raise ResponsesEventTooLarge(
+                    "Responses generated control event exceeded configured bound"
+                )
+        else:
+            if data and len(data) > self.max_event_bytes:
+                raise ResponsesEventTooLarge(
+                    f"Responses SSE event exceeded {self.max_event_bytes} bytes"
+                )
+            if self.total_event_count >= self.max_stream_events:
+                raise ResponsesStreamTooLarge(
+                    f"Responses SSE stream exceeded {self.max_stream_events} events"
+                )
+            if data:
+                self._check_stream_admission(len(data))
+                self.total_stream_bytes += len(data)
         observed_at = datetime.now()
         sequence_number = self._next_sequence_number
         self._next_sequence_number += 1
-        self.event_count += 1
-        self.total_event_count += 1
+        if not control:
+            self.event_count += 1
+            self.total_event_count += 1
+        else:
+            self.control_event_count += 1
+            self.control_event_bytes += len(data)
         self.last_event_observed_at = observed_at
         if is_done_marker:
             self.done_marker_count += 1
         if is_malformed:
             self.malformed_event_count += 1
-        data = _coerce_bytes(wire_event) if wire_event is not None else b""
         separator_length = _separator_length_at_end(data)
         event = ParsedResponsesEvent(
             sequence_number=sequence_number,
@@ -810,12 +1089,13 @@ class ResponsesEventPipeline:
             raw_event=None,
             separator=data[-separator_length:] if separator_length else b"",
         )
-        self._hold_event(event)
-        self._emit(event)
-        if self.summary_reducer is not None and self.summary_reducer.overflow:
-            raise ResponsesEventRetentionTooLarge(
-                "Responses event summary retention exceeded configured bound"
-            )
+        if not control:
+            self._hold_event(event)
+            self._emit(event)
+            if self.summary_reducer is not None and self.summary_reducer.overflow:
+                raise ResponsesEventRetentionTooLarge(
+                    "Responses event summary retention exceeded configured bound"
+                )
         return event
 
     def prepare_replay(self, prefix_bytes: int) -> None:
@@ -842,7 +1122,7 @@ class ResponsesEventPipeline:
             if next_bytes > self._replay_consumed_bytes:
                 break
             ready.append(self._held_events.popleft())
-            self._held_event_bytes -= event.byte_count
+            self._held_event_bytes -= self._held_representation_bytes(event)
             self._replay_consumed_event_bytes = next_bytes
         return ready
 
@@ -861,6 +1141,9 @@ class ResponsesEventPipeline:
         events = self._drain_replayed_events()
         if self._replay_remaining_bytes == 0 and self._replay_buffer is not None:
             self._buffer = bytearray(self._replay_buffer)
+            self._pending_cr = self._buffer.endswith(b"\r") and not self._buffer.endswith(
+                b"\r\n"
+            )
             self._replay_buffer = None
         if self._replay_remaining_bytes == 0:
             self.retain_events = False
@@ -908,6 +1191,10 @@ class ResponsesEventPipeline:
             "max_held_events": self.max_held_events,
             "max_held_bytes": self.max_held_bytes,
             "omitted_held_event_count": self.omitted_held_event_count,
+            "control_event_count": self.control_event_count,
+            "control_event_bytes": self.control_event_bytes,
+            "max_control_events": self.max_control_events,
+            "max_control_bytes": self.max_control_bytes,
             "replay_remaining_bytes": self.replay_remaining_bytes,
         }
         if self.summary_reducer is not None:
@@ -927,6 +1214,7 @@ class ResponsesEventSummaryReducer:
     _IDENTITY_BYTES_LIMIT = 1024
     _ALIAS_LIMIT = 128
     _EVENT_TYPE_LIMIT = DEFAULT_MAX_EVENT_TYPES
+    _DELTA_KEY_LIMIT = DEFAULT_MAX_DELTA_KEYS
     _USAGE_BYTES_LIMIT = 16 * 1024
 
     def __init__(
@@ -953,6 +1241,7 @@ class ResponsesEventSummaryReducer:
         self._aliases: dict[str, str] = {}
         self._key_by_output_index: dict[int, str] = {}
         self._delta_keys_seen: set[str] = set()
+        self._delta_key_order: Deque[str] = deque()
         self._stream_text_parts: list[str] = []
         self._stream_text_bytes = 0
         self._output_bytes = 0
@@ -1005,8 +1294,23 @@ class ResponsesEventSummaryReducer:
             return f"output:{output_index}"
         return f"fallback:{fallback}"
 
+    def _remember_delta_key(self, key: str) -> None:
+        if key in self._delta_keys_seen:
+            return
+        if len(self._delta_keys_seen) >= self._DELTA_KEY_LIMIT:
+            evicted = self._delta_key_order.popleft()
+            self._delta_keys_seen.discard(evicted)
+        self._delta_keys_seen.add(key)
+        self._delta_key_order.append(key)
+
     def _record_event_type(self, event_type: Optional[str]) -> None:
         if not event_type:
+            return
+        if (
+            event_type not in self._event_counts
+            and len(self._event_counts) >= self._EVENT_TYPE_LIMIT
+        ):
+            self._overflow = True
             return
         self._event_counts[event_type] = self._event_counts.get(event_type, 0) + 1
         if (
@@ -1062,26 +1366,32 @@ class ResponsesEventSummaryReducer:
         if isinstance(copied, dict):
             self._usage_payload = copied
 
-    def _ensure_item(self, key: str) -> Optional[dict[str, Any]]:
+    def _item_slot(self, key: str) -> Optional[tuple[dict[str, Any], bool]]:
         existing = self._output_items.get(key)
         if existing is not None:
-            return existing
+            return existing, False
         if len(self._output_items) >= self.max_output_items:
             self._overflow = True
             self._omitted_items += 1
             return None
-        item: dict[str, Any] = {"id": key}
-        self._output_items[key] = item
-        self._ordered_keys.append(key)
-        return item
+        return {"id": key}, True
 
-    def _charge_output(self, value: Any, previous: Any = None) -> bool:
-        new_size = _json_size(value)
-        previous_size = _json_size(previous) if previous is not None else 0
+    def _commit_item(
+        self,
+        key: str,
+        candidate: dict[str, Any],
+        *,
+        created: bool,
+    ) -> None:
+        if created:
+            self._ordered_keys.append(key)
+        self._output_items[key] = candidate
+
+    def _charge_delta(self, previous_size: int, new_size: Optional[int]) -> bool:
         if new_size is None:
             self._overflow = True
             return False
-        projected = self._output_bytes - (previous_size or 0) + new_size
+        projected = self._output_bytes - previous_size + new_size
         if projected > self.max_output_bytes:
             self._overflow = True
             self._omitted_output_bytes += max(0, projected - self.max_output_bytes)
@@ -1110,46 +1420,72 @@ class ResponsesEventSummaryReducer:
                 alias in self._aliases or len(self._aliases) < self._ALIAS_LIMIT
             ):
                 self._aliases[alias] = key
-        target = self._ensure_item(key)
-        if target is None:
+        slot = self._item_slot(key)
+        if slot is None:
             return
-        previous = dict(target)
-        target.update(copy.deepcopy(item))
-        self._charge_output(target, previous)
+        target, created = slot
+        previous_size = _json_size(target) or 0
+        candidate = {**copy.deepcopy(target), **copy.deepcopy(item)}
+        if not self._charge_delta(previous_size, _json_size(candidate)):
+            return
+        self._commit_item(key, candidate, created=created)
 
     def _append_text(self, key: str, value: Any, *, done: bool) -> None:
         if not isinstance(value, str):
             return
-        encoded = value.encode("utf-8")
-        target = self._ensure_item(key)
-        if target is None:
+        if done and key in self._delta_keys_seen:
             return
+        encoded = value.encode("utf-8")
+        slot = self._item_slot(key)
+        if slot is None:
+            return
+        target, created = slot
         content = target.get("content")
         if not isinstance(content, list):
             content = []
-        output_text: Optional[dict[str, Any]] = None
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "output_text":
-                output_text = part
-                break
+            output_text = None
+        else:
+            content = [copy.deepcopy(part) for part in content]
+            output_text = None
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "output_text":
+                    output_text = part
+                    break
         if output_text is None:
             output_text = {"type": "output_text", "text": ""}
             content.append(output_text)
-        previous = dict(target)
-        output_text["text"] = value if done else f"{output_text.get('text', '')}{value}"
-        target["content"] = content
-        target.setdefault("type", "message")
-        target.setdefault("role", "assistant")
-        if not self._charge_output(target, previous):
-            return
-        if self._stream_text_bytes + len(encoded) > self.max_output_bytes:
+        next_text = value if done else f"{output_text.get('text', '')}{value}"
+        candidate = {
+            **copy.deepcopy(target),
+            "content": content,
+            "type": target.get("type") or "message",
+            "role": target.get("role") or "assistant",
+        }
+        for part in candidate["content"]:
+            if isinstance(part, dict) and part.get("type") == "output_text":
+                part["text"] = next_text
+                break
+        if not done and self._stream_text_bytes + len(encoded) > self.max_output_bytes:
             self._overflow = True
             self._omitted_output_bytes += (
                 self._stream_text_bytes + len(encoded) - self.max_output_bytes
             )
             return
-        self._stream_text_bytes += len(encoded)
-        self._stream_text_parts.append(value)
+        if done and key not in self._delta_keys_seen:
+            if self._stream_text_bytes + len(encoded) > self.max_output_bytes:
+                self._overflow = True
+                self._omitted_output_bytes += (
+                    self._stream_text_bytes + len(encoded) - self.max_output_bytes
+                )
+                return
+        previous_size = _json_size(target) or 0
+        if not self._charge_delta(previous_size, _json_size(candidate)):
+            return
+        if not done or key not in self._delta_keys_seen:
+            self._stream_text_bytes += len(encoded)
+            self._stream_text_parts.append(value)
+            self._remember_delta_key(key)
+        self._commit_item(key, candidate, created=created)
 
     def _append_arguments(self, payload: dict[str, Any], *, done: bool) -> None:
         raw_alias = self._bounded_identity(payload.get("item_id"))
@@ -1157,20 +1493,25 @@ class ResponsesEventSummaryReducer:
             raw_alias or "",
             self._item_key(payload, fallback=len(self._ordered_keys)),
         )
-        target = self._ensure_item(key)
-        if target is None:
+        slot = self._item_slot(key)
+        if slot is None:
             return
+        target, created = slot
         value = payload.get("arguments")
         if not isinstance(value, str):
             value = payload.get("delta")
         if not isinstance(value, str):
             return
-        previous = dict(target)
         current = target.get("arguments")
-        target["arguments"] = value if done else f"{current or ''}{value}"
-        target.setdefault("type", "function_call")
-        if not self._charge_output(target, previous):
+        candidate = {
+            **copy.deepcopy(target),
+            "arguments": value if done else f"{current or ''}{value}",
+            "type": target.get("type") or "function_call",
+        }
+        previous_size = _json_size(target) or 0
+        if not self._charge_delta(previous_size, _json_size(candidate)):
             return
+        self._commit_item(key, candidate, created=created)
 
     def consume(self, event: Any) -> None:
         payload = self._event_payload(event)
@@ -1189,9 +1530,10 @@ class ResponsesEventSummaryReducer:
             self._record_terminal(event_type, payload)
             return
         if event_type == "error":
-            error = payload.get("error")
-            if isinstance(error, dict) and self._first_error_payload is None:
-                copied = self._bounded_copy(error, self._USAGE_BYTES_LIMIT)
+            if self._first_error_payload is None:
+                nested = payload.get("error")
+                source = nested if isinstance(nested, dict) else payload
+                copied = self._bounded_copy(source, self._USAGE_BYTES_LIMIT)
                 if isinstance(copied, dict):
                     self._first_error_payload = copied
             return
@@ -1207,8 +1549,6 @@ class ResponsesEventSummaryReducer:
                 raw_alias or "",
                 self._item_key(payload, fallback=len(self._ordered_keys)),
             )
-            if event_type.endswith(".delta"):
-                self._delta_keys_seen.add(key)
             self._append_text(
                 key,
                 payload.get("delta")
