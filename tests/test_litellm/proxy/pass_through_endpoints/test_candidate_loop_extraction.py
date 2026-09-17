@@ -718,14 +718,27 @@ async def test_candidate_loop_shared_account_hash_admission_denial_does_not_cont
 
 
 def test_healthy_same_key_traffic_skips_probe_lock_acquire() -> None:
-    family = candidate_loop.alias_routing_state.family("codex_auto_agent")
-    assert family.get_generation("openai:account") == 0
+    denied = SimpleNamespace(
+        account_hash="acct-a",
+        lane_fingerprint="lane-a",
+        provider="openai",
+    )
     assert candidate_loop._admission_denial_shares_account_hash(
-        SimpleNamespace(account_hash="shared")
+        denied,
+        remaining_candidate={
+            "codex_oauth_account_hash": "acct-a",
+            "provider": "openai",
+        },
     )
-    assert not candidate_loop._admission_denial_shares_account_hash(
-        SimpleNamespace(account_hash="")
+    assert candidate_loop._admission_identities_are_independent(
+        denied,
+        remaining_candidate={"account_hash": "acct-b", "provider": "xai"},
     )
+    assert not candidate_loop._admission_identities_are_independent(
+        denied,
+        remaining_candidate=None,
+    )
+
 
 
 def test_no_io_skipped_selection_records_named_reason_once() -> None:
@@ -734,13 +747,13 @@ def test_no_io_skipped_selection_records_named_reason_once() -> None:
         attempt, reason=candidate_loop._NO_IO_SKIP_FOLLOWER
     )
     candidate_loop._record_no_io_skipped_selection(
-        attempt, reason=candidate_loop._NO_IO_SKIP_FOLLOWER
+        attempt, reason=candidate_loop._NO_IO_SKIP_PRECHECK_COOLDOWN
     )
     assert attempt["skip_reason"] == "skipped_follower"
     assert attempt["terminal_disposition"] == "skipped"
     attempt["attempted_provider_call"] = True
     candidate_loop._record_no_io_skipped_selection(
-        attempt, reason=candidate_loop._NO_IO_SKIP_PRECHECK_COOLDOWN
+        attempt, reason=candidate_loop._NO_IO_SKIP_TOCTOU_COOLDOWN
     )
     assert attempt["skip_reason"] == "skipped_follower"
 

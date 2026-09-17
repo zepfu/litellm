@@ -133,17 +133,70 @@ def _record_no_io_skipped_selection(
     """Stamp one bounded no-I/O skip without overwriting a later reason."""
     if attempt_record.get("attempted_provider_call") is True:
         return
-    attempt_record["terminal_disposition"] = "skipped"
-    attempt_record["skip_reason"] = reason
+    attempt_record.setdefault("terminal_disposition", "skipped")
+    attempt_record.setdefault("skip_reason", reason)
     attempt_record.setdefault("status", reason)
+    attempt_record.setdefault("attempted_provider_call", False)
+    attempt_record.setdefault("provider_attempt_budget_refunded", True)
 
 
-def _admission_denial_shares_account_hash(decision: Any) -> bool:
-    """True when a denied lane is bound to a shared account identity."""
-    account_hash = getattr(decision, "account_hash", None)
-    if not isinstance(account_hash, str):
+def _admission_identities_are_independent(
+    denied: Any,
+    *,
+    remaining_candidate: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """True when a denied lane may yield to a different admission identity."""
+    denied_hash = getattr(denied, "account_hash", None)
+    denied_fingerprint = getattr(denied, "lane_fingerprint", None)
+    denied_provider = str(getattr(denied, "provider", "") or "").strip().lower()
+    if remaining_candidate is None:
         return False
-    return bool(account_hash.strip())
+    remaining_hash = remaining_candidate.get("codex_oauth_account_hash") or (
+        remaining_candidate.get("account_hash")
+    )
+    remaining_fingerprint = remaining_candidate.get("admission_lane_fingerprint")
+    remaining_provider = str(remaining_candidate.get("provider") or "").strip().lower()
+    if (
+        isinstance(denied_hash, str)
+        and denied_hash.strip()
+        and isinstance(remaining_hash, str)
+        and remaining_hash.strip()
+        and denied_hash.strip() == remaining_hash.strip()
+    ):
+        return False
+    if (
+        isinstance(denied_fingerprint, str)
+        and denied_fingerprint.strip()
+        and isinstance(remaining_fingerprint, str)
+        and remaining_fingerprint.strip()
+        and denied_fingerprint.strip() == remaining_fingerprint.strip()
+    ):
+        return False
+    if denied_provider and remaining_provider and denied_provider != remaining_provider:
+        return True
+    if (
+        isinstance(denied_hash, str)
+        and denied_hash.strip()
+        and isinstance(remaining_hash, str)
+        and remaining_hash.strip()
+    ):
+        return denied_hash.strip() != remaining_hash.strip()
+    return True
+
+
+def _admission_denial_shares_account_hash(
+    decision: Any,
+    *,
+    remaining_candidate: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """True when a denied lane shares admission identity with remaining work."""
+    if remaining_candidate is None:
+        account_hash = getattr(decision, "account_hash", None)
+        return isinstance(account_hash, str) and bool(account_hash.strip())
+    return not _admission_identities_are_independent(
+        decision, remaining_candidate=remaining_candidate
+    )
+
 
 
 def _session_affinity_mod():
@@ -1498,6 +1551,24 @@ async def handle_alias_route(  # noqa: PLR0915
         else:
             attempt_record["provider_attempt_budget_refunded"] = False
 
+    def _persist_no_io_skipped_selection() -> None:
+        """Keep refunded no-I/O selections on the terminal attempt list."""
+        if attempt_record.get("attempted_provider_call") is True:
+            return
+        if attempt_record not in attempts:
+            attempts.append(attempt_record)
+        _record_auto_agent_alias_attempt_failure(
+            alias_family=alias_family,
+            alias_model=alias_model,
+            request=request,
+            prepared_request_body=prepared_request_body,
+            selection=selection,
+            attempts=attempts,
+            attempt_record=attempt_record,
+            error_class=str(attempt_record.get("skip_reason") or "skipped"),
+            add_alias_metadata_fn=add_alias_metadata_fn,
+        )
+
     def _claim_alpha_probe_injection_slot() -> Optional[int]:
         """Claim one bounded request-local synthetic probe slot."""
         if alpha_probe_control is None:
@@ -2626,7 +2697,10 @@ async def handle_alias_route(  # noqa: PLR0915
             )
             independent_lane_fallback = (
                 account_failover_planned
-                and not _admission_denial_shares_account_hash(admission_decision)
+                and _admission_identities_are_independent(
+                    admission_decision,
+                    remaining_candidate=candidate,
+                )
             )
             if independent_lane_fallback:
                 _carry_native_openai_responses_owner_snapshot(
@@ -2745,15 +2819,12 @@ async def handle_alias_route(  # noqa: PLR0915
                     )
 
                 family_state = alias_routing_state.family(alias_family)
-                cooldown_generation = family_state.get_generation(
-                    selection["cooldown_key"]
-                )
-                is_recovery_probe = cooldown_generation > 0
+                # Healthy traffic is currently cool with no in-flight probe
+                # intent. Sticky cooldown generation is not half-open state.
                 healthy_same_key_traffic = (
                     probe_failure_exc is None
                     and not skip_after_probe_wait
                     and active_seconds <= 0
-                    and not is_recovery_probe
                 )
 
                 existing_probe_intent = (
@@ -2786,9 +2857,30 @@ async def handle_alias_route(  # noqa: PLR0915
                             selection_provider_egress_reached
                         ),
                     )
+                    _persist_no_io_skipped_selection()
                     break
 
                 if healthy_same_key_traffic:
+                    _toctou_remaining = family_state.peek_cooldown_remaining(
+                        selection["cooldown_key"]
+                    )
+                    if _toctou_remaining > 0:
+                        skip_after_probe_wait = True
+                        attempt_record["status"] = "skipped_single_flight_cooldown"
+                        attempt_record["cooldown_seconds"] = _toctou_remaining
+                        _record_no_io_skipped_selection(
+                            attempt_record,
+                            reason=_NO_IO_SKIP_TOCTOU_COOLDOWN,
+                        )
+                        _refund_selection_budget_if_no_provider_egress(
+                            attempt_record=attempt_record,
+                            budget_was_counted=selection_budget_counted,
+                            selection_provider_egress_reached=(
+                                selection_provider_egress_reached
+                            ),
+                        )
+                        _persist_no_io_skipped_selection()
+                        break
                     clear_reservation = (
                         alias_routing_state.publication_intents.get_clear_reservation(
                             alias_family, selection["cooldown_key"]
@@ -2816,6 +2908,7 @@ async def handle_alias_route(  # noqa: PLR0915
                                 selection_provider_egress_reached
                             ),
                         )
+                        _persist_no_io_skipped_selection()
                         break
                     probe_lock = None
                     intent = None
@@ -2864,6 +2957,7 @@ async def handle_alias_route(  # noqa: PLR0915
                                 selection_provider_egress_reached
                             ),
                         )
+                        _persist_no_io_skipped_selection()
                         break
                     if _claim.outcome is ClaimOutcome.FOLLOWER:
                         probe_lock.release()
@@ -2889,6 +2983,7 @@ async def handle_alias_route(  # noqa: PLR0915
                                 selection_provider_egress_reached
                             ),
                         )
+                        _persist_no_io_skipped_selection()
                         break
                     assert _claim.intent is not None
                     intent = _claim.intent
@@ -2943,6 +3038,7 @@ async def handle_alias_route(  # noqa: PLR0915
                                 selection_provider_egress_reached
                             ),
                         )
+                        _persist_no_io_skipped_selection()
                         break
 
                 # BaseException-safe: intent is ALWAYS completed and removed,
