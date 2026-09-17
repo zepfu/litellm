@@ -149,18 +149,30 @@ class OhmypiDriver:
         # Identity is merged first, operator litellm-alpha.yml second.
         # Exact selector wins over operator retry.fallbackChains.default, so a
         # provider-pinned nvidia child fails closed instead of escaping to sota.
+        # Pin the HV2 orch parent/child aliases the same way: Ohmypi 18.2.4
+        # retries sota-xai:xhigh / basic onto logical sota after 409s unless
+        # the exact selector (including thinking-level suffix) is empty.
         # Do not set default here; non-pinned runs keep the operator chain.
-        nvidia_selector = self.model_selector("provider-nvidia")
+        pinned_aliases = (
+            "provider-nvidia",
+            "basic",
+            "work",
+            "expert",
+            "sota-xai",
+            "sota-moonshot",
+            "sota-zai",
+        )
+        chains: dict[str, list[str]] = {}
+        for alias in pinned_aliases:
+            selector = self.model_selector(alias)
+            chains[selector] = []
+            chains[f"{selector}:xhigh"] = []
         return {
             "providers": {
                 "litellm-alpha": {"headers": dict(headers)},
                 "litellm-alpha-passthrough": {"headers": dict(headers)},
             },
-            "retry": {
-                "fallbackChains": {
-                    nvidia_selector: [],
-                }
-            },
+            "retry": {"fallbackChains": chains},
         }
 
     def identity_overlay_path(self) -> Path:

@@ -1359,6 +1359,39 @@ def test_should_stage_empty_fallback_chain_for_provider_nvidia_without_changing_
     assert "default" not in chains
 
 
+def test_should_pin_empty_fallback_chains_for_ohmypi_orch_aliases_including_xhigh(
+    hv, config
+) -> None:
+    from hv2.drivers.codex import CodexDriver
+    from hv2.drivers.ohmypi import OhmypiDriver
+
+    driver = OhmypiDriver(config)
+    overlay = driver.identity_overlay_payload(version="18.2.4")
+    chains = overlay["retry"]["fallbackChains"]
+    aliases = (
+        "provider-nvidia",
+        "basic",
+        "work",
+        "expert",
+        "sota-xai",
+        "sota-moonshot",
+        "sota-zai",
+    )
+    for alias in aliases:
+        selector = driver.model_selector(alias)
+        assert chains[selector] == []
+        assert chains[f"{selector}:xhigh"] == []
+    assert "default" not in chains
+    assert "litellm-alpha-passthrough/sota" not in chains
+    assert "litellm-alpha-passthrough/sota:xhigh" not in chains
+    # Operator default chain must stay unset so non-harness ompla is unchanged.
+
+    _skip_unless_codex_tui_shipped(config)
+    codex = CodexDriver(config).identity_overlay_payload(version="0.142.5")
+    assert "retry" not in codex or "fallbackChains" not in (codex.get("retry") or {})
+    assert codex["headers"]["x-aawm-client"] == "Codex"
+
+
 def test_should_export_ohmypi_identity_overlay_on_pi_config_files_for_child_sessions(
     hv, config, tmp_path: Path
 ) -> None:
