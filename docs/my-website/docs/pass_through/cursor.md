@@ -4,6 +4,12 @@ import Image from '@theme/IdealImage';
 
 Pass-through endpoints for the [Cursor Cloud Agents API](https://docs.cursor.com/account/api) — launch and manage cloud agents that work on your repositories, in native format (no translation).
 
+This is **not** the Cursor Agent CLI Connect turn. CLI intercepts use hidden
+`--agent-endpoint` against `POST /agent.v1.AgentService/Run` (see
+[Cursor Agent CLI](/docs/providers/cursor_agent)). Do not point
+`CURSOR_API_ENDPOINT` at LiteLLM, and do not send Agent CLI turns through
+`/cursor`.
+
 | Feature | Supported | Notes |
 |---------|-----------|-------|
 | Cost Tracking | ✅ | Logged as $0.00 (subscription-based, no per-request pricing) |
