@@ -822,6 +822,41 @@ deployment, compare the proxy readiness generation with the latest sidecar
 aggregate generation; while they differ, readiness is degraded but existing
 requests continue without an immediate inventory hard-stop.
 
+The proxy exposes the local generation in `aawm_alias_config` and reports the
+comparison under `codex_oauth_inventory_generation` on `/health/readiness`.
+`status=matched` / `health=healthy` means every latest sidecar observation for
+the environment has the same valid generation. `status=mismatch` /
+`health=degraded` is emitted only when current observations are present, valid,
+and differ from the local generation; that confirmed mismatch returns HTTP
+`503`. Missing, malformed, empty, or temporarily unavailable observations stay
+`status=unknown` and do not stop live routing. The comparison reads the newest
+row per credential scope so older auth-file identity rows do not create a
+false mismatch.
+
+Every Codex refresh, passive-health, and quota event carries
+`codex_oauth_inventory_generation`; each aggregate event also carries
+`codex_oauth_inventory_generation_status` (`valid`, `missing`, or `invalid`).
+When `--once` emits `provider_status_sidecar_one_shot_status`, the following
+fields summarize aggregate generation evidence without changing the existing
+required-refresh exit policy:
+
+- `codex_oauth_inventory_generation`: the one valid generation, or `null` when
+  none or more than one generation is available.
+- `codex_oauth_inventory_generation_status`: `not_applicable`, `healthy`,
+  `unknown`, or `degraded`.
+- `codex_oauth_inventory_generation_reason`: the bounded reason, such as
+  `codex_generation_valid`, `codex_generation_missing`, or
+  `codex_generation_mismatch`.
+- `codex_oauth_inventory_generations`: sorted distinct valid generations.
+- `codex_oauth_inventory_generation_observation_count`: aggregate observations
+  considered for this one-shot run.
+
+The digest input contains only validated schema, routing, record, path, enable,
+priority, weight, model, and expected-hash fields. It never contains account
+IDs, access or refresh tokens, or credential-file contents. A null generation
+on an unavailable candidate means that inventory identity could not be
+validated; it is diagnostic metadata and does not authorize fallback routing.
+
 | Area | Location |
 | --- | --- |
 | Shared lock | `litellm/secret_managers/credential_file_lock.py` |

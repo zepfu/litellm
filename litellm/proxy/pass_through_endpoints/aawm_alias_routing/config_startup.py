@@ -30,7 +30,9 @@ performs its own deterministic directory load at startup.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import json
 import logging
 import os
 import stat
@@ -38,13 +40,14 @@ import threading
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Awaitable, Callable, Mapping, Optional, Sequence
 
 import yaml
 
 from litellm.secret_managers.codex_oauth_inventory import (
     CodexOAuthInventoryError,
     codex_oauth_inventory_generation_digest,
+    is_codex_oauth_inventory_generation,
     load_codex_oauth_inventory,
 )
 
@@ -67,6 +70,34 @@ DEFAULT_CONFIG_DIR: Path = (
 _YAML_SUFFIXES = frozenset({".yaml", ".yml"})
 
 _MAX_CONFIG_FILE_BYTES = 10 * 1024 * 1024
+
+_CODEX_OAUTH_INVENTORY_GENERATION_QUERY = """
+SELECT id, observed_at, metadata
+FROM (
+    SELECT DISTINCT ON (COALESCE(credential_scope, ''))
+        id, observed_at, metadata
+    FROM public.provider_auth_current
+    WHERE environment = $1::text
+      AND provider = 'openai'
+      AND auth_family = 'codex_oauth'
+    ORDER BY
+        COALESCE(credential_scope, ''),
+        observed_at DESC,
+        id DESC
+) AS latest_by_scope
+ORDER BY observed_at DESC, id DESC
+LIMIT $2::integer
+"""
+_CODEX_OAUTH_GENERATION_QUERY_MAX_ROWS = 128
+_CODEX_OAUTH_GENERATION_QUERY_TIMEOUT_SECONDS = 1.5
+_CODEX_OAUTH_OBSERVATION_ENVIRONMENT_ENV = (
+    "AAWM_CODEX_OAUTH_QUOTA_OBSERVATION_ENVIRONMENT"
+)
+_CODEX_OAUTH_RUNTIME_ENVIRONMENT_VARS = (
+    "AAWM_LITELLM_ENVIRONMENT",
+    "LITELLM_INSTANCE_ENVIRONMENT",
+    "LITELLM_ENVIRONMENT",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -658,6 +689,156 @@ def is_startup_not_loaded() -> bool:
     """Return ``True`` if startup was never attempted (not_loaded state)."""
     with _state_lock:
         return not _startup_state.activated and not _startup_state.failed
+
+
+def _resolve_codex_oauth_observation_environment() -> Optional[str]:
+    """Resolve the environment label written by the provider-status sidecar."""
+    explicit = os.getenv(_CODEX_OAUTH_OBSERVATION_ENVIRONMENT_ENV)
+    if explicit is not None:
+        return explicit.strip() or None
+    for environment_var in _CODEX_OAUTH_RUNTIME_ENVIRONMENT_VARS:
+        environment = os.getenv(environment_var, "").strip()
+        if environment:
+            return environment
+    return None
+
+
+def _codex_oauth_generation_from_row(
+    row: Any,
+) -> tuple[str, Optional[str]]:
+    try:
+        values = dict(row)
+    except (TypeError, ValueError):
+        values = {}
+    metadata = values.get("metadata")
+    if isinstance(metadata, (str, bytes, bytearray)):
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            metadata = None
+    if not isinstance(metadata, Mapping):
+        return "missing", None
+    generation = metadata.get("codex_oauth_inventory_generation")
+    if generation is None or generation == "":
+        return "missing", None
+    if is_codex_oauth_inventory_generation(generation):
+        return "valid", generation
+    return "invalid", None
+
+
+async def get_codex_oauth_inventory_generation_status(
+    *,
+    local_generation: Optional[str],
+    get_pool: Optional[Callable[[], Awaitable[Any]]] = None,
+) -> dict[str, Any]:
+    """Compare the local inventory digest with current sidecar observations.
+
+    Persisted observations remain informational.  A confirmed mismatch is
+    surfaced to readiness, while missing or malformed observations remain
+    visible as ``unknown`` so a sidecar/database startup race does not stop
+    live routing.
+    """
+    safe_local_generation = (
+        local_generation
+        if is_codex_oauth_inventory_generation(local_generation)
+        else None
+    )
+    environment = _resolve_codex_oauth_observation_environment()
+    result: dict[str, Any] = {
+        "status": "unknown",
+        "health": "unknown",
+        "readiness_degraded": False,
+        "environment": environment,
+        "local_generation": safe_local_generation,
+        "sidecar_generation": None,
+        "sidecar_generations": [],
+        "observation_count": 0,
+        "valid_observation_count": 0,
+        "reason": None,
+    }
+    if environment is None:
+        result["reason"] = "observation_environment_unconfigured"
+        return result
+    if safe_local_generation is None:
+        result["reason"] = "local_generation_unavailable"
+        return result
+
+    async def _fetch_rows() -> Any:
+        from ..aawm_context_query import (
+            _aawm_pool_fetch,
+            _get_aawm_callback_pool,
+        )
+
+        pool = await (get_pool or _get_aawm_callback_pool)()
+        return await _aawm_pool_fetch(
+            pool,
+            _CODEX_OAUTH_INVENTORY_GENERATION_QUERY,
+            environment,
+            _CODEX_OAUTH_GENERATION_QUERY_MAX_ROWS,
+            get_timeout=lambda: _CODEX_OAUTH_GENERATION_QUERY_TIMEOUT_SECONDS,
+        )
+
+    try:
+        rows = await asyncio.wait_for(
+            _fetch_rows(),
+            timeout=_CODEX_OAUTH_GENERATION_QUERY_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:  # noqa: BLE001
+        result["reason"] = "observation_query_failed"
+        result["error_class"] = exc.__class__.__name__
+        return result
+
+    if not isinstance(rows, Sequence):
+        result["reason"] = "observation_rows_invalid"
+        return result
+    result["observation_count"] = len(rows)
+    generation_values: set[str] = set()
+    valid_observation_count = 0
+    missing_count = 0
+    invalid_count = 0
+    for row in rows:
+        generation_state, generation = _codex_oauth_generation_from_row(row)
+        if generation_state == "valid" and generation is not None:
+            valid_observation_count += 1
+            generation_values.add(generation)
+        elif generation_state == "missing":
+            missing_count += 1
+        else:
+            invalid_count += 1
+    result["valid_observation_count"] = valid_observation_count
+    result["sidecar_generations"] = sorted(generation_values)
+    if len(generation_values) == 1:
+        result["sidecar_generation"] = next(iter(generation_values))
+    if not rows:
+        result["reason"] = "no_current_codex_observation"
+        return result
+    if missing_count or invalid_count:
+        result["reason"] = (
+            "sidecar_generation_incomplete"
+            if missing_count and invalid_count
+            else "sidecar_generation_missing"
+            if missing_count
+            else "sidecar_generation_invalid"
+        )
+        return result
+    if generation_values == {safe_local_generation}:
+        result.update(
+            {
+                "status": "matched",
+                "health": "healthy",
+                "reason": "generation_match",
+            }
+        )
+        return result
+    result.update(
+        {
+            "status": "mismatch",
+            "health": "degraded",
+            "readiness_degraded": True,
+            "reason": "generation_mismatch",
+        }
+    )
+    return result
 
 
 def get_startup_status() -> dict[str, Any]:

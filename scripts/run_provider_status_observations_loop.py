@@ -113,6 +113,7 @@ from litellm.secret_managers.codex_oauth_inventory import (
     CodexOAuthCredentialSnapshot,
     CodexOAuthInventory,
     codex_oauth_inventory_generation_digest,
+    is_codex_oauth_inventory_generation,
     load_codex_oauth_credential,
     load_codex_oauth_inventory,
 )
@@ -9711,6 +9712,7 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
 
     inventory = _require_codex_oauth_inventory(config)
     records = inventory.ordered_records(enabled_only=True)
+    inventory_generation = codex_oauth_inventory_generation_digest(inventory)
     events: list[Dict[str, Any]] = []
     attempted_any = False
     for record in records:
@@ -9950,6 +9952,7 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
                 "event": "codex_reset_credit_poll",
                 "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
                 "environment": config.environment,
+                "codex_oauth_inventory_generation": inventory_generation,
                 **summary,
             }
         )
@@ -9959,9 +9962,7 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
             _codex_account_aggregate_event(
                 event_name="codex_quota_poll_aggregate",
                 config=config,
-                inventory_generation=codex_oauth_inventory_generation_digest(
-                    inventory
-                ),
+                inventory_generation=inventory_generation,
                 records=records,
                 usable_by_label=state.codex_quota_usable_by_label,
                 status_by_label=state.codex_quota_status_by_label,
@@ -15899,6 +15900,19 @@ def _codex_account_aggregate_event(
     usable_by_label: Mapping[str, bool],
     status_by_label: Mapping[str, str],
 ) -> Dict[str, Any]:
+    if inventory_generation is None or (
+        isinstance(inventory_generation, str)
+        and not inventory_generation.strip()
+    ):
+        inventory_generation_status = "missing"
+        safe_inventory_generation = None
+    elif is_codex_oauth_inventory_generation(inventory_generation):
+        inventory_generation_status = "valid"
+        safe_inventory_generation = inventory_generation
+    else:
+        inventory_generation_status = "invalid"
+        safe_inventory_generation = None
+
     accounts = [
         {
             "account_label": record.label,
@@ -15930,7 +15944,8 @@ def _codex_account_aggregate_event(
         "event": event_name,
         "observed_at": _utc_timestamp(),
         "environment": config.environment,
-        "codex_oauth_inventory_generation": inventory_generation,
+        "codex_oauth_inventory_generation": safe_inventory_generation,
+        "codex_oauth_inventory_generation_status": inventory_generation_status,
         "health": health,
         "account_count": len(accounts),
         "usable_count": usable_count,
@@ -18565,6 +18580,98 @@ def _sidecar_one_shot_policy(event: Mapping[str, Any]) -> str:
     return "optional"
 
 
+_CODEX_OAUTH_GENERATION_AGGREGATE_EVENTS = frozenset(
+    {
+        "codex_oauth_refresh_aggregate",
+        "codex_oauth_health_aggregate",
+        "codex_quota_poll_aggregate",
+    }
+)
+
+
+def _codex_oauth_generation_maintenance_status(
+    config: ProviderStatusLoopConfig,
+    events: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Summarize whether this one-shot run published a usable generation."""
+    maintenance_enabled = any(
+        (
+            config.codex_oauth_refresh_enabled,
+            config.codex_reset_credit_poll_enabled,
+            config.provider_auth_health_poll_enabled,
+        )
+    )
+    aggregate_events = [
+        event
+        for event in events
+        if event.get("event") in _CODEX_OAUTH_GENERATION_AGGREGATE_EVENTS
+    ]
+    if not maintenance_enabled:
+        return {
+            "status": "not_applicable",
+            "generation": None,
+            "generations": [],
+            "observation_count": 0,
+            "reason": "codex_maintenance_disabled",
+        }
+    if not aggregate_events:
+        return {
+            "status": "unknown",
+            "generation": None,
+            "generations": [],
+            "observation_count": 0,
+            "reason": "no_codex_generation_observation",
+        }
+
+    generation_values: set[str] = set()
+    generation_states: set[str] = set()
+    for event in aggregate_events:
+        generation = event.get("codex_oauth_inventory_generation")
+        generation_status = event.get(
+            "codex_oauth_inventory_generation_status"
+        )
+        if generation_status not in {"valid", "missing", "invalid"}:
+            if generation is None or (
+                isinstance(generation, str) and not generation.strip()
+            ):
+                generation_status = "missing"
+            elif is_codex_oauth_inventory_generation(generation):
+                generation_status = "valid"
+            else:
+                generation_status = "invalid"
+        generation_states.add(str(generation_status))
+        if (
+            generation_status == "valid"
+            and is_codex_oauth_inventory_generation(generation)
+        ):
+            generation_values.add(generation)
+
+    generations = sorted(generation_values)
+    generation = generations[0] if len(generations) == 1 else None
+    if "invalid" in generation_states:
+        status = "degraded"
+        reason = "codex_generation_invalid"
+    elif len(generations) > 1:
+        status = "degraded"
+        reason = "codex_generation_mismatch"
+    elif "missing" in generation_states:
+        status = "unknown"
+        reason = "codex_generation_missing"
+    elif generation is not None:
+        status = "healthy"
+        reason = "codex_generation_valid"
+    else:
+        status = "unknown"
+        reason = "codex_generation_unavailable"
+    return {
+        "status": status,
+        "generation": generation,
+        "generations": generations,
+        "observation_count": len(aggregate_events),
+        "reason": reason,
+    }
+
+
 def _required_one_shot_refresh_failures(
     events: Sequence[Mapping[str, Any]],
 ) -> list[Mapping[str, Any]]:
@@ -18621,11 +18728,30 @@ def _build_one_shot_status_event(
     optional_failures = [
         event for event in optional_events if _optional_one_shot_event_failed(event)
     ]
+    codex_generation_status = _codex_oauth_generation_maintenance_status(
+        config,
+        events,
+    )
     return {
         "event": "provider_status_sidecar_one_shot_status",
         "observed_at": _utc_timestamp(),
         "environment": config.environment,
         "status": "failed" if failures else "healthy",
+        "codex_oauth_inventory_generation": codex_generation_status[
+            "generation"
+        ],
+        "codex_oauth_inventory_generation_status": codex_generation_status[
+            "status"
+        ],
+        "codex_oauth_inventory_generation_reason": codex_generation_status[
+            "reason"
+        ],
+        "codex_oauth_inventory_generations": codex_generation_status[
+            "generations"
+        ],
+        "codex_oauth_inventory_generation_observation_count": (
+            codex_generation_status["observation_count"]
+        ),
         "required_task_count": len(required_events),
         "required_failure_count": len(failures),
         "required_tasks": [event.get("event") for event in required_events],

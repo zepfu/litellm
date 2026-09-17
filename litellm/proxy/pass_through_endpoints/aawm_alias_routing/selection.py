@@ -393,6 +393,10 @@ def _codex_auto_agent_candidate_public_shape(
         ("codex_oauth_account_weight", "account_weight"),
         ("codex_oauth_credential_affinity", "credential_affinity"),
         ("codex_oauth_selection_strategy", "selection_strategy"),
+        (
+            "codex_oauth_inventory_generation",
+            "codex_oauth_inventory_generation",
+        ),
         ("xai_oauth_account_label", "account_label"),
         ("xai_oauth_account_hash", "account_hash"),
         ("xai_oauth_lane_key", "account_lane"),
@@ -408,7 +412,10 @@ def _codex_auto_agent_candidate_public_shape(
         }:
             continue
         value = candidate.get(source_field)
-        if value is not None:
+        if value is not None or (
+            source_field == "codex_oauth_inventory_generation"
+            and source_field in candidate
+        ):
             shaped[public_field] = value
     if lane_key is not None and include_account_identity:
         shaped["lane_key"] = lane_key
@@ -885,6 +892,7 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
         "account_weight",
         "credential_affinity",
         "selection_strategy",
+        "codex_oauth_inventory_generation",
         "lane_key",
         "cooldown_key",
         "cooldown_seconds",
@@ -3344,6 +3352,7 @@ async def _resolve_codex_oauth_account_candidate_contexts(
                 {
                     "candidate": {
                         **candidate_template,
+                        "codex_oauth_inventory_generation": None,
                         **(
                             {"codex_oauth_account_label": pinned_label}
                             if pinned_label
@@ -3364,6 +3373,7 @@ async def _resolve_codex_oauth_account_candidate_contexts(
                     "auth_status": "degraded",
                     "skip_reason": "auth_degraded",
                     "failure_phase": "affinity_account_context_missing",
+                    "codex_oauth_inventory_generation": None,
                     "attempted_provider_call": False,
                 }
             ]
@@ -3392,7 +3402,7 @@ async def _resolve_codex_oauth_account_candidate_contexts(
             )
     except CodexOAuthInventoryError:
         records = ()
-        routing_fields = {}
+        routing_fields = {"codex_oauth_inventory_generation": None}
 
     if not records:
         unavailable_candidate = dict(candidate_template)
@@ -3409,6 +3419,9 @@ async def _resolve_codex_oauth_account_candidate_contexts(
                 "lane_key": pinned_lane or "codex-oauth:unavailable",
                 "auth_status": "degraded",
                 "skip_reason": "auth_degraded",
+                "codex_oauth_inventory_generation": routing_fields.get(
+                    "codex_oauth_inventory_generation"
+                ),
                 "failure_phase": (
                     "affinity_account_unavailable"
                     if affinity is not None
@@ -3437,6 +3450,9 @@ async def _resolve_codex_oauth_account_candidate_contexts(
             "candidate": account_candidate,
             "lane_key": lane_key,
             "auth_status": "healthy",
+            "codex_oauth_inventory_generation": routing_fields.get(
+                "codex_oauth_inventory_generation"
+            ),
         }
         if (
             pinned_hash is not None

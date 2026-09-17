@@ -33,7 +33,6 @@ from litellm.secret_managers.codex_oauth_inventory import (
     CodexOAuthCredentialSnapshot,
     CodexOAuthInventoryError,
     CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY,
-    codex_oauth_inventory_generation_digest,
     load_codex_oauth_credential,
     load_codex_oauth_inventory,
 )
@@ -1545,30 +1544,41 @@ async def _resolve_model_less_direct_codex_oauth_contexts(
     # Local helpers (this module).
     from litellm.secret_managers.codex_oauth_inventory import (
         CodexOAuthInventoryError,
+        codex_oauth_inventory_generation_digest,
         load_codex_oauth_inventory,
     )
 
+    inventory_generation: Optional[str] = None
     try:
         inventory = load_codex_oauth_inventory()
+        inventory_generation = codex_oauth_inventory_generation_digest(inventory)
         records = inventory.ordered_records(enabled_only=True, model=None)
         routing_fields = {
             "codex_oauth_credential_affinity": (
                 inventory.routing.credential_affinity
             ),
             "codex_oauth_selection_strategy": inventory.routing.strategy,
+            "codex_oauth_inventory_generation": inventory_generation,
         }
     except CodexOAuthInventoryError:
         records = ()
-        routing_fields = {}
+        routing_fields = {
+            "codex_oauth_inventory_generation": inventory_generation,
+        }
 
     if not records:
+        unavailable_candidate = dict(candidate_template)
+        unavailable_candidate["codex_oauth_inventory_generation"] = (
+            inventory_generation
+        )
         return [
             {
-                "candidate": dict(candidate_template),
+                "candidate": unavailable_candidate,
                 "lane_key": "codex-oauth:unavailable",
                 "auth_status": "degraded",
                 "skip_reason": "auth_degraded",
                 "failure_phase": "account_inventory_unavailable",
+                "codex_oauth_inventory_generation": inventory_generation,
                 "attempted_provider_call": False,
             }
         ]
@@ -1593,6 +1603,7 @@ async def _resolve_model_less_direct_codex_oauth_contexts(
             "candidate": account_candidate,
             "lane_key": lane_key,
             "auth_status": "healthy",
+            "codex_oauth_inventory_generation": inventory_generation,
         }
         try:
             loaded = await _load_codex_oauth_headers_for_record(request, record)
@@ -1615,9 +1626,7 @@ async def _resolve_model_less_direct_codex_oauth_contexts(
                         "auth_status": "degraded",
                         "skip_reason": "auth_degraded",
                         "failure_phase": "account_identity_mismatch",
-                        "codex_oauth_inventory_generation": (
-                            codex_oauth_inventory_generation_digest(inventory)
-                        ),
+                        "codex_oauth_inventory_generation": inventory_generation,
                         "attempted_provider_call": False,
                     }
                 )
@@ -2060,10 +2069,8 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
             "codex_oauth_account_label": selected_auth.account_label,
             "codex_oauth_account_hash": selected_auth.account_hash,
             "codex_oauth_lane_key": selected_auth.lane_key,
-            "codex_oauth_inventory_generation": (
-                codex_oauth_inventory_generation_digest(
-                    load_codex_oauth_inventory()
-                )
+            "codex_oauth_inventory_generation": candidate.get(
+                "codex_oauth_inventory_generation"
             ),
             "codex_oauth_account_display": selected_auth.account_display,
             "codex_auto_agent_selected_provider": CODEX_AUTO_AGENT_NATIVE_PROVIDER,
