@@ -4875,6 +4875,20 @@ async def handle_alias_route(  # noqa: PLR0915
                         )
                     )
                     if fresh_fallback_body is not None:
+                        sa_mod = _session_affinity_mod()
+                        leftover_lease = (
+                            session_owner_lease
+                            or sa_mod.get_request_session_owner_lease(request)
+                        )
+                        base_session_identity = session_owner_identity
+                        if not isinstance(base_session_identity, str) or not (
+                            base_session_identity.strip()
+                        ):
+                            base_session_identity = (
+                                leftover_lease.session_identity
+                                if leftover_lease is not None
+                                else None
+                            )
                         prepared_request_body = fresh_fallback_body
                         has_continuation_state = _codex_auto_agent_request_has_continuation_state(
                             prepared_request_body
@@ -4884,7 +4898,7 @@ async def handle_alias_route(  # noqa: PLR0915
                         )
                         if replay_safety is not None:
                             replay_safety = (
-                                _session_affinity_mod().classify_session_owner_replay_safety_body(
+                                sa_mod.classify_session_owner_replay_safety_body(
                                     prepared_request_body
                                 )
                             )
@@ -4893,6 +4907,17 @@ async def handle_alias_route(  # noqa: PLR0915
                             if replay_safety is not None
                             else True
                         )
+                        rebind_cursor_skip = getattr(
+                            sa_mod,
+                            "rebind_request_session_owner_after_cursor_replay_skip",
+                            None,
+                        )
+                        if callable(rebind_cursor_skip):
+                            rebind_cursor_skip(
+                                request,
+                                rebuilt_body=prepared_request_body,
+                                base_session_identity=base_session_identity,
+                            )
                         if not attempted_provider_call:
                             _refund_selection_budget_if_no_provider_egress(
                                 attempt_record=attempt_record,

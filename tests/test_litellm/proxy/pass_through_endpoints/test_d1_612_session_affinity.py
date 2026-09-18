@@ -2204,6 +2204,159 @@ def test_effective_redispatch_identity_is_deterministic_server_only_and_single_g
     assert sa.get_request_effective_session_identity(mock_request) is None
 
 
+def _cursor_skip_replay_safe_body() -> dict[str, Any]:
+    return {
+        "model": "sota-xai",
+        "input": [
+            {"role": "user", "content": "another one?"},
+            {
+                "type": "function_call",
+                "call_id": "read-1",
+                "name": "read",
+                "arguments": '{"path":"."}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "read-1",
+                "output": ".",
+            },
+        ],
+    }
+
+
+def test_cursor_replay_skip_clears_leftover_request_lease_and_mints_redispatch_identity() -> None:
+    from starlette.datastructures import State
+
+    request = type("Req", (), {})()
+    request.state = State()
+    leftover = sa.SessionOwnerLease(
+        session_identity="cursor-turn-1",
+        cache_key="cursor-turn-1",
+        reservation_token=None,
+        held_reservation=False,
+        decision=sa.SessionOwnerGuardDecision.UNOWNED_RESERVED.value,
+        attributes={
+            "provider": "cursor_agent",
+            "model": "cursor_agent/cursor-grok-4.6-high",
+            "route_family": "codex_cursor_agent_aiserver_adapter",
+        },
+    )
+    sa.set_request_session_owner_lease(request, leftover)
+    rebuilt = _cursor_skip_replay_safe_body()
+
+    rebound = sa.rebind_request_session_owner_after_cursor_replay_skip(
+        request,
+        rebuilt_body=rebuilt,
+        base_session_identity="cursor-turn-1",
+    )
+
+    assert rebound is True
+    assert sa.get_request_session_owner_lease(request) is None
+    assert sa.request_session_owner_already_guarded(request) is False
+    effective = sa.get_request_effective_session_identity(request)
+    assert effective is not None
+    assert effective.startswith(sa._SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_PREFIX)
+    assert (
+        sa.resolve_canonical_session_identity(request, rebuilt) == effective
+    )
+
+
+def test_cursor_replay_skip_clears_released_leftover_lease() -> None:
+    from starlette.datastructures import State
+
+    request = type("Req", (), {})()
+    request.state = State()
+    leftover = sa.SessionOwnerLease(
+        session_identity="cursor-turn-1",
+        reservation_token="tok-released",
+        held_reservation=False,
+        released=True,
+        decision=sa.SessionOwnerGuardDecision.UNOWNED_RESERVED.value,
+    )
+    sa.set_request_session_owner_lease(request, leftover)
+
+    rebound = sa.rebind_request_session_owner_after_cursor_replay_skip(
+        request,
+        rebuilt_body=_cursor_skip_replay_safe_body(),
+        base_session_identity="cursor-turn-1",
+    )
+
+    assert rebound is True
+    assert sa.get_request_session_owner_lease(request) is None
+
+
+def test_cursor_replay_skip_does_not_clear_live_reservation_or_promoted_owner() -> None:
+    from starlette.datastructures import State
+
+    live_request = type("Req", (), {})()
+    live_request.state = State()
+    live = sa.SessionOwnerLease(
+        session_identity="cursor-live",
+        reservation_token="tok-live",
+        held_reservation=True,
+        released=False,
+        promoted=False,
+    )
+    sa.set_request_session_owner_lease(live_request, live)
+    assert (
+        sa.rebind_request_session_owner_after_cursor_replay_skip(
+            live_request,
+            rebuilt_body=_cursor_skip_replay_safe_body(),
+            base_session_identity="cursor-live",
+        )
+        is False
+    )
+    assert sa.get_request_session_owner_lease(live_request) is live
+
+    owned_request = type("Req", (), {})()
+    owned_request.state = State()
+    owned = sa.SessionOwnerLease(
+        session_identity="cursor-owned",
+        reservation_token="tok-owned",
+        held_reservation=False,
+        promoted=True,
+    )
+    sa.set_request_session_owner_lease(owned_request, owned)
+    assert (
+        sa.rebind_request_session_owner_after_cursor_replay_skip(
+            owned_request,
+            rebuilt_body=_cursor_skip_replay_safe_body(),
+            base_session_identity="cursor-owned",
+        )
+        is False
+    )
+    assert sa.get_request_session_owner_lease(owned_request) is owned
+
+
+def test_cursor_replay_skip_keeps_previous_response_id_fail_closed() -> None:
+    from starlette.datastructures import State
+
+    request = type("Req", (), {})()
+    request.state = State()
+    leftover = sa.SessionOwnerLease(
+        session_identity="cursor-turn-1",
+        held_reservation=False,
+        reservation_token=None,
+    )
+    sa.set_request_session_owner_lease(request, leftover)
+    unsafe = {
+        "model": "sota-xai",
+        "previous_response_id": "resp_cursor_owned",
+        "input": [{"type": "function_call_output", "call_id": "x", "output": "."}],
+    }
+
+    assert (
+        sa.rebind_request_session_owner_after_cursor_replay_skip(
+            request,
+            rebuilt_body=unsafe,
+            base_session_identity="cursor-turn-1",
+        )
+        is False
+    )
+    assert sa.get_request_session_owner_lease(request) is leftover
+    assert sa.get_request_effective_session_identity(request) is None
+
+
 def test_codex_auto_review_identity_is_exact_idempotent_and_canonical() -> None:
     from starlette.datastructures import State
 

@@ -8172,6 +8172,63 @@ def set_validated_cursor_replay(
     )
 
 
+def rebind_request_session_owner_after_cursor_replay_skip(
+    request: Any,
+    *,
+    rebuilt_body: Optional[Mapping[str, Any]],
+    base_session_identity: Optional[str] = None,
+) -> bool:
+    """Clear leftover Cursor lease after a replay-safe skip; mint redispatch identity.
+
+    A Cursor retained-session miss can skip to the next in-alias candidate only
+    when the rebuilt body is replay-safe. The Cursor attempt still leaves a
+    request-local lease; the next candidate then 409s with
+    ``session_owner_request_lease_identity_conflict``. Clear that leftover
+    only when there is no live Redis reservation and no promoted owner.
+    Codex ``previous_response_id`` bodies stay fail-closed.
+    """
+
+    if request is None:
+        return False
+    if not is_replay_safe_session_owner_redispatch_body(rebuilt_body):
+        return False
+    state = getattr(request, "state", None)
+    if state is None:
+        return False
+    lease = get_request_session_owner_lease(request)
+    if lease is not None and lease.promoted:
+        return False
+    live_reservation = bool(
+        lease is not None
+        and lease.held_reservation
+        and lease.reservation_token
+        and not lease.released
+    )
+    if live_reservation:
+        return False
+    base = _clean_optional_str(base_session_identity)
+    if base is None and lease is not None:
+        base = _clean_optional_str(lease.session_identity)
+    if base is None:
+        base = resolve_canonical_session_identity(request, rebuilt_body)
+    if lease is not None:
+        if lease.released:
+            if not reset_released_request_session_owner_guard(request):
+                return False
+        elif not clear_non_held_request_session_owner_lease(request):
+            setattr(state, _REQUEST_STATE_LEASE_ATTR, None)
+            setattr(state, _REQUEST_STATE_GUARDED_ATTR, False)
+    if get_request_session_owner_lease(request) is not None:
+        return False
+    if base is None:
+        return True
+    activate_session_owner_redispatch_effective_identity(
+        request=request,
+        base_session_identity=base,
+    )
+    return True
+
+
 def reset_released_request_session_owner_guard(request: Any) -> bool:
     """Clear a released fresh-request reservation before account failover.
 
