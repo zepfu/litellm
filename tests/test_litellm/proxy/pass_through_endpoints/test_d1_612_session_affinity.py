@@ -2328,6 +2328,59 @@ def test_cursor_replay_skip_does_not_clear_live_reservation_or_promoted_owner() 
     assert sa.get_request_session_owner_lease(owned_request) is owned
 
 
+def test_cursor_replay_skip_mints_identity_from_request_call_id_when_session_missing() -> None:
+    from starlette.datastructures import State
+
+    request = type("Req", (), {})()
+    request.state = State()
+    request.state.aawm_alias_request_litellm_call_id = "ohmypi-round3-call"
+    leftover = sa.SessionOwnerLease(
+        session_identity=None,
+        reservation_token=None,
+        held_reservation=False,
+        decision=sa.SessionOwnerGuardDecision.UNOWNED_RESERVED.value,
+    )
+    sa.set_request_session_owner_lease(request, leftover)
+
+    rebound = sa.rebind_request_session_owner_after_cursor_replay_skip(
+        request,
+        rebuilt_body=_cursor_skip_replay_safe_body(),
+        base_session_identity=None,
+    )
+
+    assert rebound is True
+    assert sa.get_request_session_owner_lease(request) is None
+    expected = (
+        f"{sa._SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_PREFIX}"
+        f"{hashlib.sha256((sa._SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_DOMAIN_SEPARATOR + 'ohmypi-round3-call').encode('utf-8')).hexdigest()}"
+    )
+    assert sa.get_request_effective_session_identity(request) == expected
+
+
+def test_cursor_replay_skip_without_identity_or_call_id_does_not_mint() -> None:
+    from starlette.datastructures import State
+
+    request = type("Req", (), {})()
+    request.state = State()
+    leftover = sa.SessionOwnerLease(
+        session_identity=None,
+        reservation_token=None,
+        held_reservation=False,
+        decision=sa.SessionOwnerGuardDecision.UNOWNED_RESERVED.value,
+    )
+    sa.set_request_session_owner_lease(request, leftover)
+
+    rebound = sa.rebind_request_session_owner_after_cursor_replay_skip(
+        request,
+        rebuilt_body=_cursor_skip_replay_safe_body(),
+        base_session_identity=None,
+    )
+
+    assert rebound is False
+    assert sa.get_request_session_owner_lease(request) is None
+    assert sa.get_request_effective_session_identity(request) is None
+
+
 def test_cursor_replay_skip_keeps_previous_response_id_fail_closed() -> None:
     from starlette.datastructures import State
 

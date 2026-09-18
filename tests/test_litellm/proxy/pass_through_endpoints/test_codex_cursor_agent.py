@@ -2404,6 +2404,148 @@ def test_cursor_fresh_replay_dispatch_rejects_ohmypi_history_with_unknown_extra(
     assert "opaque-provider-state" not in json.dumps(diagnostic)
 
 
+def _ohmypi_sota_xai_round3_history_body() -> dict[str, Any]:
+    """Live Ohmypi sota-xai round-3 skip body from alpha-error.jsonl 11:55Z."""
+
+    return {
+        "model": "sota-xai",
+        "tools": [
+            {
+                "type": "function",
+                "name": "glob",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                },
+            }
+        ],
+        "input": [
+            {"role": "user", "content": "just a test"},
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": "I'm here. Test received — all good.",
+                "aawm_route_identity": {"alias": "sota-xai"},
+            },
+            {"role": "user", "content": "how about now"},
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": "I'll check the current workspace.",
+                "aawm_route_identity": {"alias": "sota-xai"},
+            },
+            {
+                "type": "function_call",
+                "name": "glob",
+                "call_id": "call-62b9d1ee-22f3-4301-8747-2935d56f4f69-0",
+                "arguments": '{"path":"*"}',
+                "aawm_route_identity": {"alias": "sota-xai"},
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-62b9d1ee-22f3-4301-8747-2935d56f4f69-0",
+                "output": "tiny_test.bed\n",
+            },
+            {
+                "type": "reasoning",
+                "encrypted_content": "cursor-owned-ciphertext-must-not-leak",
+                "summary": [{"type": "summary_text", "text": "workspace listing"}],
+            },
+            {"role": "user", "content": "just 1 more test"},
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": "Still here.",
+                "aawm_route_identity": {"alias": "sota-xai"},
+            },
+        ],
+    }
+
+
+def test_cursor_fresh_replay_dispatch_drops_ohmypi_cursor_reasoning() -> None:
+    body = _ohmypi_sota_xai_round3_history_body()
+    rejection: dict[str, Any] = {}
+
+    rebuilt = (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+            body,
+            continuation_exc=_cursor_continuation_failure(),
+            rejection_diagnostic_out=rejection,
+        )
+    )
+
+    assert rebuilt is not None, rejection
+    assert "previous_response_id" not in rebuilt
+    assert all(item.get("type") != "reasoning" for item in rebuilt["input"])
+    assert "cursor-owned-ciphertext-must-not-leak" not in json.dumps(rebuilt)
+    assert rebuilt["input"] == [
+        {"role": "user", "content": "just a test"},
+        {"role": "assistant", "content": "I'm here. Test received — all good."},
+        {"role": "user", "content": "how about now"},
+        {"role": "assistant", "content": "I'll check the current workspace."},
+        {
+            "type": "function_call",
+            "call_id": "call-62b9d1ee-22f3-4301-8747-2935d56f4f69-0",
+            "name": "glob",
+            "arguments": '{"path":"*"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-62b9d1ee-22f3-4301-8747-2935d56f4f69-0",
+            "output": "tiny_test.bed\n",
+        },
+        {"role": "user", "content": "just 1 more test"},
+        {"role": "assistant", "content": "Still here."},
+    ]
+
+
+def test_cursor_fresh_replay_dispatch_rejects_id_only_reasoning() -> None:
+    body = _ohmypi_sota_xai_round3_history_body()
+    body["input"][6] = {"type": "reasoning", "id": "rs_missing_ciphertext"}
+    rejection: dict[str, Any] = {}
+
+    assert (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+            body,
+            continuation_exc=_cursor_continuation_failure(),
+            rejection_diagnostic_out=rejection,
+        )
+        is None
+    )
+    diagnostic = rejection[
+        codex_candidate_calls._CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD
+    ]
+    assert diagnostic["stage"] == "stock_full_history"
+    assert diagnostic["reason"] == "item_type"
+    assert "rs_missing_ciphertext" not in json.dumps(diagnostic)
+
+
+def test_cursor_fresh_replay_dispatch_rejects_stock_reasoning_with_id() -> None:
+    body = _ohmypi_sota_xai_round3_history_body()
+    body["input"][6] = {
+        "type": "reasoning",
+        "id": "rs_stock_owned",
+        "encrypted_content": "cursor-owned-ciphertext-must-not-leak",
+        "summary": [],
+    }
+    rejection: dict[str, Any] = {}
+
+    assert (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+            body,
+            continuation_exc=_cursor_continuation_failure(),
+            rejection_diagnostic_out=rejection,
+        )
+        is None
+    )
+    diagnostic = rejection[
+        codex_candidate_calls._CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD
+    ]
+    assert diagnostic["stage"] == "stock_full_history"
+    assert diagnostic["reason"] == "item_type"
+    assert "cursor-owned-ciphertext-must-not-leak" not in json.dumps(diagnostic)
+
+
 @pytest.mark.parametrize(
     "external_web_access",
     [True, False],

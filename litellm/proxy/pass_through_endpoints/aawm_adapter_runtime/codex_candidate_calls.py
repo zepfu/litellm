@@ -56,6 +56,10 @@ _OHMYPI_CLIENT_HISTORY_EXTRA_KEYS = frozenset({"aawm_route_identity"})
 _OHMYPI_CLIENT_HISTORY_MESSAGE_ROLES = frozenset(
     {"assistant", "developer", "system", "user"}
 )
+_OHMYPI_CURSOR_REASONING_CORE_KEYS = frozenset(
+    {"type", "encrypted_content", "summary", "id", "status"}
+)
+_OHMYPI_SKIP_HISTORY_ITEM = object()
 _CURSOR_REPLAY_ACLOSE_TIMEOUT_SECONDS = 1.0
 _CURSOR_REPLAY_SHUTDOWN_TIMEOUT_SECONDS = 2.0
 _CURSOR_REPLAY_REGISTRY: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -3944,9 +3948,11 @@ def _cursor_replay_ohmypi_client_history_item(
 
     Live Ohmypi tool continuations send ``{role, content}`` chat items and
     extra ``aawm_route_identity`` on typed function items, often without
-    Codex ``id`` fields. That shape is still a self-contained call graph:
-    rebuild a provider-neutral body so the next in-alias candidate can
-    resume. Unknown extras and provider-owned item types stay rejected.
+    Codex ``id`` fields. After a Cursor tool turn the client also replays a
+    ``type=reasoning`` blob with ``encrypted_content``. That ciphertext is
+    Cursor-owned and must not go to native xAI; drop it and keep the
+    self-contained call graph so the next in-alias candidate can resume.
+    Unknown extras and provider-owned item types stay rejected.
     """
 
     item = dict(raw_item)
@@ -3972,8 +3978,14 @@ def _cursor_replay_ohmypi_client_history_item(
         and core <= {"type", "id", "call_id", "output"}
         and (extras or "id" not in core)
     )
+    looks_like_cursor_reasoning = (
+        item_type == "reasoning" and core <= _OHMYPI_CURSOR_REASONING_CORE_KEYS
+    )
     if extras and not (
-        looks_like_message or looks_like_function_call or looks_like_function_output
+        looks_like_message
+        or looks_like_function_call
+        or looks_like_function_output
+        or looks_like_cursor_reasoning
     ):
         return _cursor_replay_rejected(
             "stock_full_history",
@@ -4083,6 +4095,40 @@ def _cursor_replay_ohmypi_client_history_item(
                 "output": output,
             }
         )
+    if looks_like_cursor_reasoning:
+        encrypted_content = item.get("encrypted_content")
+        if not isinstance(encrypted_content, str) or not encrypted_content.strip():
+            return _cursor_replay_rejected(
+                "stock_full_history",
+                "item_type",
+                item=item,
+            )
+        summary = item.get("summary")
+        if "summary" in item and not isinstance(summary, (list, str)):
+            return _cursor_replay_rejected(
+                "stock_full_history",
+                "item_type",
+                item=item,
+            )
+        item_id = item.get("id")
+        if "id" in item and (
+            not isinstance(item_id, str) or not item_id.strip()
+        ):
+            return _cursor_replay_rejected(
+                "stock_full_history",
+                "id_shape",
+                item=item,
+            )
+        if isinstance(item_id, str) and item_id.strip().casefold().startswith(
+            "rs_"
+        ):
+            return _cursor_replay_rejected(
+                "stock_full_history",
+                "item_type",
+                item=item,
+            )
+        # Cursor-owned ciphertext cannot resume on native xAI. Drop it.
+        return _CursorReplayValidationResult(value=_OHMYPI_SKIP_HISTORY_ITEM)
     return None
 
 
@@ -4147,6 +4193,8 @@ def _cursor_replay_stock_codex_full_history_input(  # noqa: PLR0915
                     ),
                 )
             canonical_item = ohmypi_item.value
+            if canonical_item is _OHMYPI_SKIP_HISTORY_ITEM:
+                continue
             if not isinstance(canonical_item, dict):
                 return _cursor_replay_rejected(
                     "stock_full_history",

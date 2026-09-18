@@ -8185,6 +8185,9 @@ def rebind_request_session_owner_after_cursor_replay_skip(
     request-local lease; the next candidate then 409s with
     ``session_owner_request_lease_identity_conflict``. Clear that leftover
     only when there is no live Redis reservation and no promoted owner.
+    Ohmypi often omits a canonical session identity; mint a request-local
+    redispatch identity from the request call id so native xAI can promote
+    instead of 409ing ``session_owner_stream_promote`` with outcome skipped.
     Codex ``previous_response_id`` bodies stay fail-closed.
     """
 
@@ -8221,7 +8224,15 @@ def rebind_request_session_owner_after_cursor_replay_skip(
     if get_request_session_owner_lease(request) is not None:
         return False
     if base is None:
-        return True
+        base = _clean_optional_str(
+            getattr(state, _SESSION_OWNER_REQUEST_CALL_ID_STATE_KEY, None)
+        )
+    if base is None:
+        context = getattr(state, _SESSION_OWNER_REQUEST_CONTEXT_STATE_KEY, None)
+        if isinstance(context, Mapping):
+            base = _clean_optional_str(context.get("litellm_call_id"))
+    if base is None:
+        return False
     activate_session_owner_redispatch_effective_identity(
         request=request,
         base_session_identity=base,
