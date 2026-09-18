@@ -2546,6 +2546,152 @@ def test_cursor_fresh_replay_dispatch_rejects_stock_reasoning_with_id() -> None:
     assert "cursor-owned-ciphertext-must-not-leak" not in json.dumps(diagnostic)
 
 
+def _ohmypi_many_function_calls_body(*, function_call_count: int) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "model": "sota-xai",
+        "tools": [
+            {
+                "type": "function",
+                "name": "glob",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                },
+            }
+        ],
+        "input": [{"role": "user", "content": "run many tools"}],
+    }
+    for index in range(function_call_count):
+        call_id = f"call-{index:04d}"
+        body["input"].extend(
+            [
+                {
+                    "type": "function_call",
+                    "name": "glob",
+                    "call_id": call_id,
+                    "arguments": '{"path":"*"}',
+                    "aawm_route_identity": {"alias": "sota-xai"},
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": f"out-{index}\n",
+                },
+            ]
+        )
+    return body
+
+
+def _assert_fresh_replay_fail_closed(
+    body: dict[str, Any],
+    *,
+    expected_reason: str,
+    continuation_exc: CursorConnectError | None = None,
+    secret_values: tuple[str, ...] = (),
+) -> None:
+    rejection: dict[str, Any] = {}
+    rebuilt = codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+        body,
+        continuation_exc=continuation_exc or _cursor_continuation_failure(),
+        rejection_diagnostic_out=rejection,
+    )
+
+    assert rebuilt is None
+    diagnostic = rejection[
+        codex_candidate_calls._CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD
+    ]
+    assert diagnostic["stage"] == "stock_full_history"
+    assert diagnostic["reason"] == expected_reason
+    diagnostic_text = json.dumps(diagnostic)
+    for secret_value in secret_values:
+        assert secret_value not in diagnostic_text
+
+
+def test_cursor_fresh_replay_dispatch_rejects_ohmypi_summary_only_reasoning() -> None:
+    body = _ohmypi_sota_xai_round3_history_body()
+    body["input"][6] = {
+        "type": "reasoning",
+        "summary": [{"type": "summary_text", "text": "workspace listing"}],
+    }
+
+    _assert_fresh_replay_fail_closed(body, expected_reason="item_type")
+
+
+@pytest.mark.parametrize(
+    ("item_index", "item_label"),
+    [
+        (1, "route-stamped-message"),
+        (4, "route-stamped-function-call"),
+        (5, "route-stamped-function-call-output"),
+    ],
+)
+def test_cursor_fresh_replay_dispatch_rejects_ohmypi_route_stamped_status_extras(
+    item_index: int,
+    item_label: str,
+) -> None:
+    body = _ohmypi_sota_xai_round3_history_body()
+    body["input"][item_index] = {
+        **body["input"][item_index],
+        "status": "completed",
+    }
+
+    _assert_fresh_replay_fail_closed(body, expected_reason="item_key_set")
+
+
+def test_cursor_fresh_replay_dispatch_rejects_ohmypi_non_string_function_output() -> None:
+    body = _ohmypi_client_history_body()
+    body["input"][-1]["output"] = {"structured": "child-output"}
+
+    _assert_fresh_replay_fail_closed(
+        body,
+        expected_reason="output_not_string",
+        secret_values=("structured", "child-output"),
+    )
+
+
+def test_cursor_fresh_replay_dispatch_rejects_ohmypi_max_stock_function_call_count() -> (
+    None
+):
+    body = _ohmypi_many_function_calls_body(
+        function_call_count=(
+            codex_candidate_calls._CURSOR_REPLAY_MAX_STOCK_FUNCTION_CALLS + 1
+        ),
+    )
+
+    _assert_fresh_replay_fail_closed(body, expected_reason="function_call_count")
+
+
+@pytest.mark.parametrize(
+    "unsupported_item",
+    [
+        {
+            "type": "computer_call",
+            "call_id": "call-computer-1",
+            "action": {"type": "screenshot"},
+        },
+        {
+            "type": "mcp_call",
+            "call_id": "call-mcp-1",
+            "name": "list_resources",
+            "arguments": "{}",
+        },
+        {"type": "item_reference", "id": "msg_unsupported_reference"},
+    ],
+    ids=["computer-call", "mcp-call", "item-reference"],
+)
+def test_cursor_fresh_replay_dispatch_rejects_stock_unsupported_item_types(
+    unsupported_item: dict[str, Any],
+) -> None:
+    body = _stock_codex_full_history_body()
+    body["input"].insert(-1, unsupported_item)
+
+    _assert_fresh_replay_fail_closed(
+        body,
+        expected_reason="item_type",
+        continuation_exc=_cursor_continuation_failure(),
+    )
+
+
 @pytest.mark.parametrize(
     "external_web_access",
     [True, False],
