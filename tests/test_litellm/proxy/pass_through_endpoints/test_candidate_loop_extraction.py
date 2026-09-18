@@ -5922,6 +5922,125 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
     assert routing_state.codex.candidate_semantic_ineligibility_by_key == {}
 
 
+def _ohmypi_sota_xai_round3_history_body() -> dict[str, Any]:
+    """Round-3 Ohmypi sota-xai skip body representative of alpha-error e08b20ec."""
+
+    return {
+        "model": "sota-xai",
+        "tools": [
+            {
+                "type": "function",
+                "name": "glob",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                },
+            }
+        ],
+        "input": [
+            {"role": "user", "content": "just a test"},
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": "I'm here. Test received — all good.",
+                "aawm_route_identity": {"alias": "sota-xai"},
+            },
+            {"role": "user", "content": "how about now"},
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": "I'll check the current workspace.",
+                "aawm_route_identity": {"alias": "sota-xai"},
+            },
+            {
+                "type": "function_call",
+                "name": "glob",
+                "call_id": "call-62b9d1ee-22f3-4301-8747-2935d56f4f69-0",
+                "arguments": '{"path":"*"}',
+                "aawm_route_identity": {"alias": "sota-xai"},
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-62b9d1ee-22f3-4301-8747-2935d56f4f69-0",
+                "output": "tiny_test.bed\n",
+            },
+            {
+                "type": "reasoning",
+                "encrypted_content": "cursor-owned-ciphertext-must-not-leak",
+                "summary": [{"type": "summary_text", "text": "workspace listing"}],
+            },
+            {"role": "user", "content": "just 1 more test"},
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": "Still here.",
+                "aawm_route_identity": {"alias": "sota-xai"},
+            },
+        ],
+    }
+
+
+def _mapped_cursor_continuation_proxy_exception(
+    cursor_candidate: dict[str, Any],
+    *,
+    previous_response_id: Optional[str] = None,
+    replay_state: Any = None,
+) -> ProxyException:
+    from litellm.llms.cursor_agent.connect import CursorConnectError
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+        codex_candidate_calls,
+    )
+
+    if previous_response_id is not None and replay_state is not None:
+        with pytest.raises(CursorConnectError) as source_exc_info:
+            codex_candidate_calls._raise_cursor_session_continuation_unavailable(
+                previous_response_id=previous_response_id,
+                replay_state=replay_state,
+            )
+        source_exc = source_exc_info.value
+    else:
+        source_exc = CursorConnectError(
+            "missing retained session",
+            status_code=409,
+        )
+        setattr(
+            source_exc,
+            codex_candidate_calls._CURSOR_SESSION_CONTINUATION_FAILURE_MARKER,
+            True,
+        )
+    with pytest.raises(ProxyException) as mapped_exc_info:
+        codex_candidate_calls._raise_cursor_agent_alias_error(
+            exc=source_exc,
+            candidate=cursor_candidate,
+        )
+    return mapped_exc_info.value
+
+
+def _install_session_owner_redis_test_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Any:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        durable as durable_mod,
+    )
+    from tests.test_litellm.proxy.pass_through_endpoints.test_d1_612_session_affinity import (
+        _FakeDualCache,
+        _FakeRedisCache,
+    )
+
+    redis_cache = _FakeRedisCache()
+    monkeypatch.setattr(
+        durable_mod,
+        "get_aawm_alias_routing_dual_cache",
+        lambda: _FakeDualCache(redis_cache),
+    )
+    monkeypatch.setattr(
+        durable_mod,
+        "get_aawm_alias_routing_state_namespace",
+        lambda: "test-ns",
+    )
+    return redis_cache
+
+
 def _cursor_skip_rebind_handle_alias_harness(  # noqa: PLR0915
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -5929,6 +6048,10 @@ def _cursor_skip_rebind_handle_alias_harness(  # noqa: PLR0915
     suppress_request_call_id: bool = False,
     gate_replay_safe: Optional[bool] = None,
     rebuilt_body_override: Optional[dict[str, Any]] = None,
+    use_ohmypi_round3_body: bool = False,
+    include_previous_response_id: bool = False,
+    drive_shipped_builder: bool = False,
+    use_native_owner_lifecycle: bool = False,
 ) -> SimpleNamespace:
     """Drive ``handle_alias_route`` Cursor skip with the real rebind helper."""
 
@@ -5952,27 +6075,8 @@ def _cursor_skip_rebind_handle_alias_harness(  # noqa: PLR0915
         "model": "xai/grok-4.6",
         "route_family": "codex_grok_native_responses_adapter",
     }
-    replay_messages = [
-        {
-            "role": "user",
-            "content": "Complete the original assignment in /workspace.",
-        },
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "id": "pwd-call",
-                    "type": "function",
-                    "function": {
-                        "name": "exec_command",
-                        "arguments": '{"cmd":"pwd","workdir":"/workspace"}',
-                    },
-                }
-            ],
-        },
-    ]
-    replay_tools = [{"type": "function", "function": {"name": "exec_command"}}]
+    replay_messages: list[dict[str, Any]] = []
+    replay_tools: list[dict[str, Any]] = []
     selections = [
         {
             "candidate": cursor_candidate,
@@ -5991,44 +6095,77 @@ def _cursor_skip_rebind_handle_alias_harness(  # noqa: PLR0915
             "in_flight_session": True,
         },
     ]
-    prepared_body = {
-        "model": "sota-xai",
-        "previous_response_id": "cursor-unretained",
-        "tools": replay_tools,
-        "input": [
+    if use_ohmypi_round3_body:
+        prepared_body = _ohmypi_sota_xai_round3_history_body()
+        if include_previous_response_id:
+            prepared_body = {
+                **prepared_body,
+                "previous_response_id": "cursor-unretained-ohmypi",
+            }
+        replay_tools = prepared_body["tools"]
+        mapped_exc = _mapped_cursor_continuation_proxy_exception(cursor_candidate)
+    else:
+        replay_messages = [
             {
-                "type": "function_call_output",
-                "call_id": "pwd-call",
-                "output": "/workspace",
+                "role": "user",
+                "content": "Complete the original assignment in /workspace.",
             },
-        ],
-    }
-    codex_candidate_calls._store_cursor_replay_state(
-        "cursor-unretained",
-        messages=replay_messages,
-        tools=replay_tools,
-    )
-    replay_state = codex_candidate_calls._peek_cursor_replay_state(
-        "cursor-unretained"
-    )
-    with pytest.raises(CursorConnectError) as source_exc_info:
-        codex_candidate_calls._raise_cursor_session_continuation_unavailable(
-            previous_response_id="cursor-unretained",
-            replay_state=replay_state,
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "pwd-call",
+                        "type": "function",
+                        "function": {
+                            "name": "exec_command",
+                            "arguments": '{"cmd":"pwd","workdir":"/workspace"}',
+                        },
+                    }
+                ],
+            },
+        ]
+        replay_tools = [{"type": "function", "function": {"name": "exec_command"}}]
+        prepared_body = {
+            "model": "sota-xai",
+            "previous_response_id": "cursor-unretained",
+            "tools": replay_tools,
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "pwd-call",
+                    "output": "/workspace",
+                },
+            ],
+        }
+        codex_candidate_calls._store_cursor_replay_state(
+            "cursor-unretained",
+            messages=replay_messages,
+            tools=replay_tools,
         )
-    with pytest.raises(ProxyException) as mapped_exc_info:
-        codex_candidate_calls._raise_cursor_agent_alias_error(
-            exc=source_exc_info.value,
-            candidate=cursor_candidate,
+        replay_state = codex_candidate_calls._peek_cursor_replay_state(
+            "cursor-unretained"
         )
-    mapped_exc = mapped_exc_info.value
-    rebuilt_request_body = (
-        rebuilt_body_override
-        or codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
-            prepared_body,
-            continuation_exc=mapped_exc,
+        with pytest.raises(CursorConnectError) as source_exc_info:
+            codex_candidate_calls._raise_cursor_session_continuation_unavailable(
+                previous_response_id="cursor-unretained",
+                replay_state=replay_state,
+            )
+        with pytest.raises(ProxyException) as mapped_exc_info:
+            codex_candidate_calls._raise_cursor_agent_alias_error(
+                exc=source_exc_info.value,
+                candidate=cursor_candidate,
+            )
+        mapped_exc = mapped_exc_info.value
+    if rebuilt_body_override is not None:
+        rebuilt_request_body = dict(rebuilt_body_override)
+    else:
+        rebuilt_request_body = (
+            codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+                prepared_body,
+                continuation_exc=mapped_exc,
+            )
         )
-    )
     assert rebuilt_request_body is not None
 
     class _NoCallIdState(State):
@@ -6043,7 +6180,7 @@ def _cursor_skip_rebind_handle_alias_harness(  # noqa: PLR0915
     )
     session_affinity.set_request_session_owner_lease(request, leftover)
 
-    if rebuilt_body_override is not None:
+    if rebuilt_body_override is not None and not drive_shipped_builder:
         monkeypatch.setattr(
             codex_candidate_calls,
             "_build_cursor_replay_safe_fresh_dispatch_body",
@@ -6065,7 +6202,13 @@ def _cursor_skip_rebind_handle_alias_harness(  # noqa: PLR0915
     monkeypatch.setattr(candidate_loop, "alias_routing_state", routing_state)
     selection_calls: list[dict[str, Any]] = []
     provider_calls: list[str] = []
+    candidate_bodies: list[dict[str, Any]] = []
     metadata_attempts: list[list[dict[str, Any]]] = []
+    guard_calls: list[dict[str, Any]] = []
+    finalize_calls: list[tuple[Any, dict[str, Any], Any]] = []
+    redis_cache = None
+    if use_native_owner_lifecycle:
+        redis_cache = _install_session_owner_redis_test_runtime(monkeypatch)
 
     async def _select(**kwargs: Any) -> dict[str, Any]:
         selection_calls.append(kwargs)
@@ -6079,8 +6222,32 @@ def _cursor_skip_rebind_handle_alias_harness(  # noqa: PLR0915
         candidate_body: dict[str, Any],
     ) -> object:
         provider_calls.append(str(candidate["provider"]))
+        candidate_bodies.append(candidate_body)
         if candidate["provider"] == "cursor_agent":
+            if include_previous_response_id or not use_ohmypi_round3_body:
+                assert candidate_body.get("previous_response_id") == prepared_body.get(
+                    "previous_response_id"
+                )
             raise mapped_exc
+        assert "previous_response_id" not in candidate_body
+        if use_ohmypi_round3_body:
+            assert candidate_body["input"] == rebuilt_request_body["input"]
+            assert all(
+                item.get("type") != "reasoning"
+                for item in candidate_body.get("input", [])
+            )
+            assert "cursor-owned-ciphertext-must-not-leak" not in json.dumps(
+                candidate_body
+            )
+            function_calls = [
+                item
+                for item in candidate_body.get("input", [])
+                if item.get("type") == "function_call"
+            ]
+            assert function_calls
+            assert function_calls[0]["call_id"] == (
+                "call-62b9d1ee-22f3-4301-8747-2935d56f4f69-0"
+            )
         return {"candidate": candidate["model"]}
 
     async def _no_active_cooldown(_key: str) -> tuple[float, str]:
@@ -6089,13 +6256,32 @@ def _cursor_skip_rebind_handle_alias_harness(  # noqa: PLR0915
     async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
         return None
 
-    async def _owner_guard(**_kwargs: Any) -> object:
+    async def _noop_owner_guard(**_kwargs: Any) -> object:
         return SimpleNamespace(
             decision=SimpleNamespace(value="no_session"),
             reservation_token=None,
             held_reservation=False,
             provenance=None,
         )
+
+    async def _native_owner_guard(**kwargs: Any) -> object:
+        guard_calls.append(kwargs)
+        return await session_affinity.ensure_session_owner_guard_for_request(**kwargs)
+
+    async def _native_finalize(lease: Any, **kwargs: Any) -> object:
+        result = await session_affinity.finalize_session_owner_lease_on_success(
+            lease,
+            **kwargs,
+        )
+        finalize_calls.append((lease, kwargs, result))
+        return result
+
+    async def _owner_guard(**kwargs: Any) -> object:
+        if use_native_owner_lifecycle:
+            candidate = kwargs.get("candidate") or {}
+            if candidate.get("provider") == "xai":
+                return await _native_owner_guard(**kwargs)
+        return await _noop_owner_guard(**kwargs)
 
     class _Admission:
         async def admit_selected_candidate(self, **_kwargs: Any) -> object:
@@ -6165,7 +6351,11 @@ def _cursor_skip_rebind_handle_alias_harness(  # noqa: PLR0915
         get_request_codex_auto_review_parent_session_identity=(
             session_affinity.get_request_codex_auto_review_parent_session_identity
         ),
-        build_session_owner_attributes=lambda **_kwargs: {},
+        build_session_owner_attributes=(
+            session_affinity.build_session_owner_attributes
+            if use_native_owner_lifecycle
+            else (lambda **_kwargs: {})
+        ),
         ensure_session_owner_guard_for_request=_owner_guard,
         get_request_session_owner_lease=(
             session_affinity.get_request_session_owner_lease
@@ -6185,6 +6375,9 @@ def _cursor_skip_rebind_handle_alias_harness(  # noqa: PLR0915
         get_request_effective_session_identity=(
             session_affinity.get_request_effective_session_identity
         ),
+        request_has_effective_session_identity=(
+            session_affinity.request_has_effective_session_identity
+        ),
         rebind_request_session_owner_after_cursor_replay_skip=_rebind_cursor_skip,
         raise_session_owner_redispatch_required=(
             session_affinity.raise_session_owner_redispatch_required
@@ -6192,8 +6385,14 @@ def _cursor_skip_rebind_handle_alias_harness(  # noqa: PLR0915
         get_session_owner_continuity_receipt=(
             session_affinity.get_session_owner_continuity_receipt
         ),
-        finalize_session_owner_lease_on_success=_noop_async,
-        finalize_session_owner_lease_on_failure=_noop_async,
+        finalize_session_owner_lease_on_success=(
+            _native_finalize if use_native_owner_lifecycle else _noop_async
+        ),
+        finalize_session_owner_lease_on_failure=(
+            session_affinity.finalize_session_owner_lease_on_failure
+            if use_native_owner_lifecycle
+            else _noop_async
+        ),
         SessionOwnerMutationOutcome=session_affinity.SessionOwnerMutationOutcome,
         SessionOwnerGuardDecision=session_affinity.SessionOwnerGuardDecision,
     )
@@ -6255,9 +6454,14 @@ def _cursor_skip_rebind_handle_alias_harness(  # noqa: PLR0915
         leftover=leftover,
         provider_calls=provider_calls,
         selection_calls=selection_calls,
+        candidate_bodies=candidate_bodies,
         metadata_attempts=metadata_attempts,
+        guard_calls=guard_calls,
+        finalize_calls=finalize_calls,
         rebuilt_request_body=rebuilt_request_body,
+        prepared_body=prepared_body,
         xai_candidate=xai_candidate,
+        redis_cache=redis_cache,
     )
 
 
@@ -6420,6 +6624,138 @@ async def test_candidate_loop_cursor_skip_successful_rebind_still_tries_next_can
     assert effective.startswith(
         session_affinity._SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_PREFIX
     )
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_ohmypi_cursor_skip_handoff_promotes_native_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leftover = session_affinity.SessionOwnerLease(
+        session_identity="cursor-turn-ohmypi",
+        cache_key="cursor-turn-ohmypi",
+        reservation_token=None,
+        held_reservation=False,
+        decision=session_affinity.SessionOwnerGuardDecision.UNOWNED_RESERVED.value,
+    )
+    harness = _cursor_skip_rebind_handle_alias_harness(
+        monkeypatch,
+        leftover=leftover,
+        use_ohmypi_round3_body=True,
+        drive_shipped_builder=True,
+        use_native_owner_lifecycle=True,
+    )
+
+    response = await harness.run()
+
+    assert response == {"candidate": harness.xai_candidate["model"]}
+    assert harness.provider_calls == ["cursor_agent", "xai"]
+    assert len(harness.selection_calls) == 2
+    assert harness.selection_calls[0]["request_body"] is harness.prepared_body
+    assert harness.selection_calls[1]["request_body"]["input"] == (
+        harness.rebuilt_request_body["input"]
+    )
+    assert "previous_response_id" not in harness.selection_calls[1]["request_body"]
+    assert "previous_response_id" not in harness.rebuilt_request_body
+    assert "previous_response_id" not in harness.prepared_body
+    assert all(
+        item.get("type") != "reasoning" for item in harness.candidate_bodies[1]["input"]
+    )
+    assert "cursor-owned-ciphertext-must-not-leak" not in json.dumps(
+        harness.candidate_bodies[1]
+    )
+    effective = session_affinity.get_request_effective_session_identity(harness.request)
+    assert effective is not None
+    assert effective.startswith(
+        session_affinity._SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_PREFIX
+    )
+    assert harness.guard_calls
+    assert all(
+        call["candidate"]["provider"] == "xai" for call in harness.guard_calls
+    )
+    assert harness.finalize_calls
+    _lease, _kwargs, finalize_result = harness.finalize_calls[-1]
+    assert finalize_result is not None
+    assert finalize_result.outcome is session_affinity.SessionOwnerMutationOutcome.PROMOTED
+    assert _lease.promoted is True
+    promoted_lease = session_affinity.get_request_session_owner_lease(harness.request)
+    assert promoted_lease is not None
+    assert promoted_lease.promoted is True
+    assert promoted_lease.session_identity == effective
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_ohmypi_cursor_skip_failed_rebind_live_reservation_before_xai(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leftover = session_affinity.SessionOwnerLease(
+        session_identity="cursor-live",
+        reservation_token="tok-live",
+        held_reservation=True,
+        released=False,
+        promoted=False,
+    )
+    harness = _cursor_skip_rebind_handle_alias_harness(
+        monkeypatch,
+        leftover=leftover,
+        use_ohmypi_round3_body=True,
+        drive_shipped_builder=True,
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await harness.run()
+
+    assert caught.value.status_code == 409
+    detail = caught.value.detail
+    assert detail["error"]["code"] == "aawm_session_owner_redispatch_required"
+    assert detail["failure_phase"] == "session_owner_held_lease_on_identity_transition"
+    assert detail["attempted_provider_call"] is False
+    assert harness.provider_calls == ["cursor_agent"]
+    assert len(harness.selection_calls) == 1
+    assert session_affinity.get_request_session_owner_lease(harness.request) is leftover
+    assert leftover.held_reservation is True
+    assert leftover.reservation_token == "tok-live"
+    assert "cursor-owned-ciphertext-must-not-leak" not in json.dumps(
+        harness.rebuilt_request_body
+    )
+    assert any(
+        item.get("type") == "function_call"
+        for item in harness.rebuilt_request_body["input"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_ohmypi_cursor_skip_failed_rebind_previous_response_id_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leftover = session_affinity.SessionOwnerLease(
+        session_identity="cursor-turn-ohmypi",
+        held_reservation=False,
+        reservation_token=None,
+    )
+    unsafe_body = {
+        **_ohmypi_sota_xai_round3_history_body(),
+        "previous_response_id": "resp_cursor_owned",
+    }
+    harness = _cursor_skip_rebind_handle_alias_harness(
+        monkeypatch,
+        leftover=leftover,
+        use_ohmypi_round3_body=True,
+        gate_replay_safe=True,
+        rebuilt_body_override=unsafe_body,
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await harness.run()
+
+    assert caught.value.status_code == 409
+    detail = caught.value.detail
+    assert detail["error"]["code"] == "aawm_session_owner_redispatch_required"
+    assert detail["failure_phase"] == "session_owner_redispatch_previous_response_id"
+    assert detail["attempted_provider_call"] is False
+    assert harness.provider_calls == ["cursor_agent"]
+    assert len(harness.selection_calls) == 1
+    assert session_affinity.get_request_session_owner_lease(harness.request) is leftover
+    assert session_affinity.get_request_effective_session_identity(harness.request) is None
 
 
 @pytest.mark.asyncio
