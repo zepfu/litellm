@@ -2649,6 +2649,48 @@ def test_cursor_fresh_replay_dispatch_rejects_ohmypi_non_string_function_output(
     )
 
 
+def test_cursor_fresh_replay_dispatch_accepts_ohmypi_live_38_function_call_pairs() -> (
+    None
+):
+    body = _ohmypi_many_function_calls_body(function_call_count=38)
+    body["input"].insert(
+        1,
+        {
+            "type": "reasoning",
+            "encrypted_content": "cursor-owned-ciphertext-must-not-leak",
+            "summary": [{"type": "summary_text", "text": "workspace listing"}],
+        },
+    )
+    rejection: dict[str, Any] = {}
+
+    rebuilt = codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+        body,
+        continuation_exc=_cursor_continuation_failure(),
+        rejection_diagnostic_out=rejection,
+    )
+
+    assert rebuilt is not None, rejection
+    assert "previous_response_id" not in rebuilt
+    function_calls = [
+        item for item in rebuilt["input"] if item.get("type") == "function_call"
+    ]
+    function_outputs = [
+        item
+        for item in rebuilt["input"]
+        if item.get("type") == "function_call_output"
+    ]
+    assert len(function_calls) == 38
+    assert len(function_outputs) == 38
+    assert [item["call_id"] for item in function_calls] == [
+        f"call-{index:04d}" for index in range(38)
+    ]
+    assert all(item.get("type") != "reasoning" for item in rebuilt["input"])
+    assert "cursor-owned-ciphertext-must-not-leak" not in json.dumps(rebuilt)
+    assert all("aawm_route_identity" not in item for item in rebuilt["input"])
+    assert 38 <= codex_candidate_calls._CURSOR_REPLAY_MAX_STOCK_FUNCTION_CALLS
+    assert codex_candidate_calls._CURSOR_REPLAY_MAX_STOCK_FUNCTION_CALLS < 10_000
+
+
 def test_cursor_fresh_replay_dispatch_rejects_ohmypi_max_stock_function_call_count() -> (
     None
 ):
@@ -2659,6 +2701,9 @@ def test_cursor_fresh_replay_dispatch_rejects_ohmypi_max_stock_function_call_cou
     )
 
     _assert_fresh_replay_fail_closed(body, expected_reason="function_call_count")
+    assert 38 < (
+        codex_candidate_calls._CURSOR_REPLAY_MAX_STOCK_FUNCTION_CALLS + 1
+    )
 
 
 @pytest.mark.parametrize(

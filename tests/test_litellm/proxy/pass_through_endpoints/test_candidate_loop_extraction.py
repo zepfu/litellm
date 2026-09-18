@@ -5922,6 +5922,56 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
     assert routing_state.codex.candidate_semantic_ineligibility_by_key == {}
 
 
+def _ohmypi_many_function_calls_body(
+    *,
+    function_call_count: int,
+    include_cursor_reasoning: bool = True,
+) -> dict[str, Any]:
+    """Ohmypi-shaped sota-xai skip body with completed function_call pairs."""
+
+    body: dict[str, Any] = {
+        "model": "sota-xai",
+        "tools": [
+            {
+                "type": "function",
+                "name": "glob",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                },
+            }
+        ],
+        "input": [{"role": "user", "content": "run many tools"}],
+    }
+    if include_cursor_reasoning:
+        body["input"].append(
+            {
+                "type": "reasoning",
+                "encrypted_content": "cursor-owned-ciphertext-must-not-leak",
+                "summary": [{"type": "summary_text", "text": "workspace listing"}],
+            }
+        )
+    for index in range(function_call_count):
+        call_id = f"call-{index:04d}"
+        body["input"].extend(
+            [
+                {
+                    "type": "function_call",
+                    "name": "glob",
+                    "call_id": call_id,
+                    "arguments": '{"path":"*"}',
+                    "aawm_route_identity": {"alias": "sota-xai"},
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": f"out-{index}\n",
+                },
+            ]
+        )
+    return body
+
+
 def _ohmypi_sota_xai_round3_history_body() -> dict[str, Any]:
     """Round-3 Ohmypi sota-xai skip body representative of alpha-error e08b20ec."""
 
@@ -6049,9 +6099,11 @@ def _cursor_skip_rebind_handle_alias_harness(  # noqa: PLR0915
     gate_replay_safe: Optional[bool] = None,
     rebuilt_body_override: Optional[dict[str, Any]] = None,
     use_ohmypi_round3_body: bool = False,
+    use_ohmypi_function_call_count: Optional[int] = None,
     include_previous_response_id: bool = False,
     drive_shipped_builder: bool = False,
     use_native_owner_lifecycle: bool = False,
+    expect_rebuild: bool = True,
 ) -> SimpleNamespace:
     """Drive ``handle_alias_route`` Cursor skip with the real rebind helper."""
 
@@ -6095,7 +6147,18 @@ def _cursor_skip_rebind_handle_alias_harness(  # noqa: PLR0915
             "in_flight_session": True,
         },
     ]
-    if use_ohmypi_round3_body:
+    if use_ohmypi_function_call_count is not None:
+        prepared_body = _ohmypi_many_function_calls_body(
+            function_call_count=use_ohmypi_function_call_count,
+        )
+        if include_previous_response_id:
+            prepared_body = {
+                **prepared_body,
+                "previous_response_id": "cursor-unretained-ohmypi",
+            }
+        replay_tools = prepared_body["tools"]
+        mapped_exc = _mapped_cursor_continuation_proxy_exception(cursor_candidate)
+    elif use_ohmypi_round3_body:
         prepared_body = _ohmypi_sota_xai_round3_history_body()
         if include_previous_response_id:
             prepared_body = {
@@ -6166,7 +6229,10 @@ def _cursor_skip_rebind_handle_alias_harness(  # noqa: PLR0915
                 continuation_exc=mapped_exc,
             )
         )
-    assert rebuilt_request_body is not None
+    if expect_rebuild:
+        assert rebuilt_request_body is not None
+    else:
+        assert rebuilt_request_body is None
 
     class _NoCallIdState(State):
         def __setattr__(self, name: str, value: Any) -> None:
@@ -6224,13 +6290,16 @@ def _cursor_skip_rebind_handle_alias_harness(  # noqa: PLR0915
         provider_calls.append(str(candidate["provider"]))
         candidate_bodies.append(candidate_body)
         if candidate["provider"] == "cursor_agent":
-            if include_previous_response_id or not use_ohmypi_round3_body:
+            if include_previous_response_id or (
+                not use_ohmypi_round3_body and use_ohmypi_function_call_count is None
+            ):
                 assert candidate_body.get("previous_response_id") == prepared_body.get(
                     "previous_response_id"
                 )
             raise mapped_exc
         assert "previous_response_id" not in candidate_body
-        if use_ohmypi_round3_body:
+        if use_ohmypi_round3_body or use_ohmypi_function_call_count is not None:
+            assert rebuilt_request_body is not None
             assert candidate_body["input"] == rebuilt_request_body["input"]
             assert all(
                 item.get("type") != "reasoning"
@@ -6245,9 +6314,16 @@ def _cursor_skip_rebind_handle_alias_harness(  # noqa: PLR0915
                 if item.get("type") == "function_call"
             ]
             assert function_calls
-            assert function_calls[0]["call_id"] == (
-                "call-62b9d1ee-22f3-4301-8747-2935d56f4f69-0"
-            )
+            if use_ohmypi_function_call_count is not None:
+                assert len(function_calls) == use_ohmypi_function_call_count
+                assert [item["call_id"] for item in function_calls] == [
+                    f"call-{index:04d}"
+                    for index in range(use_ohmypi_function_call_count)
+                ]
+            else:
+                assert function_calls[0]["call_id"] == (
+                    "call-62b9d1ee-22f3-4301-8747-2935d56f4f69-0"
+                )
         return {"candidate": candidate["model"]}
 
     async def _no_active_cooldown(_key: str) -> tuple[float, str]:
@@ -6756,6 +6832,104 @@ async def test_candidate_loop_ohmypi_cursor_skip_failed_rebind_previous_response
     assert len(harness.selection_calls) == 1
     assert session_affinity.get_request_session_owner_lease(harness.request) is leftover
     assert session_affinity.get_request_effective_session_identity(harness.request) is None
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_ohmypi_cursor_skip_handoff_38_function_call_pairs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+        codex_candidate_calls,
+    )
+
+    leftover = session_affinity.SessionOwnerLease(
+        session_identity="cursor-turn-ohmypi-38",
+        cache_key="cursor-turn-ohmypi-38",
+        reservation_token=None,
+        held_reservation=False,
+        decision=session_affinity.SessionOwnerGuardDecision.UNOWNED_RESERVED.value,
+    )
+    harness = _cursor_skip_rebind_handle_alias_harness(
+        monkeypatch,
+        leftover=leftover,
+        use_ohmypi_function_call_count=38,
+        drive_shipped_builder=True,
+        use_native_owner_lifecycle=True,
+    )
+
+    response = await harness.run()
+
+    assert response == {"candidate": harness.xai_candidate["model"]}
+    assert harness.provider_calls == ["cursor_agent", "xai"]
+    assert len(harness.selection_calls) == 2
+    rebuilt_input = harness.rebuilt_request_body["input"]
+    assert harness.selection_calls[1]["request_body"]["input"] == rebuilt_input
+    assert "previous_response_id" not in harness.selection_calls[1]["request_body"]
+    function_calls = [
+        item for item in rebuilt_input if item.get("type") == "function_call"
+    ]
+    function_outputs = [
+        item for item in rebuilt_input if item.get("type") == "function_call_output"
+    ]
+    assert len(function_calls) == 38
+    assert len(function_outputs) == 38
+    assert all(item.get("type") != "reasoning" for item in rebuilt_input)
+    assert "cursor-owned-ciphertext-must-not-leak" not in json.dumps(
+        harness.candidate_bodies[1]
+    )
+    effective = session_affinity.get_request_effective_session_identity(harness.request)
+    assert effective is not None
+    assert effective.startswith(
+        session_affinity._SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_PREFIX
+    )
+    _lease, _kwargs, finalize_result = harness.finalize_calls[-1]
+    assert (
+        finalize_result.outcome
+        is session_affinity.SessionOwnerMutationOutcome.PROMOTED
+    )
+    assert 38 <= codex_candidate_calls._CURSOR_REPLAY_MAX_STOCK_FUNCTION_CALLS
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_ohmypi_cursor_skip_rejects_oversized_function_call_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+        codex_candidate_calls,
+    )
+
+    leftover = session_affinity.SessionOwnerLease(
+        session_identity="cursor-turn-ohmypi-oversize",
+        held_reservation=False,
+        reservation_token=None,
+    )
+    oversized = codex_candidate_calls._CURSOR_REPLAY_MAX_STOCK_FUNCTION_CALLS + 1
+    harness = _cursor_skip_rebind_handle_alias_harness(
+        monkeypatch,
+        leftover=leftover,
+        use_ohmypi_function_call_count=oversized,
+        drive_shipped_builder=True,
+        expect_rebuild=False,
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await harness.run()
+
+    assert caught.value.status_code == 409
+    assert caught.value.detail["error"]["code"] == (
+        "aawm_codex_auto_agent_candidate_ineligible"
+    )
+    assert harness.provider_calls == ["cursor_agent"]
+    assert len(harness.selection_calls) == 1
+    attempts = harness.metadata_attempts[-1]
+    reject = attempts[0][
+        codex_candidate_calls._CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD
+    ]
+    assert reject["reason"] == "function_call_count"
+    assert reject["stage"] == "stock_full_history"
+    assert attempts[0]["error_class"] == "continuation_state_unavailable"
+    assert attempts[0]["attempted_provider_call"] is False
+    assert 38 < oversized
 
 
 @pytest.mark.asyncio
