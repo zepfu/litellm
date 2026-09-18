@@ -2303,6 +2303,107 @@ def test_cursor_fresh_replay_dispatch_accepts_stock_codex_full_history(
     )
 
 
+def _ohmypi_client_history_body() -> dict[str, Any]:
+    """Live Ohmypi expert continuation shape from alpha-error.jsonl 2026-09-18."""
+
+    return {
+        "model": "expert",
+        "tools": [
+            {
+                "type": "function",
+                "name": "bash",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                },
+            }
+        ],
+        "input": [
+            {
+                "role": "user",
+                "content": (
+                    "FIRST: reply with exactly the word PONG. "
+                    "Then run the single shell command date."
+                ),
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": "PONG",
+                "aawm_route_identity": {"alias": "expert"},
+            },
+            {
+                "type": "function_call",
+                "name": "bash",
+                "call_id": "b9b0a292-1705-45e4-b5cb-bc572fe9b9bc",
+                "arguments": '{"command":"date"}',
+                "aawm_route_identity": {"alias": "expert"},
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "b9b0a292-1705-45e4-b5cb-bc572fe9b9bc",
+                "output": "Thu 17 Sep 2026 08:34:26 PM EDT\n",
+            },
+        ],
+    }
+
+
+def test_cursor_fresh_replay_dispatch_accepts_ohmypi_client_history() -> None:
+    body = _ohmypi_client_history_body()
+    rebuilt = (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+            body,
+            continuation_exc=_cursor_continuation_failure(),
+        )
+    )
+
+    assert rebuilt is not None
+    assert "previous_response_id" not in rebuilt
+    assert rebuilt["input"] == [
+        {
+            "role": "user",
+            "content": (
+                "FIRST: reply with exactly the word PONG. "
+                "Then run the single shell command date."
+            ),
+        },
+        {"role": "assistant", "content": "PONG"},
+        {
+            "type": "function_call",
+            "call_id": "b9b0a292-1705-45e4-b5cb-bc572fe9b9bc",
+            "name": "bash",
+            "arguments": '{"command":"date"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "b9b0a292-1705-45e4-b5cb-bc572fe9b9bc",
+            "output": "Thu 17 Sep 2026 08:34:26 PM EDT\n",
+        },
+    ]
+    assert all("aawm_route_identity" not in item for item in rebuilt["input"])
+
+
+def test_cursor_fresh_replay_dispatch_rejects_ohmypi_history_with_unknown_extra() -> None:
+    body = _ohmypi_client_history_body()
+    body["input"][0]["encrypted_content"] = "opaque-provider-state"
+    rejection: dict[str, Any] = {}
+
+    assert (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+            body,
+            continuation_exc=_cursor_continuation_failure(),
+            rejection_diagnostic_out=rejection,
+        )
+        is None
+    )
+    diagnostic = rejection[
+        codex_candidate_calls._CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD
+    ]
+    assert diagnostic["stage"] == "stock_full_history"
+    assert diagnostic["reason"] == "item_type"
+    assert "opaque-provider-state" not in json.dumps(diagnostic)
+
+
 @pytest.mark.parametrize(
     "external_web_access",
     [True, False],

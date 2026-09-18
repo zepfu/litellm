@@ -52,6 +52,10 @@ _CURSOR_REPLAY_MAX_ENTRY_BYTES = 1 * 1024 * 1024
 _CURSOR_REPLAY_MAX_TOTAL_BYTES = 16 * 1024 * 1024
 _CURSOR_REPLAY_MAX_STOCK_FUNCTION_CALLS = 32
 _CURSOR_REPLAY_MAX_STOCK_INPUT_ITEMS = 256
+_OHMYPI_CLIENT_HISTORY_EXTRA_KEYS = frozenset({"aawm_route_identity"})
+_OHMYPI_CLIENT_HISTORY_MESSAGE_ROLES = frozenset(
+    {"assistant", "developer", "system", "user"}
+)
 _CURSOR_REPLAY_ACLOSE_TIMEOUT_SECONDS = 1.0
 _CURSOR_REPLAY_SHUTDOWN_TIMEOUT_SECONDS = 2.0
 _CURSOR_REPLAY_REGISTRY: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -3933,6 +3937,155 @@ def _cursor_replay_stock_codex_function_call_item(
     return _CursorReplayValidationResult(value=canonical_item)
 
 
+def _cursor_replay_ohmypi_client_history_item(
+    raw_item: Mapping[str, Any],
+) -> Optional[_CursorReplayValidationResult]:
+    """Accept Ohmypi client-managed history that Codex stock grammar rejects.
+
+    Live Ohmypi tool continuations send ``{role, content}`` chat items and
+    extra ``aawm_route_identity`` on typed function items, often without
+    Codex ``id`` fields. That shape is still a self-contained call graph:
+    rebuild a provider-neutral body so the next in-alias candidate can
+    resume. Unknown extras and provider-owned item types stay rejected.
+    """
+
+    item = dict(raw_item)
+    keys = set(item)
+    extras = keys & _OHMYPI_CLIENT_HISTORY_EXTRA_KEYS
+    core = keys - extras
+    item_type = item.get("type")
+    looks_like_message = core in (
+        {"role", "content"},
+        {"type", "role", "content"},
+    ) and (
+        "type" not in core or item_type == "message"
+    )
+    looks_like_function_call = (
+        item_type == "function_call"
+        and {"name", "arguments", "call_id"} <= core
+        and core <= {"type", "id", "name", "arguments", "call_id", "namespace"}
+        and (extras or "id" not in core)
+    )
+    looks_like_function_output = (
+        item_type == "function_call_output"
+        and {"call_id", "output"} <= core
+        and core <= {"type", "id", "call_id", "output"}
+        and (extras or "id" not in core)
+    )
+    if extras and not (
+        looks_like_message or looks_like_function_call or looks_like_function_output
+    ):
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "item_key_set",
+            item=item,
+        )
+    if looks_like_message:
+        role = item.get("role")
+        if role not in _OHMYPI_CLIENT_HISTORY_MESSAGE_ROLES:
+            return _cursor_replay_rejected(
+                "stock_full_history",
+                "message_role",
+                item=item,
+            )
+        content_text = _cursor_response_content_text(item.get("content"))
+        if role == "user" and not content_text.strip():
+            return _cursor_replay_rejected(
+                "stock_full_history",
+                "empty_user_text",
+                item=item,
+            )
+        if not isinstance(item.get("content"), (str, list)) and not content_text:
+            return _cursor_replay_rejected(
+                "stock_full_history",
+                "content_part_text_type",
+                item=item,
+            )
+        return _CursorReplayValidationResult(
+            value={"role": role, "content": content_text}
+        )
+    if looks_like_function_call:
+        name = item.get("name")
+        call_id = item.get("call_id")
+        arguments = item.get("arguments")
+        namespace = item.get("namespace")
+        if (
+            not isinstance(name, str)
+            or not name.strip()
+            or not isinstance(call_id, str)
+            or not call_id.strip()
+        ):
+            return _cursor_replay_rejected(
+                "stock_full_history",
+                "function_call_fields",
+                item=item,
+            )
+        if "namespace" in item and (
+            not isinstance(namespace, str)
+            or not namespace
+            or namespace != namespace.strip()
+        ):
+            return _cursor_replay_rejected(
+                "stock_full_history",
+                "function_namespace",
+                item=item,
+            )
+        if isinstance(arguments, dict):
+            arguments = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+        if not isinstance(arguments, str):
+            return _cursor_replay_rejected(
+                "stock_full_history",
+                "arguments_not_object",
+                item=item,
+            )
+        try:
+            parsed_arguments = json.loads(arguments)
+        except (TypeError, ValueError):
+            return _cursor_replay_rejected(
+                "stock_full_history",
+                "arguments_not_object",
+                item=item,
+            )
+        if not isinstance(parsed_arguments, dict):
+            return _cursor_replay_rejected(
+                "stock_full_history",
+                "arguments_not_object",
+                item=item,
+            )
+        canonical_item = {
+            "type": "function_call",
+            "call_id": call_id.strip(),
+            "name": name.strip(),
+            "arguments": arguments,
+        }
+        if namespace is not None:
+            canonical_item["namespace"] = namespace
+        return _CursorReplayValidationResult(value=canonical_item)
+    if looks_like_function_output:
+        call_id = item.get("call_id")
+        output = item.get("output")
+        if not isinstance(call_id, str) or not call_id.strip():
+            return _cursor_replay_rejected(
+                "stock_full_history",
+                "call_id_shape",
+                item=item,
+            )
+        if not isinstance(output, str):
+            return _cursor_replay_rejected(
+                "stock_full_history",
+                "output_not_string",
+                item=item,
+            )
+        return _CursorReplayValidationResult(
+            value={
+                "type": "function_call_output",
+                "call_id": call_id.strip(),
+                "output": output,
+            }
+        )
+    return None
+
+
 def _cursor_replay_stock_codex_full_history_input(  # noqa: PLR0915
     request_body: dict[str, Any],
 ) -> _CursorReplayValidationResult:
@@ -3980,6 +4133,44 @@ def _cursor_replay_stock_codex_full_history_input(  # noqa: PLR0915
                 item_index=item_index,
                 item=raw_item,
             )
+        ohmypi_item = _cursor_replay_ohmypi_client_history_item(raw_item)
+        if ohmypi_item is not None:
+            if ohmypi_item.rejection is not None:
+                rejection = ohmypi_item.rejection
+                return _CursorReplayValidationResult(
+                    value=None,
+                    rejection=_cursor_replay_rejection(
+                        "stock_full_history",
+                        rejection.reason,
+                        item_index=item_index,
+                        item=raw_item,
+                    ),
+                )
+            canonical_item = ohmypi_item.value
+            if not isinstance(canonical_item, dict):
+                return _cursor_replay_rejected(
+                    "stock_full_history",
+                    "item_not_object",
+                    item_index=item_index,
+                    item=raw_item,
+                )
+            canonical_type = canonical_item.get("type")
+            if canonical_type is None and canonical_item.get("role") == "user":
+                if bool(str(canonical_item.get("content") or "").strip()):
+                    saw_nonempty_user_message = True
+            elif canonical_type == "function_call":
+                if function_call_count >= _CURSOR_REPLAY_MAX_STOCK_FUNCTION_CALLS:
+                    return _cursor_replay_rejected(
+                        "stock_full_history",
+                        "function_call_count",
+                        item_index=item_index,
+                        item=raw_item,
+                    )
+                function_call_count += 1
+            elif canonical_type == "function_call_output":
+                output_count += 1
+            replayed_input.append(canonical_item)
+            continue
         item_type = raw_item.get("type")
         if item_type == "message":
             message_result = _cursor_replay_stock_codex_message_item(
