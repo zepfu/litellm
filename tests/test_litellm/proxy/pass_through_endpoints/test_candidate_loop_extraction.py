@@ -1310,10 +1310,16 @@ async def test_half_open_post_expiry_probes_single_flight_provider_io(
     previous_manager = cooldown_state_mod._manager
     configure_cooldown_state_runtime(manager=state)
     monkeypatch.setattr(candidate_loop, "alias_routing_state", state)
+
+    class _YieldingMissDualCache:
+        async def async_get_cache(self, key, raise_on_error=False, **_kwargs: Any):
+            await asyncio.sleep(0.05)
+            return None
+
     monkeypatch.setattr(
         cooldown_state_mod,
         "get_aawm_alias_routing_dual_cache",
-        lambda: None,
+        lambda: _YieldingMissDualCache(),
     )
     monkeypatch.setattr(
         candidate_loop,
@@ -1382,7 +1388,10 @@ async def test_half_open_post_expiry_probes_single_flight_provider_io(
             _one("probe-1"), _one("probe-2"), return_exceptions=True
         )
         successes = [r for r in responses if getattr(r, "body", None) == b'{"ok":true}']
-        assert len(successes) >= 1
+        failures = [r for r in responses if isinstance(r, BaseException)]
+        assert len(successes) >= 1, (
+            f"half-open probes produced no success (failures={failures!r})"
+        )
         assert cooldown_key not in state.family("codex").cooldown_until_monotonic_by_key
         assert probe.max_current == 1
         assert probe.lock_acquires >= 1

@@ -351,6 +351,10 @@ class AliasFamilyState:
     # Per-key generation: each key tracks its own clear count so an unrelated
     # clear of key A cannot discard a valid in-flight read for key B.
     cooldown_generation_by_key: dict[str, int] = field(default_factory=dict)
+    # In-flight leftover recovery after an expired cooldown timestamp is
+    # popped. Concurrent readers that miss the leftover map still classify
+    # the key as half-open until the popping reader finishes DualCache I/O.
+    pending_recovery_by_key: dict[str, int] = field(default_factory=dict)
 
     def get_generation(self, cooldown_key: str) -> int:
         """Return the per-key generation counter (0 for never-cleared keys)."""
@@ -580,6 +584,7 @@ class AliasFamilyState:
                 negative_cleared.append(key)
             if self.evidence_events_by_key.pop(key, None) is not None:
                 evidence_cleared.append(key)
+            self.pending_recovery_by_key.pop(key, None)
         # Advance per-key generation so stale durable reads are detected.
         self.bump_generation(cooldown_keys)
         return positive_cleared, negative_cleared, evidence_cleared
@@ -642,6 +647,7 @@ class AliasFamilyState:
         self.candidate_semantic_ineligibility_by_key.clear()
         self.session_affinity_by_key.clear()
         self.evidence_events_by_key.clear()
+        self.pending_recovery_by_key.clear()
         # Bump generation for every tracked key so any in-flight durable read
         # (which captured a prior generation) is invalidated.
         self.bump_generation(list(self.cooldown_generation_by_key))

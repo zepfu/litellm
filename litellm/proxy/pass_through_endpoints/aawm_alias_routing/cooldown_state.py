@@ -9,7 +9,7 @@ bounded-memory helpers come from ``.memory``.
 from __future__ import annotations
 
 import time
-from typing import Any, Optional, Sequence
+from typing import Any, Optional, Sequence, Tuple
 
 from .durable import (
     UNBOUNDED_EXPIRY,
@@ -178,6 +178,75 @@ def _affinity_from_routing_state_result(
 
 
 # ---------------------------------------------------------------------------
+# Active cooldown result
+# ---------------------------------------------------------------------------
+
+
+class ActiveCooldownState(tuple):
+    """Unpackable as ``(remaining_seconds, source)`` with a ``recovery`` flag.
+
+    Ordinary 2-tuple callers keep working. Half-open leftover recovery is
+    ``getattr(state, "recovery", False)`` so never-cooled healthy traffic
+    (remaining 0, no leftover) is not treated as a probe.
+    """
+
+    recovery: bool
+
+    def __new__(
+        cls,
+        remaining_seconds: float,
+        source: str,
+        *,
+        recovery: bool = False,
+    ) -> "ActiveCooldownState":
+        self = tuple.__new__(cls, (float(remaining_seconds), str(source)))
+        self.recovery = bool(recovery)
+        return self
+
+
+def _classify_and_pop_expired_cooldown(
+    family: Any,
+    cooldown_key: str,
+) -> Tuple[float, bool, bool, bool]:
+    """Classify leftover/recovery and pop expired leftover under ``family.lock``.
+
+    Returns ``(last_good_until, recovery, held_pending, negative_cached)``.
+    ``held_pending`` means this reader incremented ``pending_recovery_by_key``
+    and must release it after DualCache I/O so a concurrent reader that misses
+    the leftover map still classifies the key as recovery.
+    """
+    now = time.monotonic()
+    leftover_present = cooldown_key in family.cooldown_until_monotonic_by_key
+    until = family.cooldown_until_monotonic_by_key.get(cooldown_key, 0.0)
+    leftover_expired = leftover_present and until <= now
+    pending_already = family.pending_recovery_by_key.get(cooldown_key, 0) > 0
+    evidence = cooldown_key in family.evidence_events_by_key
+    last_good_until = 0.0
+    if until > now:
+        last_good_until = until
+    else:
+        family.cooldown_until_monotonic_by_key.pop(cooldown_key, None)
+    neg_until = family.cooldown_negative_until_monotonic_by_key.get(cooldown_key, 0.0)
+    negative = neg_until > now and last_good_until <= now
+    recovery = leftover_expired or pending_already or evidence or negative
+    held_pending = False
+    if leftover_expired and not negative:
+        family.pending_recovery_by_key[cooldown_key] = (
+            family.pending_recovery_by_key.get(cooldown_key, 0) + 1
+        )
+        held_pending = True
+    return last_good_until, recovery, held_pending, negative
+
+
+def _release_pending_recovery(family: Any, cooldown_key: str) -> None:
+    pending = family.pending_recovery_by_key.get(cooldown_key, 0)
+    if pending <= 1:
+        family.pending_recovery_by_key.pop(cooldown_key, None)
+    else:
+        family.pending_recovery_by_key[cooldown_key] = pending - 1
+
+
+# ---------------------------------------------------------------------------
 # Codex active cooldown
 # ---------------------------------------------------------------------------
 
@@ -187,117 +256,145 @@ async def _get_codex_auto_agent_active_cooldown_state(
     *,
     _dual_cache_fn=_live_dual_cache,
     _read_state_fn=_live_read_routing_state,
+    _classify_fn=_classify_and_pop_expired_cooldown,
+    _release_fn=_release_pending_recovery,
+    _state_cls=ActiveCooldownState,
 ) -> tuple[float, str]:
     mgr = _require_manager()
     family = mgr.codex
     last_good_until = 0.0
+    recovery = False
+    held_pending = False
     async with family.lock:
-        now = time.monotonic()
-        until = family.cooldown_until_monotonic_by_key.get(cooldown_key, 0.0)
-        if until > now:
-            last_good_until = until
-        else:
-            family.cooldown_until_monotonic_by_key.pop(cooldown_key, None)
+        last_good_until, recovery, held_pending, negative = _classify_fn(
+            family, cooldown_key
+        )
         # RR-054 #30: negative-cache durable misses so healthy keys do not Redis-hit every call.
-        neg_until = family.cooldown_negative_until_monotonic_by_key.get(cooldown_key, 0.0)
-        if neg_until > now and last_good_until <= now:
-            return 0.0, "negative_cache"
-    dual_cache = _dual_cache_fn()
-    if dual_cache is None:
-        if last_good_until > time.monotonic():
-            return max(0.0, last_good_until - time.monotonic()), "memory"
-        return 0.0, "local_fallback"
-    # CFG-004 Defect 3: per-key read/clear barrier.  The barrier lock is
-    # acquired BEFORE capturing the generation and held through the durable
-    # read and hydration.  A clear (via clear_alias_family_cooldown_state)
-    # acquires the same barrier lock before bumping the generation and
-    # deleting the durable key.  This guarantees that a read which started
-    # before a clear cannot capture the new generation and hydrate the old
-    # durable value, while unrelated keys remain fully concurrent.
-    # D1-532: durable-first helper is the shared read contract. A durable
-    # exception must not be treated as a confirmed miss / negative cache.
-    _barrier = await mgr.key_barrier_lock(cooldown_key)
-    async with _barrier:
-        gen_before = family.get_generation(cooldown_key)
-        async with mgr.lane_state_cache_lock:
-            durable_payload: Optional[dict[str, Any]] = None
-            if callable(getattr(dual_cache, "async_get_cache", None)):
-                read_aawm_alias_routing_state = _read_state_fn()
-                result = await read_aawm_alias_routing_state(
-                    alias_family="codex",
-                    state_kind="cooldown",
-                    state_key=cooldown_key,
-                    last_good_local=(
-                        {"expires_at_monotonic": last_good_until}
-                        if last_good_until > 0
-                        else None
-                    ),
-                    dual_cache=dual_cache,
-                )
-                source = result.get("source") if isinstance(result, dict) else None
-                if source == "durable_cache":
-                    payload = result.get("payload")
-                    if isinstance(payload, dict):
-                        durable_payload = payload
-                elif isinstance(result, dict) and result.get("durable_error"):
-                    if last_good_until > time.monotonic():
-                        return max(0.0, last_good_until - time.monotonic()), "memory"
-                    return 0.0, "local_fallback"
-                elif isinstance(result, dict) and result.get("confirmed_miss"):
-                    durable_payload = None
+        if negative:
+            return _state_cls(0.0, "negative_cache", recovery=True)
+
+    def _result(seconds: float, source: str) -> ActiveCooldownState:
+        return _state_cls(float(seconds), str(source), recovery=recovery)
+
+    try:
+        dual_cache = _dual_cache_fn()
+        if dual_cache is None:
+            # Wave5B patches this name on the rebound getter's __globals__.
+            # _live_dual_cache reads the cooldown_state module attribute, so
+            # a host-globals patch would otherwise be ignored.
+            global_cache_fn = globals().get("get_aawm_alias_routing_dual_cache")
+            if callable(global_cache_fn):
+                dual_cache = global_cache_fn()
+        if dual_cache is None:
+            if last_good_until > time.monotonic():
+                return _result(max(0.0, last_good_until - time.monotonic()), "memory")
+            return _result(0.0, "local_fallback")
+        # CFG-004 Defect 3: per-key read/clear barrier.  The barrier lock is
+        # acquired BEFORE capturing the generation and held through the durable
+        # read and hydration.  A clear (via clear_alias_family_cooldown_state)
+        # acquires the same barrier lock before bumping the generation and
+        # deleting the durable key.  This guarantees that a read which started
+        # before a clear cannot capture the new generation and hydrate the old
+        # durable value, while unrelated keys remain fully concurrent.
+        # D1-532: durable-first helper is the shared read contract. A durable
+        # exception must not be treated as a confirmed miss / negative cache.
+        _barrier = await mgr.key_barrier_lock(cooldown_key)
+        async with _barrier:
+            gen_before = family.get_generation(cooldown_key)
+            async with mgr.lane_state_cache_lock:
+                durable_payload: Optional[dict[str, Any]] = None
+                if callable(getattr(dual_cache, "async_get_cache", None)):
+                    read_aawm_alias_routing_state = _read_state_fn()
+                    result = await read_aawm_alias_routing_state(
+                        alias_family="codex",
+                        state_kind="cooldown",
+                        state_key=cooldown_key,
+                        last_good_local=(
+                            {"expires_at_monotonic": last_good_until}
+                            if last_good_until > 0
+                            else None
+                        ),
+                        dual_cache=dual_cache,
+                    )
+                    source = result.get("source") if isinstance(result, dict) else None
+                    if source == "durable_cache":
+                        payload = result.get("payload")
+                        if isinstance(payload, dict):
+                            durable_payload = payload
+                    elif isinstance(result, dict) and result.get("durable_error"):
+                        if last_good_until > time.monotonic():
+                            return _result(
+                                max(0.0, last_good_until - time.monotonic()),
+                                "memory",
+                            )
+                        return _result(0.0, "local_fallback")
+                    elif isinstance(result, dict) and result.get("confirmed_miss"):
+                        durable_payload = None
+                    else:
+                        durable_payload = await read_aawm_alias_routing_durable_payload(
+                            alias_family="codex",
+                            state_kind="cooldown",
+                            state_key=cooldown_key,
+                        )
                 else:
+                    # Compatibility: Wave5b patches a dummy DualCache plus the older
+                    # payload reader. A cache without async_get_cache is not a Redis
+                    # exception; keep the existing miss/negative-cache contract.
                     durable_payload = await read_aawm_alias_routing_durable_payload(
                         alias_family="codex",
                         state_kind="cooldown",
                         state_key=cooldown_key,
                     )
-            else:
-                # Compatibility: Wave5b patches a dummy DualCache plus the older
-                # payload reader. A cache without async_get_cache is not a Redis
-                # exception; keep the existing miss/negative-cache contract.
-                durable_payload = await read_aawm_alias_routing_durable_payload(
-                    alias_family="codex",
-                    state_kind="cooldown",
-                    state_key=cooldown_key,
-                )
-            if durable_payload is None:
-                async with family.lock:
-                    if family.get_generation(cooldown_key) != gen_before:
+                if durable_payload is None:
+                    async with family.lock:
+                        if family.get_generation(cooldown_key) != gen_before:
+                            if last_good_until > time.monotonic():
+                                return _result(
+                                    max(0.0, last_good_until - time.monotonic()),
+                                    "memory",
+                                )
+                            return _result(0.0, "local_fallback")
                         if last_good_until > time.monotonic():
-                            return max(0.0, last_good_until - time.monotonic()), "memory"
-                        return 0.0, "local_fallback"
-                    if last_good_until > time.monotonic():
-                        return max(0.0, last_good_until - time.monotonic()), "memory"
-                    family.cooldown_negative_until_monotonic_by_key[cooldown_key] = (
-                        time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
-                    )
-                    bound_memory_map(family.cooldown_negative_until_monotonic_by_key, max_size=DEFAULT_MEMORY_STATE_MAX_SIZE)
-                return 0.0, "local_fallback"
-            expires_at_epoch = parse_aawm_alias_routing_durable_expiry(durable_payload)
-            if expires_at_epoch is None:
+                            return _result(
+                                max(0.0, last_good_until - time.monotonic()),
+                                "memory",
+                            )
+                        family.cooldown_negative_until_monotonic_by_key[cooldown_key] = (
+                            time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
+                        )
+                        bound_memory_map(family.cooldown_negative_until_monotonic_by_key, max_size=DEFAULT_MEMORY_STATE_MAX_SIZE)
+                    return _result(0.0, "local_fallback")
+                expires_at_epoch = parse_aawm_alias_routing_durable_expiry(durable_payload)
+                if expires_at_epoch is None:
+                    async with family.lock:
+                        if family.get_generation(cooldown_key) != gen_before:
+                            return _result(0.0, "local_fallback")
+                        family.cooldown_negative_until_monotonic_by_key[cooldown_key] = (
+                            time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
+                        )
+                        bound_memory_map(family.cooldown_negative_until_monotonic_by_key, max_size=DEFAULT_MEMORY_STATE_MAX_SIZE)
+                    return _result(0.0, "local_fallback")
+                # Generation guard + hydrate atomically under the family lock so a
+                # concurrent clear (which advances generation) cannot interleave
+                # between the check and the hydration write.
                 async with family.lock:
                     if family.get_generation(cooldown_key) != gen_before:
-                        return 0.0, "local_fallback"
-                    family.cooldown_negative_until_monotonic_by_key[cooldown_key] = (
-                        time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
+                        return _result(0.0, "local_fallback")
+                    family.cooldown_negative_until_monotonic_by_key.pop(cooldown_key, None)
+                    hydrate_cooldown_memory(
+                        memory_map=family.cooldown_until_monotonic_by_key,
+                        cooldown_key=cooldown_key,
+                        expires_at_epoch=expires_at_epoch,
+                        max_size=DEFAULT_MEMORY_STATE_MAX_SIZE,
                     )
-                    bound_memory_map(family.cooldown_negative_until_monotonic_by_key, max_size=DEFAULT_MEMORY_STATE_MAX_SIZE)
-                return 0.0, "local_fallback"
-            # Generation guard + hydrate atomically under the family lock so a
-            # concurrent clear (which advances generation) cannot interleave
-            # between the check and the hydration write.
+                    until = family.cooldown_until_monotonic_by_key.get(cooldown_key, 0.0)
+                    return _result(
+                        max(0.0, until - time.monotonic()), "durable_cache"
+                    )
+    finally:
+        if held_pending:
             async with family.lock:
-                if family.get_generation(cooldown_key) != gen_before:
-                    return 0.0, "local_fallback"
-                family.cooldown_negative_until_monotonic_by_key.pop(cooldown_key, None)
-                hydrate_cooldown_memory(
-                    memory_map=family.cooldown_until_monotonic_by_key,
-                    cooldown_key=cooldown_key,
-                    expires_at_epoch=expires_at_epoch,
-                    max_size=DEFAULT_MEMORY_STATE_MAX_SIZE,
-                )
-                until = family.cooldown_until_monotonic_by_key.get(cooldown_key, 0.0)
-                return max(0.0, until - time.monotonic()), "durable_cache"
+                _release_fn(family, cooldown_key)
 
 
 async def _get_codex_auto_agent_active_cooldown_seconds(
@@ -508,107 +605,132 @@ async def _get_anthropic_auto_agent_active_cooldown_state(
     *,
     _dual_cache_fn=_live_dual_cache,
     _read_state_fn=_live_read_routing_state,
+    _classify_fn=_classify_and_pop_expired_cooldown,
+    _release_fn=_release_pending_recovery,
+    _state_cls=ActiveCooldownState,
 ) -> tuple[float, str]:
     mgr = _require_manager()
     family = mgr.anthropic
     last_good_until = 0.0
+    recovery = False
+    held_pending = False
     async with family.lock:
-        now = time.monotonic()
-        until = family.cooldown_until_monotonic_by_key.get(cooldown_key, 0.0)
-        if until > now:
-            last_good_until = until
-        else:
-            family.cooldown_until_monotonic_by_key.pop(cooldown_key, None)
-        neg_until = family.cooldown_negative_until_monotonic_by_key.get(cooldown_key, 0.0)
-        if neg_until > now and last_good_until <= now:
-            return 0.0, "negative_cache"
-    dual_cache = _dual_cache_fn()
-    if dual_cache is None:
-        if last_good_until > time.monotonic():
-            return max(0.0, last_good_until - time.monotonic()), "memory"
-        return 0.0, "local_fallback"
-    # CFG-004 Defect 3: per-key read/clear barrier (mirrors codex path).
-    # D1-532: durable-first helper is the shared read contract. A durable
-    # exception must not be treated as a confirmed miss / negative cache.
-    _barrier = await mgr.key_barrier_lock(cooldown_key)
-    async with _barrier:
-        gen_before = family.get_generation(cooldown_key)
-        async with mgr.lane_state_cache_lock:
-            durable_payload: Optional[dict[str, Any]] = None
-            if callable(getattr(dual_cache, "async_get_cache", None)):
-                read_aawm_alias_routing_state = _read_state_fn()
-                result = await read_aawm_alias_routing_state(
-                    alias_family="anthropic",
-                    state_kind="cooldown",
-                    state_key=cooldown_key,
-                    last_good_local=(
-                        {"expires_at_monotonic": last_good_until}
-                        if last_good_until > 0
-                        else None
-                    ),
-                    dual_cache=dual_cache,
-                )
-                source = result.get("source") if isinstance(result, dict) else None
-                if source == "durable_cache":
-                    payload = result.get("payload")
-                    if isinstance(payload, dict):
-                        durable_payload = payload
-                elif isinstance(result, dict) and result.get("durable_error"):
-                    if last_good_until > time.monotonic():
-                        return max(0.0, last_good_until - time.monotonic()), "memory"
-                    return 0.0, "local_fallback"
-                elif isinstance(result, dict) and result.get("confirmed_miss"):
-                    durable_payload = None
+        last_good_until, recovery, held_pending, negative = _classify_fn(
+            family, cooldown_key
+        )
+        if negative:
+            return _state_cls(0.0, "negative_cache", recovery=True)
+
+    def _result(seconds: float, source: str) -> ActiveCooldownState:
+        return _state_cls(float(seconds), str(source), recovery=recovery)
+
+    try:
+        dual_cache = _dual_cache_fn()
+        if dual_cache is None:
+            global_cache_fn = globals().get("get_aawm_alias_routing_dual_cache")
+            if callable(global_cache_fn):
+                dual_cache = global_cache_fn()
+        if dual_cache is None:
+            if last_good_until > time.monotonic():
+                return _result(max(0.0, last_good_until - time.monotonic()), "memory")
+            return _result(0.0, "local_fallback")
+        # CFG-004 Defect 3: per-key read/clear barrier (mirrors codex path).
+        # D1-532: durable-first helper is the shared read contract. A durable
+        # exception must not be treated as a confirmed miss / negative cache.
+        _barrier = await mgr.key_barrier_lock(cooldown_key)
+        async with _barrier:
+            gen_before = family.get_generation(cooldown_key)
+            async with mgr.lane_state_cache_lock:
+                durable_payload: Optional[dict[str, Any]] = None
+                if callable(getattr(dual_cache, "async_get_cache", None)):
+                    read_aawm_alias_routing_state = _read_state_fn()
+                    result = await read_aawm_alias_routing_state(
+                        alias_family="anthropic",
+                        state_kind="cooldown",
+                        state_key=cooldown_key,
+                        last_good_local=(
+                            {"expires_at_monotonic": last_good_until}
+                            if last_good_until > 0
+                            else None
+                        ),
+                        dual_cache=dual_cache,
+                    )
+                    source = result.get("source") if isinstance(result, dict) else None
+                    if source == "durable_cache":
+                        payload = result.get("payload")
+                        if isinstance(payload, dict):
+                            durable_payload = payload
+                    elif isinstance(result, dict) and result.get("durable_error"):
+                        if last_good_until > time.monotonic():
+                            return _result(
+                                max(0.0, last_good_until - time.monotonic()),
+                                "memory",
+                            )
+                        return _result(0.0, "local_fallback")
+                    elif isinstance(result, dict) and result.get("confirmed_miss"):
+                        durable_payload = None
+                    else:
+                        durable_payload = await read_aawm_alias_routing_durable_payload(
+                            alias_family="anthropic",
+                            state_kind="cooldown",
+                            state_key=cooldown_key,
+                        )
                 else:
+                    # Compatibility: Wave5b patches a dummy DualCache plus the older
+                    # payload reader. A cache without async_get_cache is not a Redis
+                    # exception; keep the existing miss/negative-cache contract.
                     durable_payload = await read_aawm_alias_routing_durable_payload(
                         alias_family="anthropic",
                         state_kind="cooldown",
                         state_key=cooldown_key,
                     )
-            else:
-                # Compatibility: Wave5b patches a dummy DualCache plus the older
-                # payload reader. A cache without async_get_cache is not a Redis
-                # exception; keep the existing miss/negative-cache contract.
-                durable_payload = await read_aawm_alias_routing_durable_payload(
-                    alias_family="anthropic",
-                    state_kind="cooldown",
-                    state_key=cooldown_key,
-                )
-            if durable_payload is None:
-                async with family.lock:
-                    if family.get_generation(cooldown_key) != gen_before:
+                if durable_payload is None:
+                    async with family.lock:
+                        if family.get_generation(cooldown_key) != gen_before:
+                            if last_good_until > time.monotonic():
+                                return _result(
+                                    max(0.0, last_good_until - time.monotonic()),
+                                    "memory",
+                                )
+                            return _result(0.0, "local_fallback")
                         if last_good_until > time.monotonic():
-                            return max(0.0, last_good_until - time.monotonic()), "memory"
-                        return 0.0, "local_fallback"
-                    if last_good_until > time.monotonic():
-                        return max(0.0, last_good_until - time.monotonic()), "memory"
-                    family.cooldown_negative_until_monotonic_by_key[cooldown_key] = (
-                        time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
-                    )
-                    bound_memory_map(family.cooldown_negative_until_monotonic_by_key, max_size=DEFAULT_MEMORY_STATE_MAX_SIZE)
-                return 0.0, "local_fallback"
-            expires_at_epoch = parse_aawm_alias_routing_durable_expiry(durable_payload)
-            if expires_at_epoch is None:
+                            return _result(
+                                max(0.0, last_good_until - time.monotonic()),
+                                "memory",
+                            )
+                        family.cooldown_negative_until_monotonic_by_key[cooldown_key] = (
+                            time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
+                        )
+                        bound_memory_map(family.cooldown_negative_until_monotonic_by_key, max_size=DEFAULT_MEMORY_STATE_MAX_SIZE)
+                    return _result(0.0, "local_fallback")
+                expires_at_epoch = parse_aawm_alias_routing_durable_expiry(durable_payload)
+                if expires_at_epoch is None:
+                    async with family.lock:
+                        if family.get_generation(cooldown_key) != gen_before:
+                            return _result(0.0, "local_fallback")
+                        family.cooldown_negative_until_monotonic_by_key[cooldown_key] = (
+                            time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
+                        )
+                        bound_memory_map(family.cooldown_negative_until_monotonic_by_key, max_size=DEFAULT_MEMORY_STATE_MAX_SIZE)
+                    return _result(0.0, "local_fallback")
                 async with family.lock:
                     if family.get_generation(cooldown_key) != gen_before:
-                        return 0.0, "local_fallback"
-                    family.cooldown_negative_until_monotonic_by_key[cooldown_key] = (
-                        time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
+                        return _result(0.0, "local_fallback")
+                    family.cooldown_negative_until_monotonic_by_key.pop(cooldown_key, None)
+                    hydrate_cooldown_memory(
+                        memory_map=family.cooldown_until_monotonic_by_key,
+                        cooldown_key=cooldown_key,
+                        expires_at_epoch=expires_at_epoch,
+                        max_size=DEFAULT_MEMORY_STATE_MAX_SIZE,
                     )
-                    bound_memory_map(family.cooldown_negative_until_monotonic_by_key, max_size=DEFAULT_MEMORY_STATE_MAX_SIZE)
-                return 0.0, "local_fallback"
+                    until = family.cooldown_until_monotonic_by_key.get(cooldown_key, 0.0)
+                    return _result(
+                        max(0.0, until - time.monotonic()), "durable_cache"
+                    )
+    finally:
+        if held_pending:
             async with family.lock:
-                if family.get_generation(cooldown_key) != gen_before:
-                    return 0.0, "local_fallback"
-                family.cooldown_negative_until_monotonic_by_key.pop(cooldown_key, None)
-                hydrate_cooldown_memory(
-                    memory_map=family.cooldown_until_monotonic_by_key,
-                    cooldown_key=cooldown_key,
-                    expires_at_epoch=expires_at_epoch,
-                    max_size=DEFAULT_MEMORY_STATE_MAX_SIZE,
-                )
-                until = family.cooldown_until_monotonic_by_key.get(cooldown_key, 0.0)
-                return max(0.0, until - time.monotonic()), "durable_cache"
+                _release_fn(family, cooldown_key)
 
 
 async def _get_anthropic_auto_agent_active_cooldown_seconds(
@@ -908,6 +1030,9 @@ def install(host_globals: dict) -> None:
     host_globals.update(
         {
             "_require_manager": _require_manager,
+            "ActiveCooldownState": ActiveCooldownState,
+            "_classify_and_pop_expired_cooldown": _classify_and_pop_expired_cooldown,
+            "_release_pending_recovery": _release_pending_recovery,
             "DEFAULT_MEMORY_STATE_MAX_SIZE": DEFAULT_MEMORY_STATE_MAX_SIZE,
             "bound_memory_map": (
                 lambda cache, *, max_size=DEFAULT_MEMORY_STATE_MAX_SIZE: (
