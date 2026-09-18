@@ -377,7 +377,16 @@ def _nested_child_route_row(path: Path, wanted: Sequence[str]) -> dict[str, Any]
                 and saw_date
                 and "aawm_session_owner_redispatch_required" in lowered
             )
-            if not aborted_thinking and not post_success_owner_409:
+            leftover_post_success_abort = (
+                saw_pong
+                and saw_date
+                and lowered in _ABORTED_THINKING_ERRORS
+            )
+            if (
+                not aborted_thinking
+                and not post_success_owner_409
+                and not leftover_post_success_abort
+            ):
                 error = err.strip()
         # Nested bash while the parent is still waiting is not a completed
         # child. Count the nested transcript after a successful yield, a
@@ -557,9 +566,19 @@ def child_spawn_evidence(
             if nested_route:
                 alias = str(nested_route.get("requested_alias") or file_agent or "")
                 if alias in wanted_set:
+                    existing = routes.get(alias)
+                    if existing and existing.get("ok") is True:
+                        continue
+                    if (
+                        existing
+                        and nested_route.get("ok") is not True
+                        and existing.get("terminal_disposition") == "completed"
+                    ):
+                        continue
                     routes[alias] = nested_route
                     if nested_route.get("ok") is True:
                         successful_agents.add(alias)
+                        failed_agents.discard(alias)
                     elif nested_route.get("terminal_disposition") in {
                         "fallback_operational",
                         "identity_unobserved",

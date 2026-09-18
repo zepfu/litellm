@@ -4828,6 +4828,168 @@ def test_should_count_nested_pong_and_date_when_ohmypi_task_result_exits_1(
         assert route["error"] == ""
 
 
+def _nested_child_pong_date_rows(name: str) -> list[str]:
+    return [
+        json.dumps(
+            {
+                "type": "session_init",
+                "agent": name,
+                "resolvedModel": f"litellm-alpha-passthrough/{name}",
+            }
+        ),
+        json.dumps(
+            {
+                "type": "model_usage",
+                "purpose": "auto-thinking",
+                "role": "tiny",
+                "model": name,
+                "stopReason": "aborted",
+                "errorMessage": "Request was aborted",
+            }
+        ),
+        json.dumps(
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "PONG"}],
+                }
+            }
+        ),
+        json.dumps(
+            {
+                "message": {
+                    "role": "toolResult",
+                    "toolName": "bash",
+                    "isError": False,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Thu 17 Sep 2026 09:26:49 PM EDT\n"
+                                "\n\nWall time: 0.02 seconds"
+                            ),
+                        }
+                    ],
+                }
+            }
+        ),
+    ]
+
+
+def test_should_ignore_leftover_hub_wait_abort_after_nested_pong_and_date(
+    tmp_path: Path,
+) -> None:
+    from hv2.checks.orch_evidence import child_spawn_evidence
+
+    session_dir = tmp_path / "omp-sessions"
+    nested = session_dir / "parent-id"
+    nested.mkdir(parents=True)
+    rows = _nested_child_pong_date_rows("work")
+    rows.extend(
+        [
+            json.dumps(
+                {
+                    "message": {
+                        "role": "toolResult",
+                        "toolName": "hub",
+                        "isError": False,
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "No message from Main within 1m.",
+                            }
+                        ],
+                    }
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "message",
+                    "message": {
+                        "role": "assistant",
+                        "content": [],
+                        "stopReason": "aborted",
+                        "errorMessage": "Request was aborted",
+                    },
+                }
+            ),
+        ]
+    )
+    (nested / "WorkProbe-2.jsonl").write_text("\n".join(rows) + "\n", encoding="utf-8")
+    evidence = child_spawn_evidence(
+        children=("work",),
+        pane="╭── π > ◕ AAWM alias sota-moonshot >\n",
+        session_dir=str(session_dir),
+    )
+    assert evidence["ok"] is True
+    assert evidence["failures"] == []
+    assert evidence["successful_agents"] == ["work"]
+    assert evidence["failed_agents"] == []
+    route = evidence["routes"]["work"]
+    assert route["ok"] is True
+    assert route["terminal_disposition"] == "completed"
+    assert route["error"] == ""
+
+
+def test_should_keep_completed_child_when_later_followup_file_409s(
+    tmp_path: Path,
+) -> None:
+    from hv2.checks.orch_evidence import child_spawn_evidence
+
+    session_dir = tmp_path / "omp-sessions"
+    nested = session_dir / "parent-id"
+    nested.mkdir(parents=True)
+    (nested / "ExpertChild.jsonl").write_text(
+        "\n".join(_nested_child_pong_date_rows("expert")) + "\n",
+        encoding="utf-8",
+    )
+    (nested / "ExpertFollowup.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "session_init",
+                        "agent": "expert",
+                        "resolvedModel": "litellm-alpha-passthrough/expert",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "errorMessage": (
+                                '409 {"detail":{"error":{"code":'
+                                '"aawm_session_owner_redispatch_required"}}}'
+                            ),
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Session ownership requires a fresh dispatch.",
+                                }
+                            ],
+                        }
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    evidence = child_spawn_evidence(
+        children=("expert",),
+        pane="╭── π > ◕ AAWM alias sota-zai >\n",
+        session_dir=str(session_dir),
+    )
+    assert evidence["ok"] is True
+    assert evidence["failures"] == []
+    assert evidence["successful_agents"] == ["expert"]
+    assert evidence["failed_agents"] == []
+    route = evidence["routes"]["expert"]
+    assert route["ok"] is True
+    assert route["terminal_disposition"] == "completed"
+    assert route["error"] == ""
+
+
 def test_should_not_infer_provider_route_identity_from_alias_prefix(
     tmp_path: Path,
 ) -> None:
