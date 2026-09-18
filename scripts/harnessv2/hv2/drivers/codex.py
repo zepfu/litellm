@@ -86,6 +86,8 @@ class CodexDriver:
         self._active_session: str | None = None
         self._active_model: str | None = None
         self._active_cwd: str | None = None
+        self._update_nux_skipped = False
+        self._trust_nux_accepted = False
 
     def _context(self, extra: Mapping[str, str] | None = None) -> dict[str, str]:
         lanes = self.spec.get("lanes") if isinstance(self.spec.get("lanes"), dict) else {}
@@ -614,12 +616,38 @@ class CodexDriver:
             if token
         ]
 
+    def _update_prompt_needles(self) -> list[str]:
+        return [
+            token
+            for token in as_str_list(self._select_spec().get("update_prompt_needles"))
+            if token
+        ]
+
+    def _update_prompt_skip_keys(self) -> list[str]:
+        keys = [
+            token
+            for token in as_str_list(self._select_spec().get("update_prompt_skip_keys"))
+            if token
+        ]
+        return keys or ["3", "Enter"]
+
     def _pane_has_trust_prompt(self, pane: str) -> bool:
+        if self._trust_nux_accepted:
+            return False
         needles = self._trust_prompt_needles()
         return bool(needles) and any(token in pane for token in needles)
 
+    def _pane_has_update_prompt(self, pane: str) -> bool:
+        if self._update_nux_skipped:
+            return False
+        needles = self._update_prompt_needles()
+        return bool(needles) and all(token in pane for token in needles)
+
+    def _pane_has_launch_nux(self, pane: str) -> bool:
+        return self._pane_has_trust_prompt(pane) or self._pane_has_update_prompt(pane)
+
     def _pane_selected_without_trust(self, pane: str, model: str) -> bool:
-        if not model or self._pane_has_trust_prompt(pane):
+        if not model or self._pane_has_launch_nux(pane):
             return False
         return self.pane_has_selector(model, pane)
 
@@ -628,42 +656,71 @@ class CodexDriver:
         if not session or session == self._default_session_name():
             return False
         proc = self._run_tmux(["send-keys", "-t", session, "Enter"])
+        if proc.returncode == 0:
+            self._trust_nux_accepted = True
         return proc.returncode == 0
 
-    def _accept_trust_prompt_if_present(self, model: str = "") -> bool:
-        """Accept the first-run directory-trust nux in a dedicated harness session.
+    def _send_update_prompt_skip(self) -> bool:
+        """Skip Codex 0.154 update nux. Never option 1 / install.sh."""
 
-        Codex 0.149 paints ``model: loading`` before the nux. ``wait_trust_seconds``
-        is too short for that splash; keep polling until the selected model is
-        visible or ``wait_ready_seconds`` elapses. Prompt-free panes that already
-        show the selected model return immediately and never send Enter.
+        session = self._session_name()
+        if not session or session == self._default_session_name():
+            return False
+        keys = self._update_prompt_skip_keys()
+        forbidden = {"1", "install.sh", "CODEX_NON_INTERACTIVE=1"}
+        if any(token in forbidden for token in keys):
+            raise PlanError(
+                "tuis.codex.select_model.update_prompt_skip_keys must skip "
+                "the update nux; never send option 1 or install.sh"
+            )
+        proc = self._run_tmux(["send-keys", "-t", session, *keys])
+        if proc.returncode == 0:
+            self._update_nux_skipped = True
+        return proc.returncode == 0
+
+    def _dismiss_launch_nux_if_present(self, model: str = "") -> bool:
+        """Dismiss Codex launch nux in a dedicated harness session.
+
+        Handles the directory-trust prompt (Enter on ``Yes, continue``)
+        and the 0.154 update prompt (option 3, never ``install.sh``).
+        Codex 0.149 paints ``model: loading`` before a nux;
+        ``wait_trust_seconds`` is too short for that splash, so keep
+        polling until the selected model is visible or
+        ``wait_ready_seconds`` elapses. Prompt-free panes that already
+        show the selected model return immediately and never send keys.
         Never send-keys the leftover operator ``codex`` pane.
         """
 
-        needles = self._trust_prompt_needles()
-        if not needles:
+        if not self._trust_prompt_needles() and not self._update_prompt_needles():
             return False
         ready_timeout = self._tmux_float("wait_ready_seconds", 20)
         trust_timeout = self._tmux_float("wait_trust_seconds", 3)
         interval = max(self._tmux_float("poll_interval_seconds", 1), 0.05)
         deadline = time.time() + max(ready_timeout, trust_timeout, 0.0)
         pane = self.capture_pane()
-        while not self._pane_has_trust_prompt(pane):
-            if self._pane_selected_without_trust(pane, model):
-                return False
-            if time.time() >= deadline:
-                return False
-            time.sleep(interval)
-            pane = self.capture_pane()
-        if not self._send_trust_prompt_enter():
-            return False
-        clear_deadline = time.time() + max(ready_timeout, 0.0)
-        while time.time() < clear_deadline:
-            pane = self.capture_pane()
-            if not self._pane_has_trust_prompt(pane):
+        dismissed = False
+        while time.time() < deadline:
+            if self._pane_has_update_prompt(pane):
+                if not self._send_update_prompt_skip():
+                    return False
+                dismissed = True
+            elif self._pane_has_trust_prompt(pane):
+                if not self._send_trust_prompt_enter():
+                    return False
+                dismissed = True
+            elif self._pane_selected_without_trust(pane, model):
+                return dismissed
+            elif dismissed and not self._pane_has_launch_nux(pane):
                 return True
             time.sleep(interval)
-        return False
+            pane = self.capture_pane()
+        return dismissed and not self._pane_has_launch_nux(pane)
+
+    def _accept_trust_prompt_if_present(self, model: str = "") -> bool:
+        return self._dismiss_launch_nux_if_present(model)
+
+    def _dismiss_update_prompt_if_present(self, model: str = "") -> bool:
+        return self._dismiss_launch_nux_if_present(model)
 
     def pane_has_selector(self, model: str, pane: str | None = None) -> bool:
         selector = self.model_selector(model)
@@ -691,13 +748,21 @@ class CodexDriver:
         deadline = time.time() + max(timeout, 0.0)
         while True:
             pane = self.capture_pane()
-            if self._pane_has_trust_prompt(pane):
+            if self._pane_has_update_prompt(pane):
+                self._send_update_prompt_skip()
+                pane = self.capture_pane()
+            elif self._pane_has_trust_prompt(pane):
                 self._send_trust_prompt_enter()
                 pane = self.capture_pane()
-            if self.pane_has_selector(model, pane):
+            if self.pane_has_selector(model, pane) and not self._pane_has_launch_nux(
+                pane
+            ):
                 return True
             if timeout <= 0 or time.time() >= deadline:
-                return self.pane_has_selector(model)
+                pane = self.capture_pane()
+                return self.pane_has_selector(model, pane) and not self._pane_has_launch_nux(
+                    pane
+                )
             time.sleep(interval)
 
     def ensure_session(
@@ -750,12 +815,14 @@ class CodexDriver:
             )
         self._active_session = session
         self._active_model = model
+        self._update_nux_skipped = False
+        self._trust_nux_accepted = False
         ready_needles = as_str_list(select.get("ready_needles")) or ["codex"]
         ready = self.wait_for_pane(
             ready_needles,
             timeout_seconds=self._tmux_float("wait_ready_seconds", 20),
         )
-        self._accept_trust_prompt_if_present(model)
+        self._dismiss_launch_nux_if_present(model)
         selector = self.model_selector(model)
         selected = self._wait_until_model_selected(
             model,

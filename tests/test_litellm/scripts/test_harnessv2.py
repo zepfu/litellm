@@ -1983,6 +1983,127 @@ def test_should_accept_codex_directory_trust_prompt_after_loading_chrome_outlast
     assert "basic" in launched["pane_preview"]
 
 
+def test_should_skip_codex_0_154_update_nux_on_dedicated_session(
+    hv, config, monkeypatch
+) -> None:
+    _skip_unless_codex_tui_shipped(config)
+    from hv2.drivers.codex import CodexDriver
+
+    nux = (_FIXTURES / "codex_update_nux_0_154.txt").read_text(encoding="utf-8")
+    assert "Skip until next version" in nux
+    assert "Update now" in nux
+    assert "install.sh" in nux
+    cfg = _clone_config(config)
+    cfg["tuis"]["codex"]["tmux"]["wait_ready_seconds"] = 1
+    cfg["tuis"]["codex"]["tmux"]["poll_interval_seconds"] = 0.01
+    driver = CodexDriver(cfg)
+    assert driver._pane_has_update_prompt(nux) is True
+    assert driver.pane_has_selector("basic", nux) is False
+    assert "3" in driver._update_prompt_skip_keys()
+    assert "Enter" in driver._update_prompt_skip_keys()
+    assert "1" not in driver._update_prompt_skip_keys()
+    calls: list[list[str]] = []
+    state = {"skipped": False}
+
+    def fake_run(args: Any, *, timeout: int = 10, stdin_text: str | None = None) -> Any:
+        row = [str(item) for item in args]
+        calls.append(row)
+        if row[:1] == ["send-keys"] and "3" in row and "Enter" in row:
+            state["skipped"] = True
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_capture() -> str:
+        if state["skipped"]:
+            return "OpenAI Codex (v0.154.0)\nmodel: basic\n>"
+        return nux
+
+    monkeypatch.setattr(driver, "_run_tmux", fake_run)
+    monkeypatch.setattr(driver, "tmux_has_session", lambda name=None: False)
+    monkeypatch.setattr(driver, "capture_pane", fake_capture)
+    monkeypatch.setattr(driver, "ensure_workspace", lambda: None)
+    launched = driver.ensure_session("basic", tools=True)
+    skip_rows = [
+        row for row in calls if row[:1] == ["send-keys"] and "3" in row and "Enter" in row
+    ]
+    assert launched["ok"] is True
+    assert launched["selected"] is True
+    assert skip_rows
+    assert not any(row[:1] == ["send-keys"] and "1" in row[2:] for row in calls)
+    assert not any("install.sh" in token for row in calls for token in row)
+    assert "Skip until next version" not in launched["pane_preview"]
+    assert "basic" in launched["pane_preview"]
+
+
+def test_should_skip_delayed_codex_0_154_update_nux_after_loading_chrome(
+    hv, config, monkeypatch
+) -> None:
+    _skip_unless_codex_tui_shipped(config)
+    from hv2.drivers.codex import CodexDriver
+
+    nux = (_FIXTURES / "codex_update_nux_0_154.txt").read_text(encoding="utf-8")
+    cfg = _clone_config(config)
+    cfg["tuis"]["codex"]["tmux"]["wait_ready_seconds"] = 1
+    cfg["tuis"]["codex"]["tmux"]["wait_trust_seconds"] = 0.05
+    cfg["tuis"]["codex"]["tmux"]["poll_interval_seconds"] = 0.01
+    driver = CodexDriver(cfg)
+    calls: list[list[str]] = []
+    captures = {"n": 0}
+    skipped = {"ok": False}
+    splash = (
+        "OpenAI Codex (v0.154.0)\n"
+        "model: loading   /model to change\n"
+        "> Ask Codex to do anything\n"
+    )
+    ready = "OpenAI Codex (v0.154.0)\nmodel: basic\n>"
+
+    def fake_run(args: Any, *, timeout: int = 10, stdin_text: str | None = None) -> Any:
+        row = [str(item) for item in args]
+        calls.append(row)
+        if row[:1] == ["send-keys"] and "3" in row and "Enter" in row:
+            skipped["ok"] = True
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_capture() -> str:
+        captures["n"] += 1
+        if skipped["ok"]:
+            return ready
+        if captures["n"] < 8:
+            return splash
+        return nux
+
+    monkeypatch.setattr(driver, "_run_tmux", fake_run)
+    monkeypatch.setattr(driver, "tmux_has_session", lambda name=None: False)
+    monkeypatch.setattr(driver, "capture_pane", fake_capture)
+    monkeypatch.setattr(driver, "ensure_workspace", lambda: None)
+    launched = driver.ensure_session("basic", tools=True)
+    assert launched["ok"] is True
+    assert launched["selected"] is True
+    assert any(row[:1] == ["send-keys"] and "3" in row and "Enter" in row for row in calls)
+    assert not any(row[:1] == ["send-keys"] and "1" in row[2:] for row in calls)
+    assert "Skip until next version" not in launched["pane_preview"]
+    assert "basic" in launched["pane_preview"]
+
+
+def test_should_reject_codex_update_nux_skip_keys_that_run_install_sh(
+    hv, config, monkeypatch
+) -> None:
+    _skip_unless_codex_tui_shipped(config)
+    from hv2.drivers.codex import CodexDriver
+    from hv2.errors import PlanError
+
+    cfg = _clone_config(config)
+    cfg["tuis"]["codex"]["select_model"]["update_prompt_skip_keys"] = ["1", "Enter"]
+    driver = CodexDriver(cfg)
+    driver._active_session = "hv2-codex-basic-1"
+    monkeypatch.setattr(
+        driver,
+        "_run_tmux",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    with pytest.raises(PlanError, match="never send option 1 or install.sh"):
+        driver._send_update_prompt_skip()
+
+
 def test_should_not_treat_codex_loading_header_with_footer_alias_as_selected(
     hv, config
 ) -> None:

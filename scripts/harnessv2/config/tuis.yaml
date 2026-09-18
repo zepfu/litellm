@@ -278,6 +278,17 @@ tuis:
       trust_prompt_needles:
         - "Do you trust the contents of this directory?"
         - "Yes, continue"
+      # Codex 0.154 paints an update nux with option 1 selected
+      # (`Update now` / install.sh). Dedicated harness sessions send
+      # option 3 (`Skip until next version`). Never option 1. Never
+      # run the install.sh curl. Never send this into leftover
+      # operator `codex` panes.
+      update_prompt_needles:
+        - "Skip until next version"
+        - "Update now"
+      update_prompt_skip_keys:
+        - "3"
+        - Enter
       env_keys:
         - PATH
         - HOME
