@@ -4912,8 +4912,9 @@ async def handle_alias_route(  # noqa: PLR0915
                             "rebind_request_session_owner_after_cursor_replay_skip",
                             None,
                         )
+                        rebound = True
                         if callable(rebind_cursor_skip):
-                            rebind_cursor_skip(
+                            rebound = rebind_cursor_skip(
                                 request,
                                 rebuilt_body=prepared_request_body,
                                 base_session_identity=base_session_identity,
@@ -4925,6 +4926,79 @@ async def handle_alias_route(  # noqa: PLR0915
                                 selection_provider_egress_reached=(
                                     selection_provider_egress_reached
                                 ),
+                            )
+                        if rebound is False:
+                            lease_after = None
+                            get_lease = getattr(
+                                sa_mod,
+                                "get_request_session_owner_lease",
+                                None,
+                            )
+                            if callable(get_lease):
+                                lease_after = get_lease(request)
+                            classify = getattr(
+                                sa_mod,
+                                "classify_session_owner_replay_safety_body",
+                                None,
+                            )
+                            rebuilt_replay_safety = replay_safety
+                            if callable(classify):
+                                rebuilt_replay_safety = classify(
+                                    prepared_request_body
+                                )
+                            replay_safe = (
+                                rebuilt_replay_safety.safe
+                                if rebuilt_replay_safety is not None
+                                else (not has_previous_response_id)
+                            )
+                            if not replay_safe or has_previous_response_id:
+                                failure_phase = (
+                                    "session_owner_redispatch_previous_response_id"
+                                )
+                            elif (
+                                lease_after is not None
+                                and getattr(
+                                    lease_after, "held_reservation", False
+                                )
+                                and getattr(
+                                    lease_after, "reservation_token", None
+                                )
+                                and not getattr(lease_after, "released", False)
+                            ):
+                                failure_phase = (
+                                    "session_owner_held_lease_on_identity_transition"
+                                )
+                            elif lease_after is not None:
+                                failure_phase = (
+                                    "session_owner_request_lease_identity_conflict"
+                                )
+                            else:
+                                failure_phase = (
+                                    "session_owner_redispatch_missing_identity"
+                                )
+                            session_identity = None
+                            if lease_after is not None:
+                                session_identity = getattr(
+                                    lease_after, "session_identity", None
+                                )
+                            if not isinstance(session_identity, str) or not (
+                                session_identity.strip()
+                            ):
+                                session_identity = base_session_identity
+                            if not isinstance(session_identity, str) or not (
+                                session_identity.strip()
+                            ):
+                                session_identity = None
+                            sa_mod.raise_session_owner_redispatch_required(
+                                session_identity=session_identity,
+                                alias_model=(
+                                    selection.get("alias_model") or alias_model
+                                ),
+                                candidate=candidate,
+                                failure_phase=failure_phase,
+                                attempted_provider_call=attempted_provider_call,
+                                request=request,
+                                replay_safety=rebuilt_replay_safety,
                             )
                         deterministically_ineligible_candidate_keys.add(cooldown_key)
                         last_retryable_exc = failure_exc

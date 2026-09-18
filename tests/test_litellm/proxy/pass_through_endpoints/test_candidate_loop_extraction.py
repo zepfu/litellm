@@ -4902,6 +4902,12 @@ async def test_candidate_loop_cursor_session_continuation_is_session_scoped(  # 
             return None
 
     session_affinity_seam = SimpleNamespace(
+        DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS=(
+            session_affinity.DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS
+        ),
+        set_competing_reservation_log_deferred=(
+            session_affinity.set_competing_reservation_log_deferred
+        ),
         is_replay_safe_session_owner_redispatch_body=replay_safe_classifier,
         classify_session_owner_replay_safety_body=(
             session_affinity.classify_session_owner_replay_safety_body
@@ -4917,6 +4923,7 @@ async def test_candidate_loop_cursor_session_continuation_is_session_scoped(  # 
         finalize_session_owner_lease_on_success=_noop_async,
         finalize_session_owner_lease_on_failure=_noop_async,
         reset_released_request_session_owner_guard=lambda _request: False,
+        get_session_owner_continuity_receipt=lambda _request: None,
         SessionOwnerMutationOutcome=SimpleNamespace(
             CONFLICT="conflict",
             ERROR="error",
@@ -5268,6 +5275,12 @@ async def test_candidate_loop_cursor_full_history_continuation_uses_fresh_next_c
         return rebuilt
 
     session_affinity_seam = SimpleNamespace(
+        DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS=(
+            session_affinity.DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS
+        ),
+        set_competing_reservation_log_deferred=(
+            session_affinity.set_competing_reservation_log_deferred
+        ),
         is_replay_safe_session_owner_redispatch_body=_classify_rebuilt_request,
         validate_cursor_replay_matches_body=(
             session_affinity.validate_cursor_replay_matches_body
@@ -5281,6 +5294,7 @@ async def test_candidate_loop_cursor_full_history_continuation_uses_fresh_next_c
         finalize_session_owner_lease_on_success=_noop_async,
         finalize_session_owner_lease_on_failure=_noop_async,
         reset_released_request_session_owner_guard=lambda _request: False,
+        get_session_owner_continuity_receipt=lambda _request: None,
         SessionOwnerMutationOutcome=SimpleNamespace(
             CONFLICT="conflict",
             ERROR="error",
@@ -5775,6 +5789,12 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
         return rebuilt
 
     session_affinity_seam = SimpleNamespace(
+        DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS=(
+            session_affinity.DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS
+        ),
+        set_competing_reservation_log_deferred=(
+            session_affinity.set_competing_reservation_log_deferred
+        ),
         is_replay_safe_session_owner_redispatch_body=_classify_rebuilt_request,
         validate_cursor_replay_matches_body=(
             session_affinity.validate_cursor_replay_matches_body
@@ -5788,6 +5808,7 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
         finalize_session_owner_lease_on_success=_noop_async,
         finalize_session_owner_lease_on_failure=_noop_async,
         reset_released_request_session_owner_guard=lambda _request: False,
+        get_session_owner_continuity_receipt=lambda _request: None,
         SessionOwnerMutationOutcome=SimpleNamespace(
             CONFLICT="conflict",
             ERROR="error",
@@ -5899,6 +5920,506 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
     assert publication_calls == []
     assert routing_state.codex.cooldown_until_monotonic_by_key == {}
     assert routing_state.codex.candidate_semantic_ineligibility_by_key == {}
+
+
+def _cursor_skip_rebind_handle_alias_harness(  # noqa: PLR0915
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    leftover: Any,
+    suppress_request_call_id: bool = False,
+    gate_replay_safe: Optional[bool] = None,
+    rebuilt_body_override: Optional[dict[str, Any]] = None,
+) -> SimpleNamespace:
+    """Drive ``handle_alias_route`` Cursor skip with the real rebind helper."""
+
+    from starlette.datastructures import State
+
+    from litellm.llms.cursor_agent.connect import CursorConnectError
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+        codex_candidate_calls,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        attempt_records,
+    )
+
+    cursor_candidate = {
+        "provider": "cursor_agent",
+        "model": "cursor_agent/cursor-grok-4.6-high",
+        "route_family": "codex_cursor_agent_aiserver_adapter",
+    }
+    xai_candidate = {
+        "provider": "xai",
+        "model": "xai/grok-4.6",
+        "route_family": "codex_grok_native_responses_adapter",
+    }
+    replay_messages = [
+        {
+            "role": "user",
+            "content": "Complete the original assignment in /workspace.",
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "pwd-call",
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": '{"cmd":"pwd","workdir":"/workspace"}',
+                    },
+                }
+            ],
+        },
+    ]
+    replay_tools = [{"type": "function", "function": {"name": "exec_command"}}]
+    selections = [
+        {
+            "candidate": cursor_candidate,
+            "lane_key": "cursor_agent_cli",
+            "cooldown_key": "cursor_agent:cursor-grok-4.6-high",
+            "selection_reason": "first_available",
+            "has_account_bound_state": True,
+            "in_flight_session": True,
+        },
+        {
+            "candidate": xai_candidate,
+            "lane_key": "xai_native",
+            "cooldown_key": "xai:grok-4.6",
+            "selection_reason": "next_available",
+            "has_account_bound_state": True,
+            "in_flight_session": True,
+        },
+    ]
+    prepared_body = {
+        "model": "sota-xai",
+        "previous_response_id": "cursor-unretained",
+        "tools": replay_tools,
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "pwd-call",
+                "output": "/workspace",
+            },
+        ],
+    }
+    codex_candidate_calls._store_cursor_replay_state(
+        "cursor-unretained",
+        messages=replay_messages,
+        tools=replay_tools,
+    )
+    replay_state = codex_candidate_calls._peek_cursor_replay_state(
+        "cursor-unretained"
+    )
+    with pytest.raises(CursorConnectError) as source_exc_info:
+        codex_candidate_calls._raise_cursor_session_continuation_unavailable(
+            previous_response_id="cursor-unretained",
+            replay_state=replay_state,
+        )
+    with pytest.raises(ProxyException) as mapped_exc_info:
+        codex_candidate_calls._raise_cursor_agent_alias_error(
+            exc=source_exc_info.value,
+            candidate=cursor_candidate,
+        )
+    mapped_exc = mapped_exc_info.value
+    rebuilt_request_body = (
+        rebuilt_body_override
+        or codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+            prepared_body,
+            continuation_exc=mapped_exc,
+        )
+    )
+    assert rebuilt_request_body is not None
+
+    class _NoCallIdState(State):
+        def __setattr__(self, name: str, value: Any) -> None:
+            if name == "aawm_alias_request_litellm_call_id":
+                return
+            super().__setattr__(name, value)
+
+    request = SimpleNamespace(
+        headers={},
+        state=_NoCallIdState() if suppress_request_call_id else State(),
+    )
+    session_affinity.set_request_session_owner_lease(request, leftover)
+
+    if rebuilt_body_override is not None:
+        monkeypatch.setattr(
+            codex_candidate_calls,
+            "_build_cursor_replay_safe_fresh_dispatch_body",
+            lambda *_args, **_kwargs: dict(rebuilt_body_override),
+        )
+    if suppress_request_call_id:
+        monkeypatch.setattr(
+            attempt_records,
+            "_bind_auto_agent_alias_request_identity",
+            lambda _request: None,
+        )
+        monkeypatch.setattr(
+            session_affinity,
+            "resolve_canonical_session_identity",
+            lambda *_args, **_kwargs: None,
+        )
+
+    routing_state = AliasRoutingStateManager()
+    monkeypatch.setattr(candidate_loop, "alias_routing_state", routing_state)
+    selection_calls: list[dict[str, Any]] = []
+    provider_calls: list[str] = []
+    metadata_attempts: list[list[dict[str, Any]]] = []
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        selection_calls.append(kwargs)
+        if not selections:
+            raise AssertionError("candidate loop selected more than two candidates")
+        return dict(selections.pop(0))
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> object:
+        provider_calls.append(str(candidate["provider"]))
+        if candidate["provider"] == "cursor_agent":
+            raise mapped_exc
+        return {"candidate": candidate["model"]}
+
+    async def _no_active_cooldown(_key: str) -> tuple[float, str]:
+        return 0.0, "memory"
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def _owner_guard(**_kwargs: Any) -> object:
+        return SimpleNamespace(
+            decision=SimpleNamespace(value="no_session"),
+            reservation_token=None,
+            held_reservation=False,
+            provenance=None,
+        )
+
+    class _Admission:
+        async def admit_selected_candidate(self, **_kwargs: Any) -> object:
+            return SimpleNamespace(allowed=True, lease=None)
+
+        async def release_provider_lane_admission(self, _lease: object) -> None:
+            return None
+
+    def _add_candidate_metadata(
+        body: dict[str, Any],
+        *,
+        selection: dict[str, Any],
+        attempts: list[dict[str, Any]],
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        metadata_attempts.append(attempts)
+        rebuilt = dict(body)
+        rebuilt["model"] = selection["candidate"]["model"]
+        return rebuilt
+
+    def _gate_replay_safe(body: dict[str, Any]) -> bool:
+        if gate_replay_safe is not None:
+            return gate_replay_safe
+        return session_affinity.is_replay_safe_session_owner_redispatch_body(body)
+
+    def _rebind_cursor_skip(
+        request: Any,
+        *,
+        rebuilt_body: Any,
+        base_session_identity: Any = None,
+    ) -> bool:
+        # handle_alias_route always binds a request call-id. Strip it here so
+        # the real helper can still exercise its no-identity False path.
+        if suppress_request_call_id:
+            state = getattr(request, "state", None)
+            if state is not None:
+                setattr(state, "aawm_alias_request_litellm_call_id", None)
+                setattr(state, "aawm_alias_request_context", None)
+            leftover_now = session_affinity.get_request_session_owner_lease(request)
+            if leftover_now is not None:
+                leftover_now.session_identity = None
+            base_session_identity = None
+        return session_affinity.rebind_request_session_owner_after_cursor_replay_skip(
+            request,
+            rebuilt_body=rebuilt_body,
+            base_session_identity=base_session_identity,
+        )
+
+    session_affinity_seam = SimpleNamespace(
+        DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS=(
+            session_affinity.DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS
+        ),
+        set_competing_reservation_log_deferred=(
+            session_affinity.set_competing_reservation_log_deferred
+        ),
+        is_replay_safe_session_owner_redispatch_body=_gate_replay_safe,
+        classify_session_owner_replay_safety_body=(
+            session_affinity.classify_session_owner_replay_safety_body
+        ),
+        validate_cursor_replay_matches_body=(
+            session_affinity.validate_cursor_replay_matches_body
+        ),
+        set_validated_cursor_replay=session_affinity.set_validated_cursor_replay,
+        resolve_canonical_session_identity=(
+            session_affinity.resolve_canonical_session_identity
+        ),
+        get_request_codex_auto_review_parent_session_identity=(
+            session_affinity.get_request_codex_auto_review_parent_session_identity
+        ),
+        build_session_owner_attributes=lambda **_kwargs: {},
+        ensure_session_owner_guard_for_request=_owner_guard,
+        get_request_session_owner_lease=(
+            session_affinity.get_request_session_owner_lease
+        ),
+        set_request_session_owner_lease=(
+            session_affinity.set_request_session_owner_lease
+        ),
+        activate_session_owner_redispatch_effective_identity=(
+            session_affinity.activate_session_owner_redispatch_effective_identity
+        ),
+        clear_non_held_request_session_owner_lease=(
+            session_affinity.clear_non_held_request_session_owner_lease
+        ),
+        reset_released_request_session_owner_guard=(
+            session_affinity.reset_released_request_session_owner_guard
+        ),
+        get_request_effective_session_identity=(
+            session_affinity.get_request_effective_session_identity
+        ),
+        rebind_request_session_owner_after_cursor_replay_skip=_rebind_cursor_skip,
+        raise_session_owner_redispatch_required=(
+            session_affinity.raise_session_owner_redispatch_required
+        ),
+        get_session_owner_continuity_receipt=(
+            session_affinity.get_session_owner_continuity_receipt
+        ),
+        finalize_session_owner_lease_on_success=_noop_async,
+        finalize_session_owner_lease_on_failure=_noop_async,
+        SessionOwnerMutationOutcome=session_affinity.SessionOwnerMutationOutcome,
+        SessionOwnerGuardDecision=session_affinity.SessionOwnerGuardDecision,
+    )
+
+    monkeypatch.setattr(
+        candidate_loop,
+        "_session_affinity_mod",
+        lambda: session_affinity_seam,
+    )
+    monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    monkeypatch.setattr(lpe, "_record_codex_failure_evidence", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        lpe,
+        "_plan_codex_oauth_account_failover",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_exclude_codex_auto_agent_request_local_candidate_without_cooldown",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "execute_cooldown_publication_transaction",
+        _noop_async,
+    )
+
+    async def _run() -> object:
+        return await candidate_loop.handle_alias_route(
+            SimpleNamespace(
+                select_candidate_fn=_select,
+                perform_candidate_request_fn=_perform,
+                resolve_cooldown_publication_fn=(
+                    lpe._resolve_auto_agent_cooldown_publication_plan
+                ),
+                publish_cooldown_memory_fn=_noop_async,
+                persist_cooldown_fn=_noop_async,
+                set_session_affinity_fn=_noop_async,
+                add_alias_metadata_fn=_add_candidate_metadata,
+                raise_redispatch_fn=lambda **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("failed Cursor skip rebind must not use alias redispatch")
+                ),
+            ),
+            alias_family="codex_auto_agent",
+            alias_model="sota-xai",
+            request=request,
+            prepared_request_body=prepared_body,
+            max_candidate_attempts=2,
+            get_active_cooldown_state_fn=_no_active_cooldown,
+            attempts_metadata_key="attempts",
+            skipped_candidates_metadata_key="skipped",
+            no_candidate_detail="no candidates",
+            log_label="Codex",
+        )
+
+    return SimpleNamespace(
+        run=_run,
+        request=request,
+        leftover=leftover,
+        provider_calls=provider_calls,
+        selection_calls=selection_calls,
+        metadata_attempts=metadata_attempts,
+        rebuilt_request_body=rebuilt_request_body,
+        xai_candidate=xai_candidate,
+    )
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_cursor_skip_failed_rebind_no_identity_raises_before_xai(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leftover = session_affinity.SessionOwnerLease(
+        session_identity=None,
+        reservation_token=None,
+        held_reservation=False,
+        decision=session_affinity.SessionOwnerGuardDecision.UNOWNED_RESERVED.value,
+    )
+    harness = _cursor_skip_rebind_handle_alias_harness(
+        monkeypatch,
+        leftover=leftover,
+        suppress_request_call_id=True,
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await harness.run()
+
+    assert caught.value.status_code == 409
+    detail = caught.value.detail
+    assert detail["error"]["code"] == "aawm_session_owner_redispatch_required"
+    assert detail["failure_phase"] == "session_owner_redispatch_missing_identity"
+    assert detail["attempted_provider_call"] is False
+    assert detail.get("canonical_session_identity") is None
+    assert harness.provider_calls == ["cursor_agent"]
+    assert len(harness.selection_calls) == 1
+    assert session_affinity.get_request_session_owner_lease(harness.request) is None
+    assert session_affinity.get_request_effective_session_identity(harness.request) is None
+    attempts = harness.metadata_attempts[-1]
+    assert attempts[0]["attempted_provider_call"] is False
+    assert attempts[0]["provider_attempt_budget_refunded"] is True
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_cursor_skip_failed_rebind_live_reservation_preserves_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leftover = session_affinity.SessionOwnerLease(
+        session_identity="cursor-live",
+        reservation_token="tok-live",
+        held_reservation=True,
+        released=False,
+        promoted=False,
+    )
+    harness = _cursor_skip_rebind_handle_alias_harness(
+        monkeypatch,
+        leftover=leftover,
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await harness.run()
+
+    assert caught.value.status_code == 409
+    detail = caught.value.detail
+    assert detail["error"]["code"] == "aawm_session_owner_redispatch_required"
+    assert detail["failure_phase"] == "session_owner_held_lease_on_identity_transition"
+    assert detail["attempted_provider_call"] is False
+    assert harness.provider_calls == ["cursor_agent"]
+    assert len(harness.selection_calls) == 1
+    assert session_affinity.get_request_session_owner_lease(harness.request) is leftover
+    assert leftover.held_reservation is True
+    assert leftover.reservation_token == "tok-live"
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_cursor_skip_failed_rebind_promoted_owner_preserves_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leftover = session_affinity.SessionOwnerLease(
+        session_identity="cursor-owned",
+        reservation_token="tok-owned",
+        held_reservation=False,
+        promoted=True,
+    )
+    harness = _cursor_skip_rebind_handle_alias_harness(
+        monkeypatch,
+        leftover=leftover,
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await harness.run()
+
+    assert caught.value.status_code == 409
+    detail = caught.value.detail
+    assert detail["error"]["code"] == "aawm_session_owner_redispatch_required"
+    assert detail["failure_phase"] == "session_owner_request_lease_identity_conflict"
+    assert detail["attempted_provider_call"] is False
+    assert harness.provider_calls == ["cursor_agent"]
+    assert len(harness.selection_calls) == 1
+    assert session_affinity.get_request_session_owner_lease(harness.request) is leftover
+    assert leftover.promoted is True
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_cursor_skip_failed_rebind_previous_response_id_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leftover = session_affinity.SessionOwnerLease(
+        session_identity="cursor-turn-1",
+        held_reservation=False,
+        reservation_token=None,
+    )
+    unsafe_body = {
+        "model": "sota-xai",
+        "previous_response_id": "resp_cursor_owned",
+        "input": [{"type": "function_call_output", "call_id": "x", "output": "."}],
+    }
+    harness = _cursor_skip_rebind_handle_alias_harness(
+        monkeypatch,
+        leftover=leftover,
+        gate_replay_safe=True,
+        rebuilt_body_override=unsafe_body,
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await harness.run()
+
+    assert caught.value.status_code == 409
+    detail = caught.value.detail
+    assert detail["error"]["code"] == "aawm_session_owner_redispatch_required"
+    assert detail["failure_phase"] == "session_owner_redispatch_previous_response_id"
+    assert detail["attempted_provider_call"] is False
+    assert harness.provider_calls == ["cursor_agent"]
+    assert len(harness.selection_calls) == 1
+    assert session_affinity.get_request_session_owner_lease(harness.request) is leftover
+    assert session_affinity.get_request_effective_session_identity(harness.request) is None
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_cursor_skip_successful_rebind_still_tries_next_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leftover = session_affinity.SessionOwnerLease(
+        session_identity="cursor-turn-1",
+        cache_key="cursor-turn-1",
+        reservation_token=None,
+        held_reservation=False,
+        decision=session_affinity.SessionOwnerGuardDecision.UNOWNED_RESERVED.value,
+    )
+    harness = _cursor_skip_rebind_handle_alias_harness(
+        monkeypatch,
+        leftover=leftover,
+    )
+
+    response = await harness.run()
+
+    assert response == {"candidate": harness.xai_candidate["model"]}
+    assert harness.provider_calls == ["cursor_agent", "xai"]
+    assert len(harness.selection_calls) == 2
+    assert harness.selection_calls[1]["excluded_candidate_keys"] == frozenset(
+        {"cursor_agent:cursor-grok-4.6-high"}
+    )
+    assert session_affinity.get_request_session_owner_lease(harness.request) is None
+    effective = session_affinity.get_request_effective_session_identity(harness.request)
+    assert effective is not None
+    assert effective.startswith(
+        session_affinity._SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_PREFIX
+    )
 
 
 @pytest.mark.asyncio
@@ -6103,6 +6624,8 @@ async def test_candidate_loop_cursor_sanitized_proto_structure_reaches_attempt_a
         }
 
     session_affinity = SimpleNamespace(
+        DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS=0,
+        set_competing_reservation_log_deferred=lambda *_a, **_k: None,
         is_replay_safe_session_owner_redispatch_body=lambda _body: False,
         validate_cursor_replay_matches_body=lambda *_args, **_kwargs: False,
         resolve_canonical_session_identity=lambda *_args, **_kwargs: None,
@@ -6113,6 +6636,7 @@ async def test_candidate_loop_cursor_sanitized_proto_structure_reaches_attempt_a
         finalize_session_owner_lease_on_success=_noop_async,
         finalize_session_owner_lease_on_failure=_noop_async,
         reset_released_request_session_owner_guard=lambda _request: False,
+        get_session_owner_continuity_receipt=lambda _request: None,
         SessionOwnerMutationOutcome=SimpleNamespace(
             CONFLICT="conflict",
             ERROR="error",
