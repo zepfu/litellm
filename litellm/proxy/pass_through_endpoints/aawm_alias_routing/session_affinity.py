@@ -8172,6 +8172,145 @@ def set_validated_cursor_replay(
     )
 
 
+_CURSOR_SKIP_REBIND_AUTHORITATIVE_SESSION_KEYS = (
+    "session_id",
+    "aawm_session_id",
+    "codex_session_id",
+    "claude_session_id",
+    "anthropic_session_id",
+    "codex_thread_id",
+)
+_CURSOR_SKIP_REBIND_AUTHORITATIVE_HEADER_KEYS = (
+    "session-id",
+    "x-session-id",
+    "x-aawm-session-id",
+    "x-codex-session-id",
+    "x-claude-session-id",
+    "anthropic-beta-session-id",
+    "x-codex-thread-id",
+    "codex-thread-id",
+)
+_CURSOR_SKIP_REBIND_AUTHORITATIVE_HEADER_NAMES = {
+    "session_id",
+    "x_session_id",
+    "x_aawm_session_id",
+    "x_codex_session_id",
+    "x_claude_session_id",
+    "anthropic_beta_session_id",
+    "x_codex_thread_id",
+    "codex_thread_id",
+}
+
+
+def _request_session_owner_call_id(request: Any) -> Optional[str]:
+    state = getattr(request, "state", None) if request is not None else None
+    if state is None:
+        return None
+    call_id = _clean_optional_str(
+        getattr(state, _SESSION_OWNER_REQUEST_CALL_ID_STATE_KEY, None)
+    )
+    if call_id is not None:
+        return call_id
+    context = getattr(state, _SESSION_OWNER_REQUEST_CONTEXT_STATE_KEY, None)
+    if isinstance(context, Mapping):
+        return _clean_optional_str(context.get("litellm_call_id"))
+    return None
+
+
+def _cursor_skip_rebind_authoritative_identity(
+    request: Any,
+    rebuilt_body: Optional[Mapping[str, Any]],
+) -> Optional[str]:
+    """Return a request-owned Codex/session identity, not inherited thread ids."""
+
+    def _canonical(value: Any) -> Optional[str]:
+        cleaned = _clean_identity_str(value)
+        if cleaned is None:
+            return None
+        return _strip_legacy_affinity_prefixes(cleaned)
+
+    effective_identity = get_request_effective_session_identity(request)
+    if effective_identity is not None:
+        return effective_identity
+    review_identity = get_request_codex_auto_review_session_identity(request)
+    if review_identity is not None:
+        return review_identity
+
+    body = rebuilt_body if isinstance(rebuilt_body, Mapping) else {}
+    metadata = body.get("litellm_metadata")
+    client_metadata = body.get("client_metadata")
+
+    def _mapping_value(mapping: Any, key: str) -> Optional[str]:
+        if not isinstance(mapping, Mapping):
+            return None
+        return _canonical(mapping.get(key))
+
+    for mapping in (client_metadata, metadata):
+        for key in _CURSOR_SKIP_REBIND_AUTHORITATIVE_SESSION_KEYS:
+            value = _mapping_value(mapping, key)
+            if value is not None:
+                return value
+
+    headers = getattr(request, "headers", None) if request is not None else None
+    if headers is not None:
+        try:
+            items = headers.items()  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            items = []
+        header_map = {
+            str(name).lower(): _canonical(value) for name, value in items
+        }
+        for key in _CURSOR_SKIP_REBIND_AUTHORITATIVE_HEADER_KEYS:
+            value = header_map.get(key)
+            if value is not None:
+                return value
+        for name, value in header_map.items():
+            if value and name.replace("-", "_") in (
+                _CURSOR_SKIP_REBIND_AUTHORITATIVE_HEADER_NAMES
+            ):
+                return value
+
+    if isinstance(body, Mapping):
+        for key in _CURSOR_SKIP_REBIND_AUTHORITATIVE_SESSION_KEYS:
+            value = _canonical(body.get(key))
+            if value is not None:
+                return value
+    return None
+
+
+def _cursor_skip_rebind_base_session_identity(
+    request: Any,
+    *,
+    rebuilt_body: Optional[Mapping[str, Any]],
+    base_session_identity: Optional[str],
+    lease: Optional[Any],
+) -> Optional[str]:
+    """Select skip-rebind minting base without inheriting a parent identity.
+
+    Authoritative Codex/session identity on this request stays first. Ohmypi
+    parent/child requests that omitted identity mint from this request's call
+    id, even when leftover Cursor lease identity, caller-injected parent
+    identity, or shared thread headers are present. Same-request retries keep
+    that call-id derivation. Leftover lease / generic canonical identity are
+    last-resort only when this request has no call id.
+    """
+
+    owned = _cursor_skip_rebind_authoritative_identity(request, rebuilt_body)
+    if owned is not None:
+        return owned
+    call_id = _request_session_owner_call_id(request)
+    if call_id is not None:
+        return call_id
+    explicit = _clean_optional_str(base_session_identity)
+    if explicit is not None:
+        return explicit
+    if lease is not None:
+        leftover = _clean_optional_str(lease.session_identity)
+        if leftover is not None:
+            return leftover
+    return resolve_canonical_session_identity(request, rebuilt_body)
+
+
 def rebind_request_session_owner_after_cursor_replay_skip(
     request: Any,
     *,
@@ -8188,7 +8327,10 @@ def rebind_request_session_owner_after_cursor_replay_skip(
     Ohmypi often omits a canonical session identity; mint a request-local
     redispatch identity from the request call id so native xAI can promote
     instead of 409ing ``session_owner_stream_promote`` with outcome skipped.
-    Codex ``previous_response_id`` bodies stay fail-closed.
+    An inherited parent session identity is not used as a child rebind base
+    solely because the child omitted identity. Codex session identity stays
+    authoritative when present. Codex ``previous_response_id`` bodies stay
+    fail-closed.
     """
 
     if request is None:
@@ -8209,11 +8351,12 @@ def rebind_request_session_owner_after_cursor_replay_skip(
     )
     if live_reservation:
         return False
-    base = _clean_optional_str(base_session_identity)
-    if base is None and lease is not None:
-        base = _clean_optional_str(lease.session_identity)
-    if base is None:
-        base = resolve_canonical_session_identity(request, rebuilt_body)
+    base = _cursor_skip_rebind_base_session_identity(
+        request,
+        rebuilt_body=rebuilt_body,
+        base_session_identity=base_session_identity,
+        lease=lease,
+    )
     if lease is not None:
         if lease.released:
             if not reset_released_request_session_owner_guard(request):
@@ -8223,14 +8366,6 @@ def rebind_request_session_owner_after_cursor_replay_skip(
             setattr(state, _REQUEST_STATE_GUARDED_ATTR, False)
     if get_request_session_owner_lease(request) is not None:
         return False
-    if base is None:
-        base = _clean_optional_str(
-            getattr(state, _SESSION_OWNER_REQUEST_CALL_ID_STATE_KEY, None)
-        )
-    if base is None:
-        context = getattr(state, _SESSION_OWNER_REQUEST_CONTEXT_STATE_KEY, None)
-        if isinstance(context, Mapping):
-            base = _clean_optional_str(context.get("litellm_call_id"))
     if base is None:
         return False
     activate_session_owner_redispatch_effective_identity(

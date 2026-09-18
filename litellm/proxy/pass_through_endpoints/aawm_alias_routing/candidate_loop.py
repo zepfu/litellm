@@ -4876,19 +4876,15 @@ async def handle_alias_route(  # noqa: PLR0915
                     )
                     if fresh_fallback_body is not None:
                         sa_mod = _session_affinity_mod()
-                        leftover_lease = (
-                            session_owner_lease
-                            or sa_mod.get_request_session_owner_lease(request)
-                        )
                         base_session_identity = session_owner_identity
                         if not isinstance(base_session_identity, str) or not (
                             base_session_identity.strip()
                         ):
-                            base_session_identity = (
-                                leftover_lease.session_identity
-                                if leftover_lease is not None
-                                else None
-                            )
+                            # Do not inject leftover Cursor/parent lease
+                            # identity just because this request omitted one.
+                            # The skip-rebind helper mints from this request's
+                            # call id, or fail-closes when no identity exists.
+                            base_session_identity = None
                         prepared_request_body = fresh_fallback_body
                         has_continuation_state = _codex_auto_agent_request_has_continuation_state(
                             prepared_request_body

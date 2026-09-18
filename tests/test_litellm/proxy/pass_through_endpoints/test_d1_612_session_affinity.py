@@ -2410,6 +2410,221 @@ def test_cursor_replay_skip_keeps_previous_response_id_fail_closed() -> None:
     assert sa.get_request_effective_session_identity(request) is None
 
 
+def _ohmypi_cursor_skip_request(
+    *,
+    model: str,
+    call_id: str,
+    leftover_identity: Optional[str] = "ohmypi-parent-thread",
+    headers: Optional[dict[str, str]] = None,
+    body_extra: Optional[dict[str, Any]] = None,
+    promoted: bool = False,
+    live_reservation: bool = False,
+) -> Any:
+    from starlette.datastructures import State
+
+    request = type("Req", (), {})()
+    request.state = State()
+    request.state.aawm_alias_request_litellm_call_id = call_id
+    request.headers = dict(headers or {"x-thread-id": "ohmypi-parent-thread"})
+    leftover = sa.SessionOwnerLease(
+        session_identity=leftover_identity,
+        cache_key=leftover_identity,
+        reservation_token="tok-live" if live_reservation else None,
+        held_reservation=live_reservation,
+        released=False,
+        promoted=promoted,
+        decision=sa.SessionOwnerGuardDecision.UNOWNED_RESERVED.value,
+        attributes={
+            "provider": "cursor_agent",
+            "model": "cursor_agent/cursor-grok-4.6-high",
+            "route_family": "codex_cursor_agent_aiserver_adapter",
+        },
+    )
+    sa.set_request_session_owner_lease(request, leftover)
+    body = _cursor_skip_replay_safe_body()
+    body["model"] = model
+    if body_extra:
+        body.update(body_extra)
+    return request, leftover, body
+
+
+def test_cursor_replay_skip_isolates_ohmypi_parent_and_child_identities() -> None:
+    """Parent/child skip-rebind must not share an inherited Ohmypi identity."""
+
+    parent_thread = "ohmypi-parent-thread"
+    parent_call_id = "sota-xai-parent-call"
+    child_call_ids = {
+        "basic": "ohmypi-basic-call",
+        "work": "ohmypi-work-call",
+        "expert": "ohmypi-expert-call",
+    }
+    codex_session = "codex-authoritative-session"
+    expected_parent = sa.derive_session_owner_effective_identity(parent_call_id)
+    expected_children = {
+        alias: sa.derive_session_owner_effective_identity(call_id)
+        for alias, call_id in child_call_ids.items()
+    }
+    expected_codex = sa.derive_session_owner_effective_identity(codex_session)
+
+    parent_request, _parent_lease, parent_body = _ohmypi_cursor_skip_request(
+        model="sota-xai",
+        call_id=parent_call_id,
+    )
+    basic_request, _basic_lease, basic_body = _ohmypi_cursor_skip_request(
+        model="basic",
+        call_id=child_call_ids["basic"],
+    )
+    work_request, _work_lease, work_body = _ohmypi_cursor_skip_request(
+        model="work",
+        call_id=child_call_ids["work"],
+    )
+    expert_request, _expert_lease, expert_body = _ohmypi_cursor_skip_request(
+        model="expert",
+        call_id=child_call_ids["expert"],
+    )
+    codex_request, _codex_lease, codex_body = _ohmypi_cursor_skip_request(
+        model="gpt-5.4",
+        call_id="codex-request-call",
+        headers={
+            "x-thread-id": parent_thread,
+            "x-codex-session-id": codex_session,
+        },
+        body_extra={"session_id": codex_session},
+    )
+    parent_retry_request, _parent_retry_lease, parent_retry_body = (
+        _ohmypi_cursor_skip_request(
+            model="sota-xai",
+            call_id=parent_call_id,
+        )
+    )
+    promoted_request, promoted_lease, promoted_body = _ohmypi_cursor_skip_request(
+        model="sota-xai",
+        call_id="promoted-call",
+        leftover_identity="cursor-owned",
+        promoted=True,
+    )
+    live_request, live_lease, live_body = _ohmypi_cursor_skip_request(
+        model="basic",
+        call_id="live-call",
+        leftover_identity="cursor-live",
+        live_reservation=True,
+    )
+
+    # Interleave parent, children, Codex, and a same-call-id parent retry so a
+    # shared inherited identity cannot hide behind a lucky request order.
+    assert (
+        sa.rebind_request_session_owner_after_cursor_replay_skip(
+            parent_request,
+            rebuilt_body=parent_body,
+            base_session_identity=parent_thread,
+        )
+        is True
+    )
+    parent_identity = sa.get_request_effective_session_identity(parent_request)
+    assert parent_identity == expected_parent
+
+    assert (
+        sa.rebind_request_session_owner_after_cursor_replay_skip(
+            basic_request,
+            rebuilt_body=basic_body,
+            base_session_identity=parent_thread,
+        )
+        is True
+    )
+    assert (
+        sa.rebind_request_session_owner_after_cursor_replay_skip(
+            work_request,
+            rebuilt_body=work_body,
+            # Child omitted identity; leftover lease + thread headers still
+            # carry the inherited parent identity.
+            base_session_identity=None,
+        )
+        is True
+    )
+    assert (
+        sa.rebind_request_session_owner_after_cursor_replay_skip(
+            parent_retry_request,
+            rebuilt_body=parent_retry_body,
+            base_session_identity=parent_thread,
+        )
+        is True
+    )
+    assert (
+        sa.rebind_request_session_owner_after_cursor_replay_skip(
+            expert_request,
+            rebuilt_body=expert_body,
+            base_session_identity=parent_thread,
+        )
+        is True
+    )
+    assert (
+        sa.rebind_request_session_owner_after_cursor_replay_skip(
+            codex_request,
+            rebuilt_body=codex_body,
+            base_session_identity=parent_thread,
+        )
+        is True
+    )
+
+    basic_identity = sa.get_request_effective_session_identity(basic_request)
+    work_identity = sa.get_request_effective_session_identity(work_request)
+    expert_identity = sa.get_request_effective_session_identity(expert_request)
+    codex_identity = sa.get_request_effective_session_identity(codex_request)
+    parent_retry_identity = sa.get_request_effective_session_identity(
+        parent_retry_request
+    )
+
+    assert basic_identity == expected_children["basic"]
+    assert work_identity == expected_children["work"]
+    assert expert_identity == expected_children["expert"]
+    assert parent_retry_identity == expected_parent
+    assert {parent_identity, basic_identity, work_identity, expert_identity} == {
+        expected_parent,
+        expected_children["basic"],
+        expected_children["work"],
+        expected_children["expert"],
+    }
+    assert parent_identity not in {
+        basic_identity,
+        work_identity,
+        expert_identity,
+    }
+    assert len({basic_identity, work_identity, expert_identity}) == 3
+    assert codex_identity == expected_codex
+    assert codex_identity not in {
+        parent_identity,
+        basic_identity,
+        work_identity,
+        expert_identity,
+        sa.derive_session_owner_effective_identity("codex-request-call"),
+    }
+
+    assert (
+        sa.rebind_request_session_owner_after_cursor_replay_skip(
+            promoted_request,
+            rebuilt_body=promoted_body,
+            base_session_identity="cursor-owned",
+        )
+        is False
+    )
+    assert sa.get_request_session_owner_lease(promoted_request) is promoted_lease
+    assert promoted_lease.promoted is True
+    assert sa.get_request_effective_session_identity(promoted_request) is None
+
+    assert (
+        sa.rebind_request_session_owner_after_cursor_replay_skip(
+            live_request,
+            rebuilt_body=live_body,
+            base_session_identity="cursor-live",
+        )
+        is False
+    )
+    assert sa.get_request_session_owner_lease(live_request) is live_lease
+    assert live_lease.held_reservation is True
+    assert live_lease.reservation_token == "tok-live"
+    assert sa.get_request_effective_session_identity(live_request) is None
+
+
 def test_codex_auto_review_identity_is_exact_idempotent_and_canonical() -> None:
     from starlette.datastructures import State
 
