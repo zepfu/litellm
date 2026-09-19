@@ -2779,6 +2779,12 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         )
     )
     if provider_attributed_status:
+        if (
+            status_code == 524
+            and isinstance(candidate, dict)
+            and candidate.get("provider") == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER
+        ):
+            return "upstream_timeout"
         if status_code in _CODEX_AUTO_AGENT_TRANSIENT_UPSTREAM_STATUS_CODES:
             return "upstream_transient_internal"
         if status_code in {408, 504}:
@@ -3061,6 +3067,12 @@ def _get_codex_auto_agent_cooldown_seconds(
         resolved = _CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
     elif _extract_adapter_exception_status_code(exc) in {429, 503, 529}:
         resolved = _CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+    elif (
+        _extract_adapter_exception_status_code(exc) == 524
+        and isinstance(candidate, dict)
+        and candidate.get("provider") == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER
+    ):
+        resolved = _CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS
     else:
         resolved = _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS
 
