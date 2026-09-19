@@ -21,6 +21,7 @@ from litellm.llms.cursor_agent.connect import (
 )
 from litellm.llms.cursor_agent.constants import CURSOR_CLI_KEY_ENV
 from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
+    AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG,
     CURSOR_AGENT_CLI_INBOUND_PROVIDER,
     CURSOR_AGENT_CLI_INBOUND_ROUTE_FAMILY,
     CURSOR_AGENT_CLI_INBOUND_TRACE_NAME,
@@ -1284,3 +1285,196 @@ async def test_inbound_middleware_dispatches_http1_without_fastapi() -> None:
     assert inner_called is False
     start = next(message for message in sent if message.get("type") == "http.response.start")
     assert start["status"] == 401
+
+
+_HEALTHY_INBOUND_LOG_MARKERS = (
+    "cursor_agent_cli_inbound lifecycle",
+    "cursor_agent_cli_inbound Run http_version=",
+    "cursor_agent_cli_inbound RunSSE http_version=",
+    "cursor_agent_cli_inbound opened agentn stream_id=",
+    "cursor_agent_cli_inbound agentn response status=",
+    "cursor_agent_cli_inbound agentn data bytes=",
+    "cursor_agent_cli_inbound agentn read EOF",
+    "cursor_agent_cli_inbound auto-answered request_context",
+    "cursor_agent_cli_inbound wrote agentn bytes=",
+    "cursor_agent_cli_inbound forwarded bytes=",
+)
+
+
+def _assert_healthy_inbound_logs_not_info(caplog) -> None:
+    info_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "INFO"
+    ]
+    hits = [
+        message
+        for message in info_messages
+        if any(marker in message for marker in _HEALTHY_INBOUND_LOG_MARKERS)
+    ]
+    assert hits == [], hits
+
+
+def test_healthy_inbound_debug_log_stays_debug_by_default(monkeypatch, caplog) -> None:
+    from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
+        _cursor_inbound_debug_log,
+        _log_inbound_cli_lifecycle,
+    )
+
+    monkeypatch.delenv(AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG, raising=False)
+    caplog.set_level("DEBUG", logger="LiteLLM Proxy")
+    _cursor_inbound_debug_log(
+        "cursor_agent_cli_inbound forwarded bytes=%s flags=%s", 25936, 0
+    )
+    _cursor_inbound_debug_log("cursor_agent_cli_inbound agentn data bytes=%s", 5266)
+    _cursor_inbound_debug_log(
+        "cursor_agent_cli_inbound wrote agentn bytes=%s end_stream=%s pending=%s",
+        12,
+        False,
+        12,
+    )
+    _log_inbound_cli_lifecycle(
+        call_id="call-1",
+        event="cleanup_finished",
+        reason="normal_response",
+        http_version="2",
+    )
+    _assert_healthy_inbound_logs_not_info(caplog)
+    debug_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "DEBUG"
+    ]
+    assert any("forwarded bytes=25936" in message for message in debug_messages)
+    assert any("agentn data bytes=5266" in message for message in debug_messages)
+    assert any("wrote agentn bytes=12" in message for message in debug_messages)
+    assert any(
+        "lifecycle call_id=call-1 event=cleanup_finished reason=normal_response"
+        in message
+        for message in debug_messages
+    )
+
+
+@pytest.mark.parametrize("value", ["0", "true", "yes", "DEBUG", "info"])
+def test_healthy_inbound_debug_log_ignores_non_exact_one(
+    monkeypatch, caplog, value: str
+) -> None:
+    from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
+        _cursor_inbound_debug_log,
+    )
+
+    monkeypatch.setenv(AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG, value)
+    caplog.set_level("DEBUG", logger="LiteLLM Proxy")
+    _cursor_inbound_debug_log("cursor_agent_cli_inbound forwarded bytes=%s flags=%s", 16, 0)
+    _assert_healthy_inbound_logs_not_info(caplog)
+
+
+def test_healthy_inbound_debug_log_promotes_on_exact_one(monkeypatch, caplog) -> None:
+    from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
+        _cursor_inbound_debug_log,
+        _log_inbound_cli_lifecycle,
+    )
+
+    monkeypatch.setenv(AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG, "1")
+    caplog.set_level("DEBUG", logger="LiteLLM Proxy")
+    _cursor_inbound_debug_log(
+        "cursor_agent_cli_inbound forwarded bytes=%s flags=%s", 25936, 0
+    )
+    _log_inbound_cli_lifecycle(
+        call_id="call-1",
+        event="cleanup_finished",
+        reason="normal_response",
+        http_version="2",
+    )
+    info_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "INFO"
+    ]
+    assert any("forwarded bytes=25936" in message for message in info_messages)
+    assert any(
+        "lifecycle call_id=call-1 event=cleanup_finished reason=normal_response"
+        in message
+        for message in info_messages
+    )
+
+
+def test_agentn_data_dispatch_is_not_info_by_default(monkeypatch, caplog) -> None:
+    from h2.events import DataReceived, ResponseReceived
+
+    from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
+        _AgentnH2Session,
+    )
+
+    class _AckConnection:
+        def acknowledge_received_data(self, *_args, **_kwargs) -> None:
+            return None
+
+    monkeypatch.delenv(AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG, raising=False)
+    caplog.set_level("DEBUG", logger="LiteLLM Proxy")
+    session = _AgentnH2Session("https://agentn.global.api5.cursor.sh")
+    session.connection = _AckConnection()
+    headers = object.__new__(ResponseReceived)
+    headers.headers = [(":status", "200"), ("content-type", "application/connect+proto")]
+    data = object.__new__(DataReceived)
+    data.data = _heartbeat_chunk()
+    data.flow_controlled_length = len(data.data)
+    data.stream_id = 1
+    session._dispatch_h2_events([headers, data])
+    _assert_healthy_inbound_logs_not_info(caplog)
+    debug_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "DEBUG"
+    ]
+    assert any("agentn response status=200" in message for message in debug_messages)
+    assert any("agentn data bytes=" in message for message in debug_messages)
+
+
+def test_agentn_stream_closed_warning_stays_visible_with_debug_gate_off(
+    monkeypatch, caplog
+) -> None:
+    from h2.events import ConnectionTerminated, DataReceived
+
+    from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
+        _AgentnH2Session,
+    )
+
+    class _AckConnection:
+        def acknowledge_received_data(self, *_args, **_kwargs) -> None:
+            return None
+
+    monkeypatch.delenv(AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG, raising=False)
+    caplog.set_level("DEBUG", logger="LiteLLM Proxy")
+    session = _AgentnH2Session("https://agentn.global.api5.cursor.sh")
+    session.connection = _AckConnection()
+    session.stream_id = 1
+    goaway = object.__new__(ConnectionTerminated)
+    goaway.error_code = 0
+    goaway.last_stream_id = 0
+    goaway.additional_data = None
+    stale = object.__new__(DataReceived)
+    stale.data = _heartbeat_chunk()
+    stale.flow_controlled_length = len(stale.data)
+    stale.stream_id = 1
+    session._dispatch_h2_events([goaway, stale])
+    _assert_healthy_inbound_logs_not_info(caplog)
+    warning_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "WARNING"
+    ]
+    assert any(
+        "cursor_agent_cli_inbound agentn stream closed event=ConnectionTerminated"
+        in message
+        for message in warning_messages
+    ), warning_messages
+
+
+def test_named_compose_files_default_inbound_debug_off() -> None:
+    repo = Path(__file__).resolve().parents[4]
+    alpha = (repo / "docker-compose.alpha.yml").read_text(encoding="utf-8")
+    dev = (repo / "docker-compose.dev.yml").read_text(encoding="utf-8")
+    expected = "AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG=${AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG:-0}"
+    assert expected in alpha
+    assert expected in dev

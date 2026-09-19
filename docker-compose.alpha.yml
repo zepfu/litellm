@@ -145,6 +145,9 @@ services:
       # Payload capture stays off by default; enable explicitly for debug sessions
       - AAWM_CAPTURE=${AAWM_CAPTURE:-0}
       - AAWM_CAPTURE_PASSTHROUGH_SHAPES=${AAWM_CAPTURE_PASSTHROUGH_SHAPES:-0}
+      # Cursor inbound Connect per-chunk diagnostics stay off unless an
+      # operator explicitly enables inbound debug.
+      - AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG=${AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG:-0}
       - LITELLM_LOG=${LITELLM_LOG:-INFO}
       - LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT=${LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT:-1}
       - LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT=${LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT:-/home/zepfu/.claude/projects}

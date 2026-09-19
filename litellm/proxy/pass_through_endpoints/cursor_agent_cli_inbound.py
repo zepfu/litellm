@@ -15,6 +15,7 @@ Raw ``CURSOR_API_KEY`` is not used as the Connect credential.
 from __future__ import annotations
 
 import asyncio
+import os
 import ssl
 import uuid
 from datetime import datetime, timezone
@@ -60,6 +61,9 @@ from litellm.proxy.pass_through_endpoints.cursor_agent_cli_hypercorn import (
 CURSOR_AGENT_CLI_INBOUND_PROVIDER = "cursor_agent_cli_inbound"
 CURSOR_AGENT_CLI_INBOUND_ROUTE_FAMILY = "cursor_agent_cli_inbound"
 CURSOR_AGENT_CLI_INBOUND_TRACE_NAME = "cursor-agent-cli-inbound"
+# Opt-in only. Exact ``1`` promotes noisy inbound Connect diagnostics to INFO
+# under ``LITELLM_LOG=INFO``. Any other value, including unset, stays DEBUG.
+AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG = "AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG"
 CURSOR_AGENT_CLI_INBOUND_TAGS = (
     "route:cursor_agent_cli_inbound",
     "cursor-agent-cli-inbound",
@@ -153,6 +157,20 @@ def _sanitize_termination_reason(reason: Any) -> str:
     return "unknown"
 
 
+def _cursor_inbound_debug_log(message: str, *args: Any) -> None:
+    """Emit high-volume inbound Cursor CLI diagnostics.
+
+    Default is DEBUG so container ``LITELLM_LOG=INFO`` stays quiet. Exact env
+    ``1`` promotes the same messages to INFO, matching ``AAWM_GROK_ROUTE_DEBUG``.
+    """
+    logger = (
+        verbose_proxy_logger.info
+        if os.getenv(AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG) == "1"
+        else verbose_proxy_logger.debug
+    )
+    logger(message, *args)
+
+
 def _log_inbound_cli_lifecycle(
     *,
     call_id: str,
@@ -169,7 +187,7 @@ def _log_inbound_cli_lifecycle(
         fields.append(f"reason={safe_reason}")
     if http_version:
         fields.append(f"http_version={http_version}")
-    verbose_proxy_logger.info(
+    _cursor_inbound_debug_log(
         "cursor_agent_cli_inbound lifecycle %s",
         " ".join(fields),
     )
@@ -1108,7 +1126,7 @@ class _AgentnH2Session:
             end_stream=False,
         )
         await self._flush_connection()
-        verbose_proxy_logger.info(
+        _cursor_inbound_debug_log(
             "cursor_agent_cli_inbound opened agentn stream_id=%s",
             self.stream_id,
         )
@@ -1144,7 +1162,7 @@ class _AgentnH2Session:
                 except ValueError:
                     self.response_status = 502
                 self._headers_event.set()
-                verbose_proxy_logger.info(
+                _cursor_inbound_debug_log(
                     "cursor_agent_cli_inbound agentn response status=%s headers=%s",
                     self.response_status,
                     ",".join(header_names),
@@ -1161,7 +1179,7 @@ class _AgentnH2Session:
                         chunks.append(forwarded)
                     if self._logged_data_chunks < _MAX_LOGGED_AGENTN_DATA_CHUNKS:
                         self._logged_data_chunks += 1
-                        verbose_proxy_logger.info(
+                        _cursor_inbound_debug_log(
                             "cursor_agent_cli_inbound agentn data bytes=%s forwarded=%s auto_replies=%s %s",
                             len(payload),
                             len(forwarded),
@@ -1169,7 +1187,7 @@ class _AgentnH2Session:
                             _summarize_connect_chunk(payload),
                         )
                     else:
-                        verbose_proxy_logger.info(
+                        _cursor_inbound_debug_log(
                             "cursor_agent_cli_inbound agentn data bytes=%s",
                             len(payload),
                         )
@@ -1225,7 +1243,7 @@ class _AgentnH2Session:
                 incoming = await reader.read(64 * 1024)
                 if not incoming:
                     self._mark_upstream_termination("upstream_eof")
-                    verbose_proxy_logger.info(
+                    _cursor_inbound_debug_log(
                         "cursor_agent_cli_inbound agentn read EOF status=%s",
                         self.response_status,
                     )
@@ -1245,7 +1263,7 @@ class _AgentnH2Session:
                 if connection_done:
                     break
                 for reply in auto_replies:
-                    verbose_proxy_logger.info(
+                    _cursor_inbound_debug_log(
                         "cursor_agent_cli_inbound auto-answered request_context bytes=%s",
                         len(reply),
                     )
@@ -1333,7 +1351,7 @@ class _AgentnH2Session:
                     "Inbound Cursor Agent CLI request half-close failed.",
                     status_code=502,
                 )
-        verbose_proxy_logger.info(
+        _cursor_inbound_debug_log(
             "cursor_agent_cli_inbound wrote agentn bytes=%s end_stream=%s pending=%s",
             len(data),
             end_stream,
@@ -1593,7 +1611,7 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
             )
             return
 
-        verbose_proxy_logger.info(
+        _cursor_inbound_debug_log(
             "cursor_agent_cli_inbound Run http_version=%s client=%s",
             http_version,
             client_host,
@@ -1694,7 +1712,7 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
             )
             async for chunk in session.iter_response_data():
                 if chunk:
-                    verbose_proxy_logger.info(
+                    _cursor_inbound_debug_log(
                         "cursor_agent_cli_inbound forwarded bytes=%s flags=%s",
                         len(chunk),
                         chunk[0] if chunk else -1,
@@ -2116,7 +2134,7 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
             )
             return
 
-        verbose_proxy_logger.info(
+        _cursor_inbound_debug_log(
             "cursor_agent_cli_inbound RunSSE http_version=%s client=%s",
             http_version,
             client_host,

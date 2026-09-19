@@ -65,6 +65,11 @@ def test_named_container_start_commands_enable_hypercorn() -> None:
     assert "--run_hypercorn" in dockerfile_dev
     assert "--run_hypercorn" in dockerfile_alpha
     assert "hypercorn==0.15.0" in requirements
+    inbound_debug = (
+        "AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG=${AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG:-0}"
+    )
+    assert inbound_debug in compose_dev
+    assert inbound_debug in compose_alpha
 
 
 class _LoopExceptionTrap:

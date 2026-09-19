@@ -51,6 +51,13 @@ Cloud Agents Basic `API_KEY:` is unchanged on `/cursor` and is not accepted
 here. Raw `CURSOR_API_KEY` is not sent as the Connect credential; API-key
 exchange stays on `api2`.
 
+Healthy inbound Connect diagnostics (`lifecycle`, Run/RunSSE start, opened
+stream, agentn response/data/EOF, auto-answered `request_context`, wrote
+agentn bytes, forwarded bytes) are DEBUG. Named containers keep
+`AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG=0`. Exact `1` promotes those same
+messages to INFO for a debug window. WARNING/ERROR (stream closed, connect
+or proxy failures) stay visible.
+
 `session_history` / Langfuse rows for inbound `Run` use provider
 `cursor_agent_cli_inbound`, tags `route:cursor_agent_cli_inbound` /
 `inbound-versus-outbound:inbound`, and metadata
