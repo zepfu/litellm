@@ -24,6 +24,8 @@ from typing import Any, Awaitable, Callable, Optional, Sequence
 from fastapi import Request
 
 from .interfaces import CooldownPublicationPlan
+from .failure_vocabulary import OPENROUTER_CREDIT_EXHAUSTED
+from .lane_keys import openrouter_credit_lane_cooldown_key
 from .policy import (
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES,
@@ -211,6 +213,19 @@ def _resolve_auto_agent_cooldown_publication_plan(
             applied_scope="candidate",
             grok_account_quota_exhausted=grok_account_quota_exhausted,
             kimi_failure_metadata=kimi_failure_metadata,
+        )
+    if error_class == OPENROUTER_CREDIT_EXHAUSTED:
+        # Structured billing evidence is credential-wide, never model/alias-wide.
+        # A missing credential cannot safely identify a shared cooldown target.
+        credit_key = openrouter_credit_lane_cooldown_key(candidate, lane_key)
+        if credit_key is None:
+            return CooldownPublicationPlan(
+                applied_scope="request_local", duration_seconds=duration,
+                request_local_action="request_local_cooldown",
+            )
+        return CooldownPublicationPlan(
+            memory_keys=(credit_key,), durable_keys=(credit_key,),
+            duration_seconds=duration, applied_scope="account",
         )
     allow_ttl_shrink = _is_managed_openai_usage_limit_candidate(
         candidate,
@@ -401,6 +416,12 @@ async def _apply_auto_agent_alias_cooldown(
         candidate=candidate,
         kimi_failure_metadata=kimi_failure_metadata,
     )
+    if error_class == OPENROUTER_CREDIT_EXHAUSTED:
+        credit_key = openrouter_credit_lane_cooldown_key(candidate, lane_key)
+        if credit_key is not None:
+            await set_candidate_cooldown(credit_key, cooldown_seconds)
+            return "account"
+        cooldown_scope = "request_local"
     if cooldown_scope == "none":
         return cooldown_scope
     if cooldown_scope == "managed_account":

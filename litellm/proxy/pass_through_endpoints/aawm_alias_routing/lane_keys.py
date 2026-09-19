@@ -261,6 +261,25 @@ def _codex_auto_agent_candidate_key(
         return "h{}:{}".format(cooldown_identity_tag, base)
     return base
 
+def resolve_openrouter_credential_lane_key() -> str:
+    """Use the same effective credential as egress; preserve missing-key lanes."""
+    from ..providers.openrouter.runtime import _get_openrouter_api_key
+
+    credential = _get_openrouter_api_key()
+    if not credential:
+        return "openrouter"
+    return "openrouter:credential:" + _hash_codex_auto_agent_lane_value(credential)
+
+
+def openrouter_credit_lane_cooldown_key(candidate: dict[str, Any], lane_key: Optional[str]) -> Optional[str]:
+    # Never publish billing state under the legacy shared/default lane.
+    if candidate.get("provider") != "openrouter" or not isinstance(lane_key, str):
+        return None
+    if re.fullmatch(r"openrouter:credential:[0-9a-f]{12}", lane_key) is None:
+        return None
+    return "openrouter:__credit_exhausted__:" + lane_key
+
+
 def _resolve_codex_auto_agent_xai_lane_key(candidate: dict[str, Any]) -> str:
     route_family = str(candidate.get("route_family") or "")
     if route_family in {

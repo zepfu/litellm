@@ -31,6 +31,8 @@ from . import cooldown_state as _cooldown_state
 from . import codex_quota_balance as _codex_quota_balance
 from .cooldown_state import _attach_aawm_alias_routing_state_sources
 from .lane_keys import (
+    openrouter_credit_lane_cooldown_key,
+    resolve_openrouter_credential_lane_key,
     _codex_auto_agent_candidate_key,
     _resolve_anthropic_auto_agent_native_cooldown_lane_key,
     _resolve_codex_auto_agent_openai_cooldown_lane_key,
@@ -60,7 +62,6 @@ from .policy import (
     CODEX_AUTO_AGENT_OPENCODE_PROVIDER as _CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
     CODEX_AUTO_AGENT_OPENCODE_GO_LANE_KEY as _CODEX_AUTO_AGENT_OPENCODE_GO_LANE_KEY,
     CODEX_AUTO_AGENT_OPENCODE_GO_PROVIDER as _CODEX_AUTO_AGENT_OPENCODE_GO_PROVIDER,
-    CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY as _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY,
     CODEX_AUTO_AGENT_OPENROUTER_PROVIDER as _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
     CODEX_AUTO_AGENT_XAI_PROVIDER as _CODEX_AUTO_AGENT_XAI_PROVIDER,
 )
@@ -1848,6 +1849,22 @@ async def _apply_kimi_code_managed_account_lane_cooldown(
     if skip_reason is None:
         skip_reason = "managed_account_cooldown"
     return cooldown_seconds, cooldown_state_source, skip_reason, "managed_account"
+
+
+async def _apply_openrouter_credit_lane_cooldown(
+    *, candidate: dict[str, Any], lane_key: Optional[str], cooldown_seconds: float,
+    cooldown_state_source: Optional[str], skip_reason: Optional[str],
+    get_active_cooldown_state: Callable[[str], Awaitable[tuple[float, str]]],
+) -> tuple[float, Optional[str], Optional[str]]:
+    key = openrouter_credit_lane_cooldown_key(candidate, lane_key)
+    if key is None:
+        return cooldown_seconds, cooldown_state_source, skip_reason
+    seconds, source = await get_active_cooldown_state(key)
+    if seconds > cooldown_seconds:
+        cooldown_seconds, cooldown_state_source = seconds, source
+    if seconds > 0 and skip_reason is None:
+        skip_reason = "credential_credit_exhausted"
+    return cooldown_seconds, cooldown_state_source, skip_reason
 
 
 async def _apply_codex_auto_agent_grok_account_lane_cooldown(
@@ -3734,7 +3751,7 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
     failure_phase: Optional[str] = None
     attempted_provider_call: Optional[bool] = None
     if candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
-        lane_key = _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
+        lane_key = resolve_openrouter_credential_lane_key()
     elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
         lane_key = _resolve_codex_auto_agent_xai_lane_key(candidate)
     elif candidate["provider"] == _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER:
@@ -3793,6 +3810,11 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         cooldown_seconds=cooldown_seconds,
         cooldown_state_source=cooldown_state_source,
         skip_reason=skip_reason,
+        get_active_cooldown_state=active_cooldown_state,
+    )
+    cooldown_seconds, cooldown_state_source, skip_reason = await _apply_openrouter_credit_lane_cooldown(
+        candidate=candidate, lane_key=lane_key, cooldown_seconds=cooldown_seconds,
+        cooldown_state_source=cooldown_state_source, skip_reason=skip_reason,
         get_active_cooldown_state=active_cooldown_state,
     )
     (
@@ -4517,7 +4539,7 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
     failure_phase: Optional[str] = None
     attempted_provider_call: Optional[bool] = None
     if candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
-        lane_key = _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
+        lane_key = resolve_openrouter_credential_lane_key()
     elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
         lane_key = _resolve_codex_auto_agent_xai_lane_key(candidate)
     elif candidate["provider"] == _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER:
@@ -4573,6 +4595,11 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
         cooldown_seconds=cooldown_seconds,
         cooldown_state_source=cooldown_state_source,
         skip_reason=skip_reason,
+        get_active_cooldown_state=_get_anthropic_active_cooldown_state,
+    )
+    cooldown_seconds, cooldown_state_source, skip_reason = await _apply_openrouter_credit_lane_cooldown(
+        candidate=candidate, lane_key=lane_key, cooldown_seconds=cooldown_seconds,
+        cooldown_state_source=cooldown_state_source, skip_reason=skip_reason,
         get_active_cooldown_state=_get_anthropic_active_cooldown_state,
     )
     (
@@ -7604,6 +7631,8 @@ def install(host_globals: dict) -> None:
         _cooldown_state._attach_aawm_alias_routing_state_sources
     )
     for _name in (
+        "resolve_openrouter_credential_lane_key",
+        "_apply_openrouter_credit_lane_cooldown",
         "_is_finite_number",
         "_cohere_observation_exhausted",
         "_cohere_local_quota_exhausted",
