@@ -177,16 +177,27 @@ async def _close_protocol(protocol: Any, task_group: Any) -> None:
         await protocol.has_data.set()
     except Exception:
         pass
+    buffers = getattr(protocol, "stream_buffers", {})
+    for buffer in list(buffers.values()):
+        close = getattr(buffer, "close", None)
+        if callable(close):
+            try:
+                await close()
+            except Exception:
+                pass
     inner = getattr(task_group, "_task_group", None)
     tasks = list(getattr(inner, "_tasks", ())) if inner is not None else []
     for task in tasks:
         if not task.done():
             task.cancel()
     if tasks:
-        await asyncio.wait_for(
-            asyncio.gather(*tasks, return_exceptions=True),
-            timeout=1,
-        )
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=1,
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
     try:
         await asyncio.wait_for(protocol.handle(Closed()), timeout=0.5)
     except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
@@ -539,7 +550,10 @@ async def test_hypercorn_h2_blocked_body_put_is_cancelled_on_close() -> None:
         blocked = asyncio.create_task(
             stream.handle(Body(stream_id=1, data=b"late-body"))
         )
-        await asyncio.sleep(0)
+        for _ in range(20):
+            if getattr(stream, "_aawm_queue_space", None) is not None:
+                break
+            await asyncio.sleep(0)
         assert blocked.done() is False
         await asyncio.wait_for(protocol._close_stream(1), timeout=1)
         await asyncio.wait_for(blocked, timeout=1)
@@ -558,6 +572,77 @@ async def test_hypercorn_h2_blocked_body_put_is_cancelled_on_close() -> None:
         assert "http.disconnect" in remaining
         disconnect_at = remaining.index("http.disconnect")
         assert "http.request" not in remaining[disconnect_at + 1 :]
+    finally:
+        await _close_protocol(protocol, task_group)
+
+
+@pytest.mark.asyncio
+async def test_hypercorn_h2_app_consume_unblocks_body_without_close() -> None:
+    from hypercorn.events import RawData
+    from hypercorn.protocol.events import Body
+
+    protocol, _sent, task_group = await _make_h2_protocol(install_guards=True)
+    try:
+        client = _new_h2_client()
+        await protocol.handle(RawData(data=_open_run(client)))
+        stream = protocol.streams[1]
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        queue.put_nowait({"type": "http.request", "body": b"held", "more_body": True})
+        stream.app_put = queue.put
+        blocked = asyncio.create_task(
+            stream.handle(Body(stream_id=1, data=b"late-body"))
+        )
+        for _ in range(20):
+            if getattr(stream, "_aawm_queue_space", None) is not None:
+                break
+            await asyncio.sleep(0)
+        assert blocked.done() is False
+        first = queue.get_nowait()
+        assert first["body"] == b"held"
+        await asyncio.wait_for(blocked, timeout=1)
+        assert blocked.exception() is None
+        assert stream.closed is False
+        assert 1 in protocol.streams
+        delivered = queue.get_nowait()
+        assert delivered["type"] == "http.request"
+        assert delivered["body"] == b"late-body"
+    finally:
+        await _close_protocol(protocol, task_group)
+
+
+@pytest.mark.asyncio
+async def test_hypercorn_h2_retired_stream_returns_connection_data_credit() -> None:
+    from hypercorn.events import RawData
+
+    protocol, _sent, task_group = await _make_h2_protocol(install_guards=True)
+    try:
+        client = _new_h2_client()
+        await protocol.handle(RawData(data=_open_run(client)))
+        stream = protocol.streams[1]
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        queue.put_nowait({"type": "http.request", "body": b"held", "more_body": True})
+        stream.app_put = queue.put
+        acks: List[int] = []
+        original_ack = protocol.connection.acknowledge_received_data
+
+        def _ack(length: int, stream_id: int) -> Any:
+            acks.append(int(length))
+            return original_ack(length, stream_id)
+
+        protocol.connection.acknowledge_received_data = _ack
+        client.send_data(1, b"late-body", end_stream=False)
+        late = client.data_to_send()
+        blocked = asyncio.create_task(protocol.handle(RawData(data=late)))
+        for _ in range(20):
+            if getattr(stream, "_aawm_queue_space", None) is not None:
+                break
+            await asyncio.sleep(0)
+        assert blocked.done() is False
+        await asyncio.wait_for(protocol._close_stream(1), timeout=1)
+        await asyncio.wait_for(blocked, timeout=1)
+        assert blocked.exception() is None
+        assert acks
+        assert sum(acks) >= len(b"late-body")
     finally:
         await _close_protocol(protocol, task_group)
 
@@ -585,7 +670,10 @@ async def test_hypercorn_h2_receive_path_blocked_body_then_goaway() -> None:
                 ]
             )
         )
-        await asyncio.sleep(0)
+        for _ in range(20):
+            if getattr(stream, "_aawm_queue_space", None) is not None:
+                break
+            await asyncio.sleep(0)
         assert blocked.done() is False
         await asyncio.wait_for(
             protocol.handle(RawData(data=_goaway(client))),
@@ -620,7 +708,10 @@ async def test_hypercorn_h2_awakened_body_put_does_not_follow_disconnect() -> No
         blocked = asyncio.create_task(
             stream.handle(Body(stream_id=1, data=b"late-body"))
         )
-        await asyncio.sleep(0)
+        for _ in range(20):
+            if getattr(stream, "_aawm_queue_space", None) is not None:
+                break
+            await asyncio.sleep(0)
         assert blocked.done() is False
         queue.get_nowait()
         await asyncio.sleep(0)

@@ -140,12 +140,49 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
 
     def _app_queue(stream: Any) -> Optional[asyncio.Queue]:
         app_put = getattr(stream, "app_put", None)
-        if app_put is None:
-            return None
-        queue = getattr(app_put, "__self__", None)
-        if isinstance(queue, asyncio.Queue):
-            return queue
+        if app_put is not None:
+            queue = getattr(app_put, "_aawm_queue", None)
+            if isinstance(queue, asyncio.Queue):
+                return queue
+            queue = getattr(app_put, "__self__", None)
+            if isinstance(queue, asyncio.Queue):
+                return queue
+        bound = getattr(stream, "_aawm_app_queue", None)
+        if isinstance(bound, asyncio.Queue):
+            return bound
         return None
+
+    def _notify_queue_space(queue: asyncio.Queue) -> None:
+        for owner in list(getattr(queue, "_aawm_owner_streams", set())):
+            space = getattr(owner, "_aawm_queue_space", None)
+            if space is not None:
+                space.set()
+
+    def _bind_queue_to_stream(stream: Any, queue: asyncio.Queue) -> None:
+        owners = getattr(queue, "_aawm_owner_streams", None)
+        if owners is None:
+            owners = set()
+            queue._aawm_owner_streams = owners
+        owners.add(stream)
+        stream._aawm_app_queue = queue
+        if getattr(queue, "_aawm_get_wrapped", False):
+            return
+        original_get = queue.get
+        original_get_nowait = queue.get_nowait
+
+        async def _wrapped_get():
+            item = await original_get()
+            _notify_queue_space(queue)
+            return item
+
+        def _wrapped_get_nowait():
+            item = original_get_nowait()
+            _notify_queue_space(queue)
+            return item
+
+        queue.get = _wrapped_get
+        queue.get_nowait = _wrapped_get_nowait
+        queue._aawm_get_wrapped = True
 
     async def _put_app_event(stream: Any, event: dict) -> None:
         """Queue an ASGI receive event without blocking the connection reader.
@@ -156,12 +193,17 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
         """
         if getattr(stream, "closed", False):
             return
-        queue = _app_queue(stream)
         app_put = getattr(stream, "app_put", None)
         if app_put is None:
             return
-        async with _stream_put_lock(stream):
-            while not getattr(stream, "closed", False):
+        queue = _app_queue(stream)
+        if isinstance(queue, asyncio.Queue):
+            _bind_queue_to_stream(stream, queue)
+            _stream_space_event(stream)
+        while not getattr(stream, "closed", False):
+            async with _stream_put_lock(stream):
+                if getattr(stream, "closed", False):
+                    return
                 if queue is None:
                     await app_put(event)
                     return
@@ -171,11 +213,17 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
                 except asyncio.QueueFull:
                     space = _stream_space_event(stream)
                     space.clear()
-                    await space.wait()
+                    if queue.maxsize <= 0 or queue.qsize() < queue.maxsize:
+                        continue
+            await space.wait()
 
     async def _http_handle(self, event: Any) -> None:
         if getattr(self, "closed", False) and not isinstance(event, StreamClosed):
             return
+        if isinstance(event, Body) or isinstance(event, EndBody):
+            queue = _app_queue(self)
+            if queue is not None:
+                _bind_queue_to_stream(self, queue)
         if isinstance(event, Body):
             await _put_app_event(
                 self,
@@ -193,6 +241,9 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
             )
             return
         await _ORIGINAL_HTTP_HANDLE(self, event)
+        queue = _app_queue(self)
+        if queue is not None:
+            _bind_queue_to_stream(self, queue)
 
     async def _release_stream_buffers(self) -> None:
         buffers = getattr(self, "stream_buffers", None)
@@ -281,9 +332,7 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
             await self.has_data.set()
             return
         stream.closed = True
-        space = getattr(stream, "_aawm_queue_space", None)
-        if space is not None:
-            space.set()
+        _stream_space_event(stream).set()
         _deliver_terminal_disconnect(stream)
         await self.has_data.set()
 
@@ -396,11 +445,17 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
                         continue
                     raise KeyError(event.stream_id)
                 await stream.handle(Body(stream_id=event.stream_id, data=event.data))
-                if not getattr(self, "closed", False) and not stream.closed:
-                    self.connection.acknowledge_received_data(
-                        event.flow_controlled_length,
-                        event.stream_id,
-                    )
+                if not getattr(self, "closed", False):
+                    try:
+                        self.connection.acknowledge_received_data(
+                            event.flow_controlled_length,
+                            event.stream_id,
+                        )
+                    except (
+                        h2.exceptions.ProtocolError,
+                        h2.exceptions.StreamClosedError,
+                    ):
+                        pass
             elif isinstance(event, h2.events.StreamEnded):
                 stream = self.streams.get(event.stream_id)
                 if stream is None:
