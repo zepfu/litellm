@@ -734,6 +734,139 @@ def test_agentn_session_dispatches_data_received_without_dropping() -> None:
     assert len(session._auto_replies) == 2
 
 
+def test_agentn_session_connection_terminated_marks_session_unusable(caplog) -> None:
+    from h2.events import ConnectionTerminated, DataReceived
+
+    from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
+        _AgentnH2Session,
+    )
+
+    class _AckConnection:
+        def acknowledge_received_data(self, *_args, **_kwargs) -> None:
+            return None
+
+    caplog.set_level("WARNING", logger="LiteLLM Proxy")
+    session = _AgentnH2Session("https://agentn.global.api5.cursor.sh")
+    session.connection = _AckConnection()
+    session.stream_id = 1
+    goaway = object.__new__(ConnectionTerminated)
+    goaway.error_code = 0
+    goaway.last_stream_id = 0
+    goaway.additional_data = None
+    stale = object.__new__(DataReceived)
+    stale.data = _heartbeat_chunk()
+    stale.flow_controlled_length = len(stale.data)
+    stale.stream_id = 1
+    chunks, ended = session._dispatch_h2_events([goaway, stale])
+    assert ended is True
+    assert chunks == []
+    assert session._connection_terminated is True
+    assert session._closed is True
+    assert session.upstream_termination_reason == "upstream_reset"
+    assert session._incoming.get_nowait() is None
+    warning_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "WARNING"
+    ]
+    assert any(
+        "cursor_agent_cli_inbound agentn stream closed event=ConnectionTerminated"
+        in message
+        for message in warning_messages
+    ), warning_messages
+
+
+@pytest.mark.asyncio
+async def test_agentn_session_receive_data_goaway_stops_read_loop() -> None:
+    from h2.config import H2Configuration
+    from h2.connection import H2Connection
+    from h2.events import ConnectionTerminated
+
+    from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
+        _AgentnH2Session,
+    )
+
+    server = H2Connection(
+        config=H2Configuration(client_side=False, header_encoding="utf-8")
+    )
+    server.initiate_connection()
+    _ = server.data_to_send()
+    server.close_connection()
+    goaway = server.data_to_send()
+    assert goaway
+
+    class _Reader:
+        def __init__(self) -> None:
+            self._payloads = [goaway, b""]
+
+        async def read(self, _size: int) -> bytes:
+            if self._payloads:
+                return self._payloads.pop(0)
+            return b""
+
+    class _Writer:
+        def write(self, _data: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        def abort(self) -> None:
+            return None
+
+        async def wait_closed(self) -> None:
+            return None
+
+    session = _AgentnH2Session("https://agentn.global.api5.cursor.sh")
+    client = H2Connection(
+        config=H2Configuration(client_side=True, header_encoding="utf-8")
+    )
+    client.initiate_connection()
+    _ = client.data_to_send()
+    session.connection = client
+    session.reader = _Reader()
+    session.writer = _Writer()
+    session.stream_id = 1
+    probe = H2Connection(
+        config=H2Configuration(client_side=True, header_encoding="utf-8")
+    )
+    probe.initiate_connection()
+    _ = probe.data_to_send()
+    assert any(
+        isinstance(event, ConnectionTerminated) for event in probe.receive_data(goaway)
+    )
+    await asyncio.wait_for(session._read_loop(), timeout=2)
+    assert session._connection_terminated is True
+    assert session._closed is True
+    assert session.upstream_termination_reason == "upstream_reset"
+    assert session.reader_termination_event.is_set()
+    await asyncio.wait_for(session.aclose(reason="upstream_reset"), timeout=2)
+    await asyncio.wait_for(session.aclose(reason="upstream_reset"), timeout=2)
+
+
+def test_agentn_session_stream_reset_on_other_stream_does_not_close_session() -> None:
+    from h2.events import StreamReset
+
+    from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
+        _AgentnH2Session,
+    )
+
+    session = _AgentnH2Session("https://agentn.global.api5.cursor.sh")
+    session.stream_id = 1
+    other = object.__new__(StreamReset)
+    other.stream_id = 3
+    other.error_code = 8
+    chunks, ended = session._dispatch_h2_events([other])
+    assert ended is False
+    assert chunks == []
+    assert session._closed is False
+    assert session._connection_terminated is False
+    assert session.upstream_termination_reason is None
+
+
 def test_proxy_server_wraps_inbound_cli_run_as_raw_asgi() -> None:
     source = (
         Path(__file__).resolve().parents[4] / "litellm" / "proxy" / "proxy_server.py"

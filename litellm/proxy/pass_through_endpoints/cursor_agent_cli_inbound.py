@@ -53,6 +53,9 @@ from litellm.llms.cursor_agent.connect import (
 )
 from litellm.llms.cursor_agent.dashboard import cursor_agent_user_agent
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
+from litellm.proxy.pass_through_endpoints.cursor_agent_cli_hypercorn import (
+    install_hypercorn_h2_receive_dispatch_guards,
+)
 
 CURSOR_AGENT_CLI_INBOUND_PROVIDER = "cursor_agent_cli_inbound"
 CURSOR_AGENT_CLI_INBOUND_ROUTE_FAMILY = "cursor_agent_cli_inbound"
@@ -991,6 +994,7 @@ class _AgentnH2Session:
         self._logged_data_chunks = 0
         self._agentn_body_decoder = _ProtoConnectFrameDecoder()
         self._auto_replies: List[bytes] = []
+        self._connection_terminated = False
 
     @property
     def upstream_termination_reason(self) -> Optional[str]:
@@ -1026,7 +1030,7 @@ class _AgentnH2Session:
     async def _flush_connection(self) -> None:
         writer = self.writer
         connection = self.connection
-        if writer is None or connection is None:
+        if writer is None or connection is None or self._closed:
             return
         outbound = connection.data_to_send()
         if outbound:
@@ -1110,7 +1114,9 @@ class _AgentnH2Session:
         )
         self._read_task = asyncio.create_task(self._read_loop())
 
-    def _dispatch_h2_events(self, events: List[Any]) -> Tuple[List[bytes], bool]:
+    def _dispatch_h2_events(  # noqa: PLR0915
+        self, events: List[Any]
+    ) -> Tuple[List[bytes], bool]:
         from h2.events import (
             ConnectionTerminated,
             DataReceived,
@@ -1174,13 +1180,35 @@ class _AgentnH2Session:
                     )
             elif isinstance(event, (StreamEnded, TrailersReceived)):
                 ended = True
-            elif isinstance(event, (StreamReset, ConnectionTerminated)):
+            elif isinstance(event, StreamReset):
+                if self.stream_id and event.stream_id not in {self.stream_id, 0}:
+                    continue
                 self._mark_upstream_termination("upstream_reset")
                 verbose_proxy_logger.warning(
                     "cursor_agent_cli_inbound agentn stream closed event=%s",
                     type(event).__name__,
                 )
                 ended = True
+            elif isinstance(event, ConnectionTerminated):
+                # GOAWAY retires the whole connection. Mark the session
+                # unusable before any later await or auto-reply write.
+                error_code = getattr(event, "error_code", None)
+                self._connection_terminated = True
+                self._closed = True
+                self._pending_wakeup.set()
+                self._request_end_stream_event.set()
+                try:
+                    self._incoming.put_nowait(None)
+                except Exception:
+                    pass
+                self._mark_upstream_termination("upstream_reset")
+                verbose_proxy_logger.warning(
+                    "cursor_agent_cli_inbound agentn stream closed event=%s error_code=%s",
+                    type(event).__name__,
+                    error_code,
+                )
+                ended = True
+                break
             elif isinstance(event, (WindowUpdated, RemoteSettingsChanged)):
                 if self.connection is not None:
                     # The writer owns the awaited flush. Only wake it here;
@@ -1212,7 +1240,10 @@ class _AgentnH2Session:
                     chunks, ended = self._dispatch_h2_events(events)
                     auto_replies = self._auto_replies
                     self._auto_replies = []
-                    await self._flush_connection()
+                    if not self._connection_terminated and not self._closed:
+                        await self._flush_connection()
+                if self._connection_terminated or self._closed:
+                    break
                 for reply in auto_replies:
                     verbose_proxy_logger.info(
                         "cursor_agent_cli_inbound auto-answered request_context bytes=%s",
@@ -1222,7 +1253,8 @@ class _AgentnH2Session:
                 for chunk in chunks:
                     await self._incoming.put(chunk)
                 if ended:
-                    self._mark_upstream_termination("normal_response")
+                    if self._upstream_termination_reason is None:
+                        self._mark_upstream_termination("normal_response")
                     break
         except asyncio.CancelledError:
             if not self._closed:
@@ -2626,6 +2658,7 @@ class CursorAgentCliInboundMiddleware:
 
     def __init__(self, app: Any) -> None:
         self.app = app
+        install_hypercorn_h2_receive_dispatch_guards()
 
     async def __call__(
         self,
