@@ -1845,6 +1845,115 @@ async def test_ensure_guard_promoted_lease_identity_conflict_logs_inherited_pare
     assert sa.get_request_session_owner_lease(request) is leftover
 
 
+def test_request_lease_identity_conflict_is_disposable_for_identityless_unheld() -> None:
+    leftover = sa.SessionOwnerLease(
+        session_identity=None,
+        reservation_token=None,
+        held_reservation=False,
+        released=False,
+        promoted=False,
+        decision=sa.SessionOwnerGuardDecision.NO_SESSION.value,
+        attributes={"provider": "openai", "model": "gpt-6-astra"},
+    )
+    provenance = sa.classify_request_lease_identity_conflict(
+        lease=leftover,
+        resolved_session_identity=None,
+        requested_attributes={"provider": "openai", "model": "gpt-6-astra"},
+    )
+    assert provenance["scope"] == "unknown"
+    assert provenance["has_lease_identity"] is False
+    assert provenance["has_resolved_identity"] is False
+    assert provenance["lease_held"] is False
+    assert provenance["lease_promoted"] is False
+    assert sa.request_lease_identity_conflict_is_disposable(provenance, leftover) is True
+
+
+def test_request_lease_identity_conflict_is_not_disposable_when_held_or_promoted() -> None:
+    held = sa.SessionOwnerLease(
+        session_identity="cursor-turn-1",
+        reservation_token="tok-live",
+        held_reservation=True,
+        released=False,
+        promoted=False,
+        attributes={"provider": "cursor_agent"},
+    )
+    promoted = sa.SessionOwnerLease(
+        session_identity="cursor-parent",
+        reservation_token="tok-owned",
+        held_reservation=False,
+        released=False,
+        promoted=True,
+        attributes={"provider": "cursor_agent"},
+    )
+    named = sa.SessionOwnerLease(
+        session_identity="cursor-named",
+        held_reservation=False,
+        released=False,
+        promoted=False,
+        attributes={"provider": "cursor_agent"},
+    )
+    held_p = sa.classify_request_lease_identity_conflict(
+        lease=held,
+        resolved_session_identity="openai-turn-2",
+        requested_attributes={"provider": "openai"},
+    )
+    promoted_p = sa.classify_request_lease_identity_conflict(
+        lease=promoted,
+        resolved_session_identity="openai-turn-2",
+        requested_attributes={"provider": "openai"},
+    )
+    named_p = sa.classify_request_lease_identity_conflict(
+        lease=named,
+        resolved_session_identity="openai-turn-2",
+        requested_attributes={"provider": "openai"},
+    )
+    assert sa.request_lease_identity_conflict_is_disposable(held_p, held) is False
+    assert sa.request_lease_identity_conflict_is_disposable(promoted_p, promoted) is False
+    assert sa.request_lease_identity_conflict_is_disposable(named_p, named) is False
+
+
+@pytest.mark.asyncio
+async def test_ensure_guard_clears_identityless_no_session_leftover_instead_of_409(
+    caplog,
+) -> None:
+    redis = _FakeRedisCache()
+    openai_attrs = _full_attrs(provider="openai", model="gpt-6-astra")
+    request = type("Req", (), {})()
+    request.state = type("State", (), {})()
+    leftover = sa.SessionOwnerLease(
+        session_identity=None,
+        reservation_token=None,
+        held_reservation=False,
+        released=False,
+        promoted=False,
+        decision=sa.SessionOwnerGuardDecision.NO_SESSION.value,
+        attributes={"provider": "openai", "model": "gpt-6-astra"},
+    )
+    sa.set_request_session_owner_lease(request, leftover)
+    sa.record_request_lease_transition(request, event="mint", lease=leftover)
+    caplog.set_level("WARNING")
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        guard = await sa.ensure_session_owner_guard_for_request(
+            request=request,
+            session_identity=None,
+            requested_attributes=openai_attrs,
+            candidate={"provider": "openai", "model": "gpt-6-astra"},
+            alias_model="gpt-6-astra",
+        )
+    assert guard.decision is sa.SessionOwnerGuardDecision.NO_SESSION
+    joined = "\n".join(record.getMessage() for record in caplog.records)
+    assert "request_lease_identity_conflict scope=unknown" in joined
+    assert "mint_provider=openai" in joined
+    assert "exit=replaced" in joined or "exit=uncleared" in joined
+    current = sa.get_request_session_owner_lease(request)
+    assert current is not leftover
+    assert current is not None
+    assert current.decision == sa.SessionOwnerGuardDecision.NO_SESSION.value
+    assert current.session_identity is None
+
+
 @pytest.mark.asyncio
 async def test_request_lease_transition_records_cursor_mint_then_uncleared_conflict(
     caplog,

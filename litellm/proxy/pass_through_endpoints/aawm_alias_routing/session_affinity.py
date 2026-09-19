@@ -8064,6 +8064,29 @@ def classify_request_lease_identity_conflict(
     }
 
 
+def request_lease_identity_conflict_is_disposable(
+    provenance: Mapping[str, Any],
+    lease: Optional[SessionOwnerLease],
+) -> bool:
+    """True when the colliding lease cannot represent an owner binding.
+
+    Live CFG-054 18:26:31 was ``scope=unknown`` with no lease identity, no
+    resolved identity, not held, and not promoted. That leftover is request
+    state, not a session pin. Held reservations and promoted owners stay
+    fail-closed 409s.
+    """
+
+    if lease is not None and (lease.held_reservation or lease.promoted):
+        return False
+    if provenance.get("lease_held") or provenance.get("lease_promoted"):
+        return False
+    if provenance.get("has_lease_identity"):
+        return False
+    if _clean_optional_str(getattr(lease, "session_identity", None)) is not None:
+        return False
+    return True
+
+
 def _log_request_lease_identity_conflict(provenance: Mapping[str, Any]) -> None:
     scope = str(provenance.get("scope") or "")
     if scope not in _LEASE_PROVENANCE_SCOPES:
@@ -9220,52 +9243,62 @@ async def ensure_session_owner_guard_for_request(
             )
             conflict["transition"] = get_request_lease_transition(request)
             _log_request_lease_identity_conflict(conflict)
-            mismatch_reason = (
-                "session_owner: request lease identity does not match "
-                "the requested session identity"
-            )
-            mismatch_cache_key = (
-                build_aawm_alias_routing_session_owner_cache_key(
-                    session_identity=resolved_session_identity
+            if request_lease_identity_conflict_is_disposable(
+                conflict, colliding_lease
+            ):
+                record_request_lease_transition(
+                    request, event="replace", previous=colliding_lease
                 )
-                if resolved_session_identity is not None
-                else None
-            )
-            guard = SessionOwnerGuardResult(
-                decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
-                session_identity=resolved_session_identity,
-                cache_key=mismatch_cache_key,
-                owner_id=colliding_lease.owner_id,
-                reservation_token=colliding_lease.reservation_token,
-                mismatch_reason=mismatch_reason,
-                provenance=build_session_owner_provenance(
+                clear_non_held_request_session_owner_lease(request)
+                colliding_lease = None
+                active_lease = None
+            else:
+                mismatch_reason = (
+                    "session_owner: request lease identity does not match "
+                    "the requested session identity"
+                )
+                mismatch_cache_key = (
+                    build_aawm_alias_routing_session_owner_cache_key(
+                        session_identity=resolved_session_identity
+                    )
+                    if resolved_session_identity is not None
+                    else None
+                )
+                guard = SessionOwnerGuardResult(
+                    decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
                     session_identity=resolved_session_identity,
-                    decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED.value,
-                    owner_id=colliding_lease.owner_id,
-                    mismatch_reason=mismatch_reason,
                     cache_key=mismatch_cache_key,
+                    owner_id=colliding_lease.owner_id,
                     reservation_token=colliding_lease.reservation_token,
-                ),
-            )
-            record_session_owner_continuity_receipt(
-                request,
-                phase="owner_guard",
-                source="request_lease",
-                session_identity=resolved_session_identity,
-                cache_key=mismatch_cache_key,
-                outcome=guard.decision.value,
-                reason_code="identity_conflict",
-            )
-            if raise_on_redispatch:
-                raise_session_owner_redispatch_required(
-                    session_identity=resolved_session_identity,
-                    guard=guard,
-                    alias_model=alias_model,
-                    candidate=requested_attributes or candidate,
-                    failure_phase="session_owner_request_lease_identity_conflict",
-                    request=request,
+                    mismatch_reason=mismatch_reason,
+                    provenance=build_session_owner_provenance(
+                        session_identity=resolved_session_identity,
+                        decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED.value,
+                        owner_id=colliding_lease.owner_id,
+                        mismatch_reason=mismatch_reason,
+                        cache_key=mismatch_cache_key,
+                        reservation_token=colliding_lease.reservation_token,
+                    ),
                 )
-            return guard
+                record_session_owner_continuity_receipt(
+                    request,
+                    phase="owner_guard",
+                    source="request_lease",
+                    session_identity=resolved_session_identity,
+                    cache_key=mismatch_cache_key,
+                    outcome=guard.decision.value,
+                    reason_code="identity_conflict",
+                )
+                if raise_on_redispatch:
+                    raise_session_owner_redispatch_required(
+                        session_identity=resolved_session_identity,
+                        guard=guard,
+                        alias_model=alias_model,
+                        candidate=requested_attributes or candidate,
+                        failure_phase="session_owner_request_lease_identity_conflict",
+                        request=request,
+                    )
+                return guard
     token = active_lease.reservation_token if active_lease is not None else None
     guard = await guard_session_owner_before_egress(
         session_identity=resolved_session_identity,
