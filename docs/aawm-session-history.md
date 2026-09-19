@@ -2283,7 +2283,9 @@ session-history and diagnostic consumers. Container log emission is narrower:
 failures, cooldowns, redispatches, no-candidate outcomes, and explicit warning
 events remain logged, while healthy selected/session-affinity continuation
 events are skipped unless `AAWM_ALIAS_ROUTE_LOG_HEALTHY=1` is set for a targeted
-debug window. Terminal no-candidate and pre-attempt terminal warnings
+debug window. The same flag also gates healthy `AAWM_XAI_DEFERRED_STREAM`
+validator-pass / iterator-progress snapshots; renewal, validation, and iterator
+failure phases still emit. Terminal no-candidate and pre-attempt terminal warnings
 additionally emit one sanitized `AAWM_ALIAS_ROUTE: terminal warning` line even
 when `AAWM_ALIAS_ROUTE_VERBOSE_JSON` and `AAWM_ALIAS_ROUTE_LOG_HEALTHY` are both
 off. The pre-attempt variants identify pinned-session cooldown and provider-lane

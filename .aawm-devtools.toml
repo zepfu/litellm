@@ -1,0 +1,37 @@
+[todo]
+root = ".analysis"
+current_filename = "current.jsonl"
+manifest_filename = "todo-manifest.json"
+agent_event_filename = "todo-agent-events.jsonl"
+archive_directory_pattern = "archive/{year}"
+archive_filename_pattern = "{prefix}-{year}.jsonl"
+archive_timezone = "UTC"
+
+[todo.prefixes]
+ALI = 3
+ALINC = 3
+ALIPRICING = 3
+ALIPROD = 3
+ALIQUOTA = 3
+CFG = 3
+COHERE = 3
+CURSOR = 3
+D1 = 3
+D1DATE = 8
+LEDGER = 3
+MS = 3
+MSPROD = 3
+MSQUOTA = 3
+MUSE = 3
+NOUS = 3
+NV = 3
+OC = 3
+OPENAI = 3
+OR = 3
+P1 = 3
+PINV = 3
+PROPOSAL = 3
+RR = 3
+TEST = 3
+XAI = 3
+ZAI = 3

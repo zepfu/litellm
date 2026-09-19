@@ -58,6 +58,7 @@ from litellm.secret_managers.credential_error_sanitizer import (
     sanitize_credential_error_message,
 )
 
+from . import audit_persist as _aawm_audit_persist
 from . import durable
 from .audit_persist import _emit_aawm_terminal_error
 from .types import Payload
@@ -7059,6 +7060,49 @@ _XAI_DEFERRED_STREAM_WIRE_DISPOSITIONS = frozenset(
 _XAI_DEFERRED_STREAM_FINALIZATION_BASES = frozenset(
     {"terminal_delivery", "iterator_eof", "failure"}
 )
+_XAI_DEFERRED_STREAM_FAILURE_PHASES = frozenset(
+    {
+        "iterator_cancelled",
+        "iterator_exception",
+        "close_before_eof",
+        "renewal_failed",
+        "stream_response_cancelled",
+        "stream_response_exception",
+        "finalization_wait_cancelled",
+        "finalization_task_raised",
+        "release_result",
+        "cleanup_outcome",
+    }
+)
+
+
+def _xai_deferred_stream_should_emit(payload: Mapping[str, Any]) -> bool:
+    """Healthy deferred-stream INFO is opt-in; failure snapshots stay on.
+
+    ``AAWM_ALIAS_ROUTE_LOG_HEALTHY=1`` (same flag as healthy
+    ``AAWM_OPENAI_FINAL_SEND_BINDING`` / alias-route JSON) emits every phase.
+    Default-off keeps validator-pass / iterator-progress snapshots quiet.
+    """
+    if _aawm_audit_persist._aawm_alias_route_healthy_json_enabled():
+        return True
+    phase = payload.get("phase")
+    if phase in _XAI_DEFERRED_STREAM_FAILURE_PHASES:
+        return True
+    if payload.get("exception_category"):
+        return True
+    if payload.get("validation_ok") is False:
+        return True
+    if payload.get("result_error_present") is True:
+        return True
+    if payload.get("mutation_outcome") in {"error", "conflict"}:
+        return True
+    if payload.get("binding_outcome") == "missing_iterator":
+        return True
+    if payload.get("terminal_status") in {"failed", "cancelled", "incomplete"}:
+        return True
+    if payload.get("requested_success") is False:
+        return True
+    return False
 
 
 def _make_xai_deferred_stream_observer(
@@ -7474,6 +7518,9 @@ def _make_xai_deferred_stream_observer(
                     payload.update(
                         _mutation_snapshot(fields.get("result"), normalized_phase)
                     )
+
+                if not _xai_deferred_stream_should_emit(payload):
+                    return None
 
                 verbose_aawm_route_logger.info(
                     "AAWM_XAI_DEFERRED_STREAM: "
