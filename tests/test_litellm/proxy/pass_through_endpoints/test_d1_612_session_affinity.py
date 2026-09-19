@@ -1944,14 +1944,50 @@ async def test_ensure_guard_clears_identityless_no_session_leftover_instead_of_4
         )
     assert guard.decision is sa.SessionOwnerGuardDecision.NO_SESSION
     joined = "\n".join(record.getMessage() for record in caplog.records)
-    assert "request_lease_identity_conflict scope=unknown" in joined
-    assert "mint_provider=openai" in joined
-    assert "exit=replaced" in joined or "exit=uncleared" in joined
+    assert "request_lease_identity_conflict" not in joined
     current = sa.get_request_session_owner_lease(request)
     assert current is not leftover
     assert current is not None
     assert current.decision == sa.SessionOwnerGuardDecision.NO_SESSION.value
     assert current.session_identity is None
+
+
+@pytest.mark.asyncio
+async def test_ensure_guard_logs_disposable_leftover_when_healthy_flag_on(
+    caplog, monkeypatch
+) -> None:
+    redis = _FakeRedisCache()
+    openai_attrs = _full_attrs(provider="openai", model="gpt-6-astra")
+    request = type("Req", (), {})()
+    request.state = type("State", (), {})()
+    leftover = sa.SessionOwnerLease(
+        session_identity=None,
+        reservation_token=None,
+        held_reservation=False,
+        released=False,
+        promoted=False,
+        decision=sa.SessionOwnerGuardDecision.NO_SESSION.value,
+        attributes={"provider": "openai", "model": "gpt-6-astra"},
+    )
+    sa.set_request_session_owner_lease(request, leftover)
+    sa.record_request_lease_transition(request, event="mint", lease=leftover)
+    monkeypatch.setenv("AAWM_ALIAS_ROUTE_LOG_HEALTHY", "1")
+    caplog.set_level("WARNING")
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        guard = await sa.ensure_session_owner_guard_for_request(
+            request=request,
+            session_identity=None,
+            requested_attributes=openai_attrs,
+            candidate={"provider": "openai", "model": "gpt-6-astra"},
+            alias_model="gpt-6-astra",
+        )
+    assert guard.decision is sa.SessionOwnerGuardDecision.NO_SESSION
+    joined = "\n".join(record.getMessage() for record in caplog.records)
+    assert "request_lease_identity_conflict scope=unknown" in joined
+    assert "mint_provider=openai" in joined
+    assert "exit=replaced" in joined or "exit=uncleared" in joined
 
 
 @pytest.mark.asyncio

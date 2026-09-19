@@ -256,7 +256,7 @@ def _record_inbound_provenance_outcome(
     now = time.monotonic()
     if now - _INBOUND_PROVENANCE_AGGREGATE_EMITTED_AT >= _INBOUND_PROVENANCE_AGGREGATE_SECONDS:
         _INBOUND_PROVENANCE_AGGREGATE_EMITTED_AT = now
-        verbose_proxy_logger.warning(
+        _cursor_inbound_debug_log(
             "cursor_agent_cli_inbound provenance_aggregate started=%s completed=%s "
             "failed=%s cancelled=%s in_flight=%s checksum_present=%s compressed=%s "
             "provenance_unknown=%s",
@@ -306,10 +306,12 @@ def _log_inbound_run_terminal(
         fields.append(f"http_version={http_version}")
     if provenance.decoder_direction:
         fields.append(f"decoder_direction={provenance.decoder_direction}")
-    verbose_proxy_logger.warning(
-        "cursor_agent_cli_inbound run_terminal %s",
-        " ".join(fields),
-    )
+    message = "cursor_agent_cli_inbound run_terminal %s"
+    rendered = " ".join(fields)
+    if termination_reason == "normal_response":
+        _cursor_inbound_debug_log(message, rendered)
+        return
+    verbose_proxy_logger.warning(message, rendered)
 
 
 def _cursor_inbound_debug_log(message: str, *args: Any) -> None:

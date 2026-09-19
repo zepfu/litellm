@@ -8087,7 +8087,19 @@ def request_lease_identity_conflict_is_disposable(
     return True
 
 
-def _log_request_lease_identity_conflict(provenance: Mapping[str, Any]) -> None:
+def _log_request_lease_identity_conflict(
+    provenance: Mapping[str, Any],
+    *,
+    disposable: bool = False,
+) -> None:
+    # Disposable identity-less leftovers are cleared instead of 409. That
+    # snapshot is healthy-route noise unless AAWM_ALIAS_ROUTE_LOG_HEALTHY=1.
+    # Held/promoted/named mismatches still warn: those remain fail-closed 409s.
+    if (
+        disposable
+        and not _aawm_audit_persist._aawm_alias_route_healthy_json_enabled()
+    ):
+        return
     scope = str(provenance.get("scope") or "")
     if scope not in _LEASE_PROVENANCE_SCOPES:
         scope = "unknown"
@@ -9242,10 +9254,13 @@ async def ensure_session_owner_guard_for_request(
                 requested_attributes=requested_attributes or candidate,
             )
             conflict["transition"] = get_request_lease_transition(request)
-            _log_request_lease_identity_conflict(conflict)
-            if request_lease_identity_conflict_is_disposable(
+            disposable = request_lease_identity_conflict_is_disposable(
                 conflict, colliding_lease
-            ):
+            )
+            _log_request_lease_identity_conflict(
+                conflict, disposable=disposable
+            )
+            if disposable:
                 record_request_lease_transition(
                     request, event="replace", previous=colliding_lease
                 )

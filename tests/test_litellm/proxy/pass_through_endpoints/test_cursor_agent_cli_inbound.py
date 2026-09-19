@@ -31,6 +31,7 @@ from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
     _Http1LaneRegistry,
     _InboundRunProvenance,
     _cli_connect_envelope,
+    _record_inbound_provenance_outcome,
     _connect_header_flush_frame,
     _log_inbound_run_terminal,
     _observe_upstream_headers,
@@ -1380,6 +1381,8 @@ _HEALTHY_INBOUND_LOG_MARKERS = (
     "cursor_agent_cli_inbound auto-answered request_context",
     "cursor_agent_cli_inbound wrote agentn bytes=",
     "cursor_agent_cli_inbound forwarded bytes=",
+    "cursor_agent_cli_inbound provenance_aggregate",
+    "cursor_agent_cli_inbound run_terminal",
 )
 
 
@@ -1705,8 +1708,13 @@ def test_run_terminal_records_first_close_booleans(caplog) -> None:
     assert "connect_endstream=not_seen" in joined
 
 
-def test_run_terminal_logs_successful_endstream_forwarded(caplog) -> None:
-    caplog.set_level("WARNING", logger="LiteLLM Proxy")
+def test_run_terminal_logs_successful_endstream_forwarded(caplog, monkeypatch) -> None:
+    from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
+        AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG,
+    )
+
+    monkeypatch.delenv(AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG, raising=False)
+    caplog.set_level("DEBUG", logger="LiteLLM Proxy")
     provenance = _InboundRunProvenance(call_id="call-ok")
     provenance.endstream_forwarded = True
     provenance.connect_endstream = "ok"
@@ -1715,15 +1723,70 @@ def test_run_terminal_logs_successful_endstream_forwarded(caplog) -> None:
         termination_reason="normal_response",
         http_version="2",
     )
-    joined = "\n".join(
+    warning = "\n".join(
         record.getMessage()
         for record in caplog.records
         if record.levelname == "WARNING"
     )
-    assert "cursor_agent_cli_inbound run_terminal" in joined
-    assert "reason=normal_response" in joined
-    assert "endstream_forwarded=true" in joined
-    assert "connect_endstream=ok" in joined
+    debug = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "DEBUG"
+    )
+    assert "cursor_agent_cli_inbound run_terminal" not in warning
+    assert "cursor_agent_cli_inbound run_terminal" in debug
+    assert "reason=normal_response" in debug
+    assert "endstream_forwarded=true" in debug
+    assert "connect_endstream=ok" in debug
+
+
+def test_run_terminal_success_promotes_when_inbound_debug_on(caplog, monkeypatch) -> None:
+    from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
+        AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG,
+    )
+
+    monkeypatch.setenv(AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG, "1")
+    caplog.set_level("DEBUG", logger="LiteLLM Proxy")
+    provenance = _InboundRunProvenance(call_id="call-ok-debug")
+    provenance.endstream_forwarded = True
+    provenance.connect_endstream = "ok"
+    _log_inbound_run_terminal(
+        provenance,
+        termination_reason="normal_response",
+        http_version="2",
+    )
+    info = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "INFO"
+    )
+    warning = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "WARNING"
+    )
+    assert "cursor_agent_cli_inbound run_terminal" in info
+    assert "endstream_forwarded=true" in info
+    assert "cursor_agent_cli_inbound run_terminal" not in warning
+
+
+def test_provenance_aggregate_stays_debug_by_default(monkeypatch, caplog) -> None:
+    from litellm.proxy.pass_through_endpoints import cursor_agent_cli_inbound as inbound
+
+    monkeypatch.delenv(AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG, raising=False)
+    inbound._INBOUND_PROVENANCE_AGGREGATE_EMITTED_AT = 0.0
+    caplog.set_level("DEBUG", logger="LiteLLM Proxy")
+    provenance = _InboundRunProvenance(call_id="call-agg")
+    _record_inbound_provenance_outcome(
+        provenance, termination_reason="normal_response"
+    )
+    _assert_healthy_inbound_logs_not_info(caplog)
+    debug = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "DEBUG"
+    )
+    assert "cursor_agent_cli_inbound provenance_aggregate" in debug
 
 
 def test_run_terminal_stays_silent_for_success_without_endstream(caplog) -> None:

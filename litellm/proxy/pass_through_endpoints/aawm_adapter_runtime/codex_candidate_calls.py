@@ -38,6 +38,7 @@ from litellm.proxy.pass_through_endpoints.aawm_text_watermark.policy import (
     apply_request_watermark_egress,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_persist import (
+    _aawm_alias_route_healthy_json_enabled,
     _emit_aawm_terminal_error,
 )
 from litellm.secret_managers.credential_error_sanitizer import (
@@ -1543,6 +1544,14 @@ def _log_cursor_continuation_marker_origin(
     producer = str(origin.get("producer") or "")
     if producer not in _CURSOR_CONTINUATION_MARKER_PRODUCERS:
         producer = "unknown"
+    # Identity-less Ohmypi tool-output turns are not a 409. That origin is
+    # healthy-route noise unless AAWM_ALIAS_ROUTE_LOG_HEALTHY=1. Missing
+    # retained-session continuations still warn: those raise 409.
+    if (
+        producer == "tool_output_without_continuation_identity"
+        and not _aawm_alias_route_healthy_json_enabled()
+    ):
+        return
     verbose_aawm_route_logger.warning(
         "cursor_continuation_marker_origin producer=%s "
         "has_previous_response_id=%s has_replay_state=%s "

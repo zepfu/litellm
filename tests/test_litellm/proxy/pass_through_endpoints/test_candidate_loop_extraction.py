@@ -4470,6 +4470,7 @@ async def test_candidate_loop_alpha_disconnect_cancels_io_or_wait(  # noqa: PLR0
 
 
 def test_cursor_continuation_unavailable_origin_is_tool_output_without_retained_session(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import logging
     from io import StringIO
@@ -4491,18 +4492,19 @@ def test_cursor_continuation_unavailable_origin_is_tool_output_without_retained_
     assert no_identity["producer"] == "tool_output_without_continuation_identity"
     assert no_identity["has_previous_response_id"] is False
     assert no_identity["has_replay_state"] is False
-    codex_candidate_calls._maybe_raise_cursor_tool_output_without_retained_session(
-        cursor_tool_outputs=[("pwd-call", "/workspace")],
-        previous_response_id=None,
-        replay_state=None,
-        retained_session=None,
-    )
+    monkeypatch.delenv("AAWM_ALIAS_ROUTE_LOG_HEALTHY", raising=False)
     route_logger = logging.getLogger("LiteLLM AAWM Route")
     stream = StringIO()
     handler = logging.StreamHandler(stream)
     handler.setLevel(logging.WARNING)
     route_logger.addHandler(handler)
     try:
+        codex_candidate_calls._maybe_raise_cursor_tool_output_without_retained_session(
+            cursor_tool_outputs=[("pwd-call", "/workspace")],
+            previous_response_id=None,
+            replay_state=None,
+            retained_session=None,
+        )
         with pytest.raises(CursorConnectError) as exc_info:
             codex_candidate_calls._raise_cursor_session_continuation_unavailable(
                 previous_response_id="cursor-unretained",
@@ -4511,12 +4513,45 @@ def test_cursor_continuation_unavailable_origin_is_tool_output_without_retained_
     finally:
         route_logger.removeHandler(handler)
     logged = stream.getvalue()
+    assert "tool_output_without_continuation_identity" not in logged
     assert "cursor_continuation_marker_origin producer=tool_output_without_retained_session" in logged
     assert "retained_session_present=false" in logged
     assert "cursor-unretained" not in logged
     assert (
         getattr(exc_info.value, "_cursor_continuation_marker_origin")["producer"]
         == "tool_output_without_retained_session"
+    )
+
+
+def test_cursor_continuation_identity_less_origin_logs_when_healthy_flag_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import logging
+    from io import StringIO
+
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+        codex_candidate_calls,
+    )
+
+    monkeypatch.setenv("AAWM_ALIAS_ROUTE_LOG_HEALTHY", "1")
+    route_logger = logging.getLogger("LiteLLM AAWM Route")
+    stream = StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setLevel(logging.WARNING)
+    route_logger.addHandler(handler)
+    try:
+        codex_candidate_calls._maybe_raise_cursor_tool_output_without_retained_session(
+            cursor_tool_outputs=[("pwd-call", "/workspace")],
+            previous_response_id=None,
+            replay_state=None,
+            retained_session=None,
+        )
+    finally:
+        route_logger.removeHandler(handler)
+    logged = stream.getvalue()
+    assert (
+        "cursor_continuation_marker_origin producer=tool_output_without_continuation_identity"
+        in logged
     )
 
 
