@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import importlib.metadata
-from typing import Any, List
+from typing import Any, List, Optional
 
 CURSOR_AGENT_CLI_HTTP2_KEEPALIVE_SECONDS = 600
 CURSOR_AGENT_CLI_H2_MAX_INBOUND_FRAME_SIZE = 16 * 1024 * 1024
+SUPPORTED_HYPERCORN_VERSION_PREFIX = "0.15."
 
 _H2_RECEIVE_DISPATCH_GUARDS_INSTALLED = False
 _ORIGINAL_H2_HANDLE: Any = None
 _ORIGINAL_H2_HANDLE_EVENTS: Any = None
 _ORIGINAL_H2_CLOSE_STREAM: Any = None
+
+
+class UnsupportedHypercornVersion(RuntimeError):
+    """Cursor inbound HTTP/2 guards require the pinned Hypercorn 0.15 line."""
 
 
 def hypercorn_h2_receive_dispatch_guards_installed() -> bool:
@@ -20,6 +25,42 @@ def hypercorn_h2_receive_dispatch_guards_installed() -> bool:
 
 def original_hypercorn_h2_handle_events() -> Any:
     return _ORIGINAL_H2_HANDLE_EVENTS
+
+
+def original_hypercorn_h2_handle() -> Any:
+    return _ORIGINAL_H2_HANDLE
+
+
+def require_supported_hypercorn_version(version: Optional[str] = None) -> str:
+    installed = version if version is not None else importlib.metadata.version("hypercorn")
+    if not str(installed).startswith(SUPPORTED_HYPERCORN_VERSION_PREFIX):
+        raise UnsupportedHypercornVersion(
+            "Cursor Agent CLI inbound requires hypercorn "
+            f"{SUPPORTED_HYPERCORN_VERSION_PREFIX}x; found {installed}."
+        )
+    return str(installed)
+
+
+def restore_hypercorn_h2_receive_dispatch_guards() -> None:
+    """Restore stock Hypercorn H2Protocol methods. Tests only."""
+    global _H2_RECEIVE_DISPATCH_GUARDS_INSTALLED
+    global _ORIGINAL_H2_HANDLE, _ORIGINAL_H2_HANDLE_EVENTS, _ORIGINAL_H2_CLOSE_STREAM
+    from hypercorn.protocol.h2 import H2Protocol
+
+    if _ORIGINAL_H2_HANDLE is not None:
+        H2Protocol.handle = _ORIGINAL_H2_HANDLE
+    if _ORIGINAL_H2_HANDLE_EVENTS is not None:
+        H2Protocol._handle_events = _ORIGINAL_H2_HANDLE_EVENTS
+    if _ORIGINAL_H2_CLOSE_STREAM is not None:
+        H2Protocol._close_stream = _ORIGINAL_H2_CLOSE_STREAM
+    if hasattr(H2Protocol, "_aawm_cursor_h2_guards"):
+        delattr(H2Protocol, "_aawm_cursor_h2_guards")
+    if hasattr(H2Protocol, "_aawm_hypercorn_version"):
+        delattr(H2Protocol, "_aawm_hypercorn_version")
+    _H2_RECEIVE_DISPATCH_GUARDS_INSTALLED = False
+    _ORIGINAL_H2_HANDLE = None
+    _ORIGINAL_H2_HANDLE_EVENTS = None
+    _ORIGINAL_H2_CLOSE_STREAM = None
 
 
 def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
@@ -38,6 +79,8 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
     global _ORIGINAL_H2_HANDLE, _ORIGINAL_H2_HANDLE_EVENTS, _ORIGINAL_H2_CLOSE_STREAM
     if _H2_RECEIVE_DISPATCH_GUARDS_INSTALLED:
         return
+
+    version = require_supported_hypercorn_version()
 
     import h2.events
     import h2.exceptions
@@ -63,9 +106,49 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
             getattr(protocol, "closed", False) or stream_id in _retired_ids(protocol)
         )
 
+    async def _release_stream_buffers(self) -> None:
+        buffers = getattr(self, "stream_buffers", None)
+        if not isinstance(buffers, dict):
+            return
+        for stream_id, buffer in list(buffers.items()):
+            close = getattr(buffer, "close", None)
+            if callable(close):
+                try:
+                    await close()
+                except Exception:
+                    pass
+            buffers.pop(stream_id, None)
+        has_data = getattr(self, "has_data", None)
+        if has_data is not None:
+            await has_data.set()
+
+    async def _enter_connection_close(self, *, notify_transport: bool) -> None:
+        already_closed = bool(getattr(self, "closed", False))
+        self.closed = True
+        # Unblock response push/drain waiters before HTTPStream disconnect
+        # delivery, which can itself wait on a full application queue.
+        await _release_stream_buffers(self)
+        stream_ids = list(self.streams.keys())
+        for stream_id in stream_ids:
+            await self._close_stream(stream_id)
+        if notify_transport and not already_closed:
+            await self.send(Closed())
+
     async def _close_stream(self, stream_id: int) -> None:
         _retired_ids(self).add(stream_id)
+        buffer = getattr(self, "stream_buffers", {}).get(stream_id)
         await _ORIGINAL_H2_CLOSE_STREAM(self, stream_id)
+        if buffer is not None:
+            close = getattr(buffer, "close", None)
+            if callable(close):
+                try:
+                    await close()
+                except Exception:
+                    pass
+            getattr(self, "stream_buffers", {}).pop(stream_id, None)
+
+    def _batch_is_connection_terminal(events: List[Any]) -> bool:
+        return any(isinstance(event, h2.events.ConnectionTerminated) for event in events)
 
     async def _handle(self, event: Any) -> None:
         if isinstance(event, RawData):
@@ -74,26 +157,29 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
             try:
                 events = self.connection.receive_data(event.data)
             except h2.exceptions.ProtocolError:
-                await self._flush()
-                await self.send(Closed())
-            else:
-                await self._handle_events(events)
+                await _enter_connection_close(self, notify_transport=True)
+                return
+            if _batch_is_connection_terminal(events):
+                await _enter_connection_close(self, notify_transport=True)
+                return
+            await self._handle_events(events)
             return
         if isinstance(event, Closed):
-            self.closed = True
-            stream_ids = list(self.streams.keys())
-            for stream_id in stream_ids:
-                await self._close_stream(stream_id)
-            await self.has_data.set()
+            await _enter_connection_close(self, notify_transport=False)
             return
         await _ORIGINAL_H2_HANDLE(self, event)
 
     async def _handle_events(self, events: List[Any]) -> None:
+        if _batch_is_connection_terminal(events):
+            await _enter_connection_close(self, notify_transport=True)
+            return
         for event in events:
             if getattr(self, "closed", False):
                 return
             if isinstance(event, h2.events.RequestReceived):
                 if self.context.terminated.is_set():
+                    if getattr(self, "closed", False):
+                        return
                     self.connection.reset_stream(event.stream_id)
                     self.connection.update_settings(
                         {h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS: 0}
@@ -146,12 +232,7 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
                 ):
                     await self._window_updated(None)
             elif isinstance(event, h2.events.ConnectionTerminated):
-                self.closed = True
-                stream_ids = list(self.streams.keys())
-                for stream_id in stream_ids:
-                    await self._close_stream(stream_id)
-                await self.has_data.set()
-                await self.send(Closed())
+                await _enter_connection_close(self, notify_transport=True)
                 return
         if not getattr(self, "closed", False):
             await self._flush()
@@ -160,7 +241,7 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
     H2Protocol._handle_events = _handle_events
     H2Protocol._close_stream = _close_stream
     H2Protocol._aawm_cursor_h2_guards = True
-    H2Protocol._aawm_hypercorn_version = importlib.metadata.version("hypercorn")
+    H2Protocol._aawm_hypercorn_version = version
     _H2_RECEIVE_DISPATCH_GUARDS_INSTALLED = True
 
 

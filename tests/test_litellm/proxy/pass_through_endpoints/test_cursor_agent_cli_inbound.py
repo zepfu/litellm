@@ -763,7 +763,8 @@ def test_agentn_session_connection_terminated_marks_session_unusable(caplog) -> 
     assert session._connection_terminated is True
     assert session._closed is True
     assert session.upstream_termination_reason == "upstream_reset"
-    assert session._incoming.get_nowait() is None
+    with pytest.raises(asyncio.QueueEmpty):
+        session._incoming.get_nowait()
     warning_messages = [
         record.getMessage()
         for record in caplog.records
@@ -776,23 +777,74 @@ def test_agentn_session_connection_terminated_marks_session_unusable(caplog) -> 
     ), warning_messages
 
 
-@pytest.mark.asyncio
-async def test_agentn_session_receive_data_goaway_stops_read_loop() -> None:
+class _CountingWriter:
+    def __init__(self) -> None:
+        self.writes = 0
+        self.closed = False
+        self.aborted = False
+
+    def write(self, _data: bytes) -> None:
+        self.writes += 1
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+    def abort(self) -> None:
+        self.aborted = True
+
+    async def wait_closed(self) -> None:
+        return None
+
+
+def _agentn_response_then_goaway(*, end_stream: bool = True) -> tuple[Any, bytes, bytes]:
     from h2.config import H2Configuration
     from h2.connection import H2Connection
-    from h2.events import ConnectionTerminated
 
+    client = H2Connection(
+        config=H2Configuration(client_side=True, header_encoding="utf-8")
+    )
+    server = H2Connection(
+        config=H2Configuration(client_side=False, header_encoding="utf-8")
+    )
+    client.initiate_connection()
+    server.initiate_connection()
+    server.receive_data(client.data_to_send())
+    client.receive_data(server.data_to_send())
+    stream_id = client.get_next_available_stream_id()
+    client.send_headers(
+        stream_id,
+        [
+            (":method", "POST"),
+            (":scheme", "https"),
+            (":authority", "agentn.global.api5.cursor.sh"),
+            (":path", "/agent.v1.AgentService/Run"),
+        ],
+        end_stream=False,
+    )
+    server.receive_data(client.data_to_send())
+    payload = _heartbeat_chunk()
+    server.send_headers(
+        stream_id,
+        [(":status", "200"), ("content-type", "application/connect+proto")],
+        end_stream=False,
+    )
+    server.send_data(stream_id, payload, end_stream=end_stream)
+    data_frames = server.data_to_send()
+    server.close_connection()
+    goaway = server.data_to_send()
+    return client, data_frames, goaway
+
+
+@pytest.mark.asyncio
+async def test_agentn_session_receive_data_goaway_stops_read_loop() -> None:
     from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
         _AgentnH2Session,
     )
 
-    server = H2Connection(
-        config=H2Configuration(client_side=False, header_encoding="utf-8")
-    )
-    server.initiate_connection()
-    _ = server.data_to_send()
-    server.close_connection()
-    goaway = server.data_to_send()
+    client, _data_frames, goaway = _agentn_response_then_goaway()
     assert goaway
 
     class _Reader:
@@ -804,47 +856,98 @@ async def test_agentn_session_receive_data_goaway_stops_read_loop() -> None:
                 return self._payloads.pop(0)
             return b""
 
-    class _Writer:
-        def write(self, _data: bytes) -> None:
-            return None
-
-        async def drain(self) -> None:
-            return None
-
-        def close(self) -> None:
-            return None
-
-        def abort(self) -> None:
-            return None
-
-        async def wait_closed(self) -> None:
-            return None
-
+    writer = _CountingWriter()
     session = _AgentnH2Session("https://agentn.global.api5.cursor.sh")
-    client = H2Connection(
-        config=H2Configuration(client_side=True, header_encoding="utf-8")
-    )
-    client.initiate_connection()
-    _ = client.data_to_send()
     session.connection = client
     session.reader = _Reader()
-    session.writer = _Writer()
+    session.writer = writer
     session.stream_id = 1
-    probe = H2Connection(
-        config=H2Configuration(client_side=True, header_encoding="utf-8")
-    )
-    probe.initiate_connection()
-    _ = probe.data_to_send()
-    assert any(
-        isinstance(event, ConnectionTerminated) for event in probe.receive_data(goaway)
-    )
+    writes_before = writer.writes
     await asyncio.wait_for(session._read_loop(), timeout=2)
     assert session._connection_terminated is True
     assert session._closed is True
     assert session.upstream_termination_reason == "upstream_reset"
     assert session.reader_termination_event.is_set()
+    assert writer.writes == writes_before
     await asyncio.wait_for(session.aclose(reason="upstream_reset"), timeout=2)
     await asyncio.wait_for(session.aclose(reason="upstream_reset"), timeout=2)
+    assert writer.closed is True
+    assert writer.aborted is True
+
+
+@pytest.mark.asyncio
+async def test_agentn_session_delivers_payload_before_coalesced_goaway() -> None:
+    from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
+        _AgentnH2Session,
+    )
+
+    client, data_frames, goaway = _agentn_response_then_goaway()
+    coalesced = data_frames + goaway
+
+    class _Reader:
+        def __init__(self) -> None:
+            self._payloads = [coalesced, b""]
+
+        async def read(self, _size: int) -> bytes:
+            if self._payloads:
+                return self._payloads.pop(0)
+            return b""
+
+    writer = _CountingWriter()
+    session = _AgentnH2Session("https://agentn.global.api5.cursor.sh")
+    session.connection = client
+    session.reader = _Reader()
+    session.writer = writer
+    session.stream_id = 1
+    collected: List[Optional[bytes]] = []
+
+    async def _consume() -> None:
+        async for chunk in session.iter_response_data():
+            collected.append(chunk)
+
+    consumer = asyncio.create_task(_consume())
+    await asyncio.wait_for(session._read_loop(), timeout=2)
+    await asyncio.wait_for(consumer, timeout=2)
+    assert collected == [_heartbeat_chunk()]
+    assert session._connection_terminated is True
+    assert writer.writes == 0
+
+
+@pytest.mark.asyncio
+async def test_agentn_session_delivers_payload_before_fragmented_goaway() -> None:
+    from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
+        _AgentnH2Session,
+    )
+
+    client, data_frames, goaway = _agentn_response_then_goaway(end_stream=False)
+
+    class _Reader:
+        def __init__(self) -> None:
+            self._payloads = [data_frames, goaway, b""]
+
+        async def read(self, _size: int) -> bytes:
+            if self._payloads:
+                return self._payloads.pop(0)
+            return b""
+
+    writer = _CountingWriter()
+    session = _AgentnH2Session("https://agentn.global.api5.cursor.sh")
+    session.connection = client
+    session.reader = _Reader()
+    session.writer = writer
+    session.stream_id = 1
+    collected: List[Optional[bytes]] = []
+
+    async def _consume() -> None:
+        async for chunk in session.iter_response_data():
+            collected.append(chunk)
+
+    consumer = asyncio.create_task(_consume())
+    await asyncio.wait_for(session._read_loop(), timeout=2)
+    await asyncio.wait_for(consumer, timeout=2)
+    assert collected == [_heartbeat_chunk()]
+    assert session._connection_terminated is True
+    assert writer.writes == 0
 
 
 def test_agentn_session_stream_reset_on_other_stream_does_not_close_session() -> None:

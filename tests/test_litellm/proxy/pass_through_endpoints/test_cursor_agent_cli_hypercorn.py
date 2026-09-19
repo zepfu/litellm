@@ -14,9 +14,14 @@ import h2.events
 import pytest
 
 from litellm.proxy.pass_through_endpoints.cursor_agent_cli_hypercorn import (
+    UnsupportedHypercornVersion,
     configure_hypercorn_for_cursor_agent_cli,
+    hypercorn_h2_receive_dispatch_guards_installed,
     install_hypercorn_h2_receive_dispatch_guards,
+    original_hypercorn_h2_handle,
     original_hypercorn_h2_handle_events,
+    require_supported_hypercorn_version,
+    restore_hypercorn_h2_receive_dispatch_guards,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -304,10 +309,6 @@ async def test_stock_hypercorn_h2_goaway_then_stale_data_keyerrors() -> None:
 def test_configure_hypercorn_installs_receive_dispatch_guards() -> None:
     from hypercorn.protocol.h2 import H2Protocol
 
-    from litellm.proxy.pass_through_endpoints.cursor_agent_cli_hypercorn import (
-        hypercorn_h2_receive_dispatch_guards_installed,
-    )
-
     config = MagicMock()
     config.alpn_protocols = ["h2", "http/1.1"]
     configure_hypercorn_for_cursor_agent_cli(config)
@@ -315,3 +316,72 @@ def test_configure_hypercorn_installs_receive_dispatch_guards() -> None:
     assert getattr(H2Protocol, "_aawm_cursor_h2_guards", False) is True
     assert str(getattr(H2Protocol, "_aawm_hypercorn_version", "")).startswith("0.15.")
     assert importlib.metadata.version("hypercorn").startswith("0.15.")
+    first_handle = H2Protocol.handle
+    captured = original_hypercorn_h2_handle()
+    install_hypercorn_h2_receive_dispatch_guards()
+    assert H2Protocol.handle is first_handle
+    assert original_hypercorn_h2_handle() is captured
+
+
+def test_unsupported_hypercorn_version_leaves_methods_untouched() -> None:
+    from hypercorn.protocol.h2 import H2Protocol
+
+    restore_hypercorn_h2_receive_dispatch_guards()
+    handle_before = H2Protocol.handle
+    events_before = H2Protocol._handle_events
+    close_before = H2Protocol._close_stream
+    with pytest.raises(UnsupportedHypercornVersion):
+        require_supported_hypercorn_version("0.18.0")
+    with pytest.raises(UnsupportedHypercornVersion):
+        from unittest.mock import patch as _patch
+
+        with _patch(
+            "litellm.proxy.pass_through_endpoints.cursor_agent_cli_hypercorn.importlib.metadata.version",
+            return_value="0.18.0",
+        ):
+            install_hypercorn_h2_receive_dispatch_guards()
+    assert H2Protocol.handle is handle_before
+    assert H2Protocol._handle_events is events_before
+    assert H2Protocol._close_stream is close_before
+    assert hypercorn_h2_receive_dispatch_guards_installed() is False
+    install_hypercorn_h2_receive_dispatch_guards()
+
+
+@pytest.mark.asyncio
+async def test_hypercorn_h2_coalesced_request_goaway_during_worker_termination() -> None:
+    from hypercorn.events import Closed, RawData
+
+    protocol, sent, task_group = await _make_h2_protocol(install_guards=True)
+    try:
+        await protocol.context.terminated.set()
+        client = _new_h2_client()
+        first = _open_run(client, end_stream=True)
+        rest = _goaway(client)
+        await protocol.handle(RawData(data=first + rest))
+        assert protocol.closed is True
+        assert 1 not in protocol.streams
+        assert any(isinstance(event, Closed) for event in sent)
+    finally:
+        await _close_protocol(protocol, task_group)
+
+
+@pytest.mark.asyncio
+async def test_hypercorn_h2_goaway_releases_blocked_response_buffer() -> None:
+    from hypercorn.events import RawData
+    from hypercorn.protocol.h2 import BUFFER_HIGH_WATER, StreamBuffer
+
+    protocol, _sent, task_group = await _make_h2_protocol(install_guards=True)
+    try:
+        client = _new_h2_client()
+        await protocol.handle(RawData(data=client.data_to_send()))
+        buffer = StreamBuffer(protocol.context.event_class)
+        protocol.stream_buffers[1] = buffer
+        blocked = asyncio.create_task(buffer.push(b"x" * int(BUFFER_HIGH_WATER)))
+        await asyncio.sleep(0)
+        assert blocked.done() is False
+        await protocol.handle(RawData(data=_goaway(client)))
+        await asyncio.wait_for(blocked, timeout=1)
+        assert protocol.closed is True
+        assert 1 not in protocol.stream_buffers
+    finally:
+        await _close_protocol(protocol, task_group)

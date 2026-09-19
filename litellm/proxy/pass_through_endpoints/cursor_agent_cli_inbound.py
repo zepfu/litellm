@@ -1190,17 +1190,14 @@ class _AgentnH2Session:
                 )
                 ended = True
             elif isinstance(event, ConnectionTerminated):
-                # GOAWAY retires the whole connection. Mark the session
-                # unusable before any later await or auto-reply write.
+                # GOAWAY retires the whole connection. Mark it unwritable
+                # immediately, but keep already-received payload for delivery
+                # after this dispatcher returns.
                 error_code = getattr(event, "error_code", None)
                 self._connection_terminated = True
                 self._closed = True
                 self._pending_wakeup.set()
                 self._request_end_stream_event.set()
-                try:
-                    self._incoming.put_nowait(None)
-                except Exception:
-                    pass
                 self._mark_upstream_termination("upstream_reset")
                 verbose_proxy_logger.warning(
                     "cursor_agent_cli_inbound agentn stream closed event=%s error_code=%s",
@@ -1240,9 +1237,12 @@ class _AgentnH2Session:
                     chunks, ended = self._dispatch_h2_events(events)
                     auto_replies = self._auto_replies
                     self._auto_replies = []
-                    if not self._connection_terminated and not self._closed:
+                    connection_done = self._connection_terminated or self._closed
+                    if not connection_done:
                         await self._flush_connection()
-                if self._connection_terminated or self._closed:
+                for chunk in chunks:
+                    await self._incoming.put(chunk)
+                if connection_done:
                     break
                 for reply in auto_replies:
                     verbose_proxy_logger.info(
@@ -1250,8 +1250,6 @@ class _AgentnH2Session:
                         len(reply),
                     )
                     await self.write_request(reply, end_stream=False)
-                for chunk in chunks:
-                    await self._incoming.put(chunk)
                 if ended:
                     if self._upstream_termination_reason is None:
                         self._mark_upstream_termination("normal_response")
