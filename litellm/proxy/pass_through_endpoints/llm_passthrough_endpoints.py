@@ -2434,15 +2434,11 @@ _ANTHROPIC_NVIDIA_PROVIDER_RUNTIME = _anthropic_nvidia_provider.Runtime(
     prepare_request_body=lambda body, **kwargs: (_prepare_anthropic_completion_adapter_request_body(body, **kwargs)),
     get_api_key=lambda: _get_anthropic_adapter_nvidia_api_key(),
     get_target_base=lambda: _get_anthropic_adapter_nvidia_target_base(),
-    normalize_endpoint=lambda **kwargs: (BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(**kwargs)),
-    join_url=lambda *args: BaseOpenAIPassThroughHandler._join_url_paths(*args),
-    url_factory=httpx.URL,
     validate_egress=lambda **kwargs: (HttpPassThroughEndpointHelpers.validate_outgoing_egress(**kwargs)),
     perform_operation=lambda **kwargs: (_perform_nvidia_completion_adapter_operation(**kwargs)),
     get_timeout_seconds=lambda model: (_get_nvidia_adapter_request_timeout_seconds(model)),
     get_inner_max_retries=lambda: _get_nvidia_adapter_inner_max_retries(),
     provider=litellm.LlmProviders.NVIDIA_NIM.value,
-    provider_target=litellm.LlmProviders.NVIDIA_NIM,
 )
 
 _ANTHROPIC_OPENROUTER_PROVIDER_RUNTIME = _anthropic_openrouter_provider.Runtime(

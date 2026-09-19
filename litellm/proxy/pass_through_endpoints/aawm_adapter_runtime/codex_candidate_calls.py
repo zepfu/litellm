@@ -6985,7 +6985,7 @@ async def _prepare_codex_nvidia_completion_adapter_route(
         raise exc
 
     target_base_url = _nvidia_runtime._get_anthropic_adapter_nvidia_target_base()
-    api_base = f"{str(target_base_url).rstrip('/')}/v1"
+    api_base = _nvidia_runtime._nvidia_api_base_from_target_base(str(target_base_url))
     target_url = f"{api_base}/chat/completions"
     HttpPassThroughEndpointHelpers.validate_outgoing_egress(
         url=target_url,

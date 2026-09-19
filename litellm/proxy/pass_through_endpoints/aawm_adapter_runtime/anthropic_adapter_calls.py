@@ -933,15 +933,11 @@ def _get_anthropic_adapter_nvidia_api_key() -> Optional[str]:
 
 
 def _get_anthropic_adapter_nvidia_target_base() -> str:
-    cleaned = (
-        _clean_secret_string(os.getenv("NVIDIA_NIM_API_BASE"))  # noqa: F821
-        or _clean_secret_string(os.getenv("AAWM_NVIDIA_API_BASE"))  # noqa: F821
-        or "https://integrate.api.nvidia.com/v1"
+    from litellm.proxy.pass_through_endpoints.providers.nvidia.runtime import (
+        _get_anthropic_adapter_nvidia_target_base as _canonical_nvidia_target_base,
     )
-    cleaned = cleaned.rstrip("/")
-    if cleaned.endswith("/v1"):
-        return cleaned[: -len("/v1")]
-    return cleaned
+
+    return _canonical_nvidia_target_base()
 
 
 def _get_anthropic_adapter_openrouter_target_base() -> str:

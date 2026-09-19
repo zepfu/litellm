@@ -5,6 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from litellm.proxy.pass_through_endpoints.providers.nvidia.runtime import (
+    _nvidia_api_base_from_target_base,
+)
+
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     adapter_config,
     adapter_driver,
@@ -20,15 +24,11 @@ class Runtime:
     prepare_request_body: Callable[..., Any]
     get_api_key: Callable[..., Any]
     get_target_base: Callable[..., Any]
-    normalize_endpoint: Callable[..., Any]
-    join_url: Callable[..., Any]
-    url_factory: Callable[..., Any]
     validate_egress: Callable[..., Any]
     perform_operation: Callable[..., Any]
     get_timeout_seconds: Callable[..., Any]
     get_inner_max_retries: Callable[..., Any]
     provider: str
-    provider_target: Any
 
 
 async def prepare_completion_route(
@@ -67,15 +67,8 @@ async def prepare_completion_route(
             "in environment."
         )
     target_base_url = runtime.get_target_base()
-    normalized_endpoint = runtime.normalize_endpoint(
-        endpoint="/v1/chat/completions",
-        base_target_url=target_base_url,
-    )
-    target_url = runtime.join_url(
-        runtime.url_factory(target_base_url),
-        normalized_endpoint,
-        runtime.provider_target,
-    )
+    api_base = _nvidia_api_base_from_target_base(str(target_base_url))
+    target_url = f"{api_base}/chat/completions"
     runtime.validate_egress(
         url=str(target_url),
         headers={"Authorization": f"Bearer {api_key}"},
@@ -94,8 +87,7 @@ async def prepare_completion_route(
         prepared_request_body=prepared_request_body,
         target_url=target_url,
         api_key=api_key,
-        api_base=f"{target_base_url.rstrip('/')}/v1",
-        client_requested_stream=client_requested_stream,
+        api_base=api_base,
         perform_kwargs={
             "custom_llm_provider": runtime.provider,
             "model_for_upstream": adapter_model,

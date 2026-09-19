@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+from urllib.parse import urlsplit
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
@@ -27,6 +28,11 @@ _ANTHROPIC_ADAPTER_NVIDIA_API_KEY_ENV_VARS = (
 _ANTHROPIC_ADAPTER_NVIDIA_RETRYABLE_STATUS_CODES = frozenset(
     {408, 429, 500, 502, 503, 504}
 )
+NVIDIA_API_BASE_VERSION_SEGMENT = "/v1"
+"""The single API version segment appended when building NVIDIA transport URLs."""
+
+NVIDIA_TARGET_BASE_DEFAULT = "https://integrate.api.nvidia.com"
+"""Canonical default NVIDIA target root, stored without a version segment."""
 
 
 @dataclass(frozen=True)
@@ -109,20 +115,71 @@ def _get_anthropic_adapter_nvidia_api_key() -> Optional[str]:
     )
 
 
+def _nvidia_target_base_api_version_violation(target_base: str) -> Optional[str]:
+    """Return a deterministic rejection reason for ambiguous version paths.
+
+    The canonical NVIDIA target root never carries a version segment: exactly
+    one trailing ``/v1`` is normalized away, and any additional version
+    segment nested inside the path is rejected instead of silently rewritten,
+    so an operator's intentional gateway path cannot be doubled or mangled.
+    """
+
+    parsed = urlsplit(target_base)
+    segments = [
+        segment
+        for segment in parsed.path.split("/")
+        if segment
+    ]
+    version_indexes = [
+        index
+        for index, segment in enumerate(segments)
+        if segment == NVIDIA_API_BASE_VERSION_SEGMENT.lstrip("/")
+    ]
+    if not version_indexes:
+        return None
+    if version_indexes == [len(segments) - 1]:
+        return None
+    return (
+        "NVIDIA API base target "
+        f"'{target_base}' must carry at most one trailing "
+        f"'{NVIDIA_API_BASE_VERSION_SEGMENT}' version segment; nested version "
+        "paths are ambiguous and are rejected instead of rewritten."
+    )
+
+
+def _canonical_nvidia_target_base(target_base: str) -> str:
+    """Normalize one NVIDIA target root without any version segment."""
+
+    cleaned = target_base.rstrip("/")
+    if cleaned.endswith(NVIDIA_API_BASE_VERSION_SEGMENT):
+        cleaned = cleaned[: -len(NVIDIA_API_BASE_VERSION_SEGMENT)]
+    return cleaned.rstrip("/") or NVIDIA_TARGET_BASE_DEFAULT
+
+
 def _get_anthropic_adapter_nvidia_target_base() -> str:
-    cleaned = (
+    raw_base = (
         _runtime_dependencies.clean_secret_string(
             _runtime_dependencies.get_env("NVIDIA_NIM_API_BASE")
         )
         or _runtime_dependencies.clean_secret_string(
             _runtime_dependencies.get_env("AAWM_NVIDIA_API_BASE")
         )
-        or "https://integrate.api.nvidia.com/v1"
+        or NVIDIA_TARGET_BASE_DEFAULT
     )
-    cleaned = cleaned.rstrip("/")
-    if cleaned.endswith("/v1"):
-        return cleaned[: -len("/v1")]
-    return cleaned
+    if raw_base == NVIDIA_TARGET_BASE_DEFAULT:
+        return NVIDIA_TARGET_BASE_DEFAULT
+    violation = _nvidia_target_base_api_version_violation(raw_base)
+    if violation is not None:
+        raise ValueError(violation)
+    return _canonical_nvidia_target_base(raw_base)
+
+
+def _nvidia_api_base_from_target_base(target_base: str) -> str:
+    """Build the NVIDIA API base by appending the version segment once."""
+    violation = _nvidia_target_base_api_version_violation(target_base)
+    if violation is not None:
+        raise ValueError(violation)
+    return f"{_canonical_nvidia_target_base(target_base)}{NVIDIA_API_BASE_VERSION_SEGMENT}"
 
 
 def _get_nvidia_adapter_max_retries() -> int:
