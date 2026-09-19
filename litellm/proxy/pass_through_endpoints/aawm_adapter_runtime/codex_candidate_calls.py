@@ -9558,7 +9558,11 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
     )
 
     _ = endpoint, fastapi_response, user_api_key_dict
-    _ = (
+    # OC-031: authoritative known-free Go models must record one
+    # response_cost=0.0 through the shared logging object. Compute the
+    # free status here and hand it to the shared completion-call path
+    # instead of discarding it.
+    is_known_free_direct = (
         not use_alias_candidate_probe
         and adapter_model in _OPENCODE_GO_FREE_MODELS
     )
@@ -10056,7 +10060,7 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
                 completion_call_kwargs=completion_call_kwargs,
                 litellm_metadata=litellm_metadata,
                 accepted_trace_user_id=None,
-                is_known_free_direct=False,
+                is_known_free_direct=is_known_free_direct,
             )
         else:
             completion_awaitable = litellm.acompletion(**completion_call_kwargs)
@@ -10094,6 +10098,14 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
         from litellm.types.utils import ModelResponse
 
         completion_response = ModelResponse(**completion_response)
+    # D1-574/OC-031: mirror the OpenCode Zen free-model behavior. The
+    # generic cost lookup cannot resolve openai/<model> to the
+    # opencode/<model> zero-price entry, so stamp the explicit zero onto
+    # the response's hidden params for the Logging -> Langfuse path.
+    if is_known_free_direct:
+        _hidden = getattr(completion_response, "_hidden_params", None)
+        if isinstance(_hidden, dict):
+            _hidden["response_cost"] = 0.0
     responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
         chat_completion_response=completion_response,
         request_input=request_input,
