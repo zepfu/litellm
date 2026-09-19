@@ -15,6 +15,14 @@ expired_prune_count = 0
 fifo_eviction_count = 0
 
 
+def normalize_monotonic_cooldown_key(key: str) -> str:
+    """Canonical form for process-local cooldown/failure-circuit map keys.
+
+    Collapses whitespace and case so equivalent model identities share one
+    bounded map entry. Applied only to map keys and labels — never fed
+    back into upstream requests.
+    """
+    return " ".join(key.split()).casefold()
 def bound_memory_map(
     cache: MutableMapping[MapKeyT, MapValueT],
     *,
@@ -22,7 +30,7 @@ def bound_memory_map(
 ) -> None:
     """Prune expired entries, then FIFO-trim to ``max_size``."""
     global fifo_eviction_count
-    prune_expired_memory_map(cache)
+    prune_expired_monotonic_map(cache)
     while len(cache) > max_size:
         try:
             oldest = next(iter(cache))
@@ -32,7 +40,7 @@ def bound_memory_map(
         fifo_eviction_count += 1
 
 
-def prune_expired_memory_map(
+def prune_expired_monotonic_map(
     cache: MutableMapping[Any, Any],
     now: Optional[float] = None,
 ) -> None:
@@ -55,7 +63,8 @@ def prune_expired_memory_map(
         expired_prune_count += 1
 
 
-prune_expired_monotonic_entries = prune_expired_memory_map
+prune_expired_memory_map = prune_expired_monotonic_map
+prune_expired_monotonic_entries = prune_expired_monotonic_map
 
 
 def hydrate_cooldown_memory(
