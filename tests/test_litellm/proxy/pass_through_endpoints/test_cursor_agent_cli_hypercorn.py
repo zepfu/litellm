@@ -355,6 +355,8 @@ def test_unsupported_hypercorn_version_leaves_methods_untouched() -> None:
     close_before = H2Protocol._close_stream
     send_before = H2Protocol._send_data
     http_before = HTTPStream.handle
+    from hypercorn.protocol.ws_stream import WSStream
+    ws_before = WSStream._handle_events
     with pytest.raises(UnsupportedHypercornVersion):
         require_supported_hypercorn_version("0.18.0")
     with pytest.raises(UnsupportedHypercornVersion):
@@ -370,6 +372,7 @@ def test_unsupported_hypercorn_version_leaves_methods_untouched() -> None:
     assert H2Protocol._close_stream is close_before
     assert H2Protocol._send_data is send_before
     assert HTTPStream.handle is http_before
+    assert WSStream._handle_events is ws_before
     assert hypercorn_h2_receive_dispatch_guards_installed() is False
     install_hypercorn_h2_receive_dispatch_guards()
 
@@ -807,14 +810,16 @@ async def test_hypercorn_h2_websocket_terminal_close_uses_websocket_disconnect()
 @pytest.mark.asyncio
 async def test_hypercorn_h2_blocked_websocket_receive_then_goaway() -> None:
     from hypercorn.events import Closed, RawData
+    from hypercorn.protocol.events import Body
     from hypercorn.protocol.ws_stream import ASGIWebsocketState, WSStream
+    from wsproto.connection import Connection, ConnectionType
+    from wsproto.events import BytesMessage, Ping
     from wsproto.frame_protocol import CloseReason
 
-    protocol, sent, task_group = await _make_h2_protocol(install_guards=True)
+    protocol, sent, task_group = await _make_h2_protocol( install_guards=True)
     try:
         client = _new_h2_client()
         stream_id = client.get_next_available_stream_id()
-       
         client.send_headers(
             stream_id,
             [
@@ -827,7 +832,7 @@ async def test_hypercorn_h2_blocked_websocket_receive_then_goaway() -> None:
         )
         await protocol.handle(RawData(data=client.data_to_send()))
         queue: asyncio.Queue = asyncio.Queue(maxsize=1)
-        queue.put_nowait({" type": "websocket.receive", "text": "held"})
+        queue.put_nowait({"type": "websocket.receive", "text": "held"})
         ws = WSStream(
             protocol.app,
             protocol.config,
@@ -842,10 +847,11 @@ async def test_hypercorn_h2_blocked_websocket_receive_then_goaway() -> None:
         ws.app_put = queue.put
         ws.scope = {"type": "websocket"}
         ws.state = ASGIWebsocketState.CONNECTED
+        ws.connection = Connection(ConnectionType.SERVER)
         protocol.streams[1] = ws
-        blocked = asyncio.create_task(
-            _blocked_ws_receive(ws, {"type": "websocket.receive", "text": "late"})
-        )
+        frames = Connection(ConnectionType.CLIENT)
+        payload = frames.send(BytesMessage(data=b"late")) + frames.send(Ping(payload=b"p"))
+        blocked = asyncio.create_task(ws.handle(Body(stream_id=1, data=payload)))
         for _ in range(20):
             if getattr(ws, "_aawm_queue_space", None) is not None:
                 break
@@ -867,24 +873,3 @@ async def test_hypercorn_h2_blocked_websocket_receive_then_goaway() -> None:
         assert CloseReason.ABNORMAL_CLOSURE.value
     finally:
         await _close_protocol(protocol, task_group)
-
-
-async def _blocked_ws_receive(stream: Any, message: dict) -> None:
-    put = stream.app_put
-    queue = getattr(put, "__self__", None)
-    if not isinstance(queue, asyncio.Queue):
-        await put(message)
-        return
-    space = getattr(stream, "_aawm_queue_space", None)
-    if space is None:
-        space = asyncio.Event()
-        stream._aawm_queue_space = space
-    while not getattr(stream, "closed", False):
-        try:
-            queue.put_nowait(message)
-            return
-        except asyncio.QueueFull:
-            space.clear()
-            if queue.qsize() < queue.maxsize:
-                continue
-            await space.wait()

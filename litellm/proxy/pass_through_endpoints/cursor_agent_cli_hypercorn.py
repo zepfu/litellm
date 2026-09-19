@@ -261,10 +261,14 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
         from hypercorn.protocol.ws_stream import FrameTooLargeError
 
         for event in self.connection.events():
+            if getattr(self, "closed", False):
+                return
             if isinstance(event, Message):
                 try:
                     self.buffer.extend(event)
                 except FrameTooLargeError:
+                    if getattr(self, "closed", False):
+                        return
                     await self._send_wsproto_event(
                         CloseConnection(code=CloseReason.MESSAGE_TOO_BIG)
                     )
@@ -273,9 +277,15 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
                     message = self.buffer.to_message()
                     self.buffer.clear()
                     await _put_app_event(self, message)
+                    if getattr(self, "closed", False):
+                        return
             elif isinstance(event, Ping):
+                if getattr(self, "closed", False):
+                    return
                 await self._send_wsproto_event(event.response())
             elif isinstance(event, CloseConnection):
+                if getattr(self, "closed", False):
+                    return
                 if self.connection.state == ConnectionState.REMOTE_CLOSING:
                     await self._send_wsproto_event(event.response())
                 await self.send(H2StreamClosed(stream_id=self.stream_id))
