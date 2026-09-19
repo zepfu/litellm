@@ -27,9 +27,14 @@ from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
     CURSOR_AGENT_CLI_INBOUND_TRACE_NAME,
     CursorAgentCliInboundMiddleware,
     InboundCursorAgentCliAuthError,
+    InboundCursorAgentCliProtocolError,
     _Http1LaneRegistry,
+    _InboundRunProvenance,
     _connect_header_flush_frame,
+    _log_inbound_run_terminal,
+    _observe_upstream_headers,
     _request_context_exec_replies,
+    _rewrite_cli_connect_bytes,
     _summarize_connect_chunk,
     _upstream_request_headers,
     build_inbound_cli_session_history_kwargs,
@@ -1036,6 +1041,82 @@ def test_upstream_http2_headers_omit_cursor_streaming() -> None:
     assert ("x-request-id", "req-http2") in forwarded
 
 
+def test_upstream_http2_headers_preserve_inbound_checksum() -> None:
+    forwarded = _upstream_request_headers(
+        {
+            "authorization": "Bearer cursor-access-token",
+            "content-type": "application/connect+proto",
+            "x-cursor-checksum": "opaque-checksum-value",
+            "x-cursor-streaming": "true",
+            "x-request-id": "req-http2",
+            "user-agent": "Cursor-CLI/2026.09.15-d2fe57e (linux x64)",
+        },
+        "cursor-access-token",
+    )
+    names = {name for name, _value in forwarded}
+    assert ("x-cursor-checksum", "opaque-checksum-value") in forwarded
+    assert "x-cursor-streaming" not in names
+    assert (
+        "user-agent",
+        "Cursor-CLI/2026.09.15-d2fe57e (linux x64)",
+    ) in forwarded
+    provenance = _InboundRunProvenance(call_id="call-1")
+    _observe_upstream_headers(
+        {
+            "authorization": "Bearer cursor-access-token",
+            "x-cursor-checksum": "opaque-checksum-value",
+            "x-cursor-streaming": "true",
+            "user-agent": "Cursor-CLI/2026.09.15-d2fe57e (linux x64)",
+        },
+        "cursor-access-token",
+        forwarded,
+        provenance,
+    )
+    assert provenance.checksum_in is True
+    assert provenance.checksum_out is True
+    assert provenance.checksum_in_eq_out is True
+    assert provenance.streaming_in is True
+    assert provenance.ua_source == "inbound"
+    assert provenance.bearer_in_eq_out is True
+
+
+def test_upstream_http2_headers_do_not_synthesize_checksum() -> None:
+    forwarded = _upstream_request_headers(
+        {
+            "authorization": "Bearer cursor-access-token",
+            "content-type": "application/connect+proto",
+        },
+        "cursor-access-token",
+    )
+    names = {name for name, _value in forwarded}
+    assert "x-cursor-checksum" not in names
+
+
+def test_sequential_runs_keep_distinct_bearers_and_checksums() -> None:
+    first = _upstream_request_headers(
+        {
+            "authorization": "Bearer token-a",
+            "content-type": "application/connect+proto",
+            "x-cursor-checksum": "checksum-a",
+        },
+        "token-a",
+    )
+    second = _upstream_request_headers(
+        {
+            "authorization": "Bearer token-b",
+            "content-type": "application/connect+proto",
+            "x-cursor-checksum": "checksum-b",
+        },
+        "token-b",
+    )
+    assert ("authorization", "Bearer token-a") in first
+    assert ("x-cursor-checksum", "checksum-a") in first
+    assert ("authorization", "Bearer token-b") in second
+    assert ("x-cursor-checksum", "checksum-b") in second
+    assert ("authorization", "Bearer token-b") not in first
+    assert ("x-cursor-checksum", "checksum-b") not in first
+
+
 def test_upstream_http2_headers_force_identity_encoding() -> None:
     forwarded = _upstream_request_headers(
         {
@@ -1478,3 +1559,122 @@ def test_named_compose_files_default_inbound_debug_off() -> None:
     expected = "AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG=${AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG:-0}"
     assert expected in alpha
     assert expected in dev
+
+
+def test_rewrite_cli_connect_bytes_buffers_partial_frame() -> None:
+    heartbeat = _heartbeat_chunk()
+    decoder = _ProtoConnectFrameDecoder()
+    assert _rewrite_cli_connect_bytes(heartbeat[:6], decoder) == b""
+    assert bytes(decoder.buffer) == heartbeat[:6]
+    assert _rewrite_cli_connect_bytes(heartbeat[6:], decoder) == heartbeat
+
+
+def test_rewrite_cli_connect_bytes_fail_closed_on_decoder_error() -> None:
+    provenance = _InboundRunProvenance(call_id="call-1")
+    decoder = _ProtoConnectFrameDecoder()
+    with pytest.raises(InboundCursorAgentCliProtocolError) as exc_info:
+        _rewrite_cli_connect_bytes(
+            b"\x00\xff\xff\xff\xffnot-a-frame",
+            decoder,
+            provenance=provenance,
+        )
+    assert exc_info.value.reason == "invalid_request"
+    assert exc_info.value.direction == "client"
+    assert provenance.decoder_failed is True
+    assert provenance.decoder_direction == "client"
+
+
+def test_request_context_exec_replies_fail_closed_on_decoder_error() -> None:
+    provenance = _InboundRunProvenance(call_id="call-1")
+    decoder = _ProtoConnectFrameDecoder()
+    with pytest.raises(InboundCursorAgentCliProtocolError) as exc_info:
+        _request_context_exec_replies(
+            b"\x00\xff\xff\xff\xffnot-a-frame",
+            decoder,
+            provenance=provenance,
+        )
+    assert exc_info.value.direction == "agentn"
+    assert provenance.decoder_failed is True
+
+
+def test_agentn_stream_reset_records_error_code_and_remote_reset(caplog) -> None:
+    from h2.events import StreamReset
+
+    from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
+        _AgentnH2Session,
+    )
+
+    caplog.set_level("WARNING", logger="LiteLLM Proxy")
+    session = _AgentnH2Session("https://agentn.global.api5.cursor.sh")
+    session.stream_id = 1
+    session.provenance = _InboundRunProvenance(call_id="call-reset")
+    reset = object.__new__(StreamReset)
+    reset.stream_id = 1
+    reset.error_code = 8
+    reset.remote_reset = True
+    chunks, ended = session._dispatch_h2_events([reset])
+    assert ended is True
+    assert chunks == []
+    assert session.provenance.stream_reset_code == 8
+    assert session.provenance.remote_reset is True
+    warning_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "WARNING"
+    ]
+    assert any(
+        "event=StreamReset" in message
+        and "error_code=8" in message
+        and "remote_reset=true" in message
+        for message in warning_messages
+    ), warning_messages
+
+
+def test_run_terminal_log_omits_secrets(caplog) -> None:
+    caplog.set_level("WARNING", logger="LiteLLM Proxy")
+    provenance = _InboundRunProvenance(call_id="call-secret")
+    provenance.checksum_in = True
+    provenance.checksum_out = True
+    provenance.checksum_in_eq_out = True
+    provenance.streaming_in = False
+    provenance.ua_source = "inbound"
+    provenance.bearer_in_eq_out = True
+    provenance.http_status = 200
+    provenance.stream_reset_code = 8
+    provenance.remote_reset = True
+    provenance.connect_endstream = "error"
+    provenance.connect_endstream_code = "unauthenticated"
+    _log_inbound_run_terminal(
+        provenance,
+        termination_reason="upstream_reset",
+        http_version="2",
+    )
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "WARNING"
+    ]
+    joined = "\n".join(messages)
+    assert "cursor_agent_cli_inbound run_terminal" in joined
+    assert "checksum_in=true" in joined
+    assert "connect_endstream_code=unauthenticated" in joined
+    assert "opaque" not in joined
+    assert "Bearer" not in joined
+    assert "eyJ" not in joined
+
+
+def test_outbound_turn_headers_still_omit_checksum() -> None:
+    from litellm.llms.cursor_agent.dashboard import build_turn_headers
+
+    headers = build_turn_headers(
+        "access-token",
+        extra_headers={
+            "x-cursor-checksum": "must-not-pass",
+            "X-Cursor-Streaming": "true",
+        },
+        request_id="req-1",
+        http2=True,
+    )
+    names = {key.lower() for key in headers}
+    assert "x-cursor-checksum" not in names
+    assert "x-cursor-streaming" not in names

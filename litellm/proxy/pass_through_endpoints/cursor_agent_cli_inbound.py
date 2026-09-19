@@ -15,9 +15,12 @@ Raw ``CURSOR_API_KEY`` is not used as the Connect credential.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import ssl
+import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
@@ -75,6 +78,39 @@ CURSOR_AGENT_HTTP1_COMPAT_METHODS = frozenset({"RunSSE", "BidiAppend"})
 _MAX_HTTP1_LANE_BODY_BYTES = 16 * 1024 * 1024
 _MAX_HTTP1_LANE_SESSIONS = 64
 _INBOUND_CLI_CLEANUP_TIMEOUT_SECONDS = 1.0
+_INBOUND_PROVENANCE_AGGREGATE_SECONDS = 60.0
+_CONNECT_ENDSTREAM_CODES = frozenset(
+    {
+        "ok",
+        "canceled",
+        "unknown",
+        "invalid_argument",
+        "deadline_exceeded",
+        "not_found",
+        "already_exists",
+        "permission_denied",
+        "resource_exhausted",
+        "failed_precondition",
+        "aborted",
+        "out_of_range",
+        "unimplemented",
+        "internal",
+        "unavailable",
+        "data_loss",
+        "unauthenticated",
+    }
+)
+_INBOUND_PROVENANCE_AGGREGATE: Dict[str, int] = {
+    "started": 0,
+    "completed": 0,
+    "failed": 0,
+    "cancelled": 0,
+    "in_flight": 0,
+    "checksum_present": 0,
+    "compressed": 0,
+    "provenance_unknown": 0,
+}
+_INBOUND_PROVENANCE_AGGREGATE_EMITTED_AT = 0.0
 
 _HOP_BY_HOP = {
     "connection",
@@ -155,6 +191,119 @@ def _sanitize_termination_reason(reason: Any) -> str:
     if candidate in _TERMINATION_REASONS:
         return candidate
     return "unknown"
+
+
+def _bool_token(value: Optional[bool]) -> str:
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return "unknown"
+
+
+def _int_token(value: Optional[int]) -> str:
+    if value is None:
+        return "unknown"
+    return str(int(value))
+
+
+def _connect_endstream_code(payload: bytes) -> Optional[str]:
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(decoded, Mapping):
+        return None
+    error = decoded.get("error")
+    candidate: Any = None
+    if isinstance(error, Mapping):
+        candidate = error.get("code") or error.get("Code")
+    if candidate is None:
+        candidate = decoded.get("code") or decoded.get("Code")
+    if not isinstance(candidate, str):
+        return None
+    lowered = candidate.strip().lower()
+    if lowered in _CONNECT_ENDSTREAM_CODES:
+        return lowered
+    return "unknown"
+
+
+def _record_inbound_provenance_outcome(
+    provenance: _InboundRunProvenance,
+    *,
+    termination_reason: str,
+) -> None:
+    global _INBOUND_PROVENANCE_AGGREGATE_EMITTED_AT
+    aggregate = _INBOUND_PROVENANCE_AGGREGATE
+    aggregate["in_flight"] = max(0, int(aggregate.get("in_flight") or 0) - 1)
+    if termination_reason == "cancelled":
+        aggregate["cancelled"] = int(aggregate.get("cancelled") or 0) + 1
+    elif termination_reason == "normal_response":
+        aggregate["completed"] = int(aggregate.get("completed") or 0) + 1
+    else:
+        aggregate["failed"] = int(aggregate.get("failed") or 0) + 1
+    if provenance.checksum_in:
+        aggregate["checksum_present"] = int(aggregate.get("checksum_present") or 0) + 1
+    if provenance.compressed_in:
+        aggregate["compressed"] = int(aggregate.get("compressed") or 0) + 1
+    if (
+        provenance.connect_endstream == "not_seen"
+        and provenance.stream_reset_code is None
+        and provenance.http_status is None
+        and termination_reason not in {"normal_response", "cancelled", "client_disconnect"}
+    ):
+        aggregate["provenance_unknown"] = int(aggregate.get("provenance_unknown") or 0) + 1
+    now = time.monotonic()
+    if now - _INBOUND_PROVENANCE_AGGREGATE_EMITTED_AT >= _INBOUND_PROVENANCE_AGGREGATE_SECONDS:
+        _INBOUND_PROVENANCE_AGGREGATE_EMITTED_AT = now
+        verbose_proxy_logger.warning(
+            "cursor_agent_cli_inbound provenance_aggregate started=%s completed=%s "
+            "failed=%s cancelled=%s in_flight=%s checksum_present=%s compressed=%s "
+            "provenance_unknown=%s",
+            aggregate["started"],
+            aggregate["completed"],
+            aggregate["failed"],
+            aggregate["cancelled"],
+            aggregate["in_flight"],
+            aggregate["checksum_present"],
+            aggregate["compressed"],
+            aggregate["provenance_unknown"],
+        )
+
+
+def _log_inbound_run_terminal(
+    provenance: _InboundRunProvenance,
+    *,
+    termination_reason: str,
+    http_version: Optional[str] = None,
+) -> None:
+    if termination_reason == "normal_response":
+        return
+    fields = [
+        f"call_id={provenance.call_id}",
+        f"reason={_sanitize_termination_reason(termination_reason)}",
+        f"checksum_in={_bool_token(provenance.checksum_in)}",
+        f"checksum_out={_bool_token(provenance.checksum_out)}",
+        f"checksum_in_eq_out={_bool_token(provenance.checksum_in_eq_out)}",
+        f"streaming_in={_bool_token(provenance.streaming_in)}",
+        f"ua_source={provenance.ua_source}",
+        f"bearer_in_eq_out={_bool_token(provenance.bearer_in_eq_out)}",
+        f"http_status={_int_token(provenance.http_status)}",
+        f"stream_reset_code={_int_token(provenance.stream_reset_code)}",
+        f"remote_reset={_bool_token(provenance.remote_reset)}",
+        f"connect_endstream={provenance.connect_endstream}",
+        f"connect_endstream_code={provenance.connect_endstream_code or 'unknown'}",
+        f"decoder_failed={_bool_token(provenance.decoder_failed)}",
+        f"data_before_reset={_bool_token(provenance.data_before_reset)}",
+    ]
+    if http_version:
+        fields.append(f"http_version={http_version}")
+    if provenance.decoder_direction:
+        fields.append(f"decoder_direction={provenance.decoder_direction}")
+    verbose_proxy_logger.warning(
+        "cursor_agent_cli_inbound run_terminal %s",
+        " ".join(fields),
+    )
 
 
 def _cursor_inbound_debug_log(message: str, *args: Any) -> None:
@@ -313,7 +462,11 @@ def _is_request_context_exec_frame(payload: bytes) -> bool:
     return isinstance(_proto_last_field(exec_fields, 10, wire_type=2), bytes)
 
 
-def _cli_connect_envelope(frame: CursorConnectProtoFrame) -> bytes:
+def _cli_connect_envelope(
+    frame: CursorConnectProtoFrame,
+    *,
+    provenance: Optional[_InboundRunProvenance] = None,
+) -> bytes:
     """Re-encode one agentn envelope the way the CLI can consume it.
 
     Agentn may set Connect compression bit 0. The stock CLI errors with
@@ -325,18 +478,37 @@ def _cli_connect_envelope(frame: CursorConnectProtoFrame) -> bytes:
     bit 0 on that envelope. If agentn sends gzip bytes under flags=2,
     gunzip the payload before wrapping.
     """
-    flags = int(frame.flags) & ~CONNECT_COMPRESSED_FLAG
-    payload = bytes(frame.payload)
-    if frame.is_end_stream and payload.startswith(b"\x1f\x8b"):
-        payload = _bounded_gzip_decompress(payload)
-    if frame.is_end_stream:
-        return bytes((flags,)) + len(payload).to_bytes(4, "big") + payload
-    return encode_connect_proto_frame(payload, flags=flags)
+    try:
+        flags = int(frame.flags) & ~CONNECT_COMPRESSED_FLAG
+        payload = bytes(frame.payload)
+        if frame.is_end_stream and payload.startswith(b"\x1f\x8b"):
+            payload = _bounded_gzip_decompress(payload)
+        if frame.is_end_stream:
+            if provenance is not None and provenance.connect_endstream == "not_seen":
+                code = _connect_endstream_code(payload)
+                if code is None:
+                    provenance.connect_endstream = "ok"
+                elif code == "unauthenticated":
+                    provenance.connect_endstream = "error"
+                    provenance.connect_endstream_code = code
+                else:
+                    provenance.connect_endstream = "error"
+                    provenance.connect_endstream_code = code
+            return bytes((flags,)) + len(payload).to_bytes(4, "big") + payload
+        return encode_connect_proto_frame(payload, flags=flags)
+    except Exception as exc:
+        raise InboundCursorAgentCliProtocolError(
+            "Inbound Cursor Agent CLI Connect envelope re-encode failed.",
+            reason="invalid_request",
+            direction="agentn",
+        ) from exc
 
 
 def _rewrite_cli_connect_bytes(
     chunk: bytes,
     decoder: _ProtoConnectFrameDecoder,
+    *,
+    provenance: Optional[_InboundRunProvenance] = None,
 ) -> bytes:
     """Re-encode CLI→agentn envelopes without Connect compression bit 0.
 
@@ -346,19 +518,31 @@ def _rewrite_cli_connect_bytes(
     small. Incomplete envelopes stay in the decoder.
     """
     try:
+        if chunk and chunk[0] & CONNECT_COMPRESSED_FLAG and provenance is not None:
+            provenance.compressed_in = True
         frames = decoder.feed(chunk)
-    except Exception:
-        verbose_proxy_logger.warning(
-            "cursor_agent_cli_inbound dropping undecodable client chunk bytes=%s",
-            len(chunk),
-        )
-        return b""
-    return b"".join(_cli_connect_envelope(frame) for frame in frames)
+        return b"".join(_cli_connect_envelope(frame, provenance=provenance) for frame in frames)
+    except InboundCursorAgentCliProtocolError:
+        if provenance is not None:
+            provenance.decoder_failed = True
+            provenance.decoder_direction = "client"
+        raise
+    except Exception as exc:
+        if provenance is not None:
+            provenance.decoder_failed = True
+            provenance.decoder_direction = "client"
+        raise InboundCursorAgentCliProtocolError(
+            "Inbound Cursor Agent CLI Connect request framing is invalid.",
+            reason="invalid_request",
+            direction="client",
+        ) from exc
 
 
 def _request_context_exec_replies(
     chunk: bytes,
     decoder: _ProtoConnectFrameDecoder,
+    *,
+    provenance: Optional[_InboundRunProvenance] = None,
 ) -> Tuple[List[bytes], bytes]:
     """Answer agentn request-context queries and drop those frames from the CLI.
 
@@ -368,35 +552,40 @@ def _request_context_exec_replies(
     """
     try:
         frames = decoder.feed(chunk)
-    except Exception:
-        # Raw DATA may include compressed Connect envelopes. Forwarding them
-        # poisons the CLI (``received compressed envelope``). Incomplete
-        # envelopes stay in the decoder; drop only this undecodable chunk.
-        verbose_proxy_logger.warning(
-            "cursor_agent_cli_inbound dropping undecodable agentn chunk bytes=%s",
-            len(chunk),
-        )
-        return [], b""
-    replies: List[bytes] = []
-    forwarded: List[bytes] = []
-    for frame in frames:
-        if frame.is_end_stream:
-            forwarded.append(_cli_connect_envelope(frame))
-            continue
-        if _is_request_context_exec_frame(frame.payload):
-            fields = _decode_proto_fields(frame.payload)
-            exec_fields = _decode_proto_fields(
-                _proto_last_field(fields, 2, wire_type=2)
-            )
-            for payload in _encode_request_context_exec_response(exec_fields):
-                replies.append(encode_connect_proto_frame(payload))
-            continue
-        forwarded.append(_cli_connect_envelope(frame))
-    # Incomplete Connect envelopes stay in the decoder until the next DATA
-    # chunk completes them. Forwarding leftover bytes here duplicates the
-    # envelope when the completed frame is later re-encoded (a 9-byte
-    # heartbeat split at 6 bytes became 15 bytes on the CLI).
-    return replies, b"".join(forwarded)
+        replies: List[bytes] = []
+        forwarded: List[bytes] = []
+        for frame in frames:
+            if frame.is_end_stream:
+                forwarded.append(_cli_connect_envelope(frame, provenance=provenance))
+                continue
+            if _is_request_context_exec_frame(frame.payload):
+                fields = _decode_proto_fields(frame.payload)
+                exec_fields = _decode_proto_fields(
+                    _proto_last_field(fields, 2, wire_type=2)
+                )
+                for payload in _encode_request_context_exec_response(exec_fields):
+                    replies.append(encode_connect_proto_frame(payload))
+                continue
+            forwarded.append(_cli_connect_envelope(frame, provenance=provenance))
+        # Incomplete Connect envelopes stay in the decoder until the next DATA
+        # chunk completes them. Forwarding leftover bytes here duplicates the
+        # envelope when the completed frame is later re-encoded (a 9-byte
+        # heartbeat split at 6 bytes became 15 bytes on the CLI).
+        return replies, b"".join(forwarded)
+    except InboundCursorAgentCliProtocolError:
+        if provenance is not None:
+            provenance.decoder_failed = True
+            provenance.decoder_direction = "agentn"
+        raise
+    except Exception as exc:
+        if provenance is not None:
+            provenance.decoder_failed = True
+            provenance.decoder_direction = "agentn"
+        raise InboundCursorAgentCliProtocolError(
+            "Inbound Cursor Agent CLI Connect response framing is invalid.",
+            reason="invalid_request",
+            direction="agentn",
+        ) from exc
 
 
 def _asgi_path(scope: Mapping[str, Any]) -> str:
@@ -439,6 +628,45 @@ class InboundCursorAgentCliAuthError(Exception):
         self.message = message
         self.status_code = status_code
         self.reason = reason
+
+
+class InboundCursorAgentCliProtocolError(Exception):
+    """Corrupt Connect framing or unsupported inbound metadata for this Run."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str = "invalid_request",
+        direction: str = "client",
+        status_code: int = 400,
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.reason = reason
+        self.direction = direction
+        self.status_code = status_code
+
+
+@dataclass
+class _InboundRunProvenance:
+    call_id: str
+    checksum_in: bool = False
+    checksum_out: bool = False
+    checksum_in_eq_out: Optional[bool] = None
+    streaming_in: bool = False
+    ua_source: str = "missing"
+    bearer_in_eq_out: Optional[bool] = None
+    http_status: Optional[int] = None
+    stream_reset_code: Optional[int] = None
+    remote_reset: Optional[bool] = None
+    connect_endstream: str = "not_seen"
+    connect_endstream_code: Optional[str] = None
+    decoder_failed: bool = False
+    decoder_direction: Optional[str] = None
+    data_before_reset: bool = False
+    compressed_in: bool = False
+    extra: Dict[str, Any] = field(default_factory=dict)
 
 
 def _header_map(headers: Any) -> Dict[str, str]:
@@ -1013,6 +1241,7 @@ class _AgentnH2Session:
         self._agentn_body_decoder = _ProtoConnectFrameDecoder()
         self._auto_replies: List[bytes] = []
         self._connection_terminated = False
+        self.provenance: Optional[_InboundRunProvenance] = None
 
     @property
     def upstream_termination_reason(self) -> Optional[str]:
@@ -1162,6 +1391,8 @@ class _AgentnH2Session:
                 except ValueError:
                     self.response_status = 502
                 self._headers_event.set()
+                if self.provenance is not None:
+                    self.provenance.http_status = self.response_status
                 _cursor_inbound_debug_log(
                     "cursor_agent_cli_inbound agentn response status=%s headers=%s",
                     self.response_status,
@@ -1173,10 +1404,13 @@ class _AgentnH2Session:
                     replies, forwarded = _request_context_exec_replies(
                         payload,
                         self._agentn_body_decoder,
+                        provenance=self.provenance,
                     )
                     self._auto_replies.extend(replies)
                     if forwarded:
                         chunks.append(forwarded)
+                        if self.provenance is not None:
+                            self.provenance.data_before_reset = True
                     if self._logged_data_chunks < _MAX_LOGGED_AGENTN_DATA_CHUNKS:
                         self._logged_data_chunks += 1
                         _cursor_inbound_debug_log(
@@ -1202,9 +1436,25 @@ class _AgentnH2Session:
                 if self.stream_id and event.stream_id not in {self.stream_id, 0}:
                     continue
                 self._mark_upstream_termination("upstream_reset")
+                error_code = getattr(event, "error_code", None)
+                try:
+                    reset_code = int(error_code)
+                except (TypeError, ValueError):
+                    reset_code = None
+                remote_reset = getattr(event, "remote_reset", None)
+                if self.provenance is not None:
+                    self.provenance.stream_reset_code = reset_code
+                    if remote_reset is None:
+                        self.provenance.remote_reset = None
+                    else:
+                        self.provenance.remote_reset = bool(remote_reset)
+                    self.provenance.http_status = self.response_status
                 verbose_proxy_logger.warning(
-                    "cursor_agent_cli_inbound agentn stream closed event=%s",
+                    "cursor_agent_cli_inbound agentn stream closed event=%s "
+                    "error_code=%s remote_reset=%s",
                     type(event).__name__,
+                    _int_token(reset_code),
+                    _bool_token(None if remote_reset is None else bool(remote_reset)),
                 )
                 ended = True
             elif isinstance(event, ConnectionTerminated):
@@ -1276,6 +1526,15 @@ class _AgentnH2Session:
             if not self._closed:
                 self._mark_upstream_termination("cancelled")
             raise
+        except InboundCursorAgentCliProtocolError as exc:
+            self._mark_upstream_termination(exc.reason)
+            if self.provenance is not None:
+                self.provenance.decoder_failed = True
+                self.provenance.decoder_direction = exc.direction
+            verbose_proxy_logger.warning(
+                "cursor_agent_cli_inbound agentn framing failed direction=%s",
+                exc.direction,
+            )
         except Exception:
             self._mark_upstream_termination("upstream_failure")
             verbose_proxy_logger.warning(
@@ -1455,14 +1714,58 @@ def _upstream_request_headers(
         if lowered in _STRIP_UPSTREAM_COMPRESSION_HEADERS:
             continue
         if lowered in _FORWARDED_REQUEST_HEADERS or lowered.startswith("x-cursor-"):
-            if lowered in {"x-cursor-checksum", "x-cursor-streaming"}:
+            if lowered == "x-cursor-streaming":
+                continue
+            if lowered == "x-cursor-checksum":
+                forwarded.append((lowered, str(value)))
+                seen.add(lowered)
                 continue
             forwarded.append((lowered, str(value)))
             seen.add(lowered)
     if "te" not in seen:
         inbound_te = _get_header(headers, "te")
-        forwarded.append(("te", inbound_te or "trailers"))
+        te_value = inbound_te or "trailers"
+        if te_value.strip().lower() not in {"", "trailers"}:
+            raise InboundCursorAgentCliProtocolError(
+                "Inbound Cursor Agent CLI HTTP/2 TE may only be trailers.",
+                reason="invalid_request",
+                direction="client",
+            )
+        forwarded.append(("te", te_value or "trailers"))
     return forwarded
+
+
+def _observe_upstream_headers(
+    inbound_headers: Mapping[str, str],
+    access_token: str,
+    forwarded: List[Tuple[str, str]],
+    provenance: _InboundRunProvenance,
+) -> None:
+    inbound_checksum = _get_header(inbound_headers, "x-cursor-checksum")
+    outbound_checksum = ""
+    outbound_bearer = ""
+    outbound_ua = ""
+    for name, value in forwarded:
+        if name == "x-cursor-checksum":
+            outbound_checksum = value
+        elif name == "authorization":
+            outbound_bearer = value
+        elif name == "user-agent":
+            outbound_ua = value
+    inbound_ua = _get_header(inbound_headers, "user-agent")
+    inbound_bearer = f"Bearer {access_token}"
+    provenance.checksum_in = bool(inbound_checksum)
+    provenance.checksum_out = bool(outbound_checksum)
+    if inbound_checksum or outbound_checksum:
+        provenance.checksum_in_eq_out = inbound_checksum == outbound_checksum
+    provenance.streaming_in = bool(_get_header(inbound_headers, "x-cursor-streaming"))
+    if inbound_ua:
+        provenance.ua_source = "inbound"
+    elif outbound_ua:
+        provenance.ua_source = "fallback"
+    else:
+        provenance.ua_source = "missing"
+    provenance.bearer_in_eq_out = inbound_bearer == outbound_bearer
 
 
 async def _cancel_and_join_tasks(tasks: List["asyncio.Task[Any]"]) -> bool:
@@ -1582,6 +1885,13 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
     active_tasks: List[asyncio.Task[Any]] = []
     all_tasks: List[asyncio.Task[Any]] = []
     deferred_error_payload: Optional[Mapping[str, str]] = None
+    provenance = _InboundRunProvenance(call_id=call_id)
+    _INBOUND_PROVENANCE_AGGREGATE["started"] = (
+        int(_INBOUND_PROVENANCE_AGGREGATE.get("started") or 0) + 1
+    )
+    _INBOUND_PROVENANCE_AGGREGATE["in_flight"] = (
+        int(_INBOUND_PROVENANCE_AGGREGATE.get("in_flight") or 0) + 1
+    )
 
     try:
         if http_version != "2":
@@ -1642,7 +1952,11 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
                     body = bytes(message.get("body") or b"")
                     end_stream = not message.get("more_body", False)
                     if body:
-                        rewritten = _rewrite_cli_connect_bytes(body, client_decoder)
+                        rewritten = _rewrite_cli_connect_bytes(
+                            body,
+                            client_decoder,
+                            provenance=provenance,
+                        )
                         if rewritten:
                             if len(sniff_buffer) < 65536:
                                 remaining = 65536 - len(sniff_buffer)
@@ -1738,8 +2052,11 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
         receive_task = asyncio.create_task(pump_client())
         active_tasks.append(receive_task)
         all_tasks.append(receive_task)
+        session.provenance = provenance
+        forwarded_headers = _upstream_request_headers(headers, access_token)
+        _observe_upstream_headers(headers, access_token, forwarded_headers, provenance)
         open_task = asyncio.create_task(
-            session.open(_upstream_request_headers(headers, access_token))
+            session.open(forwarded_headers)
         )
         active_tasks.append(open_task)
         all_tasks.append(open_task)
@@ -1769,6 +2086,9 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
                         result = task.result()
                     except asyncio.CancelledError:
                         candidate_reason = candidate_reason or "cancelled"
+                    except InboundCursorAgentCliProtocolError as exc:
+                        candidate_reason = candidate_reason or exc.reason
+                        error_message = exc.reason
                     except Exception:
                         candidate_reason = candidate_reason or "receive_failed"
                     else:
@@ -1902,6 +2222,18 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
                     ),
                     "detail": "Cursor Agent CLI inbound request failed.",
                 }
+    except InboundCursorAgentCliProtocolError as protocol_exc:
+        status_code = protocol_exc.status_code
+        error_message = protocol_exc.reason
+        termination_reason = protocol_exc.reason
+        provenance.decoder_failed = True
+        provenance.decoder_direction = protocol_exc.direction
+        if not response_started:
+            deferred_error_payload = {
+                "error": "cursor_agent_cli_inbound_protocol",
+                "reason": protocol_exc.reason,
+                "detail": "Cursor Agent CLI inbound Connect framing is invalid.",
+            }
     except InboundCursorAgentCliAuthError as exc:
         status_code = exc.status_code
         error_message = exc.reason
@@ -2006,6 +2338,17 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
         )
         if error_message is None and cleanup_reason != "normal_response":
             error_message = cleanup_reason
+        if session is not None and session.provenance is not None:
+            provenance.http_status = provenance.http_status or session.response_status
+        _log_inbound_run_terminal(
+            provenance,
+            termination_reason=cleanup_reason,
+            http_version=http_version,
+        )
+        _record_inbound_provenance_outcome(
+            provenance,
+            termination_reason=cleanup_reason,
+        )
         try:
             if deferred_error_payload is not None and not response_started:
                 response_started = True
