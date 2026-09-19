@@ -1458,8 +1458,21 @@ def _cursor_replay_state_snapshot(
 _CURSOR_CONTINUATION_MARKER_PRODUCERS = frozenset(
     {
         "tool_output_without_retained_session",
+        "tool_output_without_continuation_identity",
     }
 )
+
+
+def _cursor_has_continuation_identity(
+    *,
+    previous_response_id: Optional[str] = None,
+    replay_state: Optional[dict[str, Any]] = None,
+) -> bool:
+    """True when this request is a Cursor tool-output continuation, not a fresh turn."""
+
+    if isinstance(previous_response_id, str) and previous_response_id.strip():
+        return True
+    return isinstance(replay_state, dict)
 
 
 def _cursor_continuation_unavailable_origin(
@@ -1473,15 +1486,55 @@ def _cursor_continuation_unavailable_origin(
     retained_session = (
         replay_state.get("retained_session") if has_replay_state else None
     )
+    has_previous = bool(
+        isinstance(previous_response_id, str) and previous_response_id.strip()
+    )
+    producer = (
+        "tool_output_without_retained_session"
+        if has_previous or has_replay_state
+        else "tool_output_without_continuation_identity"
+    )
     return {
-        "producer": "tool_output_without_retained_session",
-        "has_previous_response_id": bool(
-            isinstance(previous_response_id, str) and previous_response_id.strip()
-        ),
+        "producer": producer,
+        "has_previous_response_id": has_previous,
         "has_replay_state": has_replay_state,
         "retained_session_present": retained_session is not None,
         "registry_consumed": bool(previous_response_id and has_replay_state),
     }
+
+
+def _maybe_raise_cursor_tool_output_without_retained_session(
+    *,
+    cursor_tool_outputs: list[tuple[str, str]],
+    previous_response_id: Optional[str] = None,
+    replay_state: Optional[dict[str, Any]] = None,
+    retained_session: Any = None,
+) -> None:
+    """Fail closed only for a real continuation whose retained session is missing.
+
+    Live leftover CURSOR-047 raised this 409 for Ohmypi tool-output turns that
+    had no ``previous_response_id`` and no replay state. Those are not Cursor
+    retained-session continuations; marking them ineligible blocked the alias
+    before a fresh Connect Run. Keep the 409 when continuation identity exists
+    and the live session is gone.
+    """
+
+    if not cursor_tool_outputs or retained_session is not None:
+        return
+    if not _cursor_has_continuation_identity(
+        previous_response_id=previous_response_id,
+        replay_state=replay_state,
+    ):
+        origin = _cursor_continuation_unavailable_origin(
+            previous_response_id=previous_response_id,
+            replay_state=replay_state,
+        )
+        _log_cursor_continuation_marker_origin(origin)
+        return
+    _raise_cursor_session_continuation_unavailable(
+        previous_response_id=previous_response_id,
+        replay_state=replay_state,
+    )
 
 
 def _log_cursor_continuation_marker_origin(
@@ -5661,15 +5714,16 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         if isinstance(replay_state, dict)
         else None
     )
-    if cursor_tool_outputs and retained_session is None:
-        _raise_cursor_session_continuation_unavailable(
-            previous_response_id=(
-                previous_response_id
-                if isinstance(previous_response_id, str)
-                else None
-            ),
-            replay_state=replay_state if isinstance(replay_state, dict) else None,
-        )
+    _maybe_raise_cursor_tool_output_without_retained_session(
+        cursor_tool_outputs=cursor_tool_outputs,
+        previous_response_id=(
+            previous_response_id
+            if isinstance(previous_response_id, str)
+            else None
+        ),
+        replay_state=replay_state if isinstance(replay_state, dict) else None,
+        retained_session=retained_session,
+    )
 
     messages = _responses_input_to_cursor_messages(
         request_body,

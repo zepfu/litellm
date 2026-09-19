@@ -4487,6 +4487,16 @@ def test_cursor_continuation_unavailable_origin_is_tool_output_without_retained_
     assert origin["has_previous_response_id"] is True
     assert origin["has_replay_state"] is True
     assert origin["retained_session_present"] is False
+    no_identity = codex_candidate_calls._cursor_continuation_unavailable_origin()
+    assert no_identity["producer"] == "tool_output_without_continuation_identity"
+    assert no_identity["has_previous_response_id"] is False
+    assert no_identity["has_replay_state"] is False
+    codex_candidate_calls._maybe_raise_cursor_tool_output_without_retained_session(
+        cursor_tool_outputs=[("pwd-call", "/workspace")],
+        previous_response_id=None,
+        replay_state=None,
+        retained_session=None,
+    )
     route_logger = logging.getLogger("LiteLLM AAWM Route")
     stream = StringIO()
     handler = logging.StreamHandler(stream)

@@ -1713,6 +1713,101 @@ def test_cursor_unretained_tool_output_continuation_does_not_build_replacement_r
         codex_candidate_calls._peek_cursor_replay_state(first_body["id"])
 
 
+def test_cursor_tool_output_without_continuation_identity_does_not_raise() -> None:
+    origin = codex_candidate_calls._cursor_continuation_unavailable_origin()
+    assert origin["producer"] == "tool_output_without_continuation_identity"
+    assert origin["has_previous_response_id"] is False
+    assert origin["has_replay_state"] is False
+    assert (
+        codex_candidate_calls._cursor_has_continuation_identity(
+            previous_response_id=None,
+            replay_state=None,
+        )
+        is False
+    )
+    codex_candidate_calls._maybe_raise_cursor_tool_output_without_retained_session(
+        cursor_tool_outputs=[("pwd-call", "/workspace")],
+        previous_response_id=None,
+        replay_state=None,
+        retained_session=None,
+    )
+
+
+def test_cursor_tool_output_with_previous_response_id_still_raises_unretained() -> None:
+    with pytest.raises(CursorConnectError) as exc_info:
+        codex_candidate_calls._maybe_raise_cursor_tool_output_without_retained_session(
+            cursor_tool_outputs=[("pwd-call", "/workspace")],
+            previous_response_id="resp-unretained",
+            replay_state={"retained_session": None, "messages": []},
+            retained_session=None,
+        )
+    origin = getattr(exc_info.value, "_cursor_continuation_marker_origin")
+    assert origin["producer"] == "tool_output_without_retained_session"
+    assert origin["has_previous_response_id"] is True
+    assert origin["has_replay_state"] is True
+    assert origin["retained_session_present"] is False
+    assert getattr(
+        exc_info.value,
+        codex_candidate_calls._CURSOR_SESSION_CONTINUATION_FAILURE_MARKER,
+        False,
+    )
+
+
+def test_cursor_ohmypi_tool_output_without_previous_response_id_starts_fresh_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.llms.cursor_agent import common_utils
+
+    run_calls: list[dict[str, Any]] = []
+    real_build_run_request = common_utils.build_run_request
+
+    class FakeCursorClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def run(
+            self,
+            payload: dict[str, Any],
+            **kwargs: Any,
+        ) -> CursorAgentRunResult:
+            run_calls.append({"payload": payload, "kwargs": kwargs})
+            return CursorAgentRunResult(text="pong", turn_ended=True)
+
+    monkeypatch.setattr(common_utils, "build_run_request", real_build_run_request)
+    monkeypatch.setattr(
+        "litellm.llms.cursor_agent.connect.CursorAgentConnectClient",
+        FakeCursorClient,
+    )
+
+    response = _call(
+        {
+            "model": "sota-xai",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "run pwd",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "pwd-call",
+                    "name": "exec_command",
+                    "arguments": '{"cmd":"pwd"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "pwd-call",
+                    "output": "/workspace",
+                },
+            ],
+        }
+    )
+    body = json.loads(response.body)
+    assert body["output_text"] == "pong"
+    assert len(run_calls) == 1
+    assert getattr(response, "status_code", 200) in {200, None}
+
+
 def test_cursor_fresh_full_history_tool_output_emits_continuation_cue() -> None:
     messages = codex_candidate_calls._responses_input_to_cursor_messages(
         {
@@ -1744,11 +1839,10 @@ def test_cursor_fresh_full_history_tool_output_emits_continuation_cue() -> None:
     }
 
 
-def test_cursor_fresh_full_history_tool_output_does_not_build_replacement_run(
+def test_cursor_fresh_full_history_tool_output_starts_fresh_run_without_continuation_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from litellm.llms.cursor_agent import common_utils
-    from litellm.proxy._types import ProxyException
 
     build_calls: list[dict[str, Any]] = []
     run_calls: list[dict[str, Any]] = []
@@ -1764,7 +1858,7 @@ def test_cursor_fresh_full_history_tool_output_does_not_build_replacement_run(
             **kwargs: Any,
         ) -> CursorAgentRunResult:
             run_calls.append({"payload": payload, "kwargs": kwargs})
-            return CursorAgentRunResult(text="unexpected fresh run", turn_ended=True)
+            return CursorAgentRunResult(text="fresh full-history run", turn_ended=True)
 
     def _build_run_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
         build_calls.append({"args": args, "kwargs": kwargs})
@@ -1776,58 +1870,49 @@ def test_cursor_fresh_full_history_tool_output_does_not_build_replacement_run(
         FakeCursorClient,
     )
 
-    with pytest.raises(ProxyException) as exc_info:
-        asyncio.run(
-            llm_passthrough_endpoints._perform_codex_auto_agent_alias_candidate_request(
-                endpoint="/v1/responses",
-                request=_request(),
-                fastapi_response=Response(),
-                user_api_key_dict=None,
-                candidate=_candidate(provider="cursor_agent"),
-                candidate_body={
-                    "model": "work",
-                    "tools": [
-                        {
-                            "type": "function",
-                            "function": {"name": "exec_command"},
-                        }
-                    ],
-                    "input": [
-                        {
-                            "type": "message",
-                            "role": "user",
-                            "content": "Complete the original assignment in /workspace.",
-                        },
-                        {
-                            "type": "function_call",
-                            "call_id": "pwd-call",
-                            "name": "exec_command",
-                            "arguments": '{"cmd":"pwd","workdir":"/workspace"}',
-                        },
-                        {
-                            "type": "function_call_output",
-                            "call_id": "pwd-call",
-                            "output": "/workspace",
-                        },
-                    ],
-                },
-                target_url="https://chatgpt.com/backend-api/codex/responses",
-                api_key="access-token",
-                forward_headers=False,
-            )
+    response = asyncio.run(
+        llm_passthrough_endpoints._perform_codex_auto_agent_alias_candidate_request(
+            endpoint="/v1/responses",
+            request=_request(),
+            fastapi_response=Response(),
+            user_api_key_dict=None,
+            candidate=_candidate(provider="cursor_agent"),
+            candidate_body={
+                "model": "work",
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "exec_command"},
+                    }
+                ],
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": "Complete the original assignment in /workspace.",
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "pwd-call",
+                        "name": "exec_command",
+                        "arguments": '{"cmd":"pwd","workdir":"/workspace"}',
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "pwd-call",
+                        "output": "/workspace",
+                    },
+                ],
+            },
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key="access-token",
+            forward_headers=False,
         )
-
-    exc = exc_info.value
-    assert exc.status_code == 409
-    assert getattr(
-        exc,
-        codex_candidate_calls._CURSOR_SESSION_CONTINUATION_FAILURE_MARKER,
-        False,
     )
-    assert exc.failure_phase == "cursor_session_continuation"
-    assert exc.attempted_provider_call is False
-    assert build_calls == []
-    assert run_calls == []
+
+    assert json.loads(response.body)["output_text"] == "fresh full-history run"
+    assert len(build_calls) == 1
+    assert len(run_calls) == 1
 
 
 def test_cursor_retained_session_consumes_function_call_output_without_new_run(
