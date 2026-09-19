@@ -15,6 +15,7 @@ _ORIGINAL_H2_HANDLE: Any = None
 _ORIGINAL_H2_HANDLE_EVENTS: Any = None
 _ORIGINAL_H2_CLOSE_STREAM: Any = None
 _ORIGINAL_H2_SEND_DATA: Any = None
+_ORIGINAL_HTTP_HANDLE: Any = None
 
 
 class UnsupportedHypercornVersion(RuntimeError):
@@ -48,7 +49,9 @@ def restore_hypercorn_h2_receive_dispatch_guards() -> None:
     global _H2_RECEIVE_DISPATCH_GUARDS_INSTALLED
     global _ORIGINAL_H2_HANDLE, _ORIGINAL_H2_HANDLE_EVENTS
     global _ORIGINAL_H2_CLOSE_STREAM, _ORIGINAL_H2_SEND_DATA
+    global _ORIGINAL_HTTP_HANDLE
     from hypercorn.protocol.h2 import H2Protocol
+    from hypercorn.protocol.http_stream import HTTPStream
 
     if _ORIGINAL_H2_HANDLE is not None:
         H2Protocol.handle = _ORIGINAL_H2_HANDLE
@@ -58,6 +61,8 @@ def restore_hypercorn_h2_receive_dispatch_guards() -> None:
         H2Protocol._close_stream = _ORIGINAL_H2_CLOSE_STREAM
     if _ORIGINAL_H2_SEND_DATA is not None:
         H2Protocol._send_data = _ORIGINAL_H2_SEND_DATA
+    if _ORIGINAL_HTTP_HANDLE is not None:
+        HTTPStream.handle = _ORIGINAL_HTTP_HANDLE
     if hasattr(H2Protocol, "_aawm_cursor_h2_guards"):
         delattr(H2Protocol, "_aawm_cursor_h2_guards")
     if hasattr(H2Protocol, "_aawm_hypercorn_version"):
@@ -67,6 +72,7 @@ def restore_hypercorn_h2_receive_dispatch_guards() -> None:
     _ORIGINAL_H2_HANDLE_EVENTS = None
     _ORIGINAL_H2_CLOSE_STREAM = None
     _ORIGINAL_H2_SEND_DATA = None
+    _ORIGINAL_HTTP_HANDLE = None
 
 
 def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
@@ -84,6 +90,7 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
     global _H2_RECEIVE_DISPATCH_GUARDS_INSTALLED
     global _ORIGINAL_H2_HANDLE, _ORIGINAL_H2_HANDLE_EVENTS
     global _ORIGINAL_H2_CLOSE_STREAM, _ORIGINAL_H2_SEND_DATA
+    global _ORIGINAL_HTTP_HANDLE
     if _H2_RECEIVE_DISPATCH_GUARDS_INSTALLED:
         return
 
@@ -95,13 +102,15 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
     import priority as priority_lib
 
     from hypercorn.events import Closed, RawData, Updated
-    from hypercorn.protocol.events import Body, EndBody
+    from hypercorn.protocol.events import Body, EndBody, StreamClosed
     from hypercorn.protocol.h2 import H2Protocol
+    from hypercorn.protocol.http_stream import HTTPStream
 
     _ORIGINAL_H2_HANDLE = H2Protocol.handle
     _ORIGINAL_H2_HANDLE_EVENTS = H2Protocol._handle_events
     _ORIGINAL_H2_CLOSE_STREAM = H2Protocol._close_stream
     _ORIGINAL_H2_SEND_DATA = H2Protocol._send_data
+    _ORIGINAL_HTTP_HANDLE = HTTPStream.handle
 
     def _retired_ids(protocol: Any) -> set:
         retired = getattr(protocol, "_aawm_retired_stream_ids", None)
@@ -114,6 +123,76 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
         return bool(
             getattr(protocol, "closed", False) or stream_id in _retired_ids(protocol)
         )
+
+    def _stream_put_lock(stream: Any) -> asyncio.Lock:
+        lock = getattr(stream, "_aawm_put_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            stream._aawm_put_lock = lock
+        return lock
+
+    def _stream_space_event(stream: Any) -> asyncio.Event:
+        event = getattr(stream, "_aawm_queue_space", None)
+        if event is None:
+            event = asyncio.Event()
+            stream._aawm_queue_space = event
+        return event
+
+    def _app_queue(stream: Any) -> Optional[asyncio.Queue]:
+        app_put = getattr(stream, "app_put", None)
+        if app_put is None:
+            return None
+        queue = getattr(app_put, "__self__", None)
+        if isinstance(queue, asyncio.Queue):
+            return queue
+        return None
+
+    async def _put_app_event(stream: Any, event: dict) -> None:
+        """Queue an ASGI receive event without blocking the connection reader.
+
+        If the application queue is full, wait on a per-stream space event
+        that close() can set. A retired stream discards the event instead of
+        cancelling the shared reader.
+        """
+        if getattr(stream, "closed", False):
+            return
+        queue = _app_queue(stream)
+        app_put = getattr(stream, "app_put", None)
+        if app_put is None:
+            return
+        async with _stream_put_lock(stream):
+            while not getattr(stream, "closed", False):
+                if queue is None:
+                    await app_put(event)
+                    return
+                try:
+                    queue.put_nowait(event)
+                    return
+                except asyncio.QueueFull:
+                    space = _stream_space_event(stream)
+                    space.clear()
+                    await space.wait()
+
+    async def _http_handle(self, event: Any) -> None:
+        if getattr(self, "closed", False) and not isinstance(event, StreamClosed):
+            return
+        if isinstance(event, Body):
+            await _put_app_event(
+                self,
+                {
+                    "type": "http.request",
+                    "body": bytes(event.data),
+                    "more_body": True,
+                },
+            )
+            return
+        if isinstance(event, EndBody):
+            await _put_app_event(
+                self,
+                {"type": "http.request", "body": b"", "more_body": False},
+            )
+            return
+        await _ORIGINAL_HTTP_HANDLE(self, event)
 
     async def _release_stream_buffers(self) -> None:
         buffers = getattr(self, "stream_buffers", None)
@@ -158,10 +237,6 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
         event = _disconnect_event_for_stream(stream)
         queue = getattr(app_put, "__self__", None)
         if isinstance(queue, asyncio.Queue):
-            waiters = list(getattr(queue, "_putters", ()))
-            for waiter in waiters:
-                if not waiter.done():
-                    waiter.cancel()
             try:
                 queue.put_nowait(event)
                 return
@@ -206,6 +281,9 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
             await self.has_data.set()
             return
         stream.closed = True
+        space = getattr(stream, "_aawm_queue_space", None)
+        if space is not None:
+            space.set()
         _deliver_terminal_disconnect(stream)
         await self.has_data.set()
 
@@ -318,7 +396,7 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
                         continue
                     raise KeyError(event.stream_id)
                 await stream.handle(Body(stream_id=event.stream_id, data=event.data))
-                if not getattr(self, "closed", False):
+                if not getattr(self, "closed", False) and not stream.closed:
                     self.connection.acknowledge_received_data(
                         event.flow_controlled_length,
                         event.stream_id,
@@ -354,6 +432,7 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
     H2Protocol._handle_events = _handle_events
     H2Protocol._close_stream = _close_stream
     H2Protocol._send_data = _send_data
+    HTTPStream.handle = _http_handle
     H2Protocol._aawm_cursor_h2_guards = True
     H2Protocol._aawm_hypercorn_version = version
     _H2_RECEIVE_DISPATCH_GUARDS_INSTALLED = True

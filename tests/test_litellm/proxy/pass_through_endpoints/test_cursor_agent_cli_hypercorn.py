@@ -337,10 +337,13 @@ def test_unsupported_hypercorn_version_leaves_methods_untouched() -> None:
     from hypercorn.protocol.h2 import H2Protocol
 
     restore_hypercorn_h2_receive_dispatch_guards()
+    from hypercorn.protocol.http_stream import HTTPStream
+
     handle_before = H2Protocol.handle
     events_before = H2Protocol._handle_events
     close_before = H2Protocol._close_stream
     send_before = H2Protocol._send_data
+    http_before = HTTPStream.handle
     with pytest.raises(UnsupportedHypercornVersion):
         require_supported_hypercorn_version("0.18.0")
     with pytest.raises(UnsupportedHypercornVersion):
@@ -355,6 +358,7 @@ def test_unsupported_hypercorn_version_leaves_methods_untouched() -> None:
     assert H2Protocol._handle_events is events_before
     assert H2Protocol._close_stream is close_before
     assert H2Protocol._send_data is send_before
+    assert HTTPStream.handle is http_before
     assert hypercorn_h2_receive_dispatch_guards_installed() is False
     install_hypercorn_h2_receive_dispatch_guards()
 
@@ -538,9 +542,9 @@ async def test_hypercorn_h2_blocked_body_put_is_cancelled_on_close() -> None:
         await asyncio.sleep(0)
         assert blocked.done() is False
         await asyncio.wait_for(protocol._close_stream(1), timeout=1)
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(blocked, timeout=1)
-        assert blocked.cancelled() is True
+        await asyncio.wait_for(blocked, timeout=1)
+        assert blocked.exception() is None
+        assert blocked.cancelled() is False
         await asyncio.wait_for(
             protocol.handle(RawData(data=_goaway(client))),
             timeout=1,
@@ -552,6 +556,79 @@ async def test_hypercorn_h2_blocked_body_put_is_cancelled_on_close() -> None:
             remaining.append(queue.get_nowait()["type"])
 
         assert "http.disconnect" in remaining
+        disconnect_at = remaining.index("http.disconnect")
+        assert "http.request" not in remaining[disconnect_at + 1 :]
+    finally:
+        await _close_protocol(protocol, task_group)
+
+
+@pytest.mark.asyncio
+async def test_hypercorn_h2_receive_path_blocked_body_then_goaway() -> None:
+    from hypercorn.events import Closed, RawData
+
+    protocol, sent, task_group = await _make_h2_protocol(install_guards=True)
+    try:
+        client = _new_h2_client()
+        await protocol.handle(RawData(data=_open_run(client)))
+        stream = protocol.streams[1]
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        queue.put_nowait({"type": "http.request", "body": b"held", "more_body": True})
+        stream.app_put = queue.put
+        blocked = asyncio.create_task(
+            protocol._handle_events(
+                [
+                    h2.events.DataReceived(
+                        stream_id=1,
+                        data=b"late-body",
+                        flow_controlled_length=9,
+                    )
+                ]
+            )
+        )
+        await asyncio.sleep(0)
+        assert blocked.done() is False
+        await asyncio.wait_for(
+            protocol.handle(RawData(data=_goaway(client))),
+            timeout=1,
+        )
+        await asyncio.wait_for(blocked, timeout=1)
+        assert blocked.exception() is None
+        assert protocol.closed is True
+        assert any(isinstance(event, Closed) for event in sent)
+        remaining = []
+        while not queue.empty():
+            remaining.append(queue.get_nowait()["type"])
+        disconnect_at = remaining.index("http.disconnect")
+        assert "http.request" not in remaining[disconnect_at + 1 :]
+    finally:
+        await _close_protocol(protocol, task_group)
+
+
+@pytest.mark.asyncio
+async def test_hypercorn_h2_awakened_body_put_does_not_follow_disconnect() -> None:
+    from hypercorn.events import RawData
+    from hypercorn.protocol.events import Body
+
+    protocol, _sent, task_group = await _make_h2_protocol(install_guards=True)
+    try:
+        client = _new_h2_client()
+        await protocol.handle(RawData(data=_open_run(client)))
+        stream = protocol.streams[1]
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        queue.put_nowait({"type": "http.request", "body": b"held", "more_body": True})
+        stream.app_put = queue.put
+        blocked = asyncio.create_task(
+            stream.handle(Body(stream_id=1, data=b"late-body"))
+        )
+        await asyncio.sleep(0)
+        assert blocked.done() is False
+        queue.get_nowait()
+        await asyncio.sleep(0)
+        await asyncio.wait_for(protocol._close_stream(1), timeout=1)
+        await asyncio.wait_for(blocked, timeout=1)
+        remaining = []
+        while not queue.empty():
+            remaining.append(queue.get_nowait()["type"])
         disconnect_at = remaining.index("http.disconnect")
         assert "http.request" not in remaining[disconnect_at + 1 :]
     finally:
