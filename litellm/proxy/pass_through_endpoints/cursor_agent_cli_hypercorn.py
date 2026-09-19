@@ -158,6 +158,10 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
         event = _disconnect_event_for_stream(stream)
         queue = getattr(app_put, "__self__", None)
         if isinstance(queue, asyncio.Queue):
+            waiters = list(getattr(queue, "_putters", ()))
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.cancel()
             try:
                 queue.put_nowait(event)
                 return
