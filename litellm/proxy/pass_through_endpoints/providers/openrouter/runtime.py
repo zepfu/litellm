@@ -13,6 +13,8 @@ import os
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional, TypeVar, Union
 
+from ...aawm_alias_routing.failure_vocabulary import FailureEvent
+
 from fastapi import Response
 
 from litellm.llms.anthropic.experimental_pass_through.providers.openrouter import (
@@ -517,13 +519,17 @@ async def _perform_openrouter_completion_adapter_operation(
     log_warnings: bool = True,
     use_alias_candidate_probe: bool = False,
 ) -> Any:
-    return await _anthropic_openrouter_retry_transport.perform_completion_operation(
-        _retry_runtime(),
-        adapter_model=adapter_model,
-        operation=operation,
-        log_warnings=log_warnings,
-        use_alias_candidate_probe=use_alias_candidate_probe,
-    )
+    try:
+        return await _anthropic_openrouter_retry_transport.perform_completion_operation(
+            _retry_runtime(),
+            adapter_model=adapter_model,
+            operation=operation,
+            log_warnings=log_warnings,
+            use_alias_candidate_probe=use_alias_candidate_probe,
+        )
+    except Exception as exc:
+        _sanitize_credit_exhaustion(exc)
+        raise
 
 
 async def _perform_openrouter_adapter_pass_through_request(
@@ -533,13 +539,78 @@ async def _perform_openrouter_adapter_pass_through_request(
     use_alias_candidate_probe: bool = False,
     **kwargs: Any,
 ) -> Response:
-    return await _anthropic_openrouter_retry_transport.perform_pass_through_request(
-        _retry_runtime(),
-        adapter_model=adapter_model,
-        log_warnings=log_warnings,
-        use_alias_candidate_probe=use_alias_candidate_probe,
-        **kwargs,
+    try:
+        return await _anthropic_openrouter_retry_transport.perform_pass_through_request(
+            _retry_runtime(),
+            adapter_model=adapter_model,
+            log_warnings=log_warnings,
+            use_alias_candidate_probe=use_alias_candidate_probe,
+            **kwargs,
+        )
+    except Exception as exc:
+        _sanitize_credit_exhaustion(exc)
+        raise
+
+
+def extract_credit_exhaustion_event(
+    exc: Any, *, error_shape_runtime: Any,
+) -> Optional[FailureEvent]:
+    """Extract only sanitized billing evidence, never upstream body material."""
+    from litellm.llms.anthropic.experimental_pass_through.providers.openrouter import error_shape
+    from ...aawm_alias_routing.classification import classify_failure
+    from ...aawm_alias_routing.failure_vocabulary import OPENROUTER_CREDIT_EXHAUSTED
+
+    response = getattr(exc, "response", None)
+    status_code = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
+    if status_code != 402 or not (
+        getattr(exc, "_aawm_provider_returned", False) is True
+        or getattr(exc, "provider_returned", False) is True
+    ):
+        return None
+    payload = error_shape.extract_error_payload(error_shape_runtime, exc)
+    if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
+        payload = getattr(exc, "body", None)
+    event = classify_failure(
+        status_code=402, provider="openrouter", provider_returned=True,
+        error_payload=payload,
     )
+    return event if event.class_name == OPENROUTER_CREDIT_EXHAUSTED else None
+
+
+def _sanitize_credit_exhaustion(exc: Exception) -> None:
+    # SDK completion exceptions may retain an HTTP response rather than the
+    # pass-through marker. Attribute only an actual OpenRouter 402 response;
+    # a local exception's status/message is insufficient.
+    from types import SimpleNamespace
+
+    response = getattr(exc, "response", None)
+    try:
+        response_url = response.request.url if response is not None else None
+    except (AttributeError, RuntimeError):
+        response_url = None
+    evidence = exc
+    if (
+        getattr(response, "status_code", None) == 402
+        and getattr(response_url, "host", None) == "openrouter.ai"
+    ):
+        try:
+            payload = response.json()
+        except (ValueError, AttributeError):
+            payload = getattr(exc, "body", None)
+        evidence = SimpleNamespace(
+            status_code=402, detail=payload, _aawm_provider_returned=True,
+        )
+    if extract_credit_exhaustion_event(evidence, error_shape_runtime=_retry_runtime()) is None:
+        return
+    from fastapi import HTTPException
+
+    sanitized = HTTPException(status_code=402, detail={"error": {
+        "code": 402, "type": "openrouter_credit_exhausted",
+        "message": "Insufficient credits for the OpenRouter credential.",
+    }})
+    setattr(sanitized, "_aawm_provider_returned", True)
+    setattr(sanitized, "attempted_provider_call", True)
+    raise sanitized from None
 
 
 def _get_openrouter_api_key() -> Optional[str]:

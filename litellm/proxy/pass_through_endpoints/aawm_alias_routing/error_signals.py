@@ -38,6 +38,7 @@ from litellm.llms.anthropic.experimental_pass_through.providers.grok import (
 from .codex_oauth import _clean_codex_auth_value
 from . import classification as _classification
 from . import failure_actions as _failure_actions
+from .failure_vocabulary import OPENROUTER_CREDIT_EXHAUSTED
 from .lane_keys import (
     _codex_auto_agent_candidate_key,
     _CODEX_AUTO_AGENT_MALFORMED_TOOL_CALL_COOLDOWN_SECONDS,
@@ -1653,6 +1654,8 @@ def _get_codex_auto_agent_candidate_cooldown_scope(
         return "none"
     if error_class == _CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_ERROR_CLASS:
         return "none"
+    if error_class == OPENROUTER_CREDIT_EXHAUSTED:
+        return "account"
     if error_class in _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES:
         return "candidate"
     if _is_kimi_code_auto_agent_candidate(candidate):
@@ -2639,6 +2642,15 @@ def _classify_openai_alpha_capacity_error_code(
     return "capacity_exhausted"
 
 
+def _openrouter_credit_exhaustion_event(
+    exc: Any, *, candidate: Optional[dict[str, Any]], attempted_provider_call: bool = True,
+) -> Any:
+    if not attempted_provider_call or not isinstance(candidate, dict) or candidate.get("provider") != "openrouter":
+        return None
+    from ..providers.openrouter.runtime import extract_credit_exhaustion_event
+    return extract_credit_exhaustion_event(exc, error_shape_runtime=_OPENROUTER_ERROR_SHAPE_RUNTIME)
+
+
 def _classify_codex_auto_agent_retryable_exhaustion(
     exc: Any,
     *,
@@ -2656,6 +2668,10 @@ def _classify_codex_auto_agent_retryable_exhaustion(
     assert _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS is not None
     assert _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS is not None
     status_code = _extract_adapter_exception_status_code(exc)
+    if status_code == 402 and _openrouter_credit_exhaustion_event(
+        exc, candidate=candidate, attempted_provider_call=attempted_provider_call,
+    ) is not None:
+        return OPENROUTER_CREDIT_EXHAUSTED
     tokens = _extract_codex_auto_agent_error_tokens(exc)
     if _is_codex_auto_agent_grok_account_quota_exhaustion(
         exc,
@@ -2806,6 +2822,7 @@ _RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES = frozenset(
 )
 _RESPONSES_PRE_COMMIT_ACCOUNT_EXHAUSTION_CLASSES = frozenset(
     {
+        OPENROUTER_CREDIT_EXHAUSTED,
         "usage_limit_reached",
     }
 )
@@ -3038,7 +3055,7 @@ def _get_codex_auto_agent_cooldown_seconds(
     if error_class in _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES:
         return _resolve_alibaba_token_plan_exhaustion_cooldown_seconds()
     tokens = _extract_codex_auto_agent_error_tokens(exc)
-    if error_class == "usage_limit_reached":
+    if error_class in {"usage_limit_reached", OPENROUTER_CREDIT_EXHAUSTED}:
         resolved = _CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS
         if header_wait is not None:
             resolved = (
@@ -3227,6 +3244,12 @@ def build_shadow_failure_action_decision_from_exc(
     the candidate loop can stamp the same sanitized comparison fields without
     re-implementing classification inputs.
     """
+    credit_event = _openrouter_credit_exhaustion_event(exc, candidate=candidate)
+    if credit_event is not None:
+        return _failure_actions.decide_shadow_failure_action(
+            credit_event, policy=policy, current_error_class=current_error_class,
+            current_cooldown_scope=current_cooldown_scope, current_status=current_status,
+        )
     status_code = _extract_adapter_exception_status_code(exc)
     source_error = _get_codex_auto_agent_source_error_summary(
         exc,

@@ -21,6 +21,7 @@ from typing import Literal, Mapping, Optional
 
 from .failure_vocabulary import (
     FailureEvent,
+    OPENROUTER_CREDIT_EXHAUSTED,
     Origin,
     SEED_FAILURE_CLASSES,
     is_coolable,
@@ -55,6 +56,7 @@ _DEFAULT_ACTION_BY_CLASS: dict[str, FailureAction] = {
     "rate_limit": "cooldown",
     "capacity": "cooldown",
     "usage_limit": "cooldown",
+    OPENROUTER_CREDIT_EXHAUSTED: "cooldown",
     "transient": "retry_same",
     "auth": "terminal",
     "quota_exhausted": "cooldown",

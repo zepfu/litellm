@@ -28,7 +28,10 @@ _VALID_SCOPES: frozenset[str] = frozenset({"provider", "account", "model", "lane
 # Structured seed classes (open registry). Growth beyond this seed set happens via
 # FailureClassRegistry.register() at runtime -- this tuple is a starting
 # point, not an exhaustive closed set.
+OPENROUTER_CREDIT_EXHAUSTED = "openrouter_credit_exhausted"
+
 SEED_FAILURE_CLASSES: tuple[str, ...] = (
+    OPENROUTER_CREDIT_EXHAUSTED,
     "rate_limit",
     "capacity",
     "usage_limit",

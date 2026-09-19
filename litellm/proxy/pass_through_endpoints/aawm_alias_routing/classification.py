@@ -259,6 +259,8 @@ def classify_failure(
     provider: Optional[str] = None,
     message: str = "",
     retry_after_seconds: Optional[float] = None,
+    provider_returned: bool = False,
+    error_payload: Optional[dict] = None,
 ) -> fv.FailureEvent:
     """Classify a status-code/message failure signal into a ``FailureEvent``.
 
@@ -294,6 +296,24 @@ def classify_failure(
             retryable=retryable,
             evidence=evidence,
         )
+
+    # Only an attributed, structured OpenRouter billing rejection can cool
+    # a credential. HTTP 402 alone (including local budget guards) is not evidence.
+    if status_code == 402 and provider == "openrouter" and provider_returned is True:
+        error = error_payload.get("error") if isinstance(error_payload, dict) else None
+        if isinstance(error, dict) and error.get("code") in (402, "402"):
+            credit_message = " ".join(str(error.get("message") or "").casefold().split())
+            if credit_message.startswith((
+                "insufficient credits", "credit limit exceeded", "key limit exceeded",
+                "key limit reached", "budget exceeded", "budget limit exceeded",
+                "this request requires more credits", "you have exceeded your credit limit",
+                "you've exceeded your credit limit",
+            )):
+                return _event(
+                    class_name=fv.OPENROUTER_CREDIT_EXHAUSTED,
+                    origin="upstream", confidence="structured", provider=provider,
+                    scope="account", retryable=True, evidence=evidence,
+                )
 
     if status_code == 429:
         if any(marker in text for marker in _QUOTA_MARKERS):
