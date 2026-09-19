@@ -6887,7 +6887,46 @@ async def test_candidate_loop_ohmypi_cursor_skip_handoff_38_function_call_pairs(
         finalize_result.outcome
         is session_affinity.SessionOwnerMutationOutcome.PROMOTED
     )
-    assert 38 <= codex_candidate_calls._CURSOR_REPLAY_MAX_STOCK_FUNCTION_CALLS
+    assert 43 <= codex_candidate_calls._CURSOR_REPLAY_MAX_STOCK_FUNCTION_CALLS
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_ohmypi_cursor_skip_handoff_43_function_call_pairs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leftover = session_affinity.SessionOwnerLease(
+        session_identity="cursor-turn-ohmypi-43",
+        cache_key="cursor-turn-ohmypi-43",
+        reservation_token=None,
+        held_reservation=False,
+        decision=session_affinity.SessionOwnerGuardDecision.UNOWNED_RESERVED.value,
+    )
+    harness = _cursor_skip_rebind_handle_alias_harness(
+        monkeypatch,
+        leftover=leftover,
+        use_ohmypi_function_call_count=43,
+        drive_shipped_builder=True,
+        use_native_owner_lifecycle=True,
+    )
+
+    response = await harness.run()
+
+    assert response == {"candidate": harness.xai_candidate["model"]}
+    assert harness.provider_calls == ["cursor_agent", "xai"]
+    rebuilt_input = harness.rebuilt_request_body["input"]
+    function_calls = [
+        item for item in rebuilt_input if item.get("type") == "function_call"
+    ]
+    function_outputs = [
+        item for item in rebuilt_input if item.get("type") == "function_call_output"
+    ]
+    assert len(function_calls) == 43
+    assert len(function_outputs) == 43
+    _lease, _kwargs, finalize_result = harness.finalize_calls[-1]
+    assert (
+        finalize_result.outcome
+        is session_affinity.SessionOwnerMutationOutcome.PROMOTED
+    )
 
 
 @pytest.mark.asyncio
@@ -6929,7 +6968,7 @@ async def test_candidate_loop_ohmypi_cursor_skip_rejects_oversized_function_call
     assert reject["stage"] == "stock_full_history"
     assert attempts[0]["error_class"] == "continuation_state_unavailable"
     assert attempts[0]["attempted_provider_call"] is False
-    assert 38 < oversized
+    assert 43 < oversized
 
 
 @pytest.mark.asyncio

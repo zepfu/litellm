@@ -50,14 +50,15 @@ _CURSOR_REPLAY_TTL_SECONDS = 600.0
 _CURSOR_REPLAY_MAX_SIZE = 256
 _CURSOR_REPLAY_MAX_ENTRY_BYTES = 1 * 1024 * 1024
 _CURSOR_REPLAY_MAX_TOTAL_BYTES = 16 * 1024 * 1024
-# Live Ohmypi sota-xai skip sample is 38 completed pairs
-# (alpha-error.jsonl 2026-09-18T20:54:59Z, item_index 80). Keep a finite cap.
-_CURSOR_REPLAY_MAX_STOCK_FUNCTION_CALLS = 38
+# Live Ohmypi expert skip sample is 43 completed pairs
+# (alpha-error.jsonl 2026-09-19T01:19:58Z). Keep a finite cap.
+_CURSOR_REPLAY_MAX_STOCK_FUNCTION_CALLS = 64
 _CURSOR_REPLAY_MAX_STOCK_INPUT_ITEMS = 256
 _OHMYPI_CLIENT_HISTORY_EXTRA_KEYS = frozenset({"aawm_route_identity"})
 _OHMYPI_CLIENT_HISTORY_MESSAGE_ROLES = frozenset(
     {"assistant", "developer", "system", "user"}
 )
+_OHMYPI_CLIENT_HISTORY_MESSAGE_STATUSES = frozenset({"completed"})
 _OHMYPI_CURSOR_REASONING_CORE_KEYS = frozenset(
     {"type", "encrypted_content", "summary", "id", "status"}
 )
@@ -3962,11 +3963,12 @@ def _cursor_replay_ohmypi_client_history_item(
     extras = keys & _OHMYPI_CLIENT_HISTORY_EXTRA_KEYS
     core = keys - extras
     item_type = item.get("type")
-    looks_like_message = core in (
+    message_core = core - {"status"}
+    looks_like_message = message_core in (
         {"role", "content"},
         {"type", "role", "content"},
     ) and (
-        "type" not in core or item_type == "message"
+        "type" not in message_core or item_type == "message"
     )
     looks_like_function_call = (
         item_type == "function_call"
@@ -3996,10 +3998,17 @@ def _cursor_replay_ohmypi_client_history_item(
         )
     if looks_like_message:
         role = item.get("role")
-        if role not in _OHMYPI_CLIENT_HISTORY_MESSAGE_ROLES:
+        status = item.get("status")
+        if role not in _OHMYPI_CLIENT_HISTORY_MESSAGE_ROLES or (
+            "status" in item
+            and (
+                not isinstance(status, str)
+                or status not in _OHMYPI_CLIENT_HISTORY_MESSAGE_STATUSES
+            )
+        ):
             return _cursor_replay_rejected(
                 "stock_full_history",
-                "message_role",
+                "message_role" if role not in _OHMYPI_CLIENT_HISTORY_MESSAGE_ROLES else "item_key_set",
                 item=item,
             )
         content_text = _cursor_response_content_text(item.get("content"))
