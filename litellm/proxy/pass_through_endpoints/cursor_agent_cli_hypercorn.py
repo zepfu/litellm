@@ -130,16 +130,32 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
         if has_data is not None:
             await has_data.set()
 
-    def _deliver_terminal_disconnect(stream: Any) -> None:
-        """Enqueue http.disconnect without waiting for the app to read.
+    def _disconnect_event_for_stream(stream: Any) -> dict:
+        scope = getattr(stream, "scope", None)
+        is_websocket = type(stream).__name__ == "WSStream" or (
+            isinstance(scope, dict) and scope.get("type") == "websocket"
+        )
+        if not is_websocket:
+            return {"type": "http.disconnect"}
+        state = getattr(stream, "state", None)
+        state_name = getattr(state, "name", "") or str(state)
+        code = 1000 if state_name in {"CLOSED", "HTTPCLOSED"} else 1006
+        return {"type": "websocket.disconnect", "code": code}
 
-        Hypercorn 0.15 HTTPStream.handle(StreamClosed) awaits Queue.put.
-        A full request queue then deadlocks terminal GOAWAY cleanup.
+    def _deliver_terminal_disconnect(stream: Any) -> None:
+        """Enqueue stream-specific disconnect without waiting for the app.
+
+        Hypercorn 0.15 HTTPStream/WSStream handle(StreamClosed) awaits
+        Queue.put. A full request queue then deadlocks GOAWAY cleanup, and
+        a disconnect already waiting on that put is not visible in
+        ``self.streams``. HTTP streams get ``http.disconnect``; HTTP/2
+        CONNECT WebSocket streams keep ``websocket.disconnect`` plus the
+        stock close code.
         """
         app_put = getattr(stream, "app_put", None)
         if app_put is None:
             return
-        event = {"type": "http.disconnect"}
+        event = _disconnect_event_for_stream(stream)
         queue = getattr(app_put, "__self__", None)
         if isinstance(queue, asyncio.Queue):
             try:
@@ -175,8 +191,9 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
             await self.send(Closed())
 
     async def _close_stream(self, stream_id: int) -> None:
-        _retired_ids(self).add(stream_id)
-        await _ORIGINAL_H2_CLOSE_STREAM(self, stream_id)
+        # Ordinary StreamClosed must not await a full application queue.
+        # Response draining and END_STREAM stay in _send_data.
+        await _close_stream_terminal(self, stream_id)
 
     async def _close_stream_terminal(self, stream_id: int) -> None:
         _retired_ids(self).add(stream_id)

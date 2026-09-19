@@ -517,3 +517,81 @@ async def test_hypercorn_h2_goaway_does_not_wait_on_full_app_queue() -> None:
         assert queue.get_nowait()["type"] == "http.disconnect"
     finally:
         await _close_protocol(protocol, task_group)
+
+
+@pytest.mark.asyncio
+async def test_hypercorn_h2_ordinary_close_then_goaway_on_full_queue() -> None:
+    from hypercorn.events import Closed, RawData
+
+    protocol, sent, task_group = await _make_h2_protocol(install_guards=True)
+    try:
+        client = _new_h2_client()
+        await protocol.handle(RawData(data=_open_run(client)))
+        stream = protocol.streams[1]
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        queue.put_nowait({"type": "http.request", "body": b"full", "more_body": True})
+        stream.app_put = queue.put
+        await asyncio.wait_for(protocol._close_stream(1), timeout=1)
+        assert stream.closed is True
+        assert 1 not in protocol.streams
+        await asyncio.wait_for(
+            protocol.handle(RawData(data=_goaway(client))),
+            timeout=1,
+        )
+        assert protocol.closed is True
+        assert any(isinstance(event, Closed) for event in sent)
+        assert queue.get_nowait()["type"] == "http.disconnect"
+    finally:
+        await _close_protocol(protocol, task_group)
+
+
+@pytest.mark.asyncio
+async def test_hypercorn_h2_websocket_terminal_close_uses_websocket_disconnect() -> None:
+    from hypercorn.events import Closed, RawData
+    from hypercorn.protocol.ws_stream import ASGIWebsocketState, WSStream
+    from wsproto.frame_protocol import CloseReason
+
+    protocol, sent, task_group = await _make_h2_protocol(install_guards=True)
+    received: List[dict] = []
+    try:
+        client = _new_h2_client()
+        stream_id = client.get_next_available_stream_id()
+        client.send_headers(
+            stream_id,
+            [
+                (b":method", b"CONNECT"),
+                (b":scheme", b"http"),
+                (b":authority", b"localhost"),
+                (b":path", b"/ws"),
+            ],
+            end_stream=False,
+        )
+        await protocol.handle(RawData(data=client.data_to_send()))
+        queue: asyncio.Queue = asyncio.Queue()
+        ws = WSStream(
+            protocol.app,
+            protocol.config,
+            protocol.context,
+            protocol.task_group,
+            False,
+            ("127.0.0.1", 9),
+            ("127.0.0.1", 4011),
+            protocol.stream_send,
+            1,
+        )
+        ws.app_put = queue.put
+        ws.scope = {"type": "websocket"}
+        ws.state = ASGIWebsocketState.CONNECTED
+        protocol.streams[1] = ws
+        await asyncio.wait_for(
+            protocol.handle(RawData(data=_goaway(client))),
+            timeout=1,
+        )
+        assert protocol.closed is True
+        assert any(isinstance(event, Closed) for event in sent)
+        event = queue.get_nowait()
+        assert event["type"] == "websocket.disconnect"
+        assert event["code"] == CloseReason.ABNORMAL_CLOSURE.value
+        received.append(event)
+    finally:
+        await _close_protocol(protocol, task_group)
