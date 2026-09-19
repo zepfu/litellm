@@ -252,6 +252,58 @@ def is_reserved_openrouter_nvidia_nemotron_free_model(model: Any) -> bool:
     return bool(wildcard)
 
 
+def normalize_openrouter_model_namespace(model: Any) -> Optional[str]:
+    """Return the OpenRouter-native model id with the LiteLLM prefix removed.
+
+    Strips surrounding whitespace and at most one leading ``openrouter/``
+    LiteLLM provider prefix (case-insensitive). Nested vendor namespaces such
+    as ``nvidia/``, ``cohere/``, and ``stealth/`` are preserved, so
+    ``openrouter/nvidia/nemotron-x:free`` becomes ``nvidia/nemotron-x:free``
+    and ``stealth/ox-alpha`` keeps ``stealth/``.
+    """
+
+    if not isinstance(model, str):
+        return None
+    candidate = model.strip()
+    if not candidate:
+        return None
+    prefix = "openrouter/"
+    if candidate[: len(prefix)].casefold() == prefix:
+        candidate = candidate[len(prefix) :].strip()
+        if not candidate:
+            return None
+    return candidate.casefold()
+
+
+# Hosted OpenRouter free aliases that do not carry a ``:free`` suffix.
+_OPENROUTER_FREE_MODEL_ALIASES = frozenset(
+    {
+        "free",
+        "elephant-alpha",
+        "owl-alpha",
+        "stealth/ox-alpha",
+    }
+)
+
+
+def is_openrouter_free_model(model: Any) -> bool:
+    """Return True for every recognized OpenRouter free-model route.
+
+    A route is free when its normalized name ends with a nonempty ``:free``
+    suffix, or when it is one of the hosted free aliases (``free``,
+    ``elephant-alpha``, ``owl-alpha``, ``stealth/ox-alpha``). Paid siblings
+    such as ``inclusionai/ling-2.6-flash`` and ``nvidia/nemotron-3-ultra``
+    are never classified as free.
+    """
+
+    candidate = normalize_openrouter_model_namespace(model)
+    if candidate is None:
+        return False
+    if candidate.endswith(":free"):
+        return len(candidate) > len(":free")
+    return candidate in _OPENROUTER_FREE_MODEL_ALIASES
+
+
 def normalize_nvidia_completion_adapter_model_name(model: Any) -> Optional[str]:
     """Return the canonical `nvidia/<model-id>` adapter key when admissible.
 
@@ -454,10 +506,12 @@ __all__ = [
     "OPENCODE_ZEN_PROVIDER",
     "OPENROUTER_FREE_DAILY_QUOTA_MODELS",
     "install_policy_compat_aliases",
+    "is_openrouter_free_model",
     "is_reserved_openrouter_nvidia_nemotron_free_model",
     "normalize_alibaba_token_plan_adapter_model_name",
     "normalize_kimi_code_chat_completions_adapter_model_name",
     "normalize_nvidia_completion_adapter_model_name",
+    "normalize_openrouter_model_namespace",
     "normalize_zai_coding_plan_adapter_model_name",
     "nvidia_completion_adapter_upstream_model",
 ]

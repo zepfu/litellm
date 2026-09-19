@@ -1,12 +1,10 @@
-"""OpenRouter free-daily-quota probe, durable cooldown helpers, and alias-probe gate.
+"""OpenRouter free-daily-quota probe and pre-transport admission.
 
-Wave 5A extraction from ``llm_passthrough_endpoints.py``.  Behavior-preserving
-relocation only; no logic changes.
-
-The quota cache tuple and lock (``_openrouter_free_daily_quota_cache``,
-``_openrouter_free_daily_quota_lock``) remain owned by the god module for
-Wave 5B.  Cache reads/writes go through injected getter/setter callbacks;
-the lock is injected as a shared object reference.
+The policy classifier governs free-model quota checks for alias selection and
+all adapter transports. Exhaustion skips alias candidates and refuses direct
+requests with a local 429 before transport; paid models bypass the quota probe.
+Adapter cooldown refusal remains alias-probe-only. Cache and lock access use
+the injected runtime seams.
 """
 
 from __future__ import annotations
@@ -22,6 +20,7 @@ from litellm.proxy._types import ProxyException
 from .policy import (
     CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
     OPENROUTER_FREE_DAILY_QUOTA_MODELS,
+    is_openrouter_free_model,
 )
 
 # ---------------------------------------------------------------------------
@@ -168,7 +167,7 @@ async def _get_openrouter_free_daily_quota_exhausted_cooldown_seconds() -> float
                     reset_at_ts = _parse_openrouter_free_daily_quota_reset_timestamp(row["expected_reset_at"])
         except Exception:
             verbose_proxy_logger.debug(
-                "OpenRouter durable quota check failed; failing open for alias selection",
+                "OpenRouter durable quota check failed; failing open for quota admission",
                 exc_info=True,
             )
             reset_at_ts = None
@@ -192,8 +191,7 @@ async def _get_openrouter_free_daily_quota_exhausted_cooldown_seconds() -> float
 def _is_openrouter_free_quota_candidate(candidate: dict[str, Any]) -> bool:
     if candidate["provider"] != CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
         return False
-    model = str(candidate.get("model") or "")
-    return model in _OPENROUTER_FREE_DAILY_QUOTA_MODELS
+    return is_openrouter_free_model(candidate.get("model"))
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +224,7 @@ async def _apply_openrouter_durable_quota_candidate_cooldown(
 
 
 # ---------------------------------------------------------------------------
-# Alias-probe cooldown gate
+# Free-quota admission and alias-probe cooldown gate
 # ---------------------------------------------------------------------------
 
 
@@ -255,6 +253,27 @@ async def _maybe_raise_openrouter_adapter_alias_probe_cooldown(
     *,
     use_alias_candidate_probe: bool = False,
 ) -> None:
+    # The retry transport invokes this gate for direct and alias routes alike.
+    # Daily free quota applies to both; adapter cooldown remains probe-only.
+    if is_openrouter_free_model(adapter_model):
+        assert _get_free_daily_quota_exhausted_cooldown_seconds is not None
+        quota_wait = await _get_free_daily_quota_exhausted_cooldown_seconds()
+        if quota_wait > 0:
+            rounded_wait = max(1, int(quota_wait))
+            message = (
+                f"OpenRouter free daily quota is exhausted for {adapter_model}. "
+                f"Retry after ~{rounded_wait}s."
+            )
+            if use_alias_candidate_probe:
+                _raise_openrouter_auto_agent_candidate_unavailable(message)
+            exc = ProxyException(
+                message=message,
+                type="rate_limit_error",
+                param="model",
+                code=429,
+            )
+            setattr(exc, "attempted_provider_call", False)
+            raise exc
     if not use_alias_candidate_probe:
         return
     assert _get_adapter_active_cooldown_seconds is not None

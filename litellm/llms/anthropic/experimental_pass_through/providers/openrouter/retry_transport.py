@@ -18,6 +18,9 @@ from typing import (
 from fastapi import HTTPException, Response
 
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import retry
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+    is_openrouter_free_model,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
     MonotonicCooldownMap,
 )
@@ -82,14 +85,7 @@ def get_rate_limit_key(runtime: Runtime, model: Optional[str]) -> str:
 
 
 def is_free_model(runtime: Runtime, model: Optional[str]) -> bool:
-    cleaned_model = runtime.clean_secret_string(model)
-    if not cleaned_model:
-        return False
-    return (
-        cleaned_model == "openrouter/elephant-alpha"
-        or cleaned_model == "openrouter/free"
-        or cleaned_model.endswith(":free")
-    )
+    return is_openrouter_free_model(runtime.clean_secret_string(model))
 
 
 def get_wait_keys(runtime: Runtime, model: Optional[str]) -> str:
