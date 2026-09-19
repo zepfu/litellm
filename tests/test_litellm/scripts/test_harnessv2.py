@@ -1327,6 +1327,69 @@ def test_should_scrub_langfuse_and_db_secrets_from_child_env(hv, config, monkeyp
         assert denied not in env
 
 
+def test_should_capture_ohmypi_pane_deep_enough_for_tool_heavy_skip_overlay(
+    hv, config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+
+    driver = OhmypiDriver(config)
+    driver._active_session = "hv2-ohmypi-sota-xai-2309452"
+    captured: list[list[str]] = []
+
+    def _run_tmux(argv: list[str], **_kwargs: Any) -> Any:
+        captured.append(list(argv))
+        return SimpleNamespace(returncode=0, stdout="pane", stderr="")
+
+    monkeypatch.setattr(driver, "_run_tmux", _run_tmux)
+    assert driver.capture_pane() == "pane"
+    assert captured == [
+        ["capture-pane", "-pt", "hv2-ohmypi-sota-xai-2309452", "-S", "-2000"]
+    ]
+
+
+def test_should_see_skip_overlay_prompt_echo_after_36_tool_rows() -> None:
+    from hv2.pane import _latest_prompt_echo_index, _pane_has_any
+
+    prompt = "AAWM36: 36 bash echoes 01-36 then STOP. Reply SKIPCAPOK"
+    tools = ""
+    for index in range(1, 37):
+        tools += (
+            " • Bash\n"
+            f'  └─ command="echo {index:02d}"\n'
+            f" {index:02d}\n"
+            "\n"
+            " Wall time: 0.03 seconds\n"
+            " ⟦Ctrl+O: Expand⟧\n"
+            "\n"
+            "\n"
+            f"2026-09-18 20:06:{index:02d}  Δ {index}.0s  ⤵ 23K  ⤴ 675\n"
+            "\n"
+        )
+    pane = (
+        f"{prompt}\n"
+        "\n"
+        f"{tools}"
+        "SKIPCAPOK\n"
+        "\n"
+        " π · 🖥 thoth · ⬢ AAWM alias sota-xai · ◕ xhigh\n"
+    )
+    truncated = "\n".join(pane.splitlines()[-200:])
+    assert prompt not in truncated
+    assert _latest_prompt_echo_index(truncated, prompt) == -1
+    assert (
+        _pane_has_any(
+            truncated, ["SKIPCAPOK"], prompt=prompt, after_echo_index=-1
+        )
+        is False
+    )
+    assert prompt in pane
+    assert _latest_prompt_echo_index(pane, prompt) >= 0
+    assert (
+        _pane_has_any(pane, ["SKIPCAPOK"], prompt=prompt, after_echo_index=-1)
+        is True
+    )
+
+
 def test_should_stage_ohmypi_identity_overlay_with_repo_and_version(hv, config) -> None:
     from hv2.drivers.ohmypi import OhmypiDriver
 

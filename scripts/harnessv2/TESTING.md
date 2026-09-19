@@ -284,7 +284,7 @@ For each selected alias the driver:
    a standalone exact `PONG` line **after the latest prompt echo**
    (not the prompt echo itself) completes the model wait even when
    recap never paints. A leftover session-dir `PONG` restored by
-   `capture-pane -S -200` before that echo is not this alias's live
+   `capture-pane -S -2000` before that echo is not this alias's live
    reply. A restored complete echo+PONG turn already on the pane
    before send is also not this alias's live reply: require a new
    prompt echo after send, then `PONG` after that echo. Each alias

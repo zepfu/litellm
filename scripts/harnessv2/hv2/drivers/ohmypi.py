@@ -441,7 +441,7 @@ class OhmypiDriver:
     def capture_pane(self) -> str:
         try:
             proc = self._run_tmux(
-                ["capture-pane", "-pt", self._session_name(), "-S", "-200"]
+                ["capture-pane", "-pt", self._session_name(), "-S", "-2000"]
             )
         except HarnessError:
             return ""
