@@ -135,10 +135,11 @@ async def _make_h2_protocol(*, install_guards: bool = True):
         sent.append(event)
 
     async def app(scope, receive, send_app):
-        await send_app({"type": "http.response.start", "status": 200, "headers": []})
-        await send_app(
-            {"type": "http.response.body", "body": b"ok", "more_body": False}
-        )
+        parked = asyncio.Event()
+        try:
+            await parked.wait()
+        except asyncio.CancelledError:
+            raise
 
     loop = asyncio.get_running_loop()
     task_group = TaskGroup(loop)
@@ -157,6 +158,17 @@ async def _make_h2_protocol(*, install_guards: bool = True):
     return protocol, sent, task_group
 
 
+async def _stop_background_sender(task_group: Any) -> None:
+    """Cancel Hypercorn's initiate() send_task so tests own _send_data."""
+    inner = getattr(task_group, "_task_group", None)
+    tasks = list(getattr(inner, "_tasks", ())) if inner is not None else []
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def _close_protocol(protocol: Any, task_group: Any) -> None:
     from hypercorn.events import Closed
 
@@ -165,22 +177,20 @@ async def _close_protocol(protocol: Any, task_group: Any) -> None:
         await protocol.has_data.set()
     except Exception:
         pass
-    try:
-        await protocol.handle(Closed())
-    except Exception:
-        pass
     inner = getattr(task_group, "_task_group", None)
     tasks = list(getattr(inner, "_tasks", ())) if inner is not None else []
     for task in tasks:
         if not task.done():
             task.cancel()
+    if tasks:
+        await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=1,
+        )
     try:
-        await asyncio.wait_for(task_group.__aexit__(None, None, None), timeout=1)
+        await asyncio.wait_for(protocol.handle(Closed()), timeout=0.5)
     except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-        try:
-            await task_group.__aexit__(None, None, None)
-        except (asyncio.CancelledError, Exception):
-            pass
+        pass
 
 
 @pytest.mark.asyncio
@@ -330,6 +340,7 @@ def test_unsupported_hypercorn_version_leaves_methods_untouched() -> None:
     handle_before = H2Protocol.handle
     events_before = H2Protocol._handle_events
     close_before = H2Protocol._close_stream
+    send_before = H2Protocol._send_data
     with pytest.raises(UnsupportedHypercornVersion):
         require_supported_hypercorn_version("0.18.0")
     with pytest.raises(UnsupportedHypercornVersion):
@@ -343,6 +354,7 @@ def test_unsupported_hypercorn_version_leaves_methods_untouched() -> None:
     assert H2Protocol.handle is handle_before
     assert H2Protocol._handle_events is events_before
     assert H2Protocol._close_stream is close_before
+    assert H2Protocol._send_data is send_before
     assert hypercorn_h2_receive_dispatch_guards_installed() is False
     install_hypercorn_h2_receive_dispatch_guards()
 
@@ -382,6 +394,84 @@ async def test_hypercorn_h2_goaway_releases_blocked_response_buffer() -> None:
         await protocol.handle(RawData(data=_goaway(client)))
         await asyncio.wait_for(blocked, timeout=1)
         assert protocol.closed is True
-        assert 1 not in protocol.stream_buffers
+        # Waiters are released, but the map entry stays for an in-flight sender.
+        assert 1 in protocol.stream_buffers
+        assert protocol.stream_buffers[1].complete is True
     finally:
+        await _close_protocol(protocol, task_group)
+
+
+@pytest.mark.asyncio
+async def test_hypercorn_h2_sender_flush_survives_goaway() -> None:
+    from hypercorn.events import RawData
+
+    protocol, _sent, task_group = await _make_h2_protocol(install_guards=True)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_flush = protocol._flush
+    try:
+        client = _new_h2_client()
+        await protocol.handle(RawData(data=_open_run(client)))
+        await _stop_background_sender(task_group)
+
+        async def _held_flush() -> None:
+            entered.set()
+            await release.wait()
+            if not protocol.closed:
+                await original_flush()
+
+        protocol._flush = _held_flush
+        buffer = protocol.stream_buffers[1]
+        protocol.priority.unblock(1)
+        await buffer.push(b"partial-body")
+        sender = asyncio.create_task(protocol._send_data(1))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        assert sender.done() is False
+        await protocol.handle(RawData(data=_goaway(client)))
+        release.set()
+        await asyncio.wait_for(sender, timeout=1)
+        assert sender.exception() is None
+        assert protocol.closed is True
+    finally:
+        release.set()
+        await _close_protocol(protocol, task_group)
+
+
+@pytest.mark.asyncio
+async def test_hypercorn_h2_ordinary_completion_keeps_sender_end_stream() -> None:
+    from hypercorn.events import Closed, RawData
+
+    protocol, sent, task_group = await _make_h2_protocol(install_guards=True)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_flush = protocol._flush
+    flushed_after_release: List[bool] = []
+    try:
+        client = _new_h2_client()
+        await protocol.handle(RawData(data=_open_run(client)))
+        await _stop_background_sender(task_group)
+
+        async def _held_flush() -> None:
+            entered.set()
+            await release.wait()
+            flushed_after_release.append(True)
+            await original_flush()
+
+        protocol._flush = _held_flush
+        buffer = protocol.stream_buffers[1]
+        protocol.priority.unblock(1)
+        await buffer.push(b"complete-body")
+        buffer.set_complete()
+        sender = asyncio.create_task(protocol._send_data(1))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        assert sender.done() is False
+        release.set()
+        await asyncio.wait_for(sender, timeout=1)
+        assert sender.exception() is None
+        assert protocol.closed is False
+        assert any(isinstance(event, Closed) for event in sent) is False
+        assert 1 not in protocol.stream_buffers
+        assert flushed_after_release
+    finally:
+        release.set()
         await _close_protocol(protocol, task_group)

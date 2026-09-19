@@ -13,6 +13,7 @@ _H2_RECEIVE_DISPATCH_GUARDS_INSTALLED = False
 _ORIGINAL_H2_HANDLE: Any = None
 _ORIGINAL_H2_HANDLE_EVENTS: Any = None
 _ORIGINAL_H2_CLOSE_STREAM: Any = None
+_ORIGINAL_H2_SEND_DATA: Any = None
 
 
 class UnsupportedHypercornVersion(RuntimeError):
@@ -44,7 +45,8 @@ def require_supported_hypercorn_version(version: Optional[str] = None) -> str:
 def restore_hypercorn_h2_receive_dispatch_guards() -> None:
     """Restore stock Hypercorn H2Protocol methods. Tests only."""
     global _H2_RECEIVE_DISPATCH_GUARDS_INSTALLED
-    global _ORIGINAL_H2_HANDLE, _ORIGINAL_H2_HANDLE_EVENTS, _ORIGINAL_H2_CLOSE_STREAM
+    global _ORIGINAL_H2_HANDLE, _ORIGINAL_H2_HANDLE_EVENTS
+    global _ORIGINAL_H2_CLOSE_STREAM, _ORIGINAL_H2_SEND_DATA
     from hypercorn.protocol.h2 import H2Protocol
 
     if _ORIGINAL_H2_HANDLE is not None:
@@ -53,6 +55,8 @@ def restore_hypercorn_h2_receive_dispatch_guards() -> None:
         H2Protocol._handle_events = _ORIGINAL_H2_HANDLE_EVENTS
     if _ORIGINAL_H2_CLOSE_STREAM is not None:
         H2Protocol._close_stream = _ORIGINAL_H2_CLOSE_STREAM
+    if _ORIGINAL_H2_SEND_DATA is not None:
+        H2Protocol._send_data = _ORIGINAL_H2_SEND_DATA
     if hasattr(H2Protocol, "_aawm_cursor_h2_guards"):
         delattr(H2Protocol, "_aawm_cursor_h2_guards")
     if hasattr(H2Protocol, "_aawm_hypercorn_version"):
@@ -61,6 +65,7 @@ def restore_hypercorn_h2_receive_dispatch_guards() -> None:
     _ORIGINAL_H2_HANDLE = None
     _ORIGINAL_H2_HANDLE_EVENTS = None
     _ORIGINAL_H2_CLOSE_STREAM = None
+    _ORIGINAL_H2_SEND_DATA = None
 
 
 def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
@@ -76,7 +81,8 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
     live stream handler must still propagate.
     """
     global _H2_RECEIVE_DISPATCH_GUARDS_INSTALLED
-    global _ORIGINAL_H2_HANDLE, _ORIGINAL_H2_HANDLE_EVENTS, _ORIGINAL_H2_CLOSE_STREAM
+    global _ORIGINAL_H2_HANDLE, _ORIGINAL_H2_HANDLE_EVENTS
+    global _ORIGINAL_H2_CLOSE_STREAM, _ORIGINAL_H2_SEND_DATA
     if _H2_RECEIVE_DISPATCH_GUARDS_INSTALLED:
         return
 
@@ -85,6 +91,7 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
     import h2.events
     import h2.exceptions
     import h2.settings
+    import priority as priority_lib
 
     from hypercorn.events import Closed, RawData, Updated
     from hypercorn.protocol.events import Body, EndBody
@@ -93,6 +100,7 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
     _ORIGINAL_H2_HANDLE = H2Protocol.handle
     _ORIGINAL_H2_HANDLE_EVENTS = H2Protocol._handle_events
     _ORIGINAL_H2_CLOSE_STREAM = H2Protocol._close_stream
+    _ORIGINAL_H2_SEND_DATA = H2Protocol._send_data
 
     def _retired_ids(protocol: Any) -> set:
         retired = getattr(protocol, "_aawm_retired_stream_ids", None)
@@ -110,14 +118,13 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
         buffers = getattr(self, "stream_buffers", None)
         if not isinstance(buffers, dict):
             return
-        for stream_id, buffer in list(buffers.items()):
+        for _stream_id, buffer in list(buffers.items()):
             close = getattr(buffer, "close", None)
             if callable(close):
                 try:
                     await close()
                 except Exception:
                     pass
-            buffers.pop(stream_id, None)
         has_data = getattr(self, "has_data", None)
         if has_data is not None:
             await has_data.set()
@@ -136,16 +143,58 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
 
     async def _close_stream(self, stream_id: int) -> None:
         _retired_ids(self).add(stream_id)
-        buffer = getattr(self, "stream_buffers", {}).get(stream_id)
         await _ORIGINAL_H2_CLOSE_STREAM(self, stream_id)
-        if buffer is not None:
-            close = getattr(buffer, "close", None)
-            if callable(close):
-                try:
-                    await close()
-                except Exception:
-                    pass
-            getattr(self, "stream_buffers", {}).pop(stream_id, None)
+
+    def _drop_priority(self, stream_id: int) -> None:
+        try:
+            self.priority.remove_stream(stream_id)
+        except (priority_lib.MissingStreamError, KeyError):
+            pass
+
+    async def _send_data(self, stream_id: int) -> None:
+        try:
+            buffer = self.stream_buffers.get(stream_id)
+            if buffer is None or getattr(self, "closed", False):
+                if buffer is not None:
+                    close = getattr(buffer, "close", None)
+                    if callable(close):
+                        try:
+                            await close()
+                        except Exception:
+                            pass
+                _drop_priority(self, stream_id)
+                return
+            chunk_size = min(
+                self.connection.local_flow_control_window(stream_id),
+                self.connection.max_outbound_frame_size,
+            )
+            chunk_size = max(0, chunk_size)
+            data = await buffer.pop(chunk_size)
+            if data:
+                self.connection.send_data(stream_id, data)
+                await self._flush()
+            else:
+                self.priority.block(stream_id)
+            buffer = self.stream_buffers.get(stream_id)
+            if buffer is None:
+                _drop_priority(self, stream_id)
+                return
+            if buffer.complete:
+                if not getattr(self, "closed", False):
+                    self.connection.end_stream(stream_id)
+                    await self._flush()
+                    self.stream_buffers.pop(stream_id, None)
+                    _drop_priority(self, stream_id)
+        except (h2.exceptions.StreamClosedError, KeyError, h2.exceptions.ProtocolError):
+            buffer = self.stream_buffers.pop(stream_id, None)
+            if buffer is not None:
+                close = getattr(buffer, "close", None)
+                if callable(close):
+                    try:
+                        await close()
+                    except Exception:
+                        pass
+            _drop_priority(self, stream_id)
 
     def _batch_is_connection_terminal(events: List[Any]) -> bool:
         return any(isinstance(event, h2.events.ConnectionTerminated) for event in events)
@@ -240,6 +289,7 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
     H2Protocol.handle = _handle
     H2Protocol._handle_events = _handle_events
     H2Protocol._close_stream = _close_stream
+    H2Protocol._send_data = _send_data
     H2Protocol._aawm_cursor_h2_guards = True
     H2Protocol._aawm_hypercorn_version = version
     _H2_RECEIVE_DISPATCH_GUARDS_INSTALLED = True
