@@ -16,6 +16,7 @@ _ORIGINAL_H2_HANDLE_EVENTS: Any = None
 _ORIGINAL_H2_CLOSE_STREAM: Any = None
 _ORIGINAL_H2_SEND_DATA: Any = None
 _ORIGINAL_HTTP_HANDLE: Any = None
+_ORIGINAL_WS_HANDLE_EVENTS: Any = None
 
 
 class UnsupportedHypercornVersion(RuntimeError):
@@ -49,9 +50,10 @@ def restore_hypercorn_h2_receive_dispatch_guards() -> None:
     global _H2_RECEIVE_DISPATCH_GUARDS_INSTALLED
     global _ORIGINAL_H2_HANDLE, _ORIGINAL_H2_HANDLE_EVENTS
     global _ORIGINAL_H2_CLOSE_STREAM, _ORIGINAL_H2_SEND_DATA
-    global _ORIGINAL_HTTP_HANDLE
+    global _ORIGINAL_HTTP_HANDLE, _ORIGINAL_WS_HANDLE_EVENTS
     from hypercorn.protocol.h2 import H2Protocol
     from hypercorn.protocol.http_stream import HTTPStream
+    from hypercorn.protocol.ws_stream import WSStream
 
     if _ORIGINAL_H2_HANDLE is not None:
         H2Protocol.handle = _ORIGINAL_H2_HANDLE
@@ -63,6 +65,8 @@ def restore_hypercorn_h2_receive_dispatch_guards() -> None:
         H2Protocol._send_data = _ORIGINAL_H2_SEND_DATA
     if _ORIGINAL_HTTP_HANDLE is not None:
         HTTPStream.handle = _ORIGINAL_HTTP_HANDLE
+    if _ORIGINAL_WS_HANDLE_EVENTS is not None:
+        WSStream._handle_events = _ORIGINAL_WS_HANDLE_EVENTS
     if hasattr(H2Protocol, "_aawm_cursor_h2_guards"):
         delattr(H2Protocol, "_aawm_cursor_h2_guards")
     if hasattr(H2Protocol, "_aawm_hypercorn_version"):
@@ -73,6 +77,7 @@ def restore_hypercorn_h2_receive_dispatch_guards() -> None:
     _ORIGINAL_H2_CLOSE_STREAM = None
     _ORIGINAL_H2_SEND_DATA = None
     _ORIGINAL_HTTP_HANDLE = None
+    _ORIGINAL_WS_HANDLE_EVENTS = None
 
 
 def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
@@ -90,7 +95,7 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
     global _H2_RECEIVE_DISPATCH_GUARDS_INSTALLED
     global _ORIGINAL_H2_HANDLE, _ORIGINAL_H2_HANDLE_EVENTS
     global _ORIGINAL_H2_CLOSE_STREAM, _ORIGINAL_H2_SEND_DATA
-    global _ORIGINAL_HTTP_HANDLE
+    global _ORIGINAL_HTTP_HANDLE, _ORIGINAL_WS_HANDLE_EVENTS
     if _H2_RECEIVE_DISPATCH_GUARDS_INSTALLED:
         return
 
@@ -105,12 +110,14 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
     from hypercorn.protocol.events import Body, EndBody, StreamClosed
     from hypercorn.protocol.h2 import H2Protocol
     from hypercorn.protocol.http_stream import HTTPStream
+    from hypercorn.protocol.ws_stream import WSStream
 
     _ORIGINAL_H2_HANDLE = H2Protocol.handle
     _ORIGINAL_H2_HANDLE_EVENTS = H2Protocol._handle_events
     _ORIGINAL_H2_CLOSE_STREAM = H2Protocol._close_stream
     _ORIGINAL_H2_SEND_DATA = H2Protocol._send_data
     _ORIGINAL_HTTP_HANDLE = HTTPStream.handle
+    _ORIGINAL_WS_HANDLE_EVENTS = WSStream._handle_events
 
     def _retired_ids(protocol: Any) -> set:
         retired = getattr(protocol, "_aawm_retired_stream_ids", None)
@@ -244,6 +251,34 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
         queue = _app_queue(self)
         if queue is not None:
             _bind_queue_to_stream(self, queue)
+
+    async def _ws_handle_events(self) -> None:
+        from wsproto.connection import ConnectionState
+        from wsproto.events import CloseConnection, Message, Ping
+        from wsproto.frame_protocol import CloseReason
+
+        from hypercorn.protocol.events import StreamClosed as H2StreamClosed
+        from hypercorn.protocol.ws_stream import FrameTooLargeError
+
+        for event in self.connection.events():
+            if isinstance(event, Message):
+                try:
+                    self.buffer.extend(event)
+                except FrameTooLargeError:
+                    await self._send_wsproto_event(
+                        CloseConnection(code=CloseReason.MESSAGE_TOO_BIG)
+                    )
+                    break
+                if event.message_finished:
+                    message = self.buffer.to_message()
+                    self.buffer.clear()
+                    await _put_app_event(self, message)
+            elif isinstance(event, Ping):
+                await self._send_wsproto_event(event.response())
+            elif isinstance(event, CloseConnection):
+                if self.connection.state == ConnectionState.REMOTE_CLOSING:
+                    await self._send_wsproto_event(event.response())
+                await self.send(H2StreamClosed(stream_id=self.stream_id))
 
     async def _release_stream_buffers(self) -> None:
         buffers = getattr(self, "stream_buffers", None)
@@ -488,6 +523,7 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
     H2Protocol._close_stream = _close_stream
     H2Protocol._send_data = _send_data
     HTTPStream.handle = _http_handle
+    WSStream._handle_events = _ws_handle_events
     H2Protocol._aawm_cursor_h2_guards = True
     H2Protocol._aawm_hypercorn_version = version
     _H2_RECEIVE_DISPATCH_GUARDS_INSTALLED = True

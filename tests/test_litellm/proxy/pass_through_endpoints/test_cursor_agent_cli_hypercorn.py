@@ -802,3 +802,89 @@ async def test_hypercorn_h2_websocket_terminal_close_uses_websocket_disconnect()
         received.append(event)
     finally:
         await _close_protocol(protocol, task_group)
+
+
+@pytest.mark.asyncio
+async def test_hypercorn_h2_blocked_websocket_receive_then_goaway() -> None:
+    from hypercorn.events import Closed, RawData
+    from hypercorn.protocol.ws_stream import ASGIWebsocketState, WSStream
+    from wsproto.frame_protocol import CloseReason
+
+    protocol, sent, task_group = await _make_h2_protocol(install_guards=True)
+    try:
+        client = _new_h2_client()
+        stream_id = client.get_next_available_stream_id()
+       
+        client.send_headers(
+            stream_id,
+            [
+                (b":method", b"CONNECT"),
+                (b":scheme", b"http"),
+                (b":authority", b"localhost"),
+                (b":path", b"/ws"),
+            ],
+            end_stream=False,
+        )
+        await protocol.handle(RawData(data=client.data_to_send()))
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        queue.put_nowait({" type": "websocket.receive", "text": "held"})
+        ws = WSStream(
+            protocol.app,
+            protocol.config,
+            protocol.context,
+            protocol.task_group,
+            False,
+            ("127.0.0.1", 9),
+            ("127.0.0.1", 4011),
+            protocol.stream_send,
+            1,
+        )
+        ws.app_put = queue.put
+        ws.scope = {"type": "websocket"}
+        ws.state = ASGIWebsocketState.CONNECTED
+        protocol.streams[1] = ws
+        blocked = asyncio.create_task(
+            _blocked_ws_receive(ws, {"type": "websocket.receive", "text": "late"})
+        )
+        for _ in range(20):
+            if getattr(ws, "_aawm_queue_space", None) is not None:
+                break
+            await asyncio.sleep(0)
+        assert blocked.done() is False
+        await asyncio.wait_for(
+            protocol.handle(RawData(data=_goaway(client))),
+            timeout=1,
+        )
+        await asyncio.wait_for(blocked, timeout=1)
+        assert blocked.exception() is None
+        assert protocol.closed is True
+        assert any(isinstance(event, Closed) for event in sent)
+        remaining = []
+        while not queue.empty():
+            remaining.append(queue.get_nowait()["type"])
+        disconnect_at = remaining.index("websocket.disconnect")
+        assert "websocket.receive" not in remaining[disconnect_at + 1 :]
+        assert CloseReason.ABNORMAL_CLOSURE.value
+    finally:
+        await _close_protocol(protocol, task_group)
+
+
+async def _blocked_ws_receive(stream: Any, message: dict) -> None:
+    put = stream.app_put
+    queue = getattr(put, "__self__", None)
+    if not isinstance(queue, asyncio.Queue):
+        await put(message)
+        return
+    space = getattr(stream, "_aawm_queue_space", None)
+    if space is None:
+        space = asyncio.Event()
+        stream._aawm_queue_space = space
+    while not getattr(stream, "closed", False):
+        try:
+            queue.put_nowait(message)
+            return
+        except asyncio.QueueFull:
+            space.clear()
+            if queue.qsize() < queue.maxsize:
+                continue
+            await space.wait()
