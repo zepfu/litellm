@@ -599,6 +599,8 @@ def test_codex_chatgpt_unsupported_request_params_in_cost_map():
     for pricing_map_path in pricing_map_paths:
         model_cost = json.loads(pricing_map_path.read_text())
         for model in (
+            "gpt-6-astra",
+            "chatgpt/gpt-6-astra",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
             "gpt-5.6-luna",

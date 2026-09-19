@@ -1048,6 +1048,21 @@ class TestUnsupportedParamDrops:
         assert "max_output_tokens" in resolved_removed
         assert "max_output_tokens" not in resolved_result
 
+    def test_gpt_6_astra_cost_map_drops_ohmypi_max_output_tokens(self):
+        from pathlib import Path
+
+        cost = json.loads(
+            Path("model_prices_and_context_window.json").read_text(encoding="utf-8")
+        )
+        cb = _make_callbacks(cost)
+        for model in ("gpt-6-astra", "chatgpt/gpt-6-astra"):
+            body = {"model": model, "max_output_tokens": 64000, "stream": True}
+            result, removed = drop_unsupported_codex_request_params_from_request_body(
+                body, callbacks=cb
+            )
+            assert "max_output_tokens" in removed
+            assert "max_output_tokens" not in result
+
     def test_depth_bound(self):
         cost = {"gpt-4o": {"unsupported_request_params": ["deep_param"]}}
         cb = CodexToolPolicyCallbacks(

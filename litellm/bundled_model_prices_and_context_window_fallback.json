@@ -17979,7 +17979,12 @@
         "supports_response_schema": true,
         "supports_xhigh_reasoning_effort": true,
         "supports_max_reasoning_effort": true,
-        "supports_vision": true
+        "supports_vision": true,
+        "unsupported_request_params": [
+            "max_output_tokens",
+            "temperature",
+            "top_p"
+        ]
     },
     "chatgpt/gpt-5.4-pro": {
         "litellm_provider": "chatgpt",
@@ -20449,7 +20454,12 @@
         "supports_vision": true,
         "supports_none_reasoning_effort": false,
         "supports_xhigh_reasoning_effort": true,
-        "supports_max_reasoning_effort": true
+        "supports_max_reasoning_effort": true,
+        "unsupported_request_params": [
+            "max_output_tokens",
+            "temperature",
+            "top_p"
+        ]
     },
     "gpt-5.6-luna": {
         "litellm_provider": "openai",
