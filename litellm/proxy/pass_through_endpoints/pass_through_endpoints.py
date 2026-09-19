@@ -1682,6 +1682,40 @@ def _export_openai_raw_retry_event_history(
         return None
 
 
+def _openai_raw_retry_console_should_emit(event: Mapping[str, Any]) -> bool:
+    """Healthy non-retryable RAW_RETRY INFO is opt-in; retryable capacity stays on.
+
+    ``AAWM_ALIAS_ROUTE_LOG_HEALTHY=1`` emits every recorded event. Default-off
+    keeps gpt-6-astra 400 ``status_not_retryable`` / denied-authorization
+    snapshots quiet. Request metadata is still attached either way.
+    """
+    if _aawm_audit_persist._aawm_alias_route_healthy_json_enabled():
+        return True
+    if event.get("retryable") is True:
+        return True
+    if event.get("authorization_result") == "authorized":
+        return True
+    error_class = event.get("error_class")
+    if (
+        isinstance(error_class, str)
+        and error_class in _RESPONSES_TRANSIENT_CAPACITY_CLASSES
+    ):
+        return True
+    status_code = event.get("classification_status_code")
+    if not isinstance(status_code, int) or isinstance(status_code, bool):
+        status_code = event.get("observed_http_status_code")
+    if (
+        isinstance(status_code, int)
+        and not isinstance(status_code, bool)
+        and (
+            status_code == status.HTTP_429_TOO_MANY_REQUESTS
+            or status_code in PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES
+        )
+    ):
+        return True
+    return False
+
+
 def _record_openai_raw_retry_event(
     *,
     event_type: str,
@@ -1900,14 +1934,15 @@ def _record_openai_raw_retry_event(
             sort_keys=True,
             separators=(",", ":"),
         )
-        verbose_proxy_logger.info(
-            "AAWM_OPENAI_RAW_RETRY: %s",
-            event_json,
-            extra={
-                "aawm_openai_raw_retry": True,
-                "aawm_openai_raw_retry_event": checked_event,
-            },
-        )
+        if _openai_raw_retry_console_should_emit(checked_event):
+            verbose_proxy_logger.info(
+                "AAWM_OPENAI_RAW_RETRY: %s",
+                event_json,
+                extra={
+                    "aawm_openai_raw_retry": True,
+                    "aawm_openai_raw_retry_event": checked_event,
+                },
+            )
     except Exception:
         # Observability must never change retry or terminal behavior.
         return
