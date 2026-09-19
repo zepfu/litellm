@@ -1455,6 +1455,53 @@ def _cursor_replay_state_snapshot(
         return None
 
 
+_CURSOR_CONTINUATION_MARKER_PRODUCERS = frozenset(
+    {
+        "tool_output_without_retained_session",
+    }
+)
+
+
+def _cursor_continuation_unavailable_origin(
+    *,
+    previous_response_id: Optional[str] = None,
+    replay_state: Optional[dict[str, Any]] = None,
+) -> dict[str, bool | str]:
+    """Boolean origin of the continuation-failure marker. No session ids."""
+
+    has_replay_state = isinstance(replay_state, dict)
+    retained_session = (
+        replay_state.get("retained_session") if has_replay_state else None
+    )
+    return {
+        "producer": "tool_output_without_retained_session",
+        "has_previous_response_id": bool(
+            isinstance(previous_response_id, str) and previous_response_id.strip()
+        ),
+        "has_replay_state": has_replay_state,
+        "retained_session_present": retained_session is not None,
+        "registry_consumed": bool(previous_response_id and has_replay_state),
+    }
+
+
+def _log_cursor_continuation_marker_origin(
+    origin: Mapping[str, Any],
+) -> None:
+    producer = str(origin.get("producer") or "")
+    if producer not in _CURSOR_CONTINUATION_MARKER_PRODUCERS:
+        producer = "unknown"
+    verbose_aawm_route_logger.warning(
+        "cursor_continuation_marker_origin producer=%s "
+        "has_previous_response_id=%s has_replay_state=%s "
+        "retained_session_present=%s registry_consumed=%s",
+        producer,
+        "true" if origin.get("has_previous_response_id") else "false",
+        "true" if origin.get("has_replay_state") else "false",
+        "true" if origin.get("retained_session_present") else "false",
+        "true" if origin.get("registry_consumed") else "false",
+    )
+
+
 def _raise_cursor_session_continuation_unavailable(
     *,
     previous_response_id: Optional[str] = None,
@@ -1462,6 +1509,11 @@ def _raise_cursor_session_continuation_unavailable(
 ) -> None:
     from litellm.llms.cursor_agent.connect import CursorConnectError
 
+    origin = _cursor_continuation_unavailable_origin(
+        previous_response_id=previous_response_id,
+        replay_state=replay_state,
+    )
+    _log_cursor_continuation_marker_origin(origin)
     exc = CursorConnectError(
         "Cursor Agent tool-output continuation cannot resume because its "
         "live retained session is unavailable.",
@@ -1476,6 +1528,7 @@ def _raise_cursor_session_continuation_unavailable(
             expected_state=replay_state,
         )
     setattr(exc, _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER, True)
+    setattr(exc, "_cursor_continuation_marker_origin", dict(origin))
     raise exc
 
 

@@ -4469,6 +4469,47 @@ async def test_candidate_loop_alpha_disconnect_cancels_io_or_wait(  # noqa: PLR0
     assert disconnect_polls == polls_after_exit
 
 
+def test_cursor_continuation_unavailable_origin_is_tool_output_without_retained_session(
+) -> None:
+    import logging
+    from io import StringIO
+
+    from litellm.llms.cursor_agent.connect import CursorConnectError
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+        codex_candidate_calls,
+    )
+
+    origin = codex_candidate_calls._cursor_continuation_unavailable_origin(
+        previous_response_id="cursor-unretained",
+        replay_state={"retained_session": None, "messages": []},
+    )
+    assert origin["producer"] == "tool_output_without_retained_session"
+    assert origin["has_previous_response_id"] is True
+    assert origin["has_replay_state"] is True
+    assert origin["retained_session_present"] is False
+    route_logger = logging.getLogger("LiteLLM AAWM Route")
+    stream = StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setLevel(logging.WARNING)
+    route_logger.addHandler(handler)
+    try:
+        with pytest.raises(CursorConnectError) as exc_info:
+            codex_candidate_calls._raise_cursor_session_continuation_unavailable(
+                previous_response_id="cursor-unretained",
+                replay_state={"retained_session": None, "messages": []},
+            )
+    finally:
+        route_logger.removeHandler(handler)
+    logged = stream.getvalue()
+    assert "cursor_continuation_marker_origin producer=tool_output_without_retained_session" in logged
+    assert "retained_session_present=false" in logged
+    assert "cursor-unretained" not in logged
+    assert (
+        getattr(exc_info.value, "_cursor_continuation_marker_origin")["producer"]
+        == "tool_output_without_retained_session"
+    )
+
+
 @pytest.mark.asyncio
 async def test_candidate_loop_preserves_cursor_ineligible_terminal_contract(
     monkeypatch: pytest.MonkeyPatch,
@@ -5175,12 +5216,23 @@ async def test_candidate_loop_cursor_full_history_continuation_uses_fresh_next_c
     replay_state = codex_candidate_calls._peek_cursor_replay_state(
         "cursor-unretained"
     )
+    origin = codex_candidate_calls._cursor_continuation_unavailable_origin(
+        previous_response_id="cursor-unretained",
+        replay_state=replay_state,
+    )
+    assert origin["producer"] == "tool_output_without_retained_session"
+    assert origin["has_previous_response_id"] is True
+    assert origin["has_replay_state"] is True
+    assert origin["retained_session_present"] is False
     with pytest.raises(CursorConnectError) as source_exc_info:
         codex_candidate_calls._raise_cursor_session_continuation_unavailable(
             previous_response_id="cursor-unretained",
             replay_state=replay_state,
         )
     source_exc = source_exc_info.value
+    assert getattr(source_exc, "_cursor_continuation_marker_origin")["producer"] == (
+        "tool_output_without_retained_session"
+    )
     with pytest.raises(ProxyException) as mapped_exc_info:
         codex_candidate_calls._raise_cursor_agent_alias_error(
             exc=source_exc,

@@ -295,6 +295,9 @@ def _log_inbound_run_terminal(
         f"connect_endstream_code={provenance.connect_endstream_code or 'unknown'}",
         f"decoder_failed={_bool_token(provenance.decoder_failed)}",
         f"data_before_reset={_bool_token(provenance.data_before_reset)}",
+        f"first_close_actor={provenance.first_close_actor or 'unknown'}",
+        f"first_close_event={provenance.first_close_event or 'unknown'}",
+        f"endstream_forwarded={_bool_token(provenance.endstream_forwarded)}",
     ]
     if http_version:
         fields.append(f"http_version={http_version}")
@@ -494,7 +497,10 @@ def _cli_connect_envelope(
                 else:
                     provenance.connect_endstream = "error"
                     provenance.connect_endstream_code = code
-            return bytes((flags,)) + len(payload).to_bytes(4, "big") + payload
+            encoded = bytes((flags,)) + len(payload).to_bytes(4, "big") + payload
+            if provenance is not None:
+                provenance.endstream_forwarded = True
+            return encoded
         return encode_connect_proto_frame(payload, flags=flags)
     except Exception as exc:
         raise InboundCursorAgentCliProtocolError(
@@ -648,6 +654,38 @@ class InboundCursorAgentCliProtocolError(Exception):
         self.status_code = status_code
 
 
+_INBOUND_FIRST_CLOSE_ACTORS = frozenset(
+    {"agentn", "cli", "local_reader", "local_lifecycle"}
+)
+_INBOUND_FIRST_CLOSE_EVENTS = frozenset(
+    {
+        "StreamReset",
+        "ConnectionTerminated",
+        "client_disconnect",
+        "read_loop_exception",
+        "protocol_error",
+        "cancelled",
+        "eof",
+        "aclose",
+        "unknown",
+    }
+)
+
+
+def _sanitize_inbound_first_close_actor(actor: str) -> str:
+    cleaned = str(actor or "").strip()
+    if cleaned in _INBOUND_FIRST_CLOSE_ACTORS:
+        return cleaned
+    return "unknown"
+
+
+def _sanitize_inbound_first_close_event(event: str) -> str:
+    cleaned = str(event or "").strip()
+    if cleaned in _INBOUND_FIRST_CLOSE_EVENTS:
+        return cleaned
+    return "unknown"
+
+
 @dataclass
 class _InboundRunProvenance:
     call_id: str
@@ -667,6 +705,9 @@ class _InboundRunProvenance:
     data_before_reset: bool = False
     compressed_in: bool = False
     extra: Dict[str, Any] = field(default_factory=dict)
+    first_close_actor: Optional[str] = None
+    first_close_event: Optional[str] = None
+    endstream_forwarded: Optional[bool] = None
 
 
 def _header_map(headers: Any) -> Dict[str, str]:
@@ -1251,9 +1292,25 @@ class _AgentnH2Session:
     def flush_termination_reason(self) -> Optional[str]:
         return self._flush_termination_reason
 
-    def _mark_upstream_termination(self, reason: str) -> None:
+    def _mark_upstream_termination(
+        self,
+        reason: str,
+        *,
+        actor: Optional[str] = None,
+        event: Optional[str] = None,
+    ) -> None:
         if self._upstream_termination_reason is None:
             self._upstream_termination_reason = _sanitize_termination_reason(reason)
+        if actor is not None:
+            self._record_first_close(actor=actor, event=event or "unknown")
+
+    def _record_first_close(self, *, actor: str, event: str) -> None:
+        if self.provenance is None:
+            return
+        if self.provenance.first_close_actor is not None:
+            return
+        self.provenance.first_close_actor = _sanitize_inbound_first_close_actor(actor)
+        self.provenance.first_close_event = _sanitize_inbound_first_close_event(event)
 
     def _flush_pending_locked(self) -> bytes:
         connection = self.connection
@@ -1435,7 +1492,9 @@ class _AgentnH2Session:
             elif isinstance(event, StreamReset):
                 if self.stream_id and event.stream_id not in {self.stream_id, 0}:
                     continue
-                self._mark_upstream_termination("upstream_reset")
+                self._mark_upstream_termination(
+                    "upstream_reset", actor="agentn", event="StreamReset"
+                )
                 error_code = getattr(event, "error_code", None)
                 try:
                     reset_code = int(error_code)
@@ -1466,7 +1525,11 @@ class _AgentnH2Session:
                 self._closed = True
                 self._pending_wakeup.set()
                 self._request_end_stream_event.set()
-                self._mark_upstream_termination("upstream_reset")
+                self._mark_upstream_termination(
+                    "upstream_reset",
+                    actor="agentn",
+                    event="ConnectionTerminated",
+                )
                 verbose_proxy_logger.warning(
                     "cursor_agent_cli_inbound agentn stream closed event=%s error_code=%s",
                     type(event).__name__,
@@ -1492,7 +1555,9 @@ class _AgentnH2Session:
             while not self._closed:
                 incoming = await reader.read(64 * 1024)
                 if not incoming:
-                    self._mark_upstream_termination("upstream_eof")
+                    self._mark_upstream_termination(
+                        "upstream_eof", actor="agentn", event="eof"
+                    )
                     _cursor_inbound_debug_log(
                         "cursor_agent_cli_inbound agentn read EOF status=%s",
                         self.response_status,
@@ -1524,10 +1589,14 @@ class _AgentnH2Session:
                     break
         except asyncio.CancelledError:
             if not self._closed:
-                self._mark_upstream_termination("cancelled")
+                self._mark_upstream_termination(
+                    "cancelled", actor="local_lifecycle", event="cancelled"
+                )
             raise
         except InboundCursorAgentCliProtocolError as exc:
-            self._mark_upstream_termination(exc.reason)
+            self._mark_upstream_termination(
+                exc.reason, actor="local_reader", event="protocol_error"
+            )
             if self.provenance is not None:
                 self.provenance.decoder_failed = True
                 self.provenance.decoder_direction = exc.direction
@@ -1535,10 +1604,27 @@ class _AgentnH2Session:
                 "cursor_agent_cli_inbound agentn framing failed direction=%s",
                 exc.direction,
             )
-        except Exception:
-            self._mark_upstream_termination("upstream_failure")
+        except Exception as exc:
+            self._mark_upstream_termination(
+                "upstream_failure",
+                actor="local_reader",
+                event="read_loop_exception",
+            )
             verbose_proxy_logger.warning(
-                "cursor_agent_cli_inbound agentn read loop failed",
+                "cursor_agent_cli_inbound agentn read loop failed "
+                "exc_type=%s first_close_actor=%s endstream_seen=%s",
+                type(exc).__name__,
+                (
+                    self.provenance.first_close_actor
+                    if self.provenance is not None
+                    else "unknown"
+                ),
+                (
+                    "false"
+                    if self.provenance is None
+                    or self.provenance.connect_endstream == "not_seen"
+                    else "true"
+                ),
             )
         finally:
             self.reader_termination_event.set()
@@ -1636,7 +1722,11 @@ class _AgentnH2Session:
 
     async def _close_impl(self, reason: str) -> bool:
         self._closed = True
-        self._mark_upstream_termination(reason)
+        self._mark_upstream_termination(
+            reason,
+            actor="cli" if reason == "client_disconnect" else "local_lifecycle",
+            event="client_disconnect" if reason == "client_disconnect" else "aclose",
+        )
         self._pending_wakeup.set()
         self._request_end_stream_event.set()
         current_task = asyncio.current_task()

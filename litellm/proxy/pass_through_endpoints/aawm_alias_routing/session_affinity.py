@@ -8358,6 +8358,116 @@ def _cursor_skip_rebind_base_session_identity(
     return resolve_canonical_session_identity(request, rebuilt_body)
 
 
+_CURSOR_SKIP_REBIND_DENIAL_REASONS = frozenset(
+    {
+        "missing_request",
+        "body_not_replay_safe",
+        "missing_request_state",
+        "lease_promoted",
+        "live_reservation",
+        "released_guard_reset_failed",
+        "lease_uncleared",
+        "missing_base_identity",
+        "ok",
+    }
+)
+
+
+def _sanitize_cursor_skip_rebind_denial_reason(reason: str) -> str:
+    cleaned = str(reason or "").strip()
+    if cleaned in _CURSOR_SKIP_REBIND_DENIAL_REASONS:
+        return cleaned
+    return "unknown"
+
+
+def _cursor_skip_rebind_lease_flags(lease: Optional[Any]) -> dict[str, bool]:
+    present = lease is not None
+    return {
+        "lease_present": present,
+        "lease_promoted": bool(present and getattr(lease, "promoted", False)),
+        "live_reservation": bool(
+            present
+            and getattr(lease, "held_reservation", False)
+            and getattr(lease, "reservation_token", None)
+            and not getattr(lease, "released", False)
+        ),
+        "lease_released": bool(present and getattr(lease, "released", False)),
+    }
+
+
+def classify_cursor_skip_rebind_denial(
+    request: Any,
+    *,
+    rebuilt_body: Optional[Mapping[str, Any]],
+    base_session_identity: Optional[str] = None,
+) -> str:
+    """Name the current skip-rebind refusal without mutating request state.
+
+    Returns one of ``_CURSOR_SKIP_REBIND_DENIAL_REASONS``. ``ok`` means this
+    snapshot would allow minting a redispatch identity. Callers that already
+    mutated the lease should still log the reason from the live ``False``
+    return site rather than treating a later ``ok`` as history.
+    """
+
+    if request is None:
+        return "missing_request"
+    if not is_replay_safe_session_owner_redispatch_body(rebuilt_body):
+        return "body_not_replay_safe"
+    state = getattr(request, "state", None)
+    if state is None:
+        return "missing_request_state"
+    lease = get_request_session_owner_lease(request)
+    flags = _cursor_skip_rebind_lease_flags(lease)
+    if flags["lease_promoted"]:
+        return "lease_promoted"
+    if flags["live_reservation"]:
+        return "live_reservation"
+    base = _cursor_skip_rebind_base_session_identity(
+        request,
+        rebuilt_body=rebuilt_body,
+        base_session_identity=base_session_identity,
+        lease=lease,
+    )
+    if base is None:
+        return "missing_base_identity"
+    return "ok"
+
+
+def _log_cursor_skip_rebind_denial(
+    *,
+    reason: str,
+    request: Any,
+    rebuilt_body: Optional[Mapping[str, Any]],
+    base_session_identity: Optional[str] = None,
+) -> None:
+    lease = get_request_session_owner_lease(request) if request is not None else None
+    flags = _cursor_skip_rebind_lease_flags(lease)
+    replay_safe = is_replay_safe_session_owner_redispatch_body(rebuilt_body)
+    has_base = (
+        _cursor_skip_rebind_base_session_identity(
+            request,
+            rebuilt_body=rebuilt_body,
+            base_session_identity=base_session_identity,
+            lease=lease,
+        )
+        is not None
+        if request is not None
+        else False
+    )
+    verbose_proxy_logger.warning(
+        "session_owner cursor_skip_rebind_denial reason=%s rebound=false "
+        "replay_safe=%s lease_present=%s lease_promoted=%s live_reservation=%s "
+        "lease_released=%s has_base_identity=%s",
+        _sanitize_cursor_skip_rebind_denial_reason(reason),
+        "true" if replay_safe else "false",
+        "true" if flags["lease_present"] else "false",
+        "true" if flags["lease_promoted"] else "false",
+        "true" if flags["live_reservation"] else "false",
+        "true" if flags["lease_released"] else "false",
+        "true" if has_base else "false",
+    )
+
+
 def rebind_request_session_owner_after_cursor_replay_skip(
     request: Any,
     *,
@@ -8380,16 +8490,25 @@ def rebind_request_session_owner_after_cursor_replay_skip(
     fail-closed.
     """
 
+    def _deny(reason: str) -> bool:
+        _log_cursor_skip_rebind_denial(
+            reason=reason,
+            request=request,
+            rebuilt_body=rebuilt_body,
+            base_session_identity=base_session_identity,
+        )
+        return False
+
     if request is None:
-        return False
+        return _deny("missing_request")
     if not is_replay_safe_session_owner_redispatch_body(rebuilt_body):
-        return False
+        return _deny("body_not_replay_safe")
     state = getattr(request, "state", None)
     if state is None:
-        return False
+        return _deny("missing_request_state")
     lease = get_request_session_owner_lease(request)
     if lease is not None and lease.promoted:
-        return False
+        return _deny("lease_promoted")
     live_reservation = bool(
         lease is not None
         and lease.held_reservation
@@ -8397,7 +8516,7 @@ def rebind_request_session_owner_after_cursor_replay_skip(
         and not lease.released
     )
     if live_reservation:
-        return False
+        return _deny("live_reservation")
     base = _cursor_skip_rebind_base_session_identity(
         request,
         rebuilt_body=rebuilt_body,
@@ -8407,14 +8526,14 @@ def rebind_request_session_owner_after_cursor_replay_skip(
     if lease is not None:
         if lease.released:
             if not reset_released_request_session_owner_guard(request):
-                return False
+                return _deny("released_guard_reset_failed")
         elif not clear_non_held_request_session_owner_lease(request):
             setattr(state, _REQUEST_STATE_LEASE_ATTR, None)
             setattr(state, _REQUEST_STATE_GUARDED_ATTR, False)
     if get_request_session_owner_lease(request) is not None:
-        return False
+        return _deny("lease_uncleared")
     if base is None:
-        return False
+        return _deny("missing_base_identity")
     activate_session_owner_redispatch_effective_identity(
         request=request,
         base_session_identity=base,

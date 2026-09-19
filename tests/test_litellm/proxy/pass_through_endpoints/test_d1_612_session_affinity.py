@@ -2328,6 +2328,79 @@ def test_cursor_replay_skip_does_not_clear_live_reservation_or_promoted_owner() 
     assert sa.get_request_session_owner_lease(owned_request) is owned
 
 
+def test_cursor_skip_rebind_denial_classifies_live_reservation_without_mutating(
+    caplog,
+) -> None:
+    from starlette.datastructures import State
+
+    request = type("Req", (), {})()
+    request.state = State()
+    live = sa.SessionOwnerLease(
+        session_identity="cursor-live",
+        reservation_token="tok-live",
+        held_reservation=True,
+        released=False,
+        promoted=False,
+    )
+    sa.set_request_session_owner_lease(request, live)
+    rebuilt = _cursor_skip_replay_safe_body()
+    reason = sa.classify_cursor_skip_rebind_denial(
+        request,
+        rebuilt_body=rebuilt,
+        base_session_identity="cursor-live",
+    )
+    assert reason == "live_reservation"
+    caplog.set_level("WARNING")
+    rebound = sa.rebind_request_session_owner_after_cursor_replay_skip(
+        request,
+        rebuilt_body=rebuilt,
+        base_session_identity="cursor-live",
+    )
+    assert rebound is False
+    assert sa.get_request_session_owner_lease(request) is live
+    joined = "\n".join(record.getMessage() for record in caplog.records)
+    assert "cursor_skip_rebind_denial reason=live_reservation rebound=false" in joined
+    assert "live_reservation=true" in joined
+    assert "tok-live" not in joined
+    assert "cursor-live" not in joined
+
+
+def test_cursor_skip_rebind_denial_classifies_promoted_owner(caplog) -> None:
+    from starlette.datastructures import State
+
+    request = type("Req", (), {})()
+    request.state = State()
+    owned = sa.SessionOwnerLease(
+        session_identity="cursor-owned",
+        reservation_token="tok-owned",
+        held_reservation=False,
+        promoted=True,
+    )
+    sa.set_request_session_owner_lease(request, owned)
+    rebuilt = _cursor_skip_replay_safe_body()
+    assert (
+        sa.classify_cursor_skip_rebind_denial(
+            request,
+            rebuilt_body=rebuilt,
+            base_session_identity="cursor-owned",
+        )
+        == "lease_promoted"
+    )
+    caplog.set_level("WARNING")
+    assert (
+        sa.rebind_request_session_owner_after_cursor_replay_skip(
+            request,
+            rebuilt_body=rebuilt,
+            base_session_identity="cursor-owned",
+        )
+        is False
+    )
+    joined = "\n".join(record.getMessage() for record in caplog.records)
+    assert "reason=lease_promoted" in joined
+    assert "lease_promoted=true" in joined
+    assert "tok-owned" not in joined
+
+
 def test_cursor_replay_skip_mints_identity_from_request_call_id_when_session_missing() -> None:
     from starlette.datastructures import State
 

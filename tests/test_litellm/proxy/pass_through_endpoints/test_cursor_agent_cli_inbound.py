@@ -30,6 +30,7 @@ from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
     InboundCursorAgentCliProtocolError,
     _Http1LaneRegistry,
     _InboundRunProvenance,
+    _cli_connect_envelope,
     _connect_header_flush_frame,
     _log_inbound_run_terminal,
     _observe_upstream_headers,
@@ -1661,6 +1662,45 @@ def test_run_terminal_log_omits_secrets(caplog) -> None:
     assert "opaque" not in joined
     assert "Bearer" not in joined
     assert "eyJ" not in joined
+    assert "first_close_actor=unknown" in joined
+    assert "endstream_forwarded=unknown" in joined
+
+
+def test_cli_connect_envelope_marks_endstream_forwarded() -> None:
+    from litellm.llms.cursor_agent.connect import CursorConnectProtoFrame
+
+    provenance = _InboundRunProvenance(call_id="call-endstream")
+    frame = CursorConnectProtoFrame(
+        flags=2, payload=b'{"ok":true}', is_end_stream=True
+    )
+    encoded = _cli_connect_envelope(frame, provenance=provenance)
+    assert provenance.connect_endstream == "ok"
+    assert provenance.endstream_forwarded is True
+    assert encoded.endswith(b'{"ok":true}')
+    assert encoded[0] == 2
+
+
+def test_run_terminal_records_first_close_booleans(caplog) -> None:
+    caplog.set_level("WARNING", logger="LiteLLM Proxy")
+    provenance = _InboundRunProvenance(call_id="call-close")
+    provenance.first_close_actor = "agentn"
+    provenance.first_close_event = "ConnectionTerminated"
+    provenance.endstream_forwarded = False
+    provenance.connect_endstream = "not_seen"
+    _log_inbound_run_terminal(
+        provenance,
+        termination_reason="upstream_reset",
+        http_version="2",
+    )
+    joined = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "WARNING"
+    )
+    assert "first_close_actor=agentn" in joined
+    assert "first_close_event=ConnectionTerminated" in joined
+    assert "endstream_forwarded=false" in joined
+    assert "connect_endstream=not_seen" in joined
 
 
 def test_outbound_turn_headers_still_omit_checksum() -> None:
