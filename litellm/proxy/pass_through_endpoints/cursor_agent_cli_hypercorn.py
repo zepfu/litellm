@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.metadata
 from typing import Any, List, Optional
 
@@ -129,6 +130,38 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
         if has_data is not None:
             await has_data.set()
 
+    def _deliver_terminal_disconnect(stream: Any) -> None:
+        """Enqueue http.disconnect without waiting for the app to read.
+
+        Hypercorn 0.15 HTTPStream.handle(StreamClosed) awaits Queue.put.
+        A full request queue then deadlocks terminal GOAWAY cleanup.
+        """
+        app_put = getattr(stream, "app_put", None)
+        if app_put is None:
+            return
+        event = {"type": "http.disconnect"}
+        queue = getattr(app_put, "__self__", None)
+        if isinstance(queue, asyncio.Queue):
+            try:
+                queue.put_nowait(event)
+                return
+            except asyncio.QueueFull:
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    queue.put_nowait(event)
+                    return
+                except asyncio.QueueFull:
+                    pass
+        put_nowait = getattr(app_put, "put_nowait", None)
+        if callable(put_nowait):
+            try:
+                put_nowait(event)
+            except Exception:
+                pass
+
     async def _enter_connection_close(self, *, notify_transport: bool) -> None:
         already_closed = bool(getattr(self, "closed", False))
         self.closed = True
@@ -137,13 +170,23 @@ def install_hypercorn_h2_receive_dispatch_guards() -> None:  # noqa: PLR0915
         await _release_stream_buffers(self)
         stream_ids = list(self.streams.keys())
         for stream_id in stream_ids:
-            await self._close_stream(stream_id)
+            await _close_stream_terminal(self, stream_id)
         if notify_transport and not already_closed:
             await self.send(Closed())
 
     async def _close_stream(self, stream_id: int) -> None:
         _retired_ids(self).add(stream_id)
         await _ORIGINAL_H2_CLOSE_STREAM(self, stream_id)
+
+    async def _close_stream_terminal(self, stream_id: int) -> None:
+        _retired_ids(self).add(stream_id)
+        stream = self.streams.pop(stream_id, None)
+        if stream is None:
+            await self.has_data.set()
+            return
+        stream.closed = True
+        _deliver_terminal_disconnect(stream)
+        await self.has_data.set()
 
     def _drop_priority(self, stream_id: int) -> None:
         try:

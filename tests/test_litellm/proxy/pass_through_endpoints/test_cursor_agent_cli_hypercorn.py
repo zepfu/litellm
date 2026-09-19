@@ -460,6 +460,21 @@ async def test_hypercorn_h2_ordinary_completion_keeps_sender_end_stream() -> Non
         protocol._flush = _held_flush
         buffer = protocol.stream_buffers[1]
         protocol.priority.unblock(1)
+        sent_bodies: List[bytes] = []
+        ended: List[int] = []
+        original_send_data = protocol.connection.send_data
+        original_end_stream = protocol.connection.end_stream
+
+        def _send_data(stream_id: int, data: bytes, *args: Any, **kwargs: Any) -> Any:
+            sent_bodies.append(bytes(data))
+            return original_send_data(stream_id, data, *args, **kwargs)
+
+        def _end_stream(stream_id: int, *args: Any, **kwargs: Any) -> Any:
+            ended.append(stream_id)
+            return original_end_stream(stream_id, *args, **kwargs)
+
+        protocol.connection.send_data = _send_data
+        protocol.connection.end_stream = _end_stream
         await buffer.push(b"complete-body")
         buffer.set_complete()
         sender = asyncio.create_task(protocol._send_data(1))
@@ -472,6 +487,33 @@ async def test_hypercorn_h2_ordinary_completion_keeps_sender_end_stream() -> Non
         assert any(isinstance(event, Closed) for event in sent) is False
         assert 1 not in protocol.stream_buffers
         assert flushed_after_release
+        assert sent_bodies == [b"complete-body"]
+        assert ended == [1]
     finally:
         release.set()
+        await _close_protocol(protocol, task_group)
+
+
+@pytest.mark.asyncio
+async def test_hypercorn_h2_goaway_does_not_wait_on_full_app_queue() -> None:
+    from hypercorn.events import Closed, RawData
+
+    protocol, sent, task_group = await _make_h2_protocol(install_guards=True)
+    try:
+        client = _new_h2_client()
+        await protocol.handle(RawData(data=_open_run(client)))
+        stream = protocol.streams[1]
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        queue.put_nowait({"type": "http.request", "body": b"full", "more_body": True})
+        stream.app_put = queue.put
+        await asyncio.wait_for(
+            protocol.handle(RawData(data=_goaway(client))),
+            timeout=1,
+        )
+        assert protocol.closed is True
+        assert 1 not in protocol.streams
+        assert any(isinstance(event, Closed) for event in sent)
+        assert queue.full() is True
+        assert queue.get_nowait()["type"] == "http.disconnect"
+    finally:
         await _close_protocol(protocol, task_group)
