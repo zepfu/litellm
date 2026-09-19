@@ -1705,6 +1705,44 @@ def test_run_terminal_records_first_close_booleans(caplog) -> None:
     assert "connect_endstream=not_seen" in joined
 
 
+def test_run_terminal_logs_successful_endstream_forwarded(caplog) -> None:
+    caplog.set_level("WARNING", logger="LiteLLM Proxy")
+    provenance = _InboundRunProvenance(call_id="call-ok")
+    provenance.endstream_forwarded = True
+    provenance.connect_endstream = "ok"
+    _log_inbound_run_terminal(
+        provenance,
+        termination_reason="normal_response",
+        http_version="2",
+    )
+    joined = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "WARNING"
+    )
+    assert "cursor_agent_cli_inbound run_terminal" in joined
+    assert "reason=normal_response" in joined
+    assert "endstream_forwarded=true" in joined
+    assert "connect_endstream=ok" in joined
+
+
+def test_run_terminal_stays_silent_for_success_without_endstream(caplog) -> None:
+    caplog.set_level("WARNING", logger="LiteLLM Proxy")
+    provenance = _InboundRunProvenance(call_id="call-silent")
+    provenance.connect_endstream = "not_seen"
+    _log_inbound_run_terminal(
+        provenance,
+        termination_reason="normal_response",
+        http_version="2",
+    )
+    joined = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "WARNING"
+    )
+    assert "run_terminal" not in joined
+
+
 def test_outbound_turn_headers_still_omit_checksum() -> None:
     from litellm.llms.cursor_agent.dashboard import build_turn_headers
 

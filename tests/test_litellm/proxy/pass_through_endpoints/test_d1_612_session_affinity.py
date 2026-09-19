@@ -1795,6 +1795,97 @@ async def test_ensure_guard_request_lease_identity_conflict_logs_request_local_s
     assert "openai-turn-2" not in joined
     assert "tok-live" not in joined
     assert sa.get_request_session_owner_lease(request) is leftover
+    assert "mint_provider=cursor_agent" in joined
+    assert "exit=uncleared" in joined
+
+
+@pytest.mark.asyncio
+async def test_ensure_guard_promoted_lease_identity_conflict_logs_inherited_parent(
+    caplog,
+) -> None:
+    redis = _FakeRedisCache()
+    openai_attrs = _full_attrs(provider="openai", model="gpt-6-astra")
+    request = type("Req", (), {})()
+    request.state = type("State", (), {})()
+    leftover = sa.SessionOwnerLease(
+        session_identity="cursor-parent",
+        reservation_token="tok-owned",
+        held_reservation=False,
+        released=False,
+        promoted=True,
+        attributes={"provider": "cursor_agent", "model": "cursor-grok-4.6-high"},
+    )
+    sa.set_request_session_owner_lease(request, leftover)
+    provenance = sa.classify_request_lease_identity_conflict(
+        lease=leftover,
+        resolved_session_identity="openai-turn-2",
+        requested_attributes=openai_attrs,
+    )
+    assert provenance["scope"] == "inherited_parent"
+    assert provenance["lease_promoted"] is True
+    caplog.set_level("WARNING")
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        with pytest.raises(HTTPException) as copilot_info:
+            await sa.ensure_session_owner_guard_for_request(
+                request=request,
+                session_identity="openai-turn-2",
+                requested_attributes=openai_attrs,
+                candidate={"provider": "openai", "model": "gpt-6-astra"},
+                alias_model="gpt-6-astra",
+            )
+    assert copilot_info.value.status_code == 409
+    joined = "\n".join(record.getMessage() for record in caplog.records)
+    assert "request_lease_identity_conflict scope=inherited_parent" in joined
+    assert "lease_promoted=true" in joined
+    assert "mint_provider=cursor_agent" in joined
+    assert "exit=uncleared" in joined
+    assert "cursor-parent" not in joined
+    assert sa.get_request_session_owner_lease(request) is leftover
+
+
+@pytest.mark.asyncio
+async def test_request_lease_transition_records_cursor_mint_then_uncleared_conflict(
+    caplog,
+) -> None:
+    redis = _FakeRedisCache()
+    cursor_attrs = _full_attrs(provider="cursor_agent", model="cursor-grok-4.6-high")
+    openai_attrs = _full_attrs(provider="openai", model="gpt-6-astra")
+    request = type("Req", (), {})()
+    request.state = type("State", (), {})()
+    caplog.set_level("WARNING")
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        first = await sa.ensure_session_owner_guard_for_request(
+            request=request,
+            session_identity="cursor-turn-1",
+            requested_attributes=cursor_attrs,
+            candidate={"provider": "cursor_agent", "model": "cursor-grok-4.6-high"},
+            alias_model="sota-xai",
+        )
+        assert first.held_reservation is True
+        transition = sa.get_request_lease_transition(request)
+        assert transition["mint_provider"] == "cursor_agent"
+        assert transition["mint_held"] is True
+        assert transition["exit"] == "none"
+        with pytest.raises(HTTPException) as copilot_info:
+            await sa.ensure_session_owner_guard_for_request(
+                request=request,
+                session_identity="openai-turn-2",
+                requested_attributes=openai_attrs,
+                candidate={"provider": "openai", "model": "gpt-6-astra"},
+                alias_model="gpt-6-astra",
+            )
+    assert copilot_info.value.status_code == 409
+    joined = "\n".join(record.getMessage() for record in caplog.records)
+    assert "mint_provider=cursor_agent" in joined
+    assert "mint_held=true" in joined
+    assert "exit=uncleared" in joined
+    assert "scope=request_local" in joined
+    assert "cursor-turn-1" not in joined
+    assert "openai-turn-2" not in joined
 
 
 @pytest.mark.asyncio

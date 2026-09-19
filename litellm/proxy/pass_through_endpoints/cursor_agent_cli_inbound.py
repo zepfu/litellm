@@ -277,7 +277,10 @@ def _log_inbound_run_terminal(
     termination_reason: str,
     http_version: Optional[str] = None,
 ) -> None:
-    if termination_reason == "normal_response":
+    if (
+        termination_reason == "normal_response"
+        and provenance.endstream_forwarded is not True
+    ):
         return
     fields = [
         f"call_id={provenance.call_id}",

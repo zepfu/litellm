@@ -5986,6 +5986,10 @@ async def finalize_request_session_owner_lease(
         return None
     if exc is not None:
         result = await finalize_session_owner_lease_on_failure(active, request=request)
+        if result is not None and result.outcome is SessionOwnerMutationOutcome.RELEASED:
+            record_request_lease_transition(
+                request, event="release", previous=active
+            )
         return result
 
     status = getattr(response, "status_code", None)
@@ -6002,6 +6006,8 @@ async def finalize_request_session_owner_lease(
         attributes=attributes or active.attributes,
         candidate=candidate,
     )
+    if result is not None and result.outcome is SessionOwnerMutationOutcome.PROMOTED:
+        record_request_lease_transition(request, event="promote", previous=active)
     if (
         raise_on_promote_failure
         and result is not None
@@ -8005,11 +8011,24 @@ def _log_request_lease_identity_conflict(provenance: Mapping[str, Any]) -> None:
     def _token(key: str) -> str:
         return "true" if provenance.get(key) else "false"
 
+    transition = provenance.get("transition")
+    if not isinstance(transition, Mapping):
+        transition = {}
+    mint_provider = _sanitize_lease_transition_provider(
+        str(transition.get("mint_provider") or "")
+    )
+    exit_value = str(transition.get("exit") or "none")
+    if exit_value not in _LEASE_TRANSITION_EXITS:
+        exit_value = "none"
+    exit_provider = _sanitize_lease_transition_provider(
+        str(transition.get("exit_provider") or "")
+    )
     verbose_proxy_logger.warning(
         "session_owner request_lease_identity_conflict scope=%s "
         "identities_equal=%s has_resolved_identity=%s has_lease_identity=%s "
         "lease_held=%s lease_promoted=%s lease_released=%s provider_equal=%s "
-        "has_lease_provider=%s has_requested_provider=%s",
+        "has_lease_provider=%s has_requested_provider=%s "
+        "mint_provider=%s mint_held=%s mint_promoted=%s exit=%s exit_provider=%s",
         scope,
         _token("identities_equal"),
         _token("has_resolved_identity"),
@@ -8020,6 +8039,11 @@ def _log_request_lease_identity_conflict(provenance: Mapping[str, Any]) -> None:
         _token("provider_equal"),
         _token("has_lease_provider"),
         _token("has_requested_provider"),
+        mint_provider,
+        "true" if transition.get("mint_held") else "false",
+        "true" if transition.get("mint_promoted") else "false",
+        exit_value,
+        exit_provider if exit_provider != "none" else "none",
     )
 
 
@@ -8198,6 +8222,13 @@ def raise_session_owner_redispatch_required(
 
 
 _REQUEST_STATE_LEASE_ATTR = "_aawm_session_owner_lease"
+_REQUEST_STATE_LEASE_TRANSITION_ATTR = "_aawm_session_owner_lease_transition"
+_LEASE_TRANSITION_EXITS = frozenset(
+    {"none", "released", "promoted", "replaced", "uncleared"}
+)
+_LEASE_TRANSITION_PROVIDERS = frozenset(
+    {"cursor_agent", "openai", "xai", "anthropic", "unknown"}
+)
 _REQUEST_STATE_GUARDED_ATTR = "_aawm_session_owner_guarded"
 
 
@@ -8232,6 +8263,107 @@ def get_request_session_owner_lease(request: Any) -> Optional[SessionOwnerLease]
     return lease if isinstance(lease, SessionOwnerLease) else None
 
 
+def _sanitize_lease_transition_provider(value: Optional[str]) -> str:
+    cleaned = str(value or "").strip()
+    if cleaned in _LEASE_TRANSITION_PROVIDERS:
+        return cleaned
+    if cleaned:
+        return "unknown"
+    return "none"
+
+
+def _lease_transition_provider(lease: Optional[SessionOwnerLease]) -> str:
+    if lease is None or not isinstance(lease.attributes, Mapping):
+        return "none"
+    return _sanitize_lease_transition_provider(
+        _clean_optional_str(lease.attributes.get("provider"))
+    )
+
+
+def record_request_lease_transition(
+    request: Any,
+    *,
+    event: str,
+    lease: Optional[SessionOwnerLease] = None,
+    previous: Optional[SessionOwnerLease] = None,
+) -> None:
+    """Bounded same-request mint/exit evidence. No identity strings."""
+
+    if request is None:
+        return
+    state = getattr(request, "state", None)
+    if state is None:
+        return
+    existing = getattr(state, _REQUEST_STATE_LEASE_TRANSITION_ATTR, None)
+    if not isinstance(existing, dict):
+        existing = {}
+    provider = _lease_transition_provider(lease if lease is not None else previous)
+    if event == "mint":
+        existing["mint_provider"] = provider
+        existing["mint_held"] = bool(
+            lease is not None
+            and lease.held_reservation
+            and lease.reservation_token
+            and not lease.released
+        )
+        existing["mint_promoted"] = bool(lease is not None and lease.promoted)
+        existing["exit"] = "none"
+        existing["exit_provider"] = "none"
+    elif event in {"release", "promote", "replace"}:
+        if event == "release":
+            existing["exit"] = "released"
+        elif event == "promote":
+            existing["exit"] = "promoted"
+        else:
+            existing["exit"] = "replaced"
+        existing["exit_provider"] = _lease_transition_provider(previous)
+    elif event == "conflict":
+        existing.setdefault("mint_provider", "none")
+        existing.setdefault("mint_held", False)
+        existing.setdefault("mint_promoted", False)
+        current_exit = existing.get("exit")
+        if current_exit not in _LEASE_TRANSITION_EXITS or current_exit == "none":
+            existing["exit"] = "uncleared"
+            if existing.get("exit_provider") in {None, "none", ""}:
+                existing["exit_provider"] = existing.get("mint_provider") or "none"
+        existing.setdefault("exit_provider", "none")
+    setattr(state, _REQUEST_STATE_LEASE_TRANSITION_ATTR, existing)
+
+
+def get_request_lease_transition(request: Any) -> dict[str, bool | str]:
+    empty: dict[str, bool | str] = {
+        "mint_provider": "none",
+        "mint_held": False,
+        "mint_promoted": False,
+        "exit": "none",
+        "exit_provider": "none",
+    }
+    if request is None:
+        return empty
+    state = getattr(request, "state", None)
+    if state is None:
+        return empty
+    existing = getattr(state, _REQUEST_STATE_LEASE_TRANSITION_ATTR, None)
+    if not isinstance(existing, dict):
+        return empty
+    exit_value = str(existing.get("exit") or "none")
+    if exit_value not in _LEASE_TRANSITION_EXITS:
+        exit_value = "none"
+    return {
+        "mint_provider": _sanitize_lease_transition_provider(
+            str(existing.get("mint_provider") or "")
+        ),
+        "mint_held": bool(existing.get("mint_held")),
+        "mint_promoted": bool(existing.get("mint_promoted")),
+        "exit": exit_value,
+        "exit_provider": _sanitize_lease_transition_provider(
+            str(existing.get("exit_provider") or "")
+        )
+        if existing.get("exit_provider") not in {None, "none", ""}
+        else "none",
+    }
+
+
 def set_request_session_owner_lease(
     request: Any, lease: Optional[SessionOwnerLease]
 ) -> None:
@@ -8240,8 +8372,23 @@ def set_request_session_owner_lease(
     state = getattr(request, "state", None)
     if state is None:
         return
+    previous = get_request_session_owner_lease(request)
     setattr(state, _REQUEST_STATE_LEASE_ATTR, lease)
     setattr(state, _REQUEST_STATE_GUARDED_ATTR, True)
+    if lease is None:
+        if previous is not None:
+            record_request_lease_transition(
+                request, event="replace", previous=previous
+            )
+        return
+    if previous is None:
+        record_request_lease_transition(request, event="mint", lease=lease)
+        return
+    if previous is not lease:
+        record_request_lease_transition(
+            request, event="replace", lease=lease, previous=previous
+        )
+        record_request_lease_transition(request, event="mint", lease=lease)
 
 
 def request_session_owner_already_guarded(request: Any) -> bool:
@@ -8985,13 +9132,18 @@ async def ensure_session_owner_guard_for_request(
                     request=request,
                 )
             return guard
-    active_lease = (
+    colliding_lease = (
         existing
-        if existing is not None and not existing.released and not existing.promoted
+        if existing is not None and not existing.released
         else None
     )
-    if active_lease is not None:
-        lease_identity = _clean_optional_str(active_lease.session_identity)
+    active_lease = (
+        colliding_lease
+        if colliding_lease is not None and not colliding_lease.promoted
+        else None
+    )
+    if colliding_lease is not None:
+        lease_identity = _clean_optional_str(colliding_lease.session_identity)
         identities_match = (
             resolved_session_identity is not None
             and lease_identity is not None
@@ -8999,13 +9151,14 @@ async def ensure_session_owner_guard_for_request(
             == _strip_legacy_affinity_prefixes(resolved_session_identity)
         )
         if not identities_match:
-            _log_request_lease_identity_conflict(
-                classify_request_lease_identity_conflict(
-                    lease=active_lease,
-                    resolved_session_identity=resolved_session_identity,
-                    requested_attributes=requested_attributes or candidate,
-                )
+            record_request_lease_transition(request, event="conflict")
+            conflict = classify_request_lease_identity_conflict(
+                lease=colliding_lease,
+                resolved_session_identity=resolved_session_identity,
+                requested_attributes=requested_attributes or candidate,
             )
+            conflict["transition"] = get_request_lease_transition(request)
+            _log_request_lease_identity_conflict(conflict)
             mismatch_reason = (
                 "session_owner: request lease identity does not match "
                 "the requested session identity"
@@ -9021,16 +9174,16 @@ async def ensure_session_owner_guard_for_request(
                 decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
                 session_identity=resolved_session_identity,
                 cache_key=mismatch_cache_key,
-                owner_id=active_lease.owner_id,
-                reservation_token=active_lease.reservation_token,
+                owner_id=colliding_lease.owner_id,
+                reservation_token=colliding_lease.reservation_token,
                 mismatch_reason=mismatch_reason,
                 provenance=build_session_owner_provenance(
                     session_identity=resolved_session_identity,
                     decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED.value,
-                    owner_id=active_lease.owner_id,
+                    owner_id=colliding_lease.owner_id,
                     mismatch_reason=mismatch_reason,
                     cache_key=mismatch_cache_key,
-                    reservation_token=active_lease.reservation_token,
+                    reservation_token=colliding_lease.reservation_token,
                 ),
             )
             record_session_owner_continuity_receipt(
