@@ -23,6 +23,21 @@ uncataloged model IDs can still be sent explicitly to OpenRouter.
   <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
 </a>
 
+## AAWM credit exhaustion
+
+A provider-attributed OpenRouter HTTP 402 with a structured credit or budget
+exhaustion error is classified as `openrouter_credit_exhausted`. AAWM advances
+through its existing safe fallback policy rather than retrying the exhausted
+credential. The cooldown uses the existing bounded usage-limit duration.
+
+Credit cooldowns apply across models sharing the effective OpenRouter API key,
+using a nonreversible hashed credential lane. A different credential has a
+separate lane. Missing credentials retain the legacy lane and cannot publish a
+shared credit cooldown. Local or unrelated HTTP 402 errors are unchanged;
+model-unavailable errors and free-daily quota exhaustion remain distinct.
+Public error details contain a fixed credit-exhaustion message, not the
+provider body or credential material.
+
 ## Usage
 ```python
 import os
