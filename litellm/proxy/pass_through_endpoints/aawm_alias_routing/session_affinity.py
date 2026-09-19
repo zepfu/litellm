@@ -225,6 +225,56 @@ def session_owner_lease_success_outcomes(
     }
 
 
+def session_owner_deferred_skipped_promote_is_noop(
+    lease: Optional[SessionOwnerLease],
+    result: Optional[SessionOwnerMutationResult],
+) -> bool:
+    """True when a completed stream has nothing to CAS-promote.
+
+    A ``NO_SESSION`` / identity-less lease cannot become owned. Raising
+    ``session_owner_stream_promote`` after a valid completed stream is leftover
+    409 noise, not ownership protection. A still-held reservation is not a
+    no-op.
+    """
+
+    if result is None or result.outcome is not SessionOwnerMutationOutcome.SKIPPED:
+        return False
+    if lease is None:
+        return True
+    if (
+        lease.held_reservation
+        and lease.reservation_token
+        and not lease.released
+    ):
+        return False
+    if lease.promoted:
+        return False
+    decision = str(lease.decision or "").strip().casefold()
+    if decision == SessionOwnerGuardDecision.NO_SESSION.value:
+        return True
+    return _clean_optional_str(lease.session_identity) is None
+
+
+def session_owner_deferred_promote_should_raise(
+    lease: Optional[SessionOwnerLease],
+    result: Optional[SessionOwnerMutationResult],
+    success_outcomes: Optional[set[SessionOwnerMutationOutcome]] = None,
+) -> bool:
+    """Whether deferred stream finalization should 409 the completed response."""
+
+    if result is None:
+        return False
+    allowed = success_outcomes or session_owner_lease_success_outcomes(lease)
+    if (
+        result.outcome in allowed
+        or result.outcome is SessionOwnerMutationOutcome.ALREADY_OWNED
+    ):
+        return False
+    if session_owner_deferred_skipped_promote_is_noop(lease, result):
+        return False
+    return True
+
+
 def _session_owner_lease_invariant_result(
     lease: SessionOwnerLease,
     *,
@@ -5599,6 +5649,19 @@ async def finalize_session_owner_lease_on_success(
             request, phase="owner_finalize", source="success", outcome="no_session"
         )
         return None
+    if (
+        str(lease.decision or "").strip().casefold()
+        == SessionOwnerGuardDecision.NO_SESSION.value
+        and not (
+            lease.held_reservation
+            and lease.reservation_token
+            and not lease.released
+        )
+    ):
+        record_session_owner_continuity_receipt(
+            request, phase="owner_finalize", source="success", outcome="no_session"
+        )
+        return None
     invariant = _session_owner_lease_release_invariant(lease)
     if invariant is not None:
         lease.last_finalization_outcome = invariant.outcome.value
@@ -6380,10 +6443,8 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
                     phase=f"{failure_phase}_release",
                 )
             raise
-        if (
-            result is not None
-            and result.outcome not in success_outcomes
-            and result.outcome is not SessionOwnerMutationOutcome.ALREADY_OWNED
+        if session_owner_deferred_promote_should_raise(
+            lease, result, success_outcomes
         ):
             release_result = await finalize_session_owner_lease_on_failure(
                 lease, request=request

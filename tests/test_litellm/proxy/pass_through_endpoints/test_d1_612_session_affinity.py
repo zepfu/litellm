@@ -5449,3 +5449,116 @@ async def test_close_retained_session_once_cannot_skip_cleanup_on_cancel() -> No
     assert session.close_calls == 1
     await sa.close_retained_session_once(session)
     assert session.close_calls == 1
+
+
+def test_deferred_skipped_promote_is_noop_for_no_session_lease() -> None:
+    skipped = sa.SessionOwnerMutationResult(
+        outcome=sa.SessionOwnerMutationOutcome.SKIPPED,
+        session_identity=None,
+    )
+    lease = sa.SessionOwnerLease(
+        session_identity=None,
+        held_reservation=False,
+        reservation_token=None,
+        released=False,
+        promoted=False,
+        decision=sa.SessionOwnerGuardDecision.NO_SESSION.value,
+        attributes={"provider": "xai", "model": "xai/grok-4.6"},
+    )
+    assert sa.session_owner_deferred_skipped_promote_is_noop(lease, skipped) is True
+    assert (
+        sa.session_owner_deferred_promote_should_raise(
+            lease,
+            skipped,
+            sa.session_owner_lease_success_outcomes(lease),
+        )
+        is False
+    )
+
+
+def test_deferred_skipped_promote_is_noop_for_identityless_unheld_lease() -> None:
+    skipped = sa.SessionOwnerMutationResult(
+        outcome=sa.SessionOwnerMutationOutcome.SKIPPED,
+        session_identity=None,
+    )
+    lease = sa.SessionOwnerLease(
+        session_identity=None,
+        held_reservation=False,
+        reservation_token=None,
+        released=False,
+        promoted=False,
+        decision=sa.SessionOwnerGuardDecision.UNOWNED_RESERVED.value,
+    )
+    assert sa.session_owner_deferred_skipped_promote_is_noop(lease, skipped) is True
+    assert sa.session_owner_deferred_promote_should_raise(lease, skipped) is False
+
+
+def test_deferred_skipped_promote_still_raises_for_held_reservation() -> None:
+    skipped = sa.SessionOwnerMutationResult(
+        outcome=sa.SessionOwnerMutationOutcome.SKIPPED,
+        session_identity=None,
+    )
+    lease = sa.SessionOwnerLease(
+        session_identity=None,
+        held_reservation=True,
+        reservation_token="tok-held",
+        released=False,
+        promoted=False,
+        decision=sa.SessionOwnerGuardDecision.NO_SESSION.value,
+    )
+    assert sa.session_owner_deferred_skipped_promote_is_noop(lease, skipped) is False
+    assert sa.session_owner_deferred_promote_should_raise(lease, skipped) is True
+
+
+def test_deferred_promote_still_raises_for_conflict_and_error() -> None:
+    lease = sa.SessionOwnerLease(
+        session_identity="sess-owned",
+        held_reservation=True,
+        reservation_token="tok-held",
+        released=False,
+        promoted=False,
+        decision=sa.SessionOwnerGuardDecision.UNOWNED_RESERVED.value,
+    )
+    conflict = sa.SessionOwnerMutationResult(
+        outcome=sa.SessionOwnerMutationOutcome.CONFLICT,
+        session_identity="sess-owned",
+    )
+    error = sa.SessionOwnerMutationResult(
+        outcome=sa.SessionOwnerMutationOutcome.ERROR,
+        session_identity="sess-owned",
+        error="session_owner: promote failed",
+    )
+    assert sa.session_owner_deferred_promote_should_raise(lease, conflict) is True
+    assert sa.session_owner_deferred_promote_should_raise(lease, error) is True
+    promoted = sa.SessionOwnerMutationResult(
+        outcome=sa.SessionOwnerMutationOutcome.PROMOTED,
+        session_identity="sess-owned",
+    )
+    assert sa.session_owner_deferred_promote_should_raise(lease, promoted) is False
+
+
+@pytest.mark.asyncio
+async def test_finalize_success_no_session_lease_returns_none_not_skipped() -> None:
+    lease = sa.SessionOwnerLease(
+        session_identity=None,
+        held_reservation=False,
+        reservation_token=None,
+        released=False,
+        promoted=False,
+        decision=sa.SessionOwnerGuardDecision.NO_SESSION.value,
+        attributes={"provider": "xai", "model": "xai/grok-4.6"},
+    )
+    result = await sa.finalize_session_owner_lease_on_success(
+        lease,
+        attributes=lease.attributes,
+        candidate={"provider": "xai", "model": "xai/grok-4.6"},
+    )
+    assert result is None
+    assert (
+        sa.session_owner_deferred_promote_should_raise(
+            lease,
+            result,
+            sa.session_owner_lease_success_outcomes(lease),
+        )
+        is False
+    )
