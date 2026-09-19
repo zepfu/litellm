@@ -7927,6 +7927,102 @@ def _build_minimized_replay_unsafe_detail(
     return detail
 
 
+_LEASE_PROVENANCE_SCOPES = frozenset(
+    {"request_local", "inherited_parent", "unknown"}
+)
+
+
+def classify_request_lease_identity_conflict(
+    *,
+    lease: Optional[SessionOwnerLease],
+    resolved_session_identity: Optional[str],
+    requested_attributes: Optional[Mapping[str, Any]] = None,
+) -> dict[str, bool | str]:
+    """Boolean provenance of a request-local lease vs canonical identity.
+
+    Does not log identity strings. Distinguishes a disposable request-local
+    leftover (held reservation, not promoted) from a still-live inherited
+    parent/compatible snapshot. The guard still 409s; this only names the
+    lease that collided.
+    """
+
+    lease_identity = _clean_optional_str(
+        getattr(lease, "session_identity", None) if lease is not None else None
+    )
+    resolved = _clean_optional_str(resolved_session_identity)
+    identities_equal = (
+        lease_identity is not None
+        and resolved is not None
+        and _strip_legacy_affinity_prefixes(lease_identity)
+        == _strip_legacy_affinity_prefixes(resolved)
+    )
+    held = bool(
+        lease is not None
+        and lease.held_reservation
+        and lease.reservation_token
+        and not lease.released
+    )
+    promoted = bool(lease is not None and lease.promoted)
+    released = bool(lease is not None and lease.released)
+    lease_provider = None
+    requested_provider = None
+    if lease is not None and isinstance(lease.attributes, Mapping):
+        lease_provider = _clean_optional_str(lease.attributes.get("provider"))
+    if isinstance(requested_attributes, Mapping):
+        requested_provider = _clean_optional_str(
+            requested_attributes.get("provider")
+        )
+    provider_equal = (
+        lease_provider is not None
+        and requested_provider is not None
+        and lease_provider == requested_provider
+    )
+    if promoted:
+        scope = "inherited_parent"
+    elif held:
+        scope = "request_local"
+    else:
+        scope = "unknown"
+    return {
+        "scope": scope,
+        "identities_equal": identities_equal,
+        "has_resolved_identity": resolved is not None,
+        "has_lease_identity": lease_identity is not None,
+        "lease_held": held,
+        "lease_promoted": promoted,
+        "lease_released": released,
+        "provider_equal": provider_equal,
+        "has_lease_provider": lease_provider is not None,
+        "has_requested_provider": requested_provider is not None,
+    }
+
+
+def _log_request_lease_identity_conflict(provenance: Mapping[str, Any]) -> None:
+    scope = str(provenance.get("scope") or "")
+    if scope not in _LEASE_PROVENANCE_SCOPES:
+        scope = "unknown"
+
+    def _token(key: str) -> str:
+        return "true" if provenance.get(key) else "false"
+
+    verbose_proxy_logger.warning(
+        "session_owner request_lease_identity_conflict scope=%s "
+        "identities_equal=%s has_resolved_identity=%s has_lease_identity=%s "
+        "lease_held=%s lease_promoted=%s lease_released=%s provider_equal=%s "
+        "has_lease_provider=%s has_requested_provider=%s",
+        scope,
+        _token("identities_equal"),
+        _token("has_resolved_identity"),
+        _token("has_lease_identity"),
+        _token("lease_held"),
+        _token("lease_promoted"),
+        _token("lease_released"),
+        _token("provider_equal"),
+        _token("has_lease_provider"),
+        _token("has_requested_provider"),
+    )
+
+
 def raise_session_owner_redispatch_required(
     *,
     session_identity: Optional[str],
@@ -8903,6 +8999,13 @@ async def ensure_session_owner_guard_for_request(
             == _strip_legacy_affinity_prefixes(resolved_session_identity)
         )
         if not identities_match:
+            _log_request_lease_identity_conflict(
+                classify_request_lease_identity_conflict(
+                    lease=active_lease,
+                    resolved_session_identity=resolved_session_identity,
+                    requested_attributes=requested_attributes or candidate,
+                )
+            )
             mismatch_reason = (
                 "session_owner: request lease identity does not match "
                 "the requested session identity"

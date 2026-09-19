@@ -1618,6 +1618,8 @@ def test_agentn_stream_reset_records_error_code_and_remote_reset(caplog) -> None
     assert chunks == []
     assert session.provenance.stream_reset_code == 8
     assert session.provenance.remote_reset is True
+    assert session.provenance.first_close_actor == "agentn"
+    assert session.provenance.first_close_event == "StreamReset"
     warning_messages = [
         record.getMessage()
         for record in caplog.records

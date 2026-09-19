@@ -1741,6 +1741,63 @@ async def test_sequential_candidates_replace_released_request_lease() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ensure_guard_request_lease_identity_conflict_logs_request_local_scope(
+    caplog,
+) -> None:
+    redis = _FakeRedisCache()
+    openai_attrs = _full_attrs(provider="openai", model="gpt-6-astra")
+    request = type("Req", (), {})()
+    request.state = type("State", (), {})()
+    leftover = sa.SessionOwnerLease(
+        session_identity="cursor-turn-1",
+        reservation_token="tok-live",
+        held_reservation=True,
+        released=False,
+        promoted=False,
+        attributes={"provider": "cursor_agent", "model": "cursor-grok-4.6-high"},
+    )
+    sa.set_request_session_owner_lease(request, leftover)
+    provenance = sa.classify_request_lease_identity_conflict(
+        lease=leftover,
+        resolved_session_identity="openai-turn-2",
+        requested_attributes=openai_attrs,
+    )
+    assert provenance["scope"] == "request_local"
+    assert provenance["identities_equal"] is False
+    assert provenance["lease_held"] is True
+    assert provenance["lease_promoted"] is False
+    assert provenance["provider_equal"] is False
+    caplog.set_level("WARNING")
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        with pytest.raises(HTTPException) as copilot_info:
+            await sa.ensure_session_owner_guard_for_request(
+                request=request,
+                session_identity="openai-turn-2",
+                requested_attributes=openai_attrs,
+                candidate={"provider": "openai", "model": "gpt-6-astra"},
+                alias_model="gpt-6-astra",
+            )
+    assert copilot_info.value.status_code == 409
+    detail = copilot_info.value.detail
+    if isinstance(detail, dict):
+        phase = detail.get("failure_phase") or (
+            (detail.get("error") or {}).get("failure_phase")
+        )
+        assert phase == "session_owner_request_lease_identity_conflict"
+    joined = "\n".join(record.getMessage() for record in caplog.records)
+    assert "request_lease_identity_conflict scope=request_local" in joined
+    assert "identities_equal=false" in joined
+    assert "lease_held=true" in joined
+    assert "provider_equal=false" in joined
+    assert "cursor-turn-1" not in joined
+    assert "openai-turn-2" not in joined
+    assert "tok-live" not in joined
+    assert sa.get_request_session_owner_lease(request) is leftover
+
+
+@pytest.mark.asyncio
 async def test_anthropic_nested_pre_egress_promotes_concrete_not_generic_attrs() -> None:
     """Nested Anthropic reserve/promote must use concrete resolved owner attrs.
 
