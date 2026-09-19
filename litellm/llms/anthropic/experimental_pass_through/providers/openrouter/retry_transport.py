@@ -547,11 +547,30 @@ async def perform_completion_operation(
     log_warnings: bool = True,
     use_alias_candidate_probe: bool = False,
 ) -> RetryResultT:
+    async def _provider_return_stamp_operation() -> RetryResultT:
+        # OR-029: stamp provenance on exceptions escaping the retried
+        # provider operation itself. Preflight raises (alias cooldown,
+        # failure circuit) happen outside this closure and stay unstamped.
+        try:
+            return await operation()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            setattr(exc, "_aawm_provider_returned", True)
+            setattr(exc, "attempted_provider_call", True)
+            setattr(exc, "provider_returned", True)
+            setattr(exc, "failure_phase", "provider_attempt")
+            setattr(exc, "provider_name", "openrouter")
+            status_code = extract_exception_status_code(runtime, exc)
+            if isinstance(status_code, int):
+                setattr(exc, "upstream_status_code", status_code)
+            raise
+
     try:
         return await run_retry_loop(
             runtime,
             adapter_model=adapter_model,
-            operation=operation,
+            operation=_provider_return_stamp_operation,
             log_warnings=log_warnings,
             use_alias_candidate_probe=use_alias_candidate_probe,
             attempt_label="OpenRouter completion adapter",
