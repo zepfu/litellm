@@ -17,6 +17,7 @@ from typing import Any, Awaitable, Callable, Optional
 from fastapi import HTTPException
 
 from litellm._logging import verbose_proxy_logger
+from litellm.proxy._types import ProxyException
 from litellm.secret_managers.main import get_secret_str
 
 
@@ -24,6 +25,9 @@ _ANTHROPIC_ADAPTER_NVIDIA_API_KEY_ENV_VARS = (
     "AAWM_NVIDIA_API_KEY",
     "NVIDIA_NIM_API_KEY",
     "NVIDIA_API_KEY",
+)
+_NVIDIA_MISSING_CREDENTIAL_INELIGIBILITY_CODE = (
+    "aawm_codex_auto_agent_candidate_ineligible"
 )
 _ANTHROPIC_ADAPTER_NVIDIA_RETRYABLE_STATUS_CODES = frozenset(
     {408, 429, 500, 502, 503, 504}
@@ -33,6 +37,51 @@ NVIDIA_API_BASE_VERSION_SEGMENT = "/v1"
 
 NVIDIA_TARGET_BASE_DEFAULT = "https://integrate.api.nvidia.com"
 """Canonical default NVIDIA target root, stored without a version segment."""
+
+
+def _nvidia_accepted_credential_source_names() -> str:
+    """Return the accepted NVIDIA credential env-var names, without values."""
+
+    names = [f"'{name}'" for name in _ANTHROPIC_ADAPTER_NVIDIA_API_KEY_ENV_VARS]
+    return f"{', '.join(names[:-1])}, or {names[-1]}"
+
+
+class NvidiaMissingCredentialError(ProxyException):
+    """Local missing/empty NVIDIA credentials raised before any provider I/O.
+
+    This is deterministic candidate preflight ineligibility, not an upstream
+    401/429. Candidate accounting must treat it as ``attempted_provider_call=False``
+    with no provider cooldown so alias fallback remains safe.
+    """
+
+    def __init__(self) -> None:
+        message = (
+            "Direct NVIDIA route is unavailable: accepted credentials "
+            f"{_nvidia_accepted_credential_source_names()} are missing or empty."
+        )
+        super().__init__(
+            message=message,
+            type="invalid_request_error",
+            param="model",
+            code=400,
+        )
+        setattr(self, "status_code", 400)
+        setattr(self, "candidate_status", "ineligible")
+        setattr(self, "ineligibility_reason", "preflight_skipped")
+        setattr(self, "failure_phase", "candidate_preflight")
+        setattr(self, "attempted_provider_call", False)
+        setattr(
+            self,
+            "detail",
+            {
+                "error": {
+                    "message": message,
+                    "code": _NVIDIA_MISSING_CREDENTIAL_INELIGIBILITY_CODE,
+                },
+                "failure_phase": "candidate_preflight",
+                "attempted_provider_call": False,
+            },
+        )
 
 
 @dataclass(frozen=True)
@@ -113,6 +162,20 @@ def _get_anthropic_adapter_nvidia_api_key() -> Optional[str]:
     return _runtime_dependencies.get_first_secret_value(
         _ANTHROPIC_ADAPTER_NVIDIA_API_KEY_ENV_VARS
     )
+
+
+def _require_nvidia_api_key() -> str:
+    """Return a usable NVIDIA credential or fail before any provider I/O."""
+
+    api_key = _get_anthropic_adapter_nvidia_api_key()
+    if not api_key:
+        _runtime_dependencies.log_debug(
+            "Direct NVIDIA credential resolution failed: accepted env vars "
+            "%s are missing or blank after cleanup",
+            _nvidia_accepted_credential_source_names(),
+        )
+        raise NvidiaMissingCredentialError()
+    return api_key
 
 
 def _nvidia_target_base_api_version_violation(target_base: str) -> Optional[str]:

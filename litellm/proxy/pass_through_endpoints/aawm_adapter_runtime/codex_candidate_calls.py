@@ -6960,29 +6960,7 @@ async def _prepare_codex_nvidia_completion_adapter_route(
             litellm_completion_request=completion_kwargs,
         )
 
-    api_key = _nvidia_runtime._get_anthropic_adapter_nvidia_api_key()
-    if not api_key:
-        exc = ProxyException(
-            message=(
-                "Codex NVIDIA adapter requests require "
-                "'AAWM_NVIDIA_API_KEY', 'NVIDIA_NIM_API_KEY', or "
-                "'NVIDIA_API_KEY' in environment."
-            ),
-            type="rate_limit_error",
-            param="model",
-            code=429,
-        )
-        setattr(
-            exc,
-            "detail",
-            {
-                "error": {
-                    "message": exc.message,
-                    "code": "aawm_codex_auto_agent_candidate_unavailable",
-                }
-            },
-        )
-        raise exc
+    api_key = _nvidia_runtime._require_nvidia_api_key()
 
     target_base_url = _nvidia_runtime._get_anthropic_adapter_nvidia_target_base()
     api_base = _nvidia_runtime._nvidia_api_base_from_target_base(str(target_base_url))

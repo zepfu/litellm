@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from litellm.proxy.pass_through_endpoints.providers.nvidia.runtime import (
+    NvidiaMissingCredentialError,
     _nvidia_api_base_from_target_base,
 )
 
@@ -60,12 +61,8 @@ async def prepare_completion_route(
         },
     )
     api_key = runtime.get_api_key()
-    if api_key is None:
-        raise Exception(
-            "Anthropic adapter requests for NVIDIA models require "
-            "'AAWM_NVIDIA_API_KEY', 'NVIDIA_NIM_API_KEY', or 'NVIDIA_API_KEY' "
-            "in environment."
-        )
+    if not api_key:
+        raise NvidiaMissingCredentialError()
     target_base_url = runtime.get_target_base()
     api_base = _nvidia_api_base_from_target_base(str(target_base_url))
     target_url = f"{api_base}/chat/completions"
