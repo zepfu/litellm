@@ -3722,7 +3722,8 @@ async def handle_alias_route(  # noqa: PLR0915
                             finally:
                                 if openrouter_sink_token is not None:
                                     _attempt_records.reset_openrouter_inner_send_sink(
-                                        openrouter_sink_token
+                                        openrouter_sink_token,
+                                        attempt_record,
                                     )
                                 if request_ledger is None and candidate_is_openai:
                                     request_ledger = (

@@ -285,6 +285,22 @@ def get_post_failure_cooldown_seconds(runtime: Runtime) -> float:
     return max(0.0, parsed)
 
 
+def get_failure_circuit_cooldown_seconds(runtime: Runtime, exc: object) -> float:
+    """Return the duration ``open_failure_circuit`` applies for *exc*.
+
+    Owner of the circuit duration: max(post-failure floor, Retry-After,
+    reset-wait), then clamp to ``[0, 300]``. Recording sites must use this
+    value instead of inventing a parallel policy.
+    """
+    cooldown_seconds = get_post_failure_cooldown_seconds(runtime)
+    retry_after_seconds = extract_retry_after_seconds(runtime, exc)
+    reset_wait_seconds = extract_reset_wait_seconds(runtime, exc)
+    for candidate in (retry_after_seconds, reset_wait_seconds):
+        if candidate is not None:
+            cooldown_seconds = max(cooldown_seconds, candidate)
+    return min(max(cooldown_seconds, 0.0), 300.0)
+
+
 async def maybe_raise_failure_circuit_open(
     runtime: Runtime,
     adapter_model: Optional[str],
@@ -320,15 +336,9 @@ async def open_failure_circuit(
     adapter_model: Optional[str],
     *,
     exc: object,
-) -> None:
+) -> float:
     rate_limit_key = get_rate_limit_key(runtime, adapter_model)
-    cooldown_seconds = get_post_failure_cooldown_seconds(runtime)
-    retry_after_seconds = extract_retry_after_seconds(runtime, exc)
-    reset_wait_seconds = extract_reset_wait_seconds(runtime, exc)
-    for candidate in (retry_after_seconds, reset_wait_seconds):
-        if candidate is not None:
-            cooldown_seconds = max(cooldown_seconds, candidate)
-    cooldown_seconds = min(max(cooldown_seconds, 0.0), 300.0)
+    cooldown_seconds = get_failure_circuit_cooldown_seconds(runtime, exc)
     async with runtime.rate_limit.lock:
         until = runtime.monotonic() + cooldown_seconds
         current_until = runtime.failure_circuit_until_monotonic_by_key.get(
@@ -338,6 +348,7 @@ async def open_failure_circuit(
         if until > current_until:
             runtime.failure_circuit_until_monotonic_by_key[rate_limit_key] = until
             bound_memory_map(runtime.failure_circuit_until_monotonic_by_key)
+    return cooldown_seconds
 
 
 def clear_failure_circuit(
@@ -558,8 +569,36 @@ async def _retry_loop_on_failure(
     hidden_retry_budget_seconds: float,
     accumulated_hidden_wait_seconds: float,
     total_attempts: int,
+    note_started_row: Optional[Callable[..., None]] = None,
+    emit_final_row: Optional[Callable[..., None]] = None,
 ) -> tuple[bool, float]:
     """Return (should_retry, updated_hidden_wait_seconds)."""
+
+    def _note(**payload: Any) -> None:
+        if note_started_row is not None:
+            note_started_row(**payload)
+            return
+        staged = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"status", "disposition", "inner_attempt"}
+            and value is not None
+        }
+        _emit_inner_send(
+            runtime,
+            inner_attempt=attempt,
+            status="in_flight",
+            disposition="started",
+            attempted_provider_call=True,
+            **staged,
+        )
+
+    def _emit_final(**payload: Any) -> None:
+        if emit_final_row is not None:
+            emit_final_row(**payload)
+            return
+        _emit_inner_send(runtime, **payload)
+
     status_code = extract_exception_status_code(runtime, exc)
     provider_name = extract_provider_name(runtime, exc)
     raw_message = extract_raw_message(runtime, exc)
@@ -585,8 +624,14 @@ async def _retry_loop_on_failure(
         and provider_wait_seconds is not None
         and not within_hidden_budget
     )
+    _note(
+        error_status_code=status_code,
+        failure_class=exc.__class__.__name__,
+    )
     if status_code == 429 and is_long_window:
-        cooldown_seconds = min(max(reset_wait_seconds or 0.0, 30.0), 300.0)
+        rate_limit_cooldown_seconds = min(max(reset_wait_seconds or 0.0, 30.0), 300.0)
+        circuit_cooldown_seconds = get_failure_circuit_cooldown_seconds(runtime, exc)
+        cooldown_seconds = max(rate_limit_cooldown_seconds, circuit_cooldown_seconds)
         if log_warnings:
             runtime.log_warning(
                 "%s upstream attempt %s hit long-window 429 "
@@ -599,13 +644,20 @@ async def _retry_loop_on_failure(
                 raw_message,
                 reset_wait_seconds or 0.0,
             )
+        _note(
+            status="terminal",
+            disposition="long_window_rate_limit",
+            delay_seconds=0.0,
+            cooldown_seconds=cooldown_seconds,
+            error_status_code=status_code,
+            failure_class="long_window_rate_limit",
+        )
         await runtime.set_cooldown_callback(
             get_cooldown_keys(runtime, model=adapter_model, exc=exc),
-            cooldown_seconds,
+            rate_limit_cooldown_seconds,
         )
         await runtime.open_failure_circuit_callback(adapter_model, exc=exc)
-        _emit_inner_send(
-            runtime,
+        _emit_final(
             inner_attempt=attempt,
             status="terminal",
             disposition="long_window_rate_limit",
@@ -634,8 +686,7 @@ async def _retry_loop_on_failure(
             raw_message=raw_message,
         )
     except Exception as probe_exc:
-        _emit_inner_send(
-            runtime,
+        _emit_final(
             inner_attempt=attempt,
             status="terminal",
             disposition="candidate_unavailable",
@@ -658,15 +709,27 @@ async def _retry_loop_on_failure(
                 provider_name,
                 raw_message,
             )
+        applied_cooldown = (
+            get_failure_circuit_cooldown_seconds(runtime, exc)
+            if status_code == 429
+            else None
+        )
+        _note(
+            status="terminal",
+            disposition="terminal",
+            delay_seconds=0.0,
+            cooldown_seconds=applied_cooldown,
+            error_status_code=status_code,
+            failure_class=exc.__class__.__name__,
+        )
         if status_code == 429:
             await runtime.open_failure_circuit_callback(adapter_model, exc=exc)
-        _emit_inner_send(
-            runtime,
+        _emit_final(
             inner_attempt=attempt,
             status="terminal",
             disposition="terminal",
             delay_seconds=0.0,
-            cooldown_seconds=None,
+            cooldown_seconds=applied_cooldown,
             error_status_code=status_code,
             failure_class=exc.__class__.__name__,
             attempted_provider_call=True,
@@ -683,12 +746,19 @@ async def _retry_loop_on_failure(
             raw_message,
             wait_seconds,
         )
+    _note(
+        status="retrying",
+        disposition="retry_backoff",
+        delay_seconds=wait_seconds,
+        cooldown_seconds=wait_seconds,
+        error_status_code=status_code,
+        failure_class="rate_limited",
+    )
     await runtime.set_cooldown_callback(
         get_cooldown_keys(runtime, model=adapter_model, exc=exc),
         wait_seconds,
     )
-    _emit_inner_send(
-        runtime,
+    _emit_final(
         inner_attempt=attempt,
         status="retrying",
         disposition="retry_backoff",
@@ -731,10 +801,54 @@ async def run_retry_loop(
         use_alias_candidate_probe=use_alias_candidate_probe,
     )
     await runtime.maybe_raise_failure_circuit_open_callback(adapter_model)
-    current_attempt = 0
+    started_inner_attempt = 0
+    started_row_finalized = True
+    known_final_payload: dict[str, Any] = {}
+
+    def _note_started_row(**payload: Any) -> None:
+        if started_row_finalized or started_inner_attempt <= 0:
+            return
+        known_final_payload.update(
+            {key: value for key, value in payload.items() if value is not None}
+        )
+        staged = {
+            key: value
+            for key, value in known_final_payload.items()
+            if key not in {"status", "disposition", "inner_attempt"}
+            and value is not None
+        }
+        _emit_inner_send(
+            runtime,
+            inner_attempt=started_inner_attempt,
+            status="in_flight",
+            disposition="started",
+            attempted_provider_call=True,
+            **staged,
+        )
+
+    def _emit_final_row(**payload: Any) -> None:
+        nonlocal started_row_finalized
+        known_final_payload.update(payload)
+        _emit_inner_send(runtime, **payload)
+        started_row_finalized = True
+
+    def _settle_outstanding_started_row() -> None:
+        if started_row_finalized or started_inner_attempt <= 0:
+            return
+        payload: dict[str, Any] = {
+            "inner_attempt": started_inner_attempt,
+            "status": "cancelled",
+            "disposition": "cancelled",
+            "delay_seconds": 0.0,
+            "cooldown_seconds": 0.0,
+            "attempted_provider_call": True,
+        }
+        payload.update(known_final_payload)
+        payload["inner_attempt"] = started_inner_attempt
+        _emit_final_row(**payload)
 
     async def _before_attempt(attempt: int) -> None:
-        nonlocal current_attempt
+        nonlocal started_inner_attempt, started_row_finalized
         runtime.log_debug(
             "%s upstream attempt %s/%s for model=%s",
             attempt_label,
@@ -747,7 +861,9 @@ async def run_retry_loop(
             adapter_model=adapter_model,
             use_alias_candidate_probe=use_alias_candidate_probe,
         )
-        current_attempt = attempt
+        started_inner_attempt = attempt
+        started_row_finalized = False
+        known_final_payload.clear()
         _emit_inner_send(
             runtime,
             inner_attempt=attempt,
@@ -763,8 +879,7 @@ async def run_retry_loop(
         # nonstream/transport callers keep the eager validated clear here.
         if clear_on_success:
             runtime.clear_failure_circuit_callback(adapter_model)
-        _emit_inner_send(
-            runtime,
+        _emit_final_row(
             inner_attempt=attempt,
             status="succeeded",
             disposition="succeeded",
@@ -775,6 +890,10 @@ async def run_retry_loop(
 
     async def _on_failure(exc: Exception, attempt: int) -> bool:
         nonlocal accumulated_hidden_wait_seconds
+        _note_started_row(
+            error_status_code=extract_exception_status_code(runtime, exc),
+            failure_class=exc.__class__.__name__,
+        )
         should_retry, accumulated_hidden_wait_seconds = await _retry_loop_on_failure(
             runtime,
             exc,
@@ -786,33 +905,22 @@ async def run_retry_loop(
             hidden_retry_budget_seconds=hidden_retry_budget_seconds,
             accumulated_hidden_wait_seconds=accumulated_hidden_wait_seconds,
             total_attempts=total_attempts,
+            note_started_row=_note_started_row,
+            emit_final_row=_emit_final_row,
         )
         return should_retry
 
-    async def _observed_operation() -> RetryResultT:
-        try:
-            return await operation()
-        except asyncio.CancelledError:
-            if current_attempt > 0:
-                _emit_inner_send(
-                    runtime,
-                    inner_attempt=current_attempt,
-                    status="cancelled",
-                    disposition="cancelled",
-                    delay_seconds=0.0,
-                    cooldown_seconds=0.0,
-                    attempted_provider_call=True,
-                )
-            raise
-
-    return await retry.run_adapter_retry_policy(
-        _observed_operation,
-        policy=retry.AdapterRetryPolicy(
-            before_attempt=_before_attempt,
-            on_failure=_on_failure,
-            on_success=_on_success,
-        ),
-    )
+    try:
+        return await retry.run_adapter_retry_policy(
+            operation,
+            policy=retry.AdapterRetryPolicy(
+                before_attempt=_before_attempt,
+                on_failure=_on_failure,
+                on_success=_on_success,
+            ),
+        )
+    finally:
+        _settle_outstanding_started_row()
 
 
 _INVALID_TOOL_DETAIL_LIMIT = 200
@@ -1033,6 +1141,7 @@ __all__ = [
     "get_header_value",
     "get_hidden_retry_budget_seconds",
     "get_max_retries",
+    "get_failure_circuit_cooldown_seconds",
     "get_post_failure_cooldown_seconds",
     "get_rate_limit_key",
     "get_retry_wait_seconds",

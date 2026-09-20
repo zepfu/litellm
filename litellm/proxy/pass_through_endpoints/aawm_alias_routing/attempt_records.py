@@ -1176,11 +1176,49 @@ def bind_openrouter_inner_send_sink(attempt_record: dict[str, Any]) -> object:
     return _openrouter_retry_transport.bind_inner_send_sink(_sink)
 
 
-def reset_openrouter_inner_send_sink(token: Any) -> None:
+def _settle_outstanding_openrouter_inner_subattempt(
+    attempt_record: dict[str, Any],
+) -> None:
+    """Finalize a leftover in_flight inner send before the sink is reset."""
+    subattempts = attempt_record.get("subattempts")
+    if not isinstance(subattempts, list) or not subattempts:
+        return
+    current = subattempts[-1]
+    if not isinstance(current, Mapping) or current.get("status") != "in_flight":
+        return
+    inner_attempt = current.get("inner_attempt")
+    if not isinstance(inner_attempt, int) or inner_attempt <= 0:
+        return
+    delay_seconds = current.get("delay_seconds")
+    payload: dict[str, Any] = {
+        "inner_attempt": inner_attempt,
+        "status": "cancelled",
+        "disposition": "cancelled",
+        "delay_seconds": 0.0 if delay_seconds is None else delay_seconds,
+        "attempted_provider_call": True,
+        "cooldown_seconds": (
+            current["cooldown_seconds"]
+            if current.get("cooldown_seconds") is not None
+            else 0.0
+        ),
+    }
+    if current.get("error_status_code") is not None:
+        payload["error_status_code"] = current["error_status_code"]
+    if current.get("failure_class") is not None:
+        payload["failure_class"] = current["failure_class"]
+    _append_openrouter_inner_subattempt(attempt_record, **payload)
+
+
+def reset_openrouter_inner_send_sink(
+    token: Any,
+    attempt_record: Optional[dict[str, Any]] = None,
+) -> None:
     from litellm.llms.anthropic.experimental_pass_through.providers.openrouter import (
         retry_transport as _openrouter_retry_transport,
     )
 
+    if attempt_record is not None:
+        _settle_outstanding_openrouter_inner_subattempt(attempt_record)
     _openrouter_retry_transport.reset_inner_send_sink(token)
 
 
