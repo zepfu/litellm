@@ -27,6 +27,12 @@ _UNVERIFIED_CAPABILITY_KEYS = (
     "max_output_tokens",
     "max_tokens",
 )
+_LONGCAT_ID = "meituan/longcat-2.0:free"
+_LONGCAT_VERIFIED_CAPABILITY_KEYS = (
+    "supports_function_calling",
+    "supports_native_streaming",
+    "supports_tool_choice",
+)
 
 
 def _repo_root() -> str:
@@ -128,6 +134,14 @@ def test_nous_cost_map_rows_exist_for_seven_ids():
         assert row["litellm_provider"] == "nous"
         assert row.get("input_cost_per_token", 1) == 0
         assert row.get("output_cost_per_token", 1) == 0
-        for capability_key in _UNVERIFIED_CAPABILITY_KEYS:
-            assert capability_key not in row
+        if model_id == _LONGCAT_ID:
+            for capability_key in _LONGCAT_VERIFIED_CAPABILITY_KEYS:
+                assert row.get(capability_key) is True
+            for capability_key in _UNVERIFIED_CAPABILITY_KEYS:
+                if capability_key in _LONGCAT_VERIFIED_CAPABILITY_KEYS:
+                    continue
+                assert capability_key not in row
+        else:
+            for capability_key in _UNVERIFIED_CAPABILITY_KEYS:
+                assert capability_key not in row
         assert bundled[cost_key] == row

@@ -26377,6 +26377,7 @@
         "output_cost_per_token": 0,
         "supports_function_calling": true,
         "supports_native_streaming": true,
+        "supports_tool_choice": true,
         "unsupported_hosted_tools": [
             "custom",
             "image_generation",

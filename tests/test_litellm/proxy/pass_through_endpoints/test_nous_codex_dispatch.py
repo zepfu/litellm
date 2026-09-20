@@ -27,6 +27,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
 )
 
 _ADAPTER_MODEL = "stealth/ox-alpha"
+_LONGCAT_ADAPTER_MODEL = "meituan/longcat-2.0:free"
 _CODEX_NOUS_ROUTE_FAMILY = "codex_nous_chat_completions_adapter"
 _NOUS_CHAT_COMPLETIONS_URL = (
     "https://inference-api.nousresearch.com/v1/chat/completions"
@@ -186,6 +187,78 @@ async def test_should_reject_nous_alias_probe_stock_codex_contract_before_provid
     )
     jwt_loader.assert_not_called()
     completion.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_should_accept_nous_alias_probe_longcat_tool_choice_required(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import litellm
+    from litellm.proxy.pass_through_endpoints import (
+        llm_passthrough_endpoints as lpe,
+    )
+    from litellm.secret_managers import hermes_nous_auth
+
+    provider_error = RuntimeError("Nous provider reached after adapted preflight")
+    jwt_loader = MagicMock(return_value=_FIXTURE_JWT)
+    completion = AsyncMock(side_effect=provider_error)
+    monkeypatch.setattr(hermes_nous_auth, "load_nous_invoke_jwt", jwt_loader)
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    monkeypatch.setattr(
+        lpe,
+        "_nous_catalog_capability_info",
+        MagicMock(
+            return_value={
+                "supports_function_calling": True,
+                "supports_native_streaming": True,
+                "supports_tool_choice": True,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        lpe.BaseOpenAIPassThroughHandler,
+        "_assemble_headers",
+        MagicMock(return_value={"Authorization": f"Bearer {_FIXTURE_JWT}"}),
+    )
+    monkeypatch.setattr(
+        lpe.HttpPassThroughEndpointHelpers,
+        "validate_outgoing_egress",
+        MagicMock(),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_annotate_request_scope_for_adapted_access_log",
+        MagicMock(),
+    )
+    monkeypatch.setattr(lpe, "_emit_adapted_route_access_log", MagicMock())
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await lpe._handle_codex_nous_chat_completions_adapter_route(
+            endpoint="/v1/responses",
+            request=_request(),
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body={
+                "model": f"nous/{_LONGCAT_ADAPTER_MODEL}",
+                "input": "run date",
+                "stream": True,
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "exec_command",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+                "tool_choice": "required",
+            },
+            adapter_model=_LONGCAT_ADAPTER_MODEL,
+            use_alias_candidate_probe=True,
+        )
+
+    assert type(exc_info.value) is RuntimeError
+    assert str(exc_info.value) == str(provider_error)
+    jwt_loader.assert_called_once_with()
+    completion.assert_awaited_once()
 
 
 @pytest.mark.asyncio

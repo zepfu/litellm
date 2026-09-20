@@ -361,6 +361,96 @@ def _emit_nous_candidate_preflight_diagnostic(
         pass
 
 
+def _nous_catalog_capability_info(*, adapter_model: str) -> dict[str, Any]:
+    """Load Nous catalog capability flags without provider credential lookup."""
+    try:
+        from litellm.utils import _get_model_info_helper
+
+        model_info = _get_model_info_helper(
+            model=adapter_model,
+            custom_llm_provider="nous",
+        )
+    except Exception:
+        model_info = {}
+    if not isinstance(model_info, dict):
+        return {}
+    return model_info
+
+
+def _nous_alias_probe_unsupported_capabilities(
+    *,
+    client_requested_stream: bool,
+    requested_tools: bool,
+    requested_tool_choice: bool,
+    model_info: Mapping[str, Any],
+) -> list[str]:
+    """Return remaining unsupported capabilities on the adapted alias body."""
+    supports_streaming = model_info.get("supports_streaming")
+    if supports_streaming is None:
+        supports_streaming = model_info.get("supports_native_streaming")
+    supports_function_calling = model_info.get("supports_function_calling")
+    supports_tool_choice = model_info.get("supports_tool_choice")
+    unsupported_capabilities: list[str] = []
+    if client_requested_stream and supports_streaming is not True:
+        unsupported_capabilities.append("streaming")
+    if requested_tools and supports_function_calling is not True:
+        unsupported_capabilities.append("function_calling")
+    if requested_tool_choice and supports_tool_choice is not True:
+        unsupported_capabilities.append("tool_choice")
+    return unsupported_capabilities
+
+
+def _raise_nous_alias_probe_contract_incompatible(
+    *,
+    unsupported_capabilities: list[str],
+    request_body: Mapping[str, Any],
+) -> None:
+    """Raise tagged alias-probe ineligible before Nous JWT or provider egress."""
+    from litellm.proxy._types import ProxyException
+
+    nous_preflight_diagnostic = _build_nous_candidate_preflight_diagnostic(
+        unsupported_capabilities=unsupported_capabilities,
+        request_body=request_body,
+    )
+    _emit_nous_candidate_preflight_diagnostic(nous_preflight_diagnostic)
+    incompatibility = ValueError(
+        "Nous candidate capability metadata does not support "
+        + ", ".join(unsupported_capabilities)
+    )
+    message = (
+        "Nous auto-agent candidate is incompatible with the "
+        "requested Codex contract for the selected model."
+    )
+    exc = ProxyException(
+        message=message,
+        type="invalid_request_error",
+        param="model",
+        code=400,
+    )
+    setattr(exc, "candidate_status", "ineligible")
+    setattr(exc, "ineligibility_reason", "contract_incompatible")
+    setattr(exc, "failure_phase", "candidate_preflight")
+    setattr(exc, "attempted_provider_call", False)
+    setattr(
+        exc,
+        "nous_candidate_preflight_diagnostic",
+        nous_preflight_diagnostic,
+    )
+    setattr(
+        exc,
+        "detail",
+        {
+            "error": {
+                "message": message,
+                "code": "aawm_codex_auto_agent_candidate_ineligible",
+            },
+            "unsupported_capabilities": unsupported_capabilities,
+            "nous_candidate_preflight_diagnostic": nous_preflight_diagnostic,
+        },
+    )
+    raise exc from incompatibility
+
+
 class _CursorPostEgressOutputError(ValueError):
     """A returned Cursor payload could not be normalized after provider Run."""
 
@@ -1951,6 +2041,9 @@ _HOST_FUNCTION_NAMES = (
     "_raise_opencode_go_alias_candidate_upstream_timeout",
     "_build_nous_candidate_preflight_diagnostic",
     "_emit_nous_candidate_preflight_diagnostic",
+    "_nous_catalog_capability_info",
+    "_nous_alias_probe_unsupported_capabilities",
+    "_raise_nous_alias_probe_contract_incompatible",
     "_handle_codex_nous_chat_completions_adapter_route",
     "_consume_opencode_zen_tools_mode_header",
     "_build_opencode_zen_completion_call_kwargs",
@@ -10143,92 +10236,10 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
         return getattr(_lpe, name)
 
     client_requested_stream = bool(request_body.get("stream"))
-    requested_tools = bool(request_body.get("tools"))
     raw_tool_choice = request_body.get("tool_choice")
     nous_auto_tool_choice = (
         isinstance(raw_tool_choice, str) and raw_tool_choice == "auto"
     )
-    requested_tool_choice = (
-        raw_tool_choice is not None and not nous_auto_tool_choice
-    )
-    if use_alias_candidate_probe and (
-        client_requested_stream
-        or requested_tools
-        or requested_tool_choice
-    ):
-        from litellm.proxy._types import ProxyException
-
-        try:
-            model_info = litellm.get_model_info(
-                model=adapter_model,
-                custom_llm_provider="nous",
-            )
-        except Exception:
-            model_info = {}
-
-        if not isinstance(model_info, dict):
-            model_info = {}
-        supports_streaming = model_info.get("supports_streaming")
-        if supports_streaming is None:
-            supports_streaming = model_info.get("supports_native_streaming")
-        supports_function_calling = model_info.get("supports_function_calling")
-        supports_tool_choice = model_info.get("supports_tool_choice")
-        unsupported_capabilities = []
-        if client_requested_stream and supports_streaming is not True:
-            unsupported_capabilities.append("streaming")
-        if requested_tools and supports_function_calling is not True:
-            unsupported_capabilities.append("function_calling")
-        if requested_tool_choice and supports_tool_choice is not True:
-            unsupported_capabilities.append("tool_choice")
-
-        if unsupported_capabilities:
-            nous_preflight_diagnostic = (
-                _build_nous_candidate_preflight_diagnostic(
-                    unsupported_capabilities=unsupported_capabilities,
-                    request_body=request_body,
-                )
-            )
-            _emit_nous_candidate_preflight_diagnostic(
-                nous_preflight_diagnostic,
-            )
-            incompatibility = ValueError(
-                "Nous candidate capability metadata does not support "
-                + ", ".join(unsupported_capabilities)
-            )
-            message = (
-                "Nous auto-agent candidate is incompatible with the "
-                "requested Codex contract for the selected model."
-            )
-            exc = ProxyException(
-                message=message,
-                type="invalid_request_error",
-                param="model",
-                code=400,
-            )
-            setattr(exc, "candidate_status", "ineligible")
-            setattr(exc, "ineligibility_reason", "contract_incompatible")
-            setattr(exc, "failure_phase", "candidate_preflight")
-            setattr(exc, "attempted_provider_call", False)
-            setattr(
-                exc,
-                "nous_candidate_preflight_diagnostic",
-                nous_preflight_diagnostic,
-            )
-            setattr(
-                exc,
-                "detail",
-                {
-                    "error": {
-                        "message": message,
-                        "code": "aawm_codex_auto_agent_candidate_ineligible",
-                    },
-                    "unsupported_capabilities": unsupported_capabilities,
-                    "nous_candidate_preflight_diagnostic": (
-                        nous_preflight_diagnostic
-                    ),
-                },
-            )
-            raise exc from incompatibility
 
     canonical_request_body = _copy.deepcopy(request_body)
     if (
@@ -10299,6 +10310,34 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
     # request for provenance, but omit this optional field from provider egress.
     adapted_request_body.pop("parallel_tool_calls", None)
     request_body = adapted_request_body
+
+    if use_alias_candidate_probe:
+        client_requested_stream = bool(request_body.get("stream"))
+        requested_tools = bool(request_body.get("tools"))
+        adapted_tool_choice = request_body.get("tool_choice")
+        requested_tool_choice = (
+            adapted_tool_choice is not None
+            and not (
+                isinstance(adapted_tool_choice, str)
+                and adapted_tool_choice == "auto"
+            )
+        )
+        if client_requested_stream or requested_tools or requested_tool_choice:
+            unsupported_capabilities = (
+                _nous_alias_probe_unsupported_capabilities(
+                    client_requested_stream=client_requested_stream,
+                    requested_tools=requested_tools,
+                    requested_tool_choice=requested_tool_choice,
+                    model_info=_nous_catalog_capability_info(
+                        adapter_model=adapter_model,
+                    ),
+                )
+            )
+            if unsupported_capabilities:
+                _raise_nous_alias_probe_contract_incompatible(
+                    unsupported_capabilities=unsupported_capabilities,
+                    request_body=request_body,
+                )
 
     request_input = request_body.get("input", "")
     responses_api_request = {
