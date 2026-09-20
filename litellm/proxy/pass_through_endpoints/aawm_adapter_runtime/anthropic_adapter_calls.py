@@ -1503,14 +1503,6 @@ def _finalize_anthropic_completion_adapter_response(
     return response
 
 
-def _opencode_zen_known_free_models() -> frozenset:
-    from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen.constants import (
-        _OPENCODE_ZEN_FREE_MODELS,
-    )
-
-    return _OPENCODE_ZEN_FREE_MODELS
-
-
 def _build_anthropic_completion_adapter_handler_call_kwargs(
     *,
     prepared_request_body: Payload,
@@ -1599,6 +1591,9 @@ async def _perform_anthropic_completion_adapter_messages_call(  # noqa: PLR0915
     from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
         LiteLLMMessagesToCompletionTransformationHandler,
     )
+    from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen.constants import (
+        _OPENCODE_ZEN_FREE_MODELS,
+    )
 
     managed_xai_oauth_request = bool(
         managed_xai_oauth_request
@@ -1634,12 +1629,14 @@ async def _perform_anthropic_completion_adapter_messages_call(  # noqa: PLR0915
     # alias probes) cost exactly 0.0. Pre-seed the existing acompletion
     # logging object so stream and non-stream success preserve the zero,
     # mirroring _prepare_opencode_zen_known_free_logging on the Codex route.
+    # Nested import of _OPENCODE_ZEN_FREE_MODELS (Codex D1-574 / OC-031) so
+    # membership survives install() rebind onto llm_passthrough_endpoints.
     is_opencode_zen_known_free_direct = (
         not use_alias_candidate_probe
         and getattr(config, "route_family", None)
         == _aawm_adapter_config.OPENCODE_ZEN_COMPLETION.route_family
         and isinstance(adapter_model, str)
-        and adapter_model in _opencode_zen_known_free_models()
+        and adapter_model in _OPENCODE_ZEN_FREE_MODELS
     )
     if is_opencode_zen_known_free_direct:
         from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
