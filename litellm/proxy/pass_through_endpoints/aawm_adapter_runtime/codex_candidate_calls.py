@@ -7860,6 +7860,9 @@ def _bind_responses_stream_timeout_terminalizer(
     rollup_kwargs: dict[str, Any],
     stream_error_callback: Optional[Any] = None,
 ) -> StreamingResponse:
+    if _aawm_alias_streaming._get_stream_timeout_terminalizer(response) is not None:
+        return response
+
     finalized = False
 
     async def _terminalize(
@@ -8017,6 +8020,22 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(
     intake_context: Optional[dict[str, Any]] = None,
     request_body: Optional[dict[str, Any]] = None,
 ) -> StreamingResponse:
+    metadata: dict[str, Any] = {}
+    if isinstance(request_body, dict):
+        raw_metadata = request_body.get("litellm_metadata")
+        if isinstance(raw_metadata, dict):
+            metadata = raw_metadata
+    provider = "openrouter"
+    if isinstance(intake_context, dict) and intake_context.get("provider"):
+        provider = str(intake_context["provider"])
+    response = _bind_responses_stream_timeout_terminalizer(
+        response,
+        adapter_model=adapter_model,
+        adapter_label="OpenRouter",
+        provider=provider,
+        intake_context=intake_context,
+        rollup_kwargs=_build_adapted_route_rollup_kwargs(metadata),
+    )
     event_summaries: list[dict[str, Any]] = []
     peek = await _aawm_alias_streaming.peek_streaming_response(
         response,
@@ -8210,16 +8229,30 @@ async def _perform_codex_auto_agent_openrouter_responses_request(
         expected_target_family="openrouter",
     )
     if isinstance(response, StreamingResponse):
+        intake_context = _build_malformed_tool_call_intake_context(
+            request,
+            request_body,
+            adapter="codex_auto_agent_openrouter_responses",
+            upstream_url=str(target_url),
+            provider="openrouter",
+        )
+        metadata = (
+            request_body.get("litellm_metadata")
+            if isinstance(request_body.get("litellm_metadata"), dict)
+            else {}
+        )
+        response = _bind_responses_stream_timeout_terminalizer(
+            response,
+            adapter_model=adapter_model,
+            adapter_label="OpenRouter",
+            provider="openrouter",
+            intake_context=intake_context,
+            rollup_kwargs=_build_adapted_route_rollup_kwargs(metadata),
+        )
         return await _validate_codex_auto_agent_openrouter_responses_stream(
             response,
             adapter_model=adapter_model,
-            intake_context=_build_malformed_tool_call_intake_context(
-                request,
-                request_body,
-                adapter="codex_auto_agent_openrouter_responses",
-                upstream_url=str(target_url),
-                provider="openrouter",
-            ),
+            intake_context=intake_context,
             request_body=request_body if isinstance(request_body, dict) else None,
         )
     if isinstance(response, Response) and not isinstance(response, StreamingResponse):
