@@ -25,17 +25,25 @@ class OpenRouterRerankConfig(BaseRerankConfig):
     """
 
     @staticmethod
-    def _normalize_api_base(api_base: Optional[str]) -> str:
-        return resolve_openrouter_complete_url("rerank", api_base=api_base)
+    def _normalize_api_base(
+        api_base: Optional[str],
+        api_key: Optional[str] = None,
+    ) -> str:
+        return resolve_openrouter_complete_url(
+            "rerank",
+            api_base=api_base,
+            api_key=api_key,
+        )
 
     def get_complete_url(
         self,
         api_base: Optional[str],
         model: str,
         optional_params: Optional[dict] = None,
+        api_key: Optional[str] = None,
     ) -> str:
         _ = model, optional_params
-        return self._normalize_api_base(api_base)
+        return self._normalize_api_base(api_base, api_key=api_key)
 
     def get_supported_cohere_rerank_params(self, model: str) -> list:
         return [

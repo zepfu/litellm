@@ -52,8 +52,16 @@ class OpenRouterResponsesAPIConfig(OpenAIResponsesAPIConfig):
         api_base: Optional[str],
         litellm_params: dict,
     ) -> str:
-        _ = litellm_params
-        return resolve_openrouter_complete_url("responses", api_base=api_base)
+        api_key = None
+        if isinstance(litellm_params, dict):
+            api_key = litellm_params.get("api_key")
+        elif litellm_params is not None:
+            api_key = getattr(litellm_params, "api_key", None)
+        return resolve_openrouter_complete_url(
+            "responses",
+            api_base=api_base,
+            api_key=api_key,
+        )
 
     def supports_native_websocket(self) -> bool:
         """OpenRouter does not support native WebSocket for Responses API"""

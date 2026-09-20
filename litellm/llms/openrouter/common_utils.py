@@ -582,13 +582,20 @@ def apply_openrouter_auth_headers(
 def resolve_openrouter_complete_url(
     endpoint: str,
     api_base: Optional[str] = None,
+    api_key: Optional[str] = None,
     *,
     policy: OpenRouterResolutionPolicy = NATIVE_POLICY,
     hooks: Optional[OpenRouterSecretHooks] = None,
 ) -> str:
-    """Resolve a versioned OpenRouter endpoint URL from the shared profile."""
+    """Resolve a versioned OpenRouter endpoint URL from the shared profile.
+
+    The URL is derived from the same key+base profile that owns Authorization.
+    Passing ``api_base`` without ``api_key`` would otherwise select an env
+    namespace target while a request key is sent to that host.
+    """
 
     profile = resolve_openrouter_credential_target(
+        explicit_api_key=api_key,
         explicit_api_base=api_base,
         policy=policy,
         hooks=hooks,

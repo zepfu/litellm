@@ -145,8 +145,17 @@ class OpenRouterImageEditConfig(BaseImageEditConfig):
         api_base: Optional[str],
         litellm_params: dict,
     ) -> str:
-        _ = model, litellm_params
-        return resolve_openrouter_complete_url("chat/completions", api_base=api_base)
+        _ = model
+        api_key = None
+        if isinstance(litellm_params, dict):
+            api_key = litellm_params.get("api_key")
+        elif litellm_params is not None:
+            api_key = getattr(litellm_params, "api_key", None)
+        return resolve_openrouter_complete_url(
+            "chat/completions",
+            api_base=api_base,
+            api_key=api_key,
+        )
 
     def transform_image_edit_request(
         self,

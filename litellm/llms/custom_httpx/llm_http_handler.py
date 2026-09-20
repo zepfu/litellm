@@ -140,6 +140,25 @@ from litellm.utils import (
 
 from .http_handler import get_shared_realtime_ssl_context
 
+
+def _openrouter_responses_headers_for_validation(
+    custom_llm_provider: Optional[str],
+    headers: Dict[str, Any],
+    extra_headers: Optional[Dict[str, Any]],
+) -> Tuple[Dict[str, Any], bool]:
+    """Merge extra_headers before OpenRouter validate; skip the post-validate update.
+
+    Image edit/generation already do this so caller Authorization cannot override
+    the service-owned credential. Responses must use the same discipline.
+    """
+    if custom_llm_provider == "openrouter":
+        merged = dict(headers)
+        if extra_headers:
+            merged.update(extra_headers)
+        return merged, True
+    return headers, False
+
+
 if TYPE_CHECKING:
     from aiohttp import ClientSession
 
@@ -1239,11 +1258,19 @@ class BaseLLMHTTPHandler:
             optional_params=optional_rerank_params,
         )
 
-        api_base = provider_config.get_complete_url(
-            api_base=api_base,
-            model=model,
-            optional_params=optional_rerank_params,
-        )
+        if custom_llm_provider == "openrouter":
+            api_base = provider_config.get_complete_url(
+                api_base=api_base,
+                model=model,
+                optional_params=optional_rerank_params,
+                api_key=api_key,
+            )
+        else:
+            api_base = provider_config.get_complete_url(
+                api_base=api_base,
+                model=model,
+                optional_params=optional_rerank_params,
+            )
 
         data = provider_config.transform_rerank_request(
             model=model,
@@ -2365,13 +2392,20 @@ class BaseLLMHTTPHandler:
         else:
             sync_httpx_client = client
 
+        headers_for_validation, skip_extra_headers_update = (
+            _openrouter_responses_headers_for_validation(
+                custom_llm_provider,
+                response_api_optional_request_params.get("extra_headers", {}) or {},
+                extra_headers,
+            )
+        )
         headers = responses_api_provider_config.validate_environment(
-            headers=response_api_optional_request_params.get("extra_headers", {}) or {},
+            headers=headers_for_validation,
             model=model,
             litellm_params=litellm_params,
         )
 
-        if extra_headers:
+        if extra_headers and not skip_extra_headers_update:
             headers.update(extra_headers)
 
         # Check if streaming is requested
@@ -2555,13 +2589,20 @@ class BaseLLMHTTPHandler:
         else:
             async_httpx_client = client
 
+        headers_for_validation, skip_extra_headers_update = (
+            _openrouter_responses_headers_for_validation(
+                custom_llm_provider,
+                response_api_optional_request_params.get("extra_headers", {}) or {},
+                extra_headers,
+            )
+        )
         headers = responses_api_provider_config.validate_environment(
-            headers=response_api_optional_request_params.get("extra_headers", {}) or {},
+            headers=headers_for_validation,
             model=model,
             litellm_params=litellm_params,
         )
 
-        if extra_headers:
+        if extra_headers and not skip_extra_headers_update:
             headers.update(extra_headers)
 
         # Check if streaming is requested
@@ -2745,11 +2786,20 @@ class BaseLLMHTTPHandler:
         else:
             async_httpx_client = client
 
+        headers_for_validation, skip_extra_headers_update = (
+            _openrouter_responses_headers_for_validation(
+                custom_llm_provider,
+                extra_headers or {},
+                extra_headers,
+            )
+        )
         headers = responses_api_provider_config.validate_environment(
-            headers=extra_headers or {}, model="None", litellm_params=litellm_params
+            headers=headers_for_validation,
+            model="None",
+            litellm_params=litellm_params,
         )
 
-        if extra_headers:
+        if extra_headers and not skip_extra_headers_update:
             headers.update(extra_headers)
 
         api_base = responses_api_provider_config.get_complete_url(
@@ -2829,11 +2879,20 @@ class BaseLLMHTTPHandler:
         else:
             sync_httpx_client = client
 
+        headers_for_validation, skip_extra_headers_update = (
+            _openrouter_responses_headers_for_validation(
+                custom_llm_provider,
+                extra_headers or {},
+                extra_headers,
+            )
+        )
         headers = responses_api_provider_config.validate_environment(
-            headers=extra_headers or {}, model="None", litellm_params=litellm_params
+            headers=headers_for_validation,
+            model="None",
+            litellm_params=litellm_params,
         )
 
-        if extra_headers:
+        if extra_headers and not skip_extra_headers_update:
             headers.update(extra_headers)
 
         api_base = responses_api_provider_config.get_complete_url(
@@ -2914,11 +2973,20 @@ class BaseLLMHTTPHandler:
         else:
             sync_httpx_client = client
 
+        headers_for_validation, skip_extra_headers_update = (
+            _openrouter_responses_headers_for_validation(
+                custom_llm_provider,
+                extra_headers or {},
+                extra_headers,
+            )
+        )
         headers = responses_api_provider_config.validate_environment(
-            headers=extra_headers or {}, model="None", litellm_params=litellm_params
+            headers=headers_for_validation,
+            model="None",
+            litellm_params=litellm_params,
         )
 
-        if extra_headers:
+        if extra_headers and not skip_extra_headers_update:
             headers.update(extra_headers)
 
         api_base = responses_api_provider_config.get_complete_url(
@@ -2985,11 +3053,20 @@ class BaseLLMHTTPHandler:
         else:
             async_httpx_client = client
 
+        headers_for_validation, skip_extra_headers_update = (
+            _openrouter_responses_headers_for_validation(
+                custom_llm_provider,
+                extra_headers or {},
+                extra_headers,
+            )
+        )
         headers = responses_api_provider_config.validate_environment(
-            headers=extra_headers or {}, model="None", litellm_params=litellm_params
+            headers=headers_for_validation,
+            model="None",
+            litellm_params=litellm_params,
         )
 
-        if extra_headers:
+        if extra_headers and not skip_extra_headers_update:
             headers.update(extra_headers)
 
         api_base = responses_api_provider_config.get_complete_url(
@@ -3078,11 +3155,20 @@ class BaseLLMHTTPHandler:
         else:
             sync_httpx_client = client
 
+        headers_for_validation, skip_extra_headers_update = (
+            _openrouter_responses_headers_for_validation(
+                custom_llm_provider,
+                extra_headers or {},
+                extra_headers,
+            )
+        )
         headers = responses_api_provider_config.validate_environment(
-            headers=extra_headers or {}, model="None", litellm_params=litellm_params
+            headers=headers_for_validation,
+            model="None",
+            litellm_params=litellm_params,
         )
 
-        if extra_headers:
+        if extra_headers and not skip_extra_headers_update:
             headers.update(extra_headers)
 
         api_base = responses_api_provider_config.get_complete_url(
@@ -3151,11 +3237,20 @@ class BaseLLMHTTPHandler:
         else:
             async_httpx_client = client
 
+        headers_for_validation, skip_extra_headers_update = (
+            _openrouter_responses_headers_for_validation(
+                custom_llm_provider,
+                extra_headers or {},
+                extra_headers,
+            )
+        )
         headers = responses_api_provider_config.validate_environment(
-            headers=extra_headers or {}, model="None", litellm_params=litellm_params
+            headers=headers_for_validation,
+            model="None",
+            litellm_params=litellm_params,
         )
 
-        if extra_headers:
+        if extra_headers and not skip_extra_headers_update:
             headers.update(extra_headers)
 
         api_base = responses_api_provider_config.get_complete_url(
@@ -3977,11 +4072,20 @@ class BaseLLMHTTPHandler:
         else:
             sync_httpx_client = client
 
+        headers_for_validation, skip_extra_headers_update = (
+            _openrouter_responses_headers_for_validation(
+                custom_llm_provider,
+                extra_headers or {},
+                extra_headers,
+            )
+        )
         headers = responses_api_provider_config.validate_environment(
-            headers=extra_headers or {}, model="None", litellm_params=litellm_params
+            headers=headers_for_validation,
+            model="None",
+            litellm_params=litellm_params,
         )
 
-        if extra_headers:
+        if extra_headers and not skip_extra_headers_update:
             headers.update(extra_headers)
 
         api_base = responses_api_provider_config.get_complete_url(
@@ -4053,11 +4157,20 @@ class BaseLLMHTTPHandler:
         else:
             async_httpx_client = client
 
+        headers_for_validation, skip_extra_headers_update = (
+            _openrouter_responses_headers_for_validation(
+                custom_llm_provider,
+                extra_headers or {},
+                extra_headers,
+            )
+        )
         headers = responses_api_provider_config.validate_environment(
-            headers=extra_headers or {}, model="None", litellm_params=litellm_params
+            headers=headers_for_validation,
+            model="None",
+            litellm_params=litellm_params,
         )
 
-        if extra_headers:
+        if extra_headers and not skip_extra_headers_update:
             headers.update(extra_headers)
 
         api_base = responses_api_provider_config.get_complete_url(
@@ -4140,11 +4253,20 @@ class BaseLLMHTTPHandler:
         else:
             sync_httpx_client = client
 
+        headers_for_validation, skip_extra_headers_update = (
+            _openrouter_responses_headers_for_validation(
+                custom_llm_provider,
+                extra_headers or {},
+                extra_headers,
+            )
+        )
         headers = responses_api_provider_config.validate_environment(
-            headers=extra_headers or {}, model=model, litellm_params=litellm_params
+            headers=headers_for_validation,
+            model=model,
+            litellm_params=litellm_params,
         )
 
-        if extra_headers:
+        if extra_headers and not skip_extra_headers_update:
             headers.update(extra_headers)
 
         api_base = responses_api_provider_config.get_complete_url(
@@ -4222,11 +4344,20 @@ class BaseLLMHTTPHandler:
         else:
             async_httpx_client = client
 
+        headers_for_validation, skip_extra_headers_update = (
+            _openrouter_responses_headers_for_validation(
+                custom_llm_provider,
+                extra_headers or {},
+                extra_headers,
+            )
+        )
         headers = responses_api_provider_config.validate_environment(
-            headers=extra_headers or {}, model=model, litellm_params=litellm_params
+            headers=headers_for_validation,
+            model=model,
+            litellm_params=litellm_params,
         )
 
-        if extra_headers:
+        if extra_headers and not skip_extra_headers_update:
             headers.update(extra_headers)
 
         api_base = responses_api_provider_config.get_complete_url(

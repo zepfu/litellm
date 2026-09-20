@@ -92,8 +92,14 @@ class OpenrouterConfig(OpenAIGPTConfig):
         litellm_params: dict,
         stream: Optional[bool] = None,
     ) -> str:
-        _ = api_key, model, optional_params, litellm_params, stream
-        return resolve_openrouter_complete_url("chat/completions", api_base=api_base)
+        _ = model, optional_params, stream
+        if api_key is None and isinstance(litellm_params, dict):
+            api_key = litellm_params.get("api_key")
+        return resolve_openrouter_complete_url(
+            "chat/completions",
+            api_base=api_base,
+            api_key=api_key,
+        )
 
     def get_supported_openai_params(self, model: str) -> list:
         """
