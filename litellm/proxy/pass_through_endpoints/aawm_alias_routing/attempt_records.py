@@ -957,6 +957,7 @@ def _record_auto_agent_alias_attempt_failure(
     _stamp_auto_agent_alias_request_identity(request=request, target=audit_event)
     if defer_terminal_error:
         audit_event["_aawm_terminal_error_already_emitted"] = True
+    _stamp_openrouter_inner_send_fields(audit_event, attempt_record)
     if _is_auto_agent_alias_skipped_audit_event(audit_event):
         _emit_auto_agent_alias_skipped_events_once(
             request=request,
@@ -1072,6 +1073,7 @@ def _record_auto_agent_alias_attempt_success(
     audit_event["request_outcome"] = "recovered" if recovered else "success"
     audit_event["attempts"] = copy.deepcopy(attempts)
     audit_event["attempt_count"] = _provider_attempt_count(attempts)
+    _stamp_openrouter_inner_send_fields(audit_event, attempt_record)
     audit_event["session_owner_continuity_receipt"] = selection.get(
         "session_owner_continuity_receipt"
     )
@@ -1089,6 +1091,97 @@ def _record_auto_agent_alias_attempt_success(
         )
     _emit_auto_agent_alias_route_event(audit_event)
     return success_body
+
+
+def _append_openrouter_inner_subattempt(
+    attempt_record: dict[str, Any],
+    *,
+    inner_attempt: int,
+    status: str,
+    disposition: str,
+    delay_seconds: Optional[float] = None,
+    cooldown_seconds: Optional[float] = None,
+    error_status_code: Optional[int] = None,
+    failure_class: Optional[str] = None,
+    attempted_provider_call: bool = True,
+) -> dict[str, Any]:
+    """Record one inner OpenRouter send on the outer alias attempt.
+
+    Nested subattempts keep the candidate-loop parent as one outer attempt so
+    quota/accepted-call accounting is not double-counted, while every wire
+    call remains observable with status, delay, cooldown, and disposition.
+    """
+    subattempts = attempt_record.get("subattempts")
+    if not isinstance(subattempts, list):
+        subattempts = []
+        attempt_record["subattempts"] = subattempts
+    payload: dict[str, Any] = {
+        "inner_attempt": inner_attempt,
+        "status": status,
+        "disposition": disposition,
+        "attempted_provider_call": attempted_provider_call,
+    }
+    if delay_seconds is not None:
+        payload["delay_seconds"] = round(float(delay_seconds), 3)
+        payload["wait_seconds"] = payload["delay_seconds"]
+    if cooldown_seconds is not None:
+        payload["cooldown_seconds"] = round(float(cooldown_seconds), 3)
+    if error_status_code is not None:
+        payload["error_status_code"] = error_status_code
+    if failure_class is not None:
+        payload["failure_class"] = failure_class
+    if subattempts and subattempts[-1].get("inner_attempt") == inner_attempt:
+        subattempts[-1].update(payload)
+        current = subattempts[-1]
+    else:
+        subattempts.append(payload)
+        current = payload
+    wire_count = sum(
+        1
+        for subattempt in subattempts
+        if isinstance(subattempt, Mapping)
+        and subattempt.get("attempted_provider_call") is not False
+    )
+    attempt_record["subattempt_count"] = len(subattempts)
+    attempt_record["logical_provider_send_count"] = wire_count
+    attempt_record["hidden_logical_retry_count"] = max(0, wire_count - 1)
+    return current
+
+
+def _stamp_openrouter_inner_send_fields(
+    target: dict[str, Any],
+    attempt_record: Mapping[str, Any],
+) -> None:
+    if not attempt_record.get("subattempts"):
+        return
+    target["subattempts"] = copy.deepcopy(attempt_record["subattempts"])
+    target["subattempt_count"] = attempt_record.get("subattempt_count")
+    target["logical_provider_send_count"] = attempt_record.get(
+        "logical_provider_send_count"
+    )
+    target["hidden_logical_retry_count"] = attempt_record.get(
+        "hidden_logical_retry_count"
+    )
+
+
+def bind_openrouter_inner_send_sink(attempt_record: dict[str, Any]) -> object:
+    """Bind the current alias attempt as the OpenRouter inner-send sink."""
+    from litellm.llms.anthropic.experimental_pass_through.providers.openrouter import (
+        retry_transport as _openrouter_retry_transport,
+    )
+
+    def _sink(**payload: Any) -> dict[str, Any]:
+        return _append_openrouter_inner_subattempt(attempt_record, **payload)
+
+    return _openrouter_retry_transport.bind_inner_send_sink(_sink)
+
+
+def reset_openrouter_inner_send_sink(token: Any) -> None:
+    from litellm.llms.anthropic.experimental_pass_through.providers.openrouter import (
+        retry_transport as _openrouter_retry_transport,
+    )
+
+    _openrouter_retry_transport.reset_inner_send_sink(token)
 
 
 # ---------------------------------------------------------------------------

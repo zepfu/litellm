@@ -15,7 +15,8 @@ from ..common import reject_raw_mcp_tools
 
 
 class RaiseCandidateUnavailable(Protocol):
-    def __call__(self, detail: object) -> NoReturn: ...
+    def __call__(self, detail: object) -> NoReturn:
+        ...
 
 
 @dataclass(frozen=True)
@@ -87,9 +88,7 @@ async def prepare_responses_route(
     if parallel_changes:
         runtime.log_debug(
             "Applied OpenRouter adapter parallel instruction policy; tools=%s",
-            parallel_changes.get(
-                "openrouter_adapter_parallel_instruction_tool_names"
-            ),
+            parallel_changes.get("openrouter_adapter_parallel_instruction_tool_names"),
         )
     translated_request_body, _forced_changes = runtime.apply_forced_tool_choice(
         prepared_request_body,
@@ -159,7 +158,9 @@ async def prepare_completion_route(
     _ = request
     config = adapter_config.OPENROUTER_COMPLETION
     client_requested_stream = bool(prepared_request_body.get("stream"))
-    upstream_adapter_model = runtime.get_completion_model(adapter_model) or adapter_model
+    upstream_adapter_model = (
+        runtime.get_completion_model(adapter_model) or adapter_model
+    )
     prepared_request_body = runtime.prepare_completion_body(
         prepared_request_body,
         adapter_model=adapter_model,
@@ -214,6 +215,10 @@ async def prepare_completion_route(
             "custom_llm_provider": runtime.provider,
             "model_for_upstream": upstream_adapter_model,
             "operation_wrapper": operation_wrapper,
-            "extra_handler_kwargs": {"headers": runtime.build_default_headers()},
+            "max_retries": 0,
+            "extra_handler_kwargs": {
+                "headers": runtime.build_default_headers(),
+                "num_retries": 0,
+            },
         },
     )

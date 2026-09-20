@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from typing import (
     Any,
@@ -45,6 +46,23 @@ from .error_shape import (
 )
 
 RetryResultT = TypeVar("RetryResultT")
+InnerSendSink = Callable[..., None]
+
+_INNER_SEND_SINK: ContextVar[Optional[InnerSendSink]] = ContextVar(
+    "aawm_openrouter_inner_send_sink",
+    default=None,
+)
+
+
+def bind_inner_send_sink(
+    callback: Optional[InnerSendSink],
+) -> Token[Optional[InnerSendSink]]:
+    """Bind a per-task sink that receives every inner OpenRouter send."""
+    return _INNER_SEND_SINK.set(callback)
+
+
+def reset_inner_send_sink(token: Token[Optional[InnerSendSink]]) -> None:
+    _INNER_SEND_SINK.reset(token)
 
 
 @dataclass(frozen=True)
@@ -80,6 +98,24 @@ class Runtime:
     getenv: Callable[[str], Optional[str]]
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     monotonic: Callable[[], float] = time.monotonic
+
+
+def _emit_inner_send(
+    runtime: Runtime,
+    **payload: Any,
+) -> None:
+    callback = _INNER_SEND_SINK.get()
+    if callback is None:
+        return
+    try:
+        callback(**payload)
+    except Exception:
+        runtime.log_debug(
+            "OpenRouter inner-send sink failed for attempt=%s disposition=%s",
+            payload.get("inner_attempt"),
+            payload.get("disposition"),
+            exc_info=True,
+        )
 
 
 def get_rate_limit_key(runtime: Runtime, model: Optional[str]) -> str:
@@ -510,6 +546,161 @@ async def set_cooldown(
     )
 
 
+async def _retry_loop_on_failure(
+    runtime: Runtime,
+    exc: Exception,
+    *,
+    attempt: int,
+    adapter_model: Optional[str],
+    attempt_label: str,
+    log_warnings: bool,
+    use_alias_candidate_probe: bool,
+    hidden_retry_budget_seconds: float,
+    accumulated_hidden_wait_seconds: float,
+    total_attempts: int,
+) -> tuple[bool, float]:
+    """Return (should_retry, updated_hidden_wait_seconds)."""
+    status_code = extract_exception_status_code(runtime, exc)
+    provider_name = extract_provider_name(runtime, exc)
+    raw_message = extract_raw_message(runtime, exc)
+    reset_wait_seconds = extract_reset_wait_seconds(runtime, exc)
+    is_long_window = is_long_window_rate_limit(
+        runtime,
+        exc,
+        hidden_retry_budget_seconds=hidden_retry_budget_seconds,
+    )
+    wait_seconds = get_retry_wait_seconds(runtime, exc, attempt)
+    provider_wait_seconds = _provider_retry_wait_seconds(runtime, exc)
+    (
+        projected_hidden_wait_seconds,
+        within_hidden_budget,
+    ) = retry.projected_hidden_retry_within_budget(
+        accumulated_hidden_wait_seconds=accumulated_hidden_wait_seconds,
+        next_wait_seconds=wait_seconds,
+        hidden_retry_budget_seconds=hidden_retry_budget_seconds,
+    )
+    retries_exhausted = attempt >= total_attempts
+    delay_budget_exhausted = (
+        hidden_retry_budget_seconds > 0
+        and provider_wait_seconds is not None
+        and not within_hidden_budget
+    )
+    if status_code == 429 and is_long_window:
+        cooldown_seconds = min(max(reset_wait_seconds or 0.0, 30.0), 300.0)
+        if log_warnings:
+            runtime.log_warning(
+                "%s upstream attempt %s hit long-window 429 "
+                "(%s, provider=%s, raw=%s, reset_wait=%.1fs) "
+                "and will not be hidden-retried",
+                attempt_label,
+                attempt,
+                exc.__class__.__name__,
+                provider_name,
+                raw_message,
+                reset_wait_seconds or 0.0,
+            )
+        await runtime.set_cooldown_callback(
+            get_cooldown_keys(runtime, model=adapter_model, exc=exc),
+            cooldown_seconds,
+        )
+        await runtime.open_failure_circuit_callback(adapter_model, exc=exc)
+        _emit_inner_send(
+            runtime,
+            inner_attempt=attempt,
+            status="terminal",
+            disposition="long_window_rate_limit",
+            delay_seconds=0.0,
+            cooldown_seconds=cooldown_seconds,
+            error_status_code=status_code,
+            failure_class="long_window_rate_limit",
+            attempted_provider_call=True,
+        )
+        return False, accumulated_hidden_wait_seconds
+    try:
+        maybe_raise_alias_probe_retired_ox_alpha_unavailable(
+            runtime,
+            exc,
+            adapter_model=adapter_model,
+            use_alias_candidate_probe=use_alias_candidate_probe,
+            status_code=status_code,
+            raw_message=raw_message,
+        )
+        maybe_raise_alias_probe_no_endpoint_unavailable(
+            runtime,
+            exc,
+            adapter_model=adapter_model,
+            use_alias_candidate_probe=use_alias_candidate_probe,
+            status_code=status_code,
+            raw_message=raw_message,
+        )
+    except Exception as probe_exc:
+        _emit_inner_send(
+            runtime,
+            inner_attempt=attempt,
+            status="terminal",
+            disposition="candidate_unavailable",
+            delay_seconds=0.0,
+            cooldown_seconds=0.0,
+            error_status_code=status_code,
+            failure_class=probe_exc.__class__.__name__,
+            attempted_provider_call=True,
+        )
+        raise
+    if status_code != 429 or retries_exhausted or delay_budget_exhausted:
+        if log_warnings:
+            runtime.log_warning(
+                "%s upstream attempt %s failed with %s "
+                "(%s, provider=%s, raw=%s) and will not be retried",
+                attempt_label,
+                attempt,
+                status_code,
+                exc.__class__.__name__,
+                provider_name,
+                raw_message,
+            )
+        if status_code == 429:
+            await runtime.open_failure_circuit_callback(adapter_model, exc=exc)
+        _emit_inner_send(
+            runtime,
+            inner_attempt=attempt,
+            status="terminal",
+            disposition="terminal",
+            delay_seconds=0.0,
+            cooldown_seconds=None,
+            error_status_code=status_code,
+            failure_class=exc.__class__.__name__,
+            attempted_provider_call=True,
+        )
+        return False, accumulated_hidden_wait_seconds
+    if log_warnings:
+        runtime.log_warning(
+            "%s upstream attempt %s hit 429 "
+            "(%s, provider=%s, raw=%s); backoff %.1fs",
+            attempt_label,
+            attempt,
+            exc.__class__.__name__,
+            provider_name,
+            raw_message,
+            wait_seconds,
+        )
+    await runtime.set_cooldown_callback(
+        get_cooldown_keys(runtime, model=adapter_model, exc=exc),
+        wait_seconds,
+    )
+    _emit_inner_send(
+        runtime,
+        inner_attempt=attempt,
+        status="retrying",
+        disposition="retry_backoff",
+        delay_seconds=wait_seconds,
+        cooldown_seconds=wait_seconds,
+        error_status_code=status_code,
+        failure_class="rate_limited",
+        attempted_provider_call=True,
+    )
+    return True, projected_hidden_wait_seconds
+
+
 async def run_retry_loop(
     runtime: Runtime,
     *,
@@ -540,8 +731,10 @@ async def run_retry_loop(
         use_alias_candidate_probe=use_alias_candidate_probe,
     )
     await runtime.maybe_raise_failure_circuit_open_callback(adapter_model)
+    current_attempt = 0
 
     async def _before_attempt(attempt: int) -> None:
+        nonlocal current_attempt
         runtime.log_debug(
             "%s upstream attempt %s/%s for model=%s",
             attempt_label,
@@ -554,113 +747,66 @@ async def run_retry_loop(
             adapter_model=adapter_model,
             use_alias_candidate_probe=use_alias_candidate_probe,
         )
+        current_attempt = attempt
+        _emit_inner_send(
+            runtime,
+            inner_attempt=attempt,
+            status="in_flight",
+            disposition="started",
+            attempted_provider_call=True,
+        )
 
-    async def _on_success(_result: RetryResultT, _attempt: int) -> None:
+    async def _on_success(_result: RetryResultT, attempt: int) -> None:
         # OR-034: lazy stream construction is not provider success.  Callers
         # that return lazy streams pass clear_on_success=False and apply the
         # validated boundary themselves (_finalize_circuit_success_boundary);
         # nonstream/transport callers keep the eager validated clear here.
         if clear_on_success:
             runtime.clear_failure_circuit_callback(adapter_model)
+        _emit_inner_send(
+            runtime,
+            inner_attempt=attempt,
+            status="succeeded",
+            disposition="succeeded",
+            delay_seconds=0.0,
+            cooldown_seconds=0.0,
+            attempted_provider_call=True,
+        )
 
     async def _on_failure(exc: Exception, attempt: int) -> bool:
         nonlocal accumulated_hidden_wait_seconds
-        status_code = extract_exception_status_code(runtime, exc)
-        provider_name = extract_provider_name(runtime, exc)
-        raw_message = extract_raw_message(runtime, exc)
-        reset_wait_seconds = extract_reset_wait_seconds(runtime, exc)
-        is_long_window = is_long_window_rate_limit(
+        should_retry, accumulated_hidden_wait_seconds = await _retry_loop_on_failure(
             runtime,
             exc,
+            attempt=attempt,
+            adapter_model=adapter_model,
+            attempt_label=attempt_label,
+            log_warnings=log_warnings,
+            use_alias_candidate_probe=use_alias_candidate_probe,
             hidden_retry_budget_seconds=hidden_retry_budget_seconds,
-        )
-        wait_seconds = get_retry_wait_seconds(runtime, exc, attempt)
-        provider_wait_seconds = _provider_retry_wait_seconds(runtime, exc)
-        (
-            projected_hidden_wait_seconds,
-            within_hidden_budget,
-        ) = retry.projected_hidden_retry_within_budget(
             accumulated_hidden_wait_seconds=accumulated_hidden_wait_seconds,
-            next_wait_seconds=wait_seconds,
-            hidden_retry_budget_seconds=hidden_retry_budget_seconds,
+            total_attempts=total_attempts,
         )
-        retries_exhausted = attempt >= total_attempts
-        delay_budget_exhausted = (
-            hidden_retry_budget_seconds > 0
-            and provider_wait_seconds is not None
-            and not within_hidden_budget
-        )
-        if status_code == 429 and is_long_window:
-            cooldown_seconds = min(max(reset_wait_seconds or 0.0, 30.0), 300.0)
-            if log_warnings:
-                runtime.log_warning(
-                    "%s upstream attempt %s hit long-window 429 "
-                    "(%s, provider=%s, raw=%s, reset_wait=%.1fs) "
-                    "and will not be hidden-retried",
-                    attempt_label,
-                    attempt,
-                    exc.__class__.__name__,
-                    provider_name,
-                    raw_message,
-                    reset_wait_seconds or 0.0,
+        return should_retry
+
+    async def _observed_operation() -> RetryResultT:
+        try:
+            return await operation()
+        except asyncio.CancelledError:
+            if current_attempt > 0:
+                _emit_inner_send(
+                    runtime,
+                    inner_attempt=current_attempt,
+                    status="cancelled",
+                    disposition="cancelled",
+                    delay_seconds=0.0,
+                    cooldown_seconds=0.0,
+                    attempted_provider_call=True,
                 )
-            await runtime.set_cooldown_callback(
-                get_cooldown_keys(runtime, model=adapter_model, exc=exc),
-                cooldown_seconds,
-            )
-            await runtime.open_failure_circuit_callback(adapter_model, exc=exc)
-            return False
-        maybe_raise_alias_probe_retired_ox_alpha_unavailable(
-            runtime,
-            exc,
-            adapter_model=adapter_model,
-            use_alias_candidate_probe=use_alias_candidate_probe,
-            status_code=status_code,
-            raw_message=raw_message,
-        )
-        maybe_raise_alias_probe_no_endpoint_unavailable(
-            runtime,
-            exc,
-            adapter_model=adapter_model,
-            use_alias_candidate_probe=use_alias_candidate_probe,
-            status_code=status_code,
-            raw_message=raw_message,
-        )
-        if status_code != 429 or retries_exhausted or delay_budget_exhausted:
-            if log_warnings:
-                runtime.log_warning(
-                    "%s upstream attempt %s failed with %s "
-                    "(%s, provider=%s, raw=%s) and will not be retried",
-                    attempt_label,
-                    attempt,
-                    status_code,
-                    exc.__class__.__name__,
-                    provider_name,
-                    raw_message,
-                )
-            if status_code == 429:
-                await runtime.open_failure_circuit_callback(adapter_model, exc=exc)
-            return False
-        if log_warnings:
-            runtime.log_warning(
-                "%s upstream attempt %s hit 429 "
-                "(%s, provider=%s, raw=%s); backoff %.1fs",
-                attempt_label,
-                attempt,
-                exc.__class__.__name__,
-                provider_name,
-                raw_message,
-                wait_seconds,
-            )
-        accumulated_hidden_wait_seconds = projected_hidden_wait_seconds
-        await runtime.set_cooldown_callback(
-            get_cooldown_keys(runtime, model=adapter_model, exc=exc),
-            wait_seconds,
-        )
-        return True
+            raise
 
     return await retry.run_adapter_retry_policy(
-        operation,
+        _observed_operation,
         policy=retry.AdapterRetryPolicy(
             before_attempt=_before_attempt,
             on_failure=_on_failure,
@@ -870,6 +1016,7 @@ async def perform_pass_through_request(
 
 __all__ = [
     "Runtime",
+    "bind_inner_send_sink",
     "clear_failure_circuit",
     "_finalize_circuit_success_boundary",
     "_ValidatedStreamCircuitBoundary",
@@ -900,6 +1047,7 @@ __all__ = [
     "open_failure_circuit",
     "perform_completion_operation",
     "perform_pass_through_request",
+    "reset_inner_send_sink",
     "run_retry_loop",
     "set_cooldown",
     "wait_for_cooldown_if_needed",

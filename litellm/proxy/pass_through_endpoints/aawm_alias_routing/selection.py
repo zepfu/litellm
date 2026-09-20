@@ -931,6 +931,10 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
         "attempt_count",
         "quota_balancing",
         "selection_diagnostics",
+        "subattempts",
+        "subattempt_count",
+        "logical_provider_send_count",
+        "hidden_logical_retry_count",
     )
 
     def _apply_skip_overlay(

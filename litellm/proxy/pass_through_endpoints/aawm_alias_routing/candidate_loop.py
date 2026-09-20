@@ -90,6 +90,7 @@ from .interfaces import (
     ResolveCooldownPublicationFn,
 )
 from .durable import get_aawm_alias_routing_state_namespace
+from .policy import CODEX_AUTO_AGENT_OPENROUTER_PROVIDER
 from .pre_commit_retry import (
     ClientDisconnectedCancellation,
     OpenAIAlphaCapacityRetryBudget,
@@ -3683,6 +3684,16 @@ async def handle_alias_route(  # noqa: PLR0915
                             attempts.append(attempt_record)
                             attempt_record["attempted_provider_call"] = False
                             attempted_provider_call = False
+                            openrouter_sink_token = None
+                            if (
+                                str(candidate.get("provider") or "").strip().lower()
+                                == CODEX_AUTO_AGENT_OPENROUTER_PROVIDER
+                            ):
+                                openrouter_sink_token = (
+                                    _attempt_records.bind_openrouter_inner_send_sink(
+                                        attempt_record
+                                    )
+                                )
                             perform_exc: Optional[BaseException] = None
                             try:
                                 response = await perform_candidate_request_fn(
@@ -3691,7 +3702,11 @@ async def handle_alias_route(  # noqa: PLR0915
                                 )
                             except BaseException as caught_exc:
                                 perform_exc = caught_exc
-                                if isinstance(caught_exc, Exception):
+                                if (
+                                    isinstance(caught_exc, Exception)
+                                    and "hidden_logical_retry_count"
+                                    not in attempt_record
+                                ):
                                     attempt_record[
                                         "hidden_logical_retry_count"
                                     ] = getattr(
@@ -3705,6 +3720,10 @@ async def handle_alias_route(  # noqa: PLR0915
                                     )
                                 raise
                             finally:
+                                if openrouter_sink_token is not None:
+                                    _attempt_records.reset_openrouter_inner_send_sink(
+                                        openrouter_sink_token
+                                    )
                                 if request_ledger is None and candidate_is_openai:
                                     request_ledger = (
                                         get_request_provider_call_ledger(request)
