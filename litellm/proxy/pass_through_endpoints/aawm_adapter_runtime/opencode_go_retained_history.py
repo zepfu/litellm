@@ -27,6 +27,7 @@ from litellm.responses.litellm_completion_transformation.session_handler import 
 _GO_ROUTE_FAMILY = "codex_opencode_go_adapter"
 _GO_API_BASE_MARKERS = ("/zen/go/",)
 _OPENAI_API_BASE_MARKERS = ("api.openai.com",)
+_ANTHROPIC_API_BASE_MARKERS = ("api.anthropic.com",)
 _FAILURE_PHASE = "opencode_go_retained_history"
 
 _UNKNOWN_MESSAGE = "OpenCode Go previous_response_id was not found."
@@ -243,6 +244,38 @@ def _first_token(mapping: Mapping[str, Any], keys: Sequence[str]) -> Optional[st
     return None
 
 
+def _tokens_from_mappings(
+    *mappings: Mapping[str, Any],
+    keys: Sequence[str],
+) -> list[str]:
+    tokens: list[str] = []
+    for mapping in mappings:
+        if not isinstance(mapping, Mapping):
+            continue
+        token = _first_token(mapping, keys)
+        if token is not None:
+            tokens.append(token)
+    return tokens
+
+
+def _collapse_identity_kind(tokens: Sequence[str]) -> Optional[str]:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        if token not in seen:
+            seen.add(token)
+            unique.append(token)
+    if len(unique) > 1:
+        _raise_retained_history_rejection(
+            message=_CROSS_OWNER_MESSAGE,
+            status_code=409,
+            reason="cross_account_history",
+        )
+    if not unique:
+        return None
+    return unique[0]
+
+
 def _content_key(value: Any) -> str:
     if value is None:
         return ""
@@ -287,13 +320,18 @@ def _spend_log_is_opencode_go(spend_log: Mapping[str, Any]) -> bool:
     has_openai_origin = any(
         marker in api_base for marker in _OPENAI_API_BASE_MARKERS
     )
+    has_anthropic_origin = any(
+        marker in api_base for marker in _ANTHROPIC_API_BASE_MARKERS
+    )
     if has_go_destination:
         return True
-    if has_openai_origin:
+    if has_openai_origin or has_anthropic_origin:
         return False
     provider = str(spend_log.get("custom_llm_provider") or "").strip().lower()
     if provider == OPENCODE_GO_PROVIDER:
         return True
+    if provider:
+        return False
     metadata = _metadata_mapping(spend_log.get("metadata"))
     route_family = str(
         metadata.get("route_family") or metadata.get("aawm_route_family") or ""
@@ -314,16 +352,15 @@ def _spend_log_is_opencode_go(spend_log: Mapping[str, Any]) -> bool:
 def _identity_from_mappings(
     *mappings: Mapping[str, Any],
 ) -> tuple[Optional[str], Optional[str], Optional[str]]:
-    account_hash: Optional[str] = None
-    account_lane: Optional[str] = None
-    user_key: Optional[str] = None
-    for mapping in mappings:
-        if account_hash is None:
-            account_hash = _first_token(mapping, _ACCOUNT_HASH_KEYS)
-        if account_lane is None:
-            account_lane = _first_token(mapping, _ACCOUNT_LANE_KEYS)
-        if user_key is None:
-            user_key = _first_token(mapping, _USER_KEY_KEYS)
+    account_hash = _collapse_identity_kind(
+        _tokens_from_mappings(*mappings, keys=_ACCOUNT_HASH_KEYS)
+    )
+    account_lane = _collapse_identity_kind(
+        _tokens_from_mappings(*mappings, keys=_ACCOUNT_LANE_KEYS)
+    )
+    user_key = _collapse_identity_kind(
+        _tokens_from_mappings(*mappings, keys=_USER_KEY_KEYS)
+    )
     return account_hash, account_lane, user_key
 
 
@@ -336,17 +373,17 @@ def _spend_log_owner_identity(
         spend_log.get("proxy_server_request")
     )
     proxy_meta = _metadata_mapping(proxy.get("litellm_metadata"))
-    account_hash, account_lane, user_key = _identity_from_mappings(
+    persisted_key: dict[str, Any] = {}
+    api_key = _account_token(spend_log.get("api_key"))
+    if api_key is not None:
+        persisted_key["user_api_key"] = api_key
+    return _identity_from_mappings(
         proxy_meta,
         nested,
         metadata,
         spend_log,
+        persisted_key,
     )
-    if user_key is None:
-        user_key = _account_token(spend_log.get("api_key")) or _account_token(
-            metadata.get("user_api_key")
-        )
-    return account_hash, account_lane, user_key
 
 
 def _current_owner_identity(
@@ -378,6 +415,9 @@ def _current_owner_identity(
             token = _account_token(getattr(user_api_key_dict, attr, None))
             if token is not None and dest not in dict_identity:
                 dict_identity[dest] = token
+    # Preserve current-account-versus-lease before request metadata can
+    # collapse one side of a same-kind conflict.
+    _identity_from_mappings(current_account, lease_attrs)
     account_hash, account_lane, user_key = _identity_from_mappings(
         current_account,
         lease_attrs,
@@ -485,9 +525,20 @@ def _validate_lossless_content(content: Any) -> None:
             _raise_unsupported_retained_history()
 
 
+def _instruction_content_for_validation(value: Any) -> Any:
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return value
+    if isinstance(value, Mapping):
+        return [value]
+    return value
+
+
 def _instructions_text(value: Any) -> Optional[str]:
     if value is None:
         return None
+    _validate_lossless_content(_instruction_content_for_validation(value))
     if isinstance(value, str):
         return value if value else None
     if isinstance(value, list):
@@ -501,7 +552,12 @@ def _instructions_text(value: Any) -> Optional[str]:
                     parts.append(text)
         combined = "\n".join(parts)
         return combined or None
-    return _content_key(value) or None
+    if isinstance(value, Mapping):
+        text = value.get("text")
+        if isinstance(text, str) and text:
+            return text
+        return None
+    _raise_unsupported_retained_history()
 
 
 def _merge_instructions(*values: Optional[str]) -> Optional[str]:
@@ -613,11 +669,46 @@ def _chat_content_from_native_content(content: Any) -> Any:
     return chat_blocks
 
 
+def _function_call_canonical_id(mapping: Mapping[str, Any]) -> Optional[str]:
+    call_id = _exact_tool_id(mapping.get("call_id"))
+    if call_id is not None:
+        return call_id
+    return _exact_tool_id(mapping.get("id"))
+
+
+def _function_call_output_canonical_id(mapping: Mapping[str, Any]) -> Optional[str]:
+    call_id = _exact_tool_id(mapping.get("call_id"))
+    if call_id is not None:
+        return call_id
+    return _exact_tool_id(mapping.get("tool_call_id"))
+
+
+def _canonicalize_function_call_item(mapping: Mapping[str, Any]) -> dict[str, Any]:
+    item = _clone_item(mapping)
+    if not isinstance(item, dict):
+        item = dict(mapping)
+    item["type"] = "function_call"
+    call_id = _function_call_canonical_id(item)
+    item["call_id"] = call_id if call_id is not None else ""
+    return item
+
+
+def _canonicalize_function_call_output_item(mapping: Mapping[str, Any]) -> dict[str, Any]:
+    item = _clone_item(mapping)
+    if not isinstance(item, dict):
+        item = dict(mapping)
+    item["type"] = "function_call_output"
+    call_id = _function_call_output_canonical_id(item)
+    item["call_id"] = call_id if call_id is not None else ""
+    if "output" not in item:
+        output = item.get("content")
+        item["output"] = output if output is not None else ""
+    return item
+
+
 def _tool_call_payload(tool_call: Any) -> tuple[str, str, str]:
     mapping = _as_message_mapping(tool_call)
-    call_id = _exact_tool_id(mapping.get("id"))
-    if call_id is None:
-        call_id = _exact_tool_id(mapping.get("call_id")) or ""
+    call_id = _function_call_canonical_id(mapping) or ""
     function = mapping.get("function")
     function_map = function if isinstance(function, Mapping) else {}
     name = function_map.get("name")
@@ -653,9 +744,6 @@ def _native_items_from_assistant_chat(message: Mapping[str, Any]) -> list[dict[s
         return items
     for tool_call in raw_calls:
         mapping = _as_message_mapping(tool_call)
-        call_id = _exact_tool_id(mapping.get("id"))
-        if call_id is None:
-            call_id = _exact_tool_id(mapping.get("call_id"))
         function = mapping.get("function")
         function_map = function if isinstance(function, Mapping) else {}
         name = function_map.get("name")
@@ -665,12 +753,15 @@ def _native_items_from_assistant_chat(message: Mapping[str, Any]) -> list[dict[s
         if arguments is None:
             arguments = mapping.get("arguments")
         items.append(
-            {
-                "type": "function_call",
-                "call_id": call_id if call_id is not None else "",
-                "name": name or "",
-                "arguments": arguments if arguments is not None else "",
-            }
+            _canonicalize_function_call_item(
+                {
+                    "type": "function_call",
+                    "call_id": _function_call_canonical_id(mapping),
+                    "id": mapping.get("id"),
+                    "name": name or "",
+                    "arguments": arguments if arguments is not None else "",
+                }
+            )
         )
     return items
 
@@ -691,22 +782,22 @@ def _native_items_from_chat_messages(messages: Sequence[Any]) -> tuple[list[dict
             )
             continue
         if role_name == "tool" or item_type == "function_call_output":
-            call_id = _exact_tool_id(mapping.get("tool_call_id"))
-            if call_id is None:
-                call_id = _exact_tool_id(mapping.get("call_id"))
             output = mapping.get("content")
             if output is None:
                 output = mapping.get("output")
             items.append(
-                {
-                    "type": "function_call_output",
-                    "call_id": call_id if call_id is not None else "",
-                    "output": output if output is not None else "",
-                }
+                _canonicalize_function_call_output_item(
+                    {
+                        "type": "function_call_output",
+                        "call_id": _function_call_output_canonical_id(mapping),
+                        "tool_call_id": mapping.get("tool_call_id"),
+                        "output": output if output is not None else "",
+                    }
+                )
             )
             continue
         if item_type == "function_call":
-            items.append(_clone_item(mapping))
+            items.append(_canonicalize_function_call_item(mapping))
             continue
         if role_name == "assistant":
             items.extend(_native_items_from_assistant_chat(mapping))
@@ -767,10 +858,10 @@ def _native_items_from_input(
         role = mapping.get("role")
         role_name = role.strip() if isinstance(role, str) else ""
         if item_type == "function_call":
-            items.append(_clone_item(mapping))
+            items.append(_canonicalize_function_call_item(mapping))
             continue
         if item_type == "function_call_output":
-            items.append(_clone_item(mapping))
+            items.append(_canonicalize_function_call_output_item(mapping))
             continue
         if role_name in {"system", "developer"}:
             collected_instructions = _merge_instructions(
@@ -799,6 +890,65 @@ def _native_items_from_input(
             continue
         _raise_unsupported_retained_history()
     return items, collected_instructions
+
+
+def _raise_previous_response_unavailable() -> Never:
+    _raise_retained_history_rejection(
+        message=_UNAVAILABLE_MESSAGE,
+        status_code=400,
+        reason="previous_response_id_unavailable",
+    )
+
+
+def _parsed_response_mapping(response: Any) -> Mapping[str, Any]:
+    if response is None:
+        _raise_previous_response_unavailable()
+    parsed = _parse_json_value(response)
+    if isinstance(response, (bytes, bytearray, str)) and not isinstance(
+        parsed, Mapping
+    ):
+        _raise_previous_response_unavailable()
+    if not isinstance(parsed, Mapping) or not parsed:
+        _raise_previous_response_unavailable()
+    return parsed
+
+
+def _request_native_items_from_spend_log(
+    spend_log: Mapping[str, Any],
+    proxy: Any,
+) -> tuple[list[dict[str, Any]], Optional[str]]:
+    request_dict = _request_dict_from_proxy_server_request(proxy)
+    if not request_dict:
+        request_dict = _request_dict_from_proxy_server_request(
+            spend_log.get("proxy_server_request")
+        )
+    if request_dict:
+        request_items, request_instructions = _native_items_from_input(
+            request_dict.get("input", request_dict.get("messages")),
+            instructions=request_dict.get("instructions"),
+        )
+        if request_items:
+            return request_items, request_instructions
+    messages = spend_log.get("messages")
+    if isinstance(messages, list) and messages:
+        request_items, request_instructions = _native_items_from_chat_messages(
+            messages
+        )
+        if request_items:
+            return request_items, request_instructions
+    _raise_previous_response_unavailable()
+
+
+def _output_native_items_from_spend_log(
+    spend_log: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], Optional[str]]:
+    _parsed_response_mapping(spend_log.get("response"))
+    output_items, output_instructions = _native_output_items_from_response(
+        spend_log.get("response")
+    )
+    if not output_items:
+        _raise_previous_response_unavailable()
+    return output_items, output_instructions
 
 
 def _native_output_items_from_response(response: Any) -> tuple[list[dict[str, Any]], Optional[str]]:
@@ -835,32 +985,16 @@ async def _native_history_from_spend_logs(
         except ProxyException:
             raise
         except Exception:
-            _raise_retained_history_rejection(
-                message=_UNAVAILABLE_MESSAGE,
-                status_code=400,
-                reason="previous_response_id_unavailable",
-            )
-        request_dict = _request_dict_from_proxy_server_request(proxy)
-        if not request_dict:
-            request_dict = _request_dict_from_proxy_server_request(
-                spend_log.get("proxy_server_request")
-            )
-        request_items: list[dict[str, Any]] = []
-        request_instructions: Optional[str] = None
-        if request_dict:
-            request_items, request_instructions = _native_items_from_input(
-                request_dict.get("input", request_dict.get("messages")),
-                instructions=request_dict.get("instructions"),
-            )
-        elif isinstance(spend_log.get("messages"), list):
-            request_items, request_instructions = _native_items_from_chat_messages(
-                spend_log.get("messages") or []
-            )
-        output_items, output_instructions = _native_output_items_from_response(
-            spend_log.get("response")
+            _raise_previous_response_unavailable()
+        request_items, request_instructions = _request_native_items_from_spend_log(
+            spend_log,
+            proxy,
         )
-        items.extend(request_items)
-        items.extend(output_items)
+        output_items, output_instructions = _output_native_items_from_spend_log(
+            spend_log
+        )
+        items = _compose_retained_items(items, request_items)
+        items = _compose_retained_items(items, output_items)
         instructions = _merge_instructions(
             instructions, request_instructions, output_instructions
         )
@@ -883,14 +1017,10 @@ def _native_id_key(item: Any) -> tuple[Any, ...]:
     mapping = _as_message_mapping(item)
     item_type = mapping.get("type")
     if item_type == "function_call":
-        call_id = _exact_tool_id(mapping.get("call_id"))
-        if call_id is None:
-            call_id = _exact_tool_id(mapping.get("id")) or ""
+        call_id = _function_call_canonical_id(mapping) or ""
         return ("function_call", call_id)
     if item_type == "function_call_output":
-        call_id = _exact_tool_id(mapping.get("call_id"))
-        if call_id is None:
-            call_id = _exact_tool_id(mapping.get("tool_call_id")) or ""
+        call_id = _function_call_output_canonical_id(mapping) or ""
         return ("function_call_output", call_id)
     if mapping.get("tool_calls"):
         call_ids = tuple(
@@ -900,9 +1030,13 @@ def _native_id_key(item: Any) -> tuple[Any, ...]:
     role = mapping.get("role")
     role_name = role.strip() if isinstance(role, str) else ""
     if role_name == "tool":
-        call_id = _exact_tool_id(mapping.get("tool_call_id")) or ""
+        call_id = _function_call_output_canonical_id(mapping) or ""
         return ("function_call_output", call_id)
-    return (item_type or "message", role_name)
+    return (
+        item_type or "message",
+        role_name,
+        _content_key(mapping.get("content")),
+    )
 
 
 def _native_semantic_key(item: Any) -> tuple[Any, ...]:
@@ -943,6 +1077,38 @@ def _native_semantic_key(item: Any) -> tuple[Any, ...]:
     )
 
 
+def _compose_retained_items(
+    existing: Sequence[Any],
+    incoming: Sequence[Any],
+) -> list[Any]:
+    if not incoming:
+        return [_clone_item(item) for item in existing]
+    if not existing:
+        return [_clone_item(item) for item in incoming]
+    existing_keys = [_native_semantic_key(item) for item in existing]
+    incoming_keys = [_native_semantic_key(item) for item in incoming]
+    existing_len = len(existing_keys)
+    incoming_len = len(incoming_keys)
+    if (
+        incoming_len >= existing_len
+        and incoming_keys[:existing_len] == existing_keys
+    ):
+        return [_clone_item(item) for item in incoming]
+    if (
+        existing_len >= incoming_len
+        and existing_keys[:incoming_len] == incoming_keys
+    ):
+        return [_clone_item(item) for item in existing]
+    overlap = 0
+    for k in range(min(existing_len, incoming_len), 0, -1):
+        if existing_keys[-k:] == incoming_keys[:k]:
+            overlap = k
+            break
+    return [_clone_item(item) for item in existing] + [
+        _clone_item(item) for item in incoming[overlap:]
+    ]
+
+
 def _classify_history_alignment(
     session_items: Sequence[Any],
     current_items: Sequence[Any],
@@ -970,10 +1136,10 @@ def _validate_native_tool_history(items: Sequence[Any]) -> Optional[str]:
         item_type = mapping.get("type")
         if item_type == "function_call" or mapping.get("tool_calls"):
             if item_type == "function_call":
-                call_id = _exact_tool_id(mapping.get("call_id"))
-                if call_id is None:
-                    call_id = _exact_tool_id(mapping.get("id"))
-                call_ids = [call_id if call_id is not None else ""]
+                outgoing_id = _exact_tool_id(mapping.get("call_id"))
+                if not outgoing_id:
+                    return "empty_tool_call_id"
+                call_ids = [outgoing_id]
             else:
                 raw_calls = mapping.get("tool_calls")
                 if not isinstance(raw_calls, list):
@@ -983,7 +1149,10 @@ def _validate_native_tool_history(items: Sequence[Any]) -> Optional[str]:
                 return "empty_tool_call_id"
             if len(call_ids) != len(set(call_ids)):
                 return "duplicate_tool_call_id"
-            seen_call_ids.update(call_ids)
+            for call_id in call_ids:
+                if call_id in seen_call_ids:
+                    return "duplicate_tool_call_id"
+                seen_call_ids.add(call_id)
             continue
         if item_type != "function_call_output" and mapping.get("role") != "tool":
             continue
