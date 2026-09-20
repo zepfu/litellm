@@ -526,6 +526,22 @@ _WIRE_COORDINATOR_OWNER_CONTRACTS = frozenset(
 _MANAGED_DIRECT_OPENAI_OWNER_ID_ENDPOINT = "codex_responses"
 _MANAGED_DIRECT_OPENAI_OWNER_ID_STATE = "codex_responses"
 
+# Canonical OpenCode Zen owner identity. New writes use provider=opencode_zen.
+# Legacy provider=opencode remains readable only when the route family is a
+# Zen adapter. Unrelated opencode and OpenCode Go stay distinct.
+_OPENCODE_ZEN_PROVIDER = "opencode_zen"
+_OPENCODE_ZEN_LEGACY_PROVIDER = "opencode"
+_OPENCODE_ZEN_ROUTE_FAMILIES = frozenset(
+    {
+        "codex_opencode_zen_adapter",
+        "anthropic_opencode_zen_responses_adapter",
+        "anthropic_opencode_zen_completion_adapter",
+    }
+)
+# Existing D1-612 nested Codex default for direct Zen reservations.
+_OPENCODE_ZEN_DIRECT_NESTED_ENDPOINT = "openai_responses"
+_OPENCODE_ZEN_DIRECT_NESTED_STATE = "openai_responses"
+
 _REQUIRED_OWNER_ATTRIBUTE_KEYS = (
     "provider",
     "model",
@@ -1386,14 +1402,46 @@ def build_aawm_alias_routing_session_owner_cache_key(
     )
 
 
-def _hosted_provider_from_attributes(attrs: Mapping[str, Any]) -> str:
-    """Hard owner identity: openai, xai, cursor, moonshot, or normalized provider."""
+def _canonical_session_owner_provider(attrs: Mapping[str, Any]) -> str:
+    """Return the owner provider, mapping legacy Zen records onto opencode_zen.
+
+    Legacy ``provider=opencode`` is canonical only when the route family is a
+    Zen adapter. Bare opencode and OpenCode Go must not inherit Zen identity.
+    """
 
     provider = (_clean_optional_str(attrs.get("provider")) or "").strip().lower()
     if not provider:
         provider = (
             _clean_optional_str(attrs.get("hosted_provider")) or ""
         ).strip().lower()
+    route_family = (_clean_optional_str(attrs.get("route_family")) or "").strip().lower()
+    if (
+        provider == _OPENCODE_ZEN_LEGACY_PROVIDER
+        and route_family in _OPENCODE_ZEN_ROUTE_FAMILIES
+    ):
+        return _OPENCODE_ZEN_PROVIDER
+    return provider
+
+
+def _apply_canonical_session_owner_identity(attrs: dict[str, Any]) -> None:
+    """Rewrite legacy Zen provider on write; leave other identities unchanged."""
+
+    raw_provider = (_clean_optional_str(attrs.get("provider")) or "").strip().lower()
+    canonical_provider = _canonical_session_owner_provider(attrs)
+    if (
+        canonical_provider == _OPENCODE_ZEN_PROVIDER
+        and raw_provider == _OPENCODE_ZEN_LEGACY_PROVIDER
+    ):
+        attrs["provider"] = canonical_provider
+    hosted = _hosted_provider_from_attributes(attrs)
+    if hosted:
+        attrs["hosted_provider"] = hosted
+
+
+def _hosted_provider_from_attributes(attrs: Mapping[str, Any]) -> str:
+    """Hard owner identity: openai, xai, cursor, moonshot, or normalized provider."""
+
+    provider = _canonical_session_owner_provider(attrs)
     route_family = (_clean_optional_str(attrs.get("route_family")) or "").strip().lower()
     if provider == "xai":
         return "xai"
@@ -1569,13 +1617,17 @@ def _lease_uses_wire_coordinator_terminal(
 
 
 def _normalized_owner_id_endpoint_state(attrs: Mapping[str, Any]) -> tuple[str, str]:
-    """Collapse equivalent managed direct-OpenAI shapes onto one owner id."""
+    """Collapse equivalent managed-OpenAI and Zen owner shapes onto one owner id."""
 
     if _managed_direct_openai_owner_shape(attrs) is not None:
         return (
             _MANAGED_DIRECT_OPENAI_OWNER_ID_ENDPOINT,
             _MANAGED_DIRECT_OPENAI_OWNER_ID_STATE,
         )
+    zen_shape = _opencode_zen_owner_shape(attrs)
+    if zen_shape is not None:
+        route_family = zen_shape[0]
+        return (route_family, route_family)
     return (
         str(attrs.get("endpoint_contract") or "default"),
         str(attrs.get("state_format") or "default"),
@@ -1682,9 +1734,7 @@ def build_session_owner_attributes(
                 )
                 if cleaned_extra is not None:
                     attributes[str(key)] = cleaned_extra
-    hosted = _hosted_provider_from_attributes(attributes)
-    if hosted:
-        attributes["hosted_provider"] = hosted
+    _apply_canonical_session_owner_identity(attributes)
     return attributes
 
 
@@ -1694,6 +1744,9 @@ def _core_owner_attributes(attributes: Mapping[str, Any]) -> Payload:
         for key in _CORE_OWNER_ATTRIBUTE_KEYS
         if key in attributes and attributes[key] is not None
     }
+    canonical_provider = _canonical_session_owner_provider(attributes)
+    if canonical_provider and "provider" in core:
+        core["provider"] = canonical_provider
     hosted = _hosted_provider_from_attributes(attributes)
     if hosted:
         core["hosted_provider"] = hosted
@@ -1794,9 +1847,7 @@ def build_session_owner_id(
             if value is not None and str(value).strip() != "":
                 merged[key] = value
         attrs = cast(Payload, merged)
-        hosted = _hosted_provider_from_attributes(attrs)
-        if hosted:
-            attrs["hosted_provider"] = hosted
+        _apply_canonical_session_owner_identity(attrs)
     hosted = _hosted_provider_from_attributes(attrs) or "unknown"
     endpoint, state = _normalized_owner_id_endpoint_state(attrs)
     return "|".join((hosted, endpoint, state))
@@ -2069,6 +2120,62 @@ def _managed_direct_openai_owner_shapes_are_equivalent(
     return left_shape is not None and right_shape is not None
 
 
+def _opencode_zen_owner_shape(
+    attributes: Mapping[str, Any],
+) -> Optional[tuple[str, str, str]]:
+    """Return the Zen owner triple when it is a known direct or alias shape.
+
+    Known shapes for one Zen route family R:
+    - alias: ``(R, R, R)``
+    - D1-612 nested Codex default: ``(R, openai_responses, openai_responses)``
+    """
+
+    if _canonical_session_owner_provider(attributes) != _OPENCODE_ZEN_PROVIDER:
+        return None
+    route_family = (
+        _clean_optional_str(attributes.get("route_family")) or ""
+    ).strip().lower()
+    if route_family not in _OPENCODE_ZEN_ROUTE_FAMILIES:
+        return None
+    endpoint = (
+        _clean_optional_str(attributes.get("endpoint_contract")) or ""
+    ).strip().lower()
+    state = (
+        _clean_optional_str(attributes.get("state_format")) or ""
+    ).strip().lower()
+    if not endpoint or not state:
+        return None
+    known_endpoint_state = {
+        (route_family, route_family),
+        (
+            _OPENCODE_ZEN_DIRECT_NESTED_ENDPOINT,
+            _OPENCODE_ZEN_DIRECT_NESTED_STATE,
+        ),
+    }
+    if (endpoint, state) not in known_endpoint_state:
+        return None
+    return (route_family, endpoint, state)
+
+
+def _opencode_zen_owner_shapes_are_equivalent(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+) -> bool:
+    """Treat alias and D1-612 nested Zen shapes as one contract per route family.
+
+    Different Zen route families stay distinct. OpenCode Go and unrelated
+    ``provider=opencode`` records are not Zen shapes.
+    """
+
+    left_shape = _opencode_zen_owner_shape(left)
+    right_shape = _opencode_zen_owner_shape(right)
+    return (
+        left_shape is not None
+        and right_shape is not None
+        and left_shape[0] == right_shape[0]
+    )
+
+
 def _attributes_exactly_equal(
     *,
     left: Mapping[str, Any],
@@ -2085,6 +2192,10 @@ def _attributes_exactly_equal(
             left_core.pop(key, None)
             right_core.pop(key, None)
     if _managed_direct_openai_owner_shapes_are_equivalent(left_core, right_core):
+        for key in ("route_family", "endpoint_contract", "state_format"):
+            left_core.pop(key, None)
+            right_core.pop(key, None)
+    if _opencode_zen_owner_shapes_are_equivalent(left_core, right_core):
         for key in ("route_family", "endpoint_contract", "state_format"):
             left_core.pop(key, None)
             right_core.pop(key, None)
@@ -2178,6 +2289,11 @@ def _compatibility_mismatch_reason(
             requested_core,
         )
     )
+    equivalent_opencode_zen = _opencode_zen_owner_shapes_are_equivalent(
+        owner_attrs,
+        requested_core,
+    )
+    equivalent_owner_shape = equivalent_managed_direct_openai or equivalent_opencode_zen
     owner_hosted = _hosted_provider_from_attributes(owner_attrs)
     requested_hosted = _hosted_provider_from_attributes(requested_core)
     if owner_hosted and requested_hosted and owner_hosted != requested_hosted:
@@ -2186,7 +2302,7 @@ def _compatibility_mismatch_reason(
             f"owner={owner_hosted} requested={requested_hosted}"
         )
     for key in ("route_family",):
-        if equivalent_managed_direct_openai:
+        if equivalent_owner_shape:
             continue
         req = _clean_optional_str(requested_core.get(key))
         own = _clean_optional_str(owner_attrs.get(key))
@@ -2204,7 +2320,7 @@ def _compatibility_mismatch_reason(
             if req is not None and own is not None and req != own:
                 return f"session_owner: {key} mismatch"
     for key in ("endpoint_contract", "state_format"):
-        if equivalent_managed_direct_openai:
+        if equivalent_owner_shape:
             continue
         req = _clean_optional_str(requested_core.get(key))
         own = _clean_optional_str(owner_attrs.get(key))
@@ -2282,7 +2398,7 @@ def owner_record_as_affinity_hint(
     if not attrs:
         return None
     affinity: dict[str, Any] = {
-        "provider": attrs.get("provider"),
+        "provider": _canonical_session_owner_provider(attrs) or attrs.get("provider"),
         "model": attrs.get("model"),
         "route_family": attrs.get("route_family"),
         "last_resort": False,

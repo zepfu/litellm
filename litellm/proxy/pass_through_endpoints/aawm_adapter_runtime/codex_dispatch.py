@@ -784,7 +784,7 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
             request=request,
             request_body=prepared_request_body,
             session_identity=_sid,
-            provider="opencode",
+            provider="opencode_zen",
             model=opencode_zen_adapter_model,
             route_family="codex_opencode_zen_adapter",
         )
