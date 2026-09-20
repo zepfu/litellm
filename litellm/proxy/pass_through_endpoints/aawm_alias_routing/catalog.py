@@ -42,11 +42,15 @@ SERVED_CONCRETE_MODELS: Tuple[Tuple[str, str, str], ...] = (
         "openrouter",
     ),
     (
-        "deepseek-v4-flash-free",
+        "opencode_zen/deepseek-v4-flash-free",
         "opencode/deepseek-v4-flash-free",
         "opencode_zen",
     ),
-    ("big-pickle", "opencode/big-pickle", "opencode_zen"),
+    (
+        "opencode_zen/big-pickle",
+        "opencode/big-pickle",
+        "opencode_zen",
+    ),
     ("muse-spark-1.3", "muse-spark-1.3", "muse_code"),
     ("muse-spark-1.3-contributor", "muse-spark-1.3-contributor", "muse_code"),
 )
