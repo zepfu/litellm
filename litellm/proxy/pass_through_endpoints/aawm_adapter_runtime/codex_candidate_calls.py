@@ -8087,7 +8087,13 @@ async def _perform_codex_auto_agent_openrouter_responses_request(
         if status_code < 200 or status_code >= 300:
             return response
         try:
-            response_body = json.loads(_decode_http_response_body(response.body))
+            def _reject_non_json_numeric_constant(constant: str) -> Any:
+                raise ValueError(constant)
+
+            response_body = json.loads(
+                bytes(response.body).decode("utf-8"),
+                parse_constant=_reject_non_json_numeric_constant,
+            )
         except Exception:
             _raise_codex_auto_agent_invalid_responses_shape(
                 response_body=response.body,
