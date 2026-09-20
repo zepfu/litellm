@@ -9374,10 +9374,10 @@ def _opencode_go_required_tool_choice_removed(removed_tool_choice: Any) -> bool:
     if removed_tool_choice is None:
         return False
     if isinstance(removed_tool_choice, str):
-        normalized = removed_tool_choice.strip().lower()
-        if not normalized:
-            return False
-        return normalized not in _OPENCODE_GO_NONSEMANTIC_TOOL_CHOICE
+        return (
+            removed_tool_choice != ""
+            and removed_tool_choice not in _OPENCODE_GO_NONSEMANTIC_TOOL_CHOICE
+        )
     return True
 
 
