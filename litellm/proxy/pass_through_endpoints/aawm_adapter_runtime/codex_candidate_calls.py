@@ -47,10 +47,6 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_persist impor
     _aawm_alias_route_healthy_json_enabled,
     _emit_aawm_terminal_error,
 )
-from litellm.proxy.pass_through_endpoints.providers.openrouter.runtime import (
-    _require_openrouter_api_key,
-    _require_openrouter_target_base,
-)
 from litellm.secret_managers.credential_error_sanitizer import (
     sanitize_credential_error_message,
 )
@@ -2121,8 +2117,6 @@ def install(
         "_refine_codex_collaboration_wait_timeout_schema",
         "_raise_cursor_agent_alias_error",
         "_raise_codex_auto_agent_missing_credential_preflight",
-        "_require_openrouter_api_key",
-        "_require_openrouter_target_base",
         "_load_codex_auto_agent_opencode_zen_api_key",
         "_raise_codex_alibaba_auto_review_validation_error",
         "_validate_codex_alibaba_auto_review_completion_or_raise",
@@ -8186,6 +8180,11 @@ async def _perform_codex_auto_agent_openrouter_responses_request(
     request_body: dict[str, Any],
     use_alias_candidate_probe: bool = False,
 ) -> Response:
+    from litellm.proxy.pass_through_endpoints.providers.openrouter.runtime import (
+        _require_openrouter_api_key,
+        _require_openrouter_target_base,
+    )
+
     openrouter_api_key = _require_openrouter_api_key(_get_openrouter_api_key())
     target_base_url = _require_openrouter_target_base(_get_openrouter_target_base())
     normalized_endpoint = BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(
@@ -11092,6 +11091,10 @@ async def _perform_codex_auto_agent_openrouter_completion_request(  # noqa: PLR0
     request_body: dict[str, Any],
     use_alias_candidate_probe: bool = False,
 ) -> Response:
+    from litellm.proxy.pass_through_endpoints.providers.openrouter.runtime import (
+        _require_openrouter_api_key,
+        _require_openrouter_target_base,
+    )
     from litellm.responses.litellm_completion_transformation.transformation import (
         LiteLLMCompletionResponsesConfig,
     )
