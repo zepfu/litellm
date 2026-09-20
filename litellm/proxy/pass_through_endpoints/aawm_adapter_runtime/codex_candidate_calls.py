@@ -47,6 +47,10 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_persist impor
     _aawm_alias_route_healthy_json_enabled,
     _emit_aawm_terminal_error,
 )
+from litellm.proxy.pass_through_endpoints.providers.openrouter.runtime import (
+    _require_openrouter_api_key,
+    _require_openrouter_target_base,
+)
 from litellm.secret_managers.credential_error_sanitizer import (
     sanitize_credential_error_message,
 )
@@ -2117,6 +2121,8 @@ def install(
         "_refine_codex_collaboration_wait_timeout_schema",
         "_raise_cursor_agent_alias_error",
         "_raise_codex_auto_agent_missing_credential_preflight",
+        "_require_openrouter_api_key",
+        "_require_openrouter_target_base",
         "_load_codex_auto_agent_opencode_zen_api_key",
         "_raise_codex_alibaba_auto_review_validation_error",
         "_validate_codex_alibaba_auto_review_completion_or_raise",
@@ -8180,29 +8186,8 @@ async def _perform_codex_auto_agent_openrouter_responses_request(
     request_body: dict[str, Any],
     use_alias_candidate_probe: bool = False,
 ) -> Response:
-    openrouter_api_key = _get_openrouter_api_key()
-    if openrouter_api_key is None:
-        exc = ProxyException(
-            message=(
-                "OpenRouter Codex auto-agent candidate requires " "AAWM_OPENROUTER_API_KEY or OPENROUTER_API_KEY."
-            ),
-            type="rate_limit_error",
-            param="model",
-            code=429,
-        )
-        setattr(
-            exc,
-            "detail",
-            {
-                "error": {
-                    "message": exc.message,
-                    "code": "aawm_codex_auto_agent_candidate_unavailable",
-                }
-            },
-        )
-        raise exc
-
-    target_base_url = _get_openrouter_target_base()
+    openrouter_api_key = _require_openrouter_api_key(_get_openrouter_api_key())
+    target_base_url = _require_openrouter_target_base(_get_openrouter_target_base())
     normalized_endpoint = BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(
         endpoint=endpoint,
         base_target_url=target_base_url,
@@ -11111,13 +11096,7 @@ async def _perform_codex_auto_agent_openrouter_completion_request(  # noqa: PLR0
         LiteLLMCompletionResponsesConfig,
     )
 
-    openrouter_api_key = _get_openrouter_api_key()
-    if openrouter_api_key is None:
-        _raise_codex_auto_agent_missing_credential_preflight(
-            message=(
-                "OpenRouter Codex auto-agent candidate requires " "AAWM_OPENROUTER_API_KEY or OPENROUTER_API_KEY."
-            ),
-        )
+    openrouter_api_key = _require_openrouter_api_key(_get_openrouter_api_key())
 
     if isinstance(request_body, dict):
         from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_body import (
@@ -11221,7 +11200,7 @@ async def _perform_codex_auto_agent_openrouter_completion_request(  # noqa: PLR0
         tag="openrouter-chat-message-shape-sanitized",
     )
 
-    target_base_url = _get_openrouter_target_base()
+    target_base_url = _require_openrouter_target_base(_get_openrouter_target_base())
     target_url = f"{target_base_url.rstrip('/')}/v1/chat/completions"
     validation_headers = {
         **_build_openrouter_default_headers(),

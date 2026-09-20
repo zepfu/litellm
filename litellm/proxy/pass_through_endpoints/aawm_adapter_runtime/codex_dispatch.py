@@ -995,35 +995,15 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
             if reserved_openrouter_model.casefold().startswith("openrouter/"):
                 reserved_openrouter_model = reserved_openrouter_model.split("/", 1)[1]
     if reserved_openrouter_model:
-        from litellm.proxy._types import ProxyException
+        from litellm.proxy.pass_through_endpoints.providers.openrouter.runtime import (
+            OpenRouterMissingHandlerError,
+        )
 
         openrouter_handler = globals().get(
             "_perform_codex_auto_agent_openrouter_responses_request"
         )
         if not callable(openrouter_handler):
-            message = (
-                "aawm_codex_auto_agent_candidate_unavailable: "
-                "reserved OpenRouter nvidia/nemotron-*:free namespace cannot "
-                "use native OpenAI/Codex OAuth; OpenRouter responses adapter "
-                f"is unavailable. ingress_model={requested_model}."
-            )
-            exc = ProxyException(
-                message=message,
-                type="rate_limit_error",
-                param="model",
-                code=429,
-            )
-            setattr(
-                exc,
-                "detail",
-                {
-                    "error": {
-                        "message": message,
-                        "code": "aawm_codex_auto_agent_candidate_unavailable",
-                    }
-                },
-            )
-            raise exc
+            raise OpenRouterMissingHandlerError(ingress_model=requested_model)
 
         if prepared_request_body.get("model") != reserved_openrouter_model:
             prepared_request_body = dict(prepared_request_body)

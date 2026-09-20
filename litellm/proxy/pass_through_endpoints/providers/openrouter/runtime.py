@@ -17,6 +17,7 @@ from ...aawm_alias_routing.failure_vocabulary import FailureEvent
 
 from fastapi import Response
 
+from litellm._logging import verbose_proxy_logger
 from litellm.llms.anthropic.experimental_pass_through.providers.openrouter import (
     retry_transport as _anthropic_openrouter_retry_transport,
 )
@@ -26,8 +27,18 @@ from litellm.llms.openrouter.common_utils import (
     SERVICE_OWNED_POLICY,
     resolve_openrouter_credential_target,
 )
+from litellm.proxy._types import ProxyException
 
 _RetryResultT = TypeVar("_RetryResultT")
+
+_ANTHROPIC_ADAPTER_OPENROUTER_API_KEY_ENV_VARS = (
+    "AAWM_OPENROUTER_API_KEY",
+    "OPENROUTER_API_KEY",
+)
+_OPENROUTER_PREFLIGHT_INELIGIBILITY_CODE = (
+    "aawm_codex_auto_agent_candidate_ineligible"
+)
+_OPENROUTER_REQUIRE_LOOKUP = object()
 
 _HOST_FUNCTION_NAMES = (
     "_get_openrouter_adapter_rate_limit_key",
@@ -62,8 +73,10 @@ _HOST_FUNCTION_NAMES = (
     "_perform_openrouter_adapter_pass_through_request",
     "_get_openrouter_api_key",
     "_get_anthropic_adapter_openrouter_api_key",
+    "_require_openrouter_api_key",
     "_get_openrouter_target_base",
     "_get_anthropic_adapter_openrouter_target_base",
+    "_require_openrouter_target_base",
     "_openrouter_chat_message_function_call",
     "_openrouter_chat_message_has_valid_content_or_tool_calls",
     "_copy_openrouter_message_value",
@@ -73,6 +86,75 @@ _HOST_FUNCTION_NAMES = (
     "_apply_openrouter_completion_message_sanitization",
     "_build_openrouter_default_headers",
 )
+
+
+def _openrouter_accepted_credential_source_names() -> str:
+    """Return the accepted OpenRouter credential env-var names, without values."""
+
+    names = [f"'{name}'" for name in _ANTHROPIC_ADAPTER_OPENROUTER_API_KEY_ENV_VARS]
+    return f"{', '.join(names[:-1])}, or {names[-1]}"
+
+
+class OpenRouterPreflightError(ProxyException):
+    """Local OpenRouter pre-send failure raised before any provider I/O.
+
+    Missing credentials, missing handlers, and other deterministic pre-send
+    failures are candidate preflight ineligibility, not an upstream 401/429.
+    Candidate accounting must treat this as ``attempted_provider_call=False``
+    with no provider cooldown so alias fallback remains safe. Direct routes
+    surface a bounded local configuration error.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            message=message,
+            type="invalid_request_error",
+            param="model",
+            code=400,
+        )
+        setattr(self, "status_code", 400)
+        setattr(self, "candidate_status", "ineligible")
+        setattr(self, "ineligibility_reason", "preflight_skipped")
+        setattr(self, "failure_phase", "candidate_preflight")
+        setattr(self, "attempted_provider_call", False)
+        setattr(
+            self,
+            "detail",
+            {
+                "error": {
+                    "message": message,
+                    "code": _OPENROUTER_PREFLIGHT_INELIGIBILITY_CODE,
+                },
+                "failure_phase": "candidate_preflight",
+                "attempted_provider_call": False,
+            },
+        )
+
+
+class OpenRouterMissingCredentialError(OpenRouterPreflightError):
+    """Local missing/empty OpenRouter credentials raised before any provider I/O."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Direct OpenRouter route is unavailable: accepted credentials "
+            f"{_openrouter_accepted_credential_source_names()} are missing or empty."
+        )
+
+
+class OpenRouterMissingHandlerError(OpenRouterPreflightError):
+    """Local missing OpenRouter handler raised before any provider I/O."""
+
+    def __init__(self, *, ingress_model: Optional[str] = None) -> None:
+        message = (
+            "Direct OpenRouter route is unavailable: reserved OpenRouter "
+            "nvidia/nemotron-*:free namespace cannot use native OpenAI/Codex "
+            "OAuth; OpenRouter responses adapter is unavailable"
+        )
+        if ingress_model:
+            message = f"{message}. ingress_model={ingress_model}."
+        else:
+            message = f"{message}."
+        super().__init__(message)
 
 
 def _is_empty_text_content(content: Any) -> bool:
@@ -655,12 +737,67 @@ def _get_anthropic_adapter_openrouter_api_key() -> Optional[str]:
     return _get_openrouter_api_key()
 
 
+def _require_openrouter_api_key(
+    api_key: Any = _OPENROUTER_REQUIRE_LOOKUP,
+) -> str:
+    """Return a usable OpenRouter credential or fail before any provider I/O.
+
+    Pass an already-resolved value from a host-bound getter so test
+    monkeypatches keep working. Omit *api_key* to resolve from runtime.
+    An explicit ``None`` or empty value is missing credentials, not a
+    request to look up again.
+    """
+
+    resolved = (
+        _get_openrouter_api_key()
+        if api_key is _OPENROUTER_REQUIRE_LOOKUP
+        else api_key
+    )
+    if not resolved:
+        verbose_proxy_logger.debug(
+            "Direct OpenRouter credential resolution failed: accepted env vars "
+            "%s are missing or blank after cleanup",
+            _openrouter_accepted_credential_source_names(),
+        )
+        raise OpenRouterMissingCredentialError()
+    return resolved
+
+
 def _get_openrouter_target_base() -> str:
     return _resolve_openrouter_service_profile().target_base
 
 
 def _get_anthropic_adapter_openrouter_target_base() -> str:
     return _get_openrouter_target_base()
+
+
+def _require_openrouter_target_base(
+    target_base: Any = _OPENROUTER_REQUIRE_LOOKUP,
+) -> str:
+    """Return a usable OpenRouter target base or fail before any provider I/O.
+
+    Pass an already-resolved value from a host-bound getter so test
+    monkeypatches keep working. Omit *target_base* to resolve from runtime.
+    An explicit empty value is a missing target, not a request to look up
+    again. Defaulting remains owned by ``_get_openrouter_target_base``.
+    """
+
+    resolved = (
+        _get_openrouter_target_base()
+        if target_base is _OPENROUTER_REQUIRE_LOOKUP
+        else target_base
+    )
+    cleaned = str(resolved or "").rstrip("/")
+    if not cleaned:
+        verbose_proxy_logger.debug(
+            "Direct OpenRouter target resolution failed: target base is "
+            "missing or empty after cleanup"
+        )
+        raise OpenRouterPreflightError(
+            "Direct OpenRouter route is unavailable: target base is missing "
+            "or empty."
+        )
+    return cleaned
 
 
 def _build_openrouter_default_headers() -> dict[str, str]:

@@ -10,6 +10,10 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     adapter_driver,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.types import Payload
+from litellm.proxy.pass_through_endpoints.providers.openrouter.runtime import (
+    _require_openrouter_api_key,
+    _require_openrouter_target_base,
+)
 
 from ..common import reject_raw_mcp_tools
 
@@ -98,13 +102,8 @@ async def prepare_responses_route(
         translated_request_body,
         contains_mcp_tools=runtime.contains_mcp_tools,
     )
-    api_key = runtime.get_api_key()
-    if api_key is None:
-        runtime.raise_candidate_unavailable(
-            "Anthropic adapter requests for OpenRouter models require "
-            "'AAWM_OPENROUTER_API_KEY' or 'OPENROUTER_API_KEY' in environment."
-        )
-    target_base_url = runtime.get_target_base()
+    api_key = _require_openrouter_api_key(runtime.get_api_key())
+    target_base_url = _require_openrouter_target_base(runtime.get_target_base())
     normalized_endpoint = runtime.normalize_endpoint(
         endpoint="/v1/responses",
         base_target_url=target_base_url,
@@ -169,13 +168,8 @@ async def prepare_completion_route(
         span_name=config.span_name,
         target_endpoint_label=config.target_endpoint_label,
     )
-    api_key = runtime.get_api_key()
-    if api_key is None:
-        runtime.raise_candidate_unavailable(
-            "Anthropic adapter requests for OpenRouter models require "
-            "'AAWM_OPENROUTER_API_KEY' or 'OPENROUTER_API_KEY' in environment."
-        )
-    target_base_url = runtime.get_target_base()
+    api_key = _require_openrouter_api_key(runtime.get_api_key())
+    target_base_url = _require_openrouter_target_base(runtime.get_target_base())
     normalized_endpoint = runtime.normalize_endpoint(
         endpoint="/v1/chat/completions",
         base_target_url=target_base_url,
