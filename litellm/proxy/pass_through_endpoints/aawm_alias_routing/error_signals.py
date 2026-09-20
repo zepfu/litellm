@@ -3052,7 +3052,14 @@ def _get_codex_auto_agent_cooldown_seconds(
         else:
             resolved = min(resolved, usage_limit_max_seconds)
         return resolved
-    if header_wait is not None:
+    is_openrouter_http_524 = (
+        _extract_adapter_exception_status_code(exc) == 524
+        and isinstance(candidate, dict)
+        and candidate.get("provider") == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER
+    )
+    if header_wait is not None and is_openrouter_http_524:
+        resolved = max(_CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS, header_wait)
+    elif header_wait is not None:
         resolved = header_wait if is_xai_header_wait else max(_CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS, header_wait)
     elif (
         error_class in {"capacity_exhausted", "upstream_overloaded", "server_overloaded"}
@@ -3067,11 +3074,7 @@ def _get_codex_auto_agent_cooldown_seconds(
         resolved = _CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
     elif _extract_adapter_exception_status_code(exc) in {429, 503, 529}:
         resolved = _CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
-    elif (
-        _extract_adapter_exception_status_code(exc) == 524
-        and isinstance(candidate, dict)
-        and candidate.get("provider") == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER
-    ):
+    elif is_openrouter_http_524:
         resolved = _CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS
     else:
         resolved = _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS
