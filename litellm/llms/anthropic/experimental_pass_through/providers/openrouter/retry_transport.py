@@ -539,6 +539,23 @@ def _bounded_completion_invalid_tool_detail(detail: str) -> str:
     return compact[: _INVALID_TOOL_DETAIL_LIMIT - 3] + "..."
 
 
+def _provider_return_int_status_code(exc: object) -> Optional[int]:
+    """Return a proven HTTP status from int .status_code/.code only.
+
+    Checks the exception, then its .response. String codes and
+    `"429" in str(exc)` are not treated as a provider return.
+    """
+    sources = (exc, getattr(exc, "response", None))
+    for source in sources:
+        if source is None:
+            continue
+        for attr in ("status_code", "code"):
+            value = getattr(source, attr, None)
+            if isinstance(value, int):
+                return value
+    return None
+
+
 async def perform_completion_operation(
     runtime: Runtime,
     *,
@@ -556,13 +573,18 @@ async def perform_completion_operation(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            setattr(exc, "_aawm_provider_returned", True)
             setattr(exc, "attempted_provider_call", True)
-            setattr(exc, "provider_returned", True)
             setattr(exc, "failure_phase", "provider_attempt")
             setattr(exc, "provider_name", "openrouter")
-            status_code = extract_exception_status_code(runtime, exc)
-            if isinstance(status_code, int):
+            already_returned = (
+                getattr(exc, "_aawm_provider_returned", False) is True
+                or getattr(exc, "provider_returned", False) is True
+            )
+            status_code = _provider_return_int_status_code(exc)
+            if already_returned or status_code is not None:
+                setattr(exc, "_aawm_provider_returned", True)
+                setattr(exc, "provider_returned", True)
+            if status_code is not None:
                 setattr(exc, "upstream_status_code", status_code)
             raise
 
