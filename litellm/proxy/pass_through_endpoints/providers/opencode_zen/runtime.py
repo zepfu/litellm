@@ -13,7 +13,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NoReturn, Optional
 
 import httpx
 from starlette.requests import Request
@@ -278,7 +278,56 @@ def _get_opencode_zen_auth_file_path() -> Optional[Path]:
     return None
 
 
-async def _load_local_opencode_zen_api_key() -> str:
+def _select_opencode_zen_provider_auth(auth_data: Any) -> Any:
+    """OC-010: Zen selects only the ``opencode`` auth entry.
+
+    Never fall back to ``opencode-go``. Presence of a Go entry is used only
+    to choose a deterministic Zen-ineligible error; the Go secret is not
+    read, copied, or returned.
+    """
+    if not isinstance(auth_data, dict):
+        return None
+    return auth_data.get("opencode")
+
+
+def _select_opencode_go_provider_auth(auth_data: Any) -> Any:
+    """Preserve historical OpenCode Go selection: Go entry, else Zen entry."""
+    if not isinstance(auth_data, dict):
+        return None
+    return auth_data.get("opencode-go") or auth_data.get("opencode")
+
+
+def _raise_invalid_opencode_auth_file(
+    *,
+    source_label: str,
+    auth_data: Any,
+    source_family: str,
+) -> NoReturn:
+    normalized_family = str(source_family or "").strip().casefold()
+    if normalized_family == _constants._OPENCODE_GO_CREDENTIAL_FAMILY:
+        # Go error text stays historically generic so Go behavior is unchanged.
+        raise ValueError(
+            f"OpenCode Zen auth file configured via {source_label} "
+            "must contain provider 'opencode' with API-key auth."
+        )
+    zen_entry_present = isinstance(auth_data, dict) and "opencode" in auth_data
+    has_go_entry = isinstance(auth_data, dict) and "opencode-go" in auth_data
+    if has_go_entry and not zen_entry_present:
+        raise ValueError(
+            f"OpenCode Zen auth file configured via {source_label} "
+            "contains only an OpenCode Go ('opencode-go') credential, "
+            "which is not valid for OpenCode Zen. OpenCode Zen "
+            "requires provider 'opencode' with API-key auth."
+        )
+    raise ValueError(
+        f"OpenCode Zen auth file configured via {source_label} "
+        "must contain provider 'opencode' with API-key auth; "
+        "OpenCode Go ('opencode-go') credentials are not valid "
+        "for OpenCode Zen."
+    )
+
+
+async def _load_local_opencode_auth_api_key(*, source_family: str) -> str:
     explicit_key = _get_first_secret_value(
         _constants._OPENCODE_ZEN_API_KEY_ENV_VARS
     )
@@ -319,9 +368,11 @@ async def _load_local_opencode_zen_api_key() -> str:
             "does not contain valid JSON."
         ) from None
 
-    provider_auth = None
-    if isinstance(auth_data, dict):
-        provider_auth = auth_data.get("opencode-go") or auth_data.get("opencode")
+    normalized_family = str(source_family or "").strip().casefold()
+    if normalized_family == _constants._OPENCODE_GO_CREDENTIAL_FAMILY:
+        provider_auth = _select_opencode_go_provider_auth(auth_data)
+    else:
+        provider_auth = _select_opencode_zen_provider_auth(auth_data)
     api_key = (
         _clean_secret_string(provider_auth.get("key"))
         if isinstance(provider_auth, dict)
@@ -333,20 +384,38 @@ async def _load_local_opencode_zen_api_key() -> str:
         else None
     )
     if api_key is None or auth_type not in {None, "api"}:
-        raise ValueError(
-            f"OpenCode Zen auth file configured via {source_label} "
-            "must contain provider 'opencode' with API-key auth."
+        _raise_invalid_opencode_auth_file(
+            source_label=source_label,
+            auth_data=auth_data,
+            source_family=normalized_family,
         )
+    assert api_key is not None
     return api_key
+
+
+async def _load_local_opencode_zen_api_key() -> str:
+    return await _load_local_opencode_auth_api_key(
+        source_family=_constants._OPENCODE_ZEN_CREDENTIAL_FAMILY,
+    )
+
+
+async def _load_local_opencode_go_api_key() -> str:
+    return await _load_local_opencode_auth_api_key(
+        source_family=_constants._OPENCODE_GO_CREDENTIAL_FAMILY,
+    )
 
 
 async def _load_opencode_zen_api_key_for_candidate(
     *,
     use_alias_candidate_probe: bool = False,
+    source_family: str = _constants._OPENCODE_ZEN_CREDENTIAL_FAMILY,
 ) -> str:
     runtime = _require_runtime()
-    load_api_key = runtime.load_local_api_key
+    normalized_family = str(source_family or "").strip().casefold()
     try:
+        if normalized_family == _constants._OPENCODE_GO_CREDENTIAL_FAMILY:
+            return await _load_local_opencode_go_api_key()
+        load_api_key = runtime.load_local_api_key
         if load_api_key is not None:
             return await load_api_key()
         return await _load_local_opencode_zen_api_key()

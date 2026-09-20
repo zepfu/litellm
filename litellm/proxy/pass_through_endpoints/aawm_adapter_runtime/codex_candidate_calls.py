@@ -25,6 +25,11 @@ from types import FunctionType
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 from litellm._logging import verbose_aawm_route_logger
+from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen.constants import (
+    _OPENCODE_GO_CREDENTIAL_FAMILY,
+    _OPENCODE_ZEN_CREDENTIAL_FAMILY,
+    _OPENCODE_ZEN_TARGET_FAMILY,
+)
 from litellm.llms.xai.route_descriptors import (
     GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
     GROK_NATIVE_OAUTH_ROUTE_FAMILY,
@@ -2174,6 +2179,9 @@ def install(
         ("_OPENCODE_GO_CHAT_COMPLETIONS_ROUTE", _OPENCODE_GO_CHAT_COMPLETIONS_ROUTE),
         ("_OPENCODE_GO_TOOLS_INDEX_RE", _OPENCODE_GO_TOOLS_INDEX_RE),
         ("_NOUS_TOOL_CHOICE_ENUMS", _NOUS_TOOL_CHOICE_ENUMS),
+        ("_OPENCODE_ZEN_CREDENTIAL_FAMILY", _OPENCODE_ZEN_CREDENTIAL_FAMILY),
+        ("_OPENCODE_ZEN_TARGET_FAMILY", _OPENCODE_ZEN_TARGET_FAMILY),
+        ("_OPENCODE_GO_CREDENTIAL_FAMILY", _OPENCODE_GO_CREDENTIAL_FAMILY),
     ):
         host_globals.setdefault(_name, _value)
 
@@ -9213,8 +9221,8 @@ async def _handle_codex_opencode_zen_adapter_route(
     HttpPassThroughEndpointHelpers.validate_outgoing_egress(
         url=target_url,
         headers=custom_headers,
-        credential_family="opencode",
-        expected_target_family="opencode",
+        credential_family=_OPENCODE_ZEN_CREDENTIAL_FAMILY,
+        expected_target_family=_OPENCODE_ZEN_TARGET_FAMILY,
     )
     _annotate_request_scope_for_adapted_access_log(request, httpx.URL(target_url))
     rollup_kwargs = _build_adapted_route_rollup_kwargs(litellm_metadata)
@@ -9656,6 +9664,7 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
         )
         api_key = await _load_opencode_zen_api_key_for_candidate(
             use_alias_candidate_probe=use_alias_candidate_probe,
+            source_family=_OPENCODE_GO_CREDENTIAL_FAMILY,
         )
         custom_headers = BaseOpenAIPassThroughHandler._assemble_headers(
             api_key=api_key,
@@ -10001,6 +10010,7 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
     )
     api_key = await _load_opencode_zen_api_key_for_candidate(
         use_alias_candidate_probe=use_alias_candidate_probe,
+        source_family=_OPENCODE_GO_CREDENTIAL_FAMILY,
     )
     custom_headers = BaseOpenAIPassThroughHandler._assemble_headers(
         api_key=api_key,

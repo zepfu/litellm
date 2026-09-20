@@ -5,6 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen.constants import (
+    _OPENCODE_ZEN_CREDENTIAL_FAMILY,
+    _OPENCODE_ZEN_TARGET_FAMILY,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     adapter_config,
     adapter_driver,
@@ -113,8 +117,8 @@ async def prepare_responses_route(
             "allowed_forward_headers": [],
             "allowed_pass_through_prefixed_headers": [],
             "custom_llm_provider": runtime.provider,
-            "egress_credential_family": "opencode",
-            "expected_target_family": "opencode",
+            "egress_credential_family": _OPENCODE_ZEN_CREDENTIAL_FAMILY,
+            "expected_target_family": _OPENCODE_ZEN_TARGET_FAMILY,
             "malformed_upstream_url": target_url,
         },
         handle_exception=handle_exception,

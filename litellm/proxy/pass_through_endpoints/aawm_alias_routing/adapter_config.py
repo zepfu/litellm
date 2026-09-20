@@ -177,8 +177,11 @@ OPENCODE_ZEN_COMPLETION = AnthropicCompletionAdapterConfig(
     tag_prefix="anthropic-opencode-zen-completion-adapter",
     span_name="anthropic.opencode_zen_completion_adapter",
     target_endpoint_label="opencode_zen:/v1/chat/completions",
-    credential_family="opencode",
-    expected_target_family="opencode",
+    # OC-010: Zen-distinct egress family; never shared with OpenCode Go.
+    # String literals avoid importing opencode_zen.constants from this module
+    # (that package's adapter imports adapter_config).
+    credential_family="opencode_zen",
+    expected_target_family="opencode_zen",
     custom_llm_provider="openai",  # OpenCode uses OpenAI-compatible base
 )
 
