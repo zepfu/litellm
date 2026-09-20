@@ -2070,10 +2070,15 @@ def _is_opencode_zen_candidate(candidate: Any) -> bool:
 
 
 def _opencode_zen_exception_is_provider_attributed(exc: Any) -> bool:
+    """Require stamps set at the Zen provider boundary.
+
+    Existence or class of ``exc.response`` is not provenance: SDK constructors
+    such as ``litellm.RateLimitError(..., response=None)`` still attach a
+    synthetic ``httpx.Response``. Numeric/string status is also not provenance.
+    """
     return (
         getattr(exc, "_aawm_provider_returned", False) is True
         or getattr(exc, "provider_returned", False) is True
-        or isinstance(getattr(exc, "response", None), httpx.Response)
     )
 
 
@@ -2404,7 +2409,7 @@ def _is_opencode_zen_unavailable_model_response(
     """
     if (
         not attempted_provider_call
-        or not (getattr(exc, "_aawm_provider_returned", False) is True or getattr(exc, "provider_returned", False) is True or isinstance(getattr(exc, "response", None), httpx.Response))
+        or not _opencode_zen_exception_is_provider_attributed(exc)
         or not isinstance(candidate, dict)
         or candidate.get("provider") != _CODEX_AUTO_AGENT_OPENCODE_PROVIDER
         or candidate.get("route_family") not in _OPENCODE_ZEN_ROUTE_FAMILIES
