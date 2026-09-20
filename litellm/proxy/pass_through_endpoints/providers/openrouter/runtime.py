@@ -552,6 +552,24 @@ async def _perform_openrouter_adapter_pass_through_request(
         raise
 
 
+def _http_status_from_exception(exc: Any) -> Optional[int]:
+    """Normalize HTTP status from exception carriers. A numeric code is not provenance."""
+    for source in (exc, getattr(exc, "response", None)):
+        if source is None:
+            continue
+        for attr in ("status_code", "code"):
+            value = getattr(source, attr, None)
+            if isinstance(value, bool) or value is None:
+                continue
+            if isinstance(value, int):
+                return value
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
 def extract_credit_exhaustion_event(
     exc: Any, *, error_shape_runtime: Any,
 ) -> Optional[FailureEvent]:
@@ -560,8 +578,7 @@ def extract_credit_exhaustion_event(
     from ...aawm_alias_routing.classification import classify_failure
     from ...aawm_alias_routing.failure_vocabulary import OPENROUTER_CREDIT_EXHAUSTED
 
-    response = getattr(exc, "response", None)
-    status_code = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
+    status_code = _http_status_from_exception(exc)
     if status_code != 402 or not (
         getattr(exc, "_aawm_provider_returned", False) is True
         or getattr(exc, "provider_returned", False) is True
