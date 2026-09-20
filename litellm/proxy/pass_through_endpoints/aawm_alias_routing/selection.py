@@ -1828,6 +1828,32 @@ async def _apply_codex_auto_agent_adapter_local_candidate_cooldown(
     return cooldown_seconds, cooldown_state_source, skip_reason
 
 
+async def _get_openrouter_account_lane_cooldown_state(
+    cooldown_key: str,
+) -> tuple[float, str]:
+    """Merge Codex and Anthropic views for the hashed OpenRouter account key.
+
+    Codex and Anthropic cooldown stores are separate. Account-wide 401/403
+    publishes ``openrouter:__account__:<lane>`` into one family; sibling
+    suppression on the other ingress has to read both stores. Candidate,
+    credit, rate, and free-quota keys stay family-scoped.
+    """
+    assert _get_codex_active_cooldown_state is not None
+    assert _get_anthropic_active_cooldown_state is not None
+    anthropic_seconds, anthropic_source = await _get_anthropic_active_cooldown_state(
+        cooldown_key
+    )
+    codex_seconds, codex_source = await _get_codex_active_cooldown_state(
+        cooldown_key
+    )
+    return _cooldown_state._format_merged_alias_family_cooldown_state_source(
+        anthropic_seconds=anthropic_seconds,
+        anthropic_source=anthropic_source,
+        codex_seconds=codex_seconds,
+        codex_source=codex_source,
+    )
+
+
 async def _apply_openrouter_account_lane_cooldown(
     *,
     candidate: dict[str, Any],
@@ -1835,13 +1861,12 @@ async def _apply_openrouter_account_lane_cooldown(
     cooldown_seconds: float,
     cooldown_state_source: Optional[str],
     skip_reason: Optional[str],
-    get_active_cooldown_state: Callable[[str], Awaitable[tuple[float, str]]],
 ) -> tuple[float, Optional[str], Optional[str], Optional[str]]:
     """Suppress sibling OpenRouter models sharing the hashed credential lane."""
     key = openrouter_account_lane_cooldown_key(candidate, lane_key)
     if key is None:
         return cooldown_seconds, cooldown_state_source, skip_reason, None
-    seconds, source = await get_active_cooldown_state(key)
+    seconds, source = await _get_openrouter_account_lane_cooldown_state(key)
     if seconds <= 0:
         return cooldown_seconds, cooldown_state_source, skip_reason, None
     if seconds > cooldown_seconds:
@@ -3853,7 +3878,6 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         cooldown_seconds=cooldown_seconds,
         cooldown_state_source=cooldown_state_source,
         skip_reason=skip_reason,
-        get_active_cooldown_state=active_cooldown_state,
     )
     (
         cooldown_seconds,
@@ -4653,7 +4677,6 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
         cooldown_seconds=cooldown_seconds,
         cooldown_state_source=cooldown_state_source,
         skip_reason=skip_reason,
-        get_active_cooldown_state=_get_anthropic_active_cooldown_state,
     )
     (
         cooldown_seconds,
@@ -7687,6 +7710,7 @@ def install(host_globals: dict) -> None:
     )
     for _name in (
         "resolve_openrouter_credential_lane_key",
+        "_get_openrouter_account_lane_cooldown_state",
         "_apply_openrouter_account_lane_cooldown",
         "_apply_openrouter_credit_lane_cooldown",
         "_is_finite_number",

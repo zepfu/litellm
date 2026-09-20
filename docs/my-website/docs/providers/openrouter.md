@@ -36,10 +36,12 @@ OpenRouter alias cooldowns keep four scopes distinct:
   401/403. Broad error text is not enough.
 
 Account cooldowns use a nonreversible hashed credential lane derived from the
-effective OpenRouter API key. Sibling models on that credential are skipped;
-a different credential stays eligible. Missing credentials keep the legacy
-lane and cannot publish a shared account cooldown. Raw credentials never
-enter cooldown keys, logs, or public error details.
+effective OpenRouter API key. Sibling models on that credential are skipped
+on both Codex and Anthropic ingress; lookup of `openrouter:__account__:<lane>`
+merges the two family cooldown stores and keeps the longer remaining
+duration. A different credential stays eligible. Missing credentials keep
+the legacy lane and cannot publish a shared account cooldown. Raw
+credentials never enter cooldown keys, logs, or public error details.
 
 ## AAWM credit exhaustion
 
