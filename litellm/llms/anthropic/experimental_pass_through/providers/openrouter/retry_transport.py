@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     Any,
     Awaitable,
@@ -91,7 +91,7 @@ class Runtime:
     wait_for_cooldown: Callable[..., Awaitable[None]]
     set_cooldown_callback: Callable[..., Awaitable[None]]
     maybe_raise_failure_circuit_open_callback: Callable[..., Awaitable[None]]
-    open_failure_circuit_callback: Callable[..., Awaitable[None]]
+    open_failure_circuit_callback: Callable[..., Awaitable[Any]]
     clear_failure_circuit_callback: Callable[[Optional[str]], None]
     log_debug: Callable[..., object]
     log_warning: Callable[..., object]
@@ -115,6 +115,105 @@ def _emit_inner_send(
             payload.get("inner_attempt"),
             payload.get("disposition"),
             exc_info=True,
+        )
+
+
+@dataclass
+class _StartedSendTracker:
+    """Track one started inner send until its final row is emitted.
+
+    Proposed cooldown values are ignored. Only ``acknowledge`` can attach an
+    applied ``cooldown_seconds`` value that settlement may copy.
+    """
+
+    runtime: Runtime
+    started_inner_attempt: int = 0
+    started_row_finalized: bool = True
+    known_final_payload: dict[str, Any] = field(default_factory=dict)
+    published_cooldown_seconds: Optional[float] = None
+
+    def note(self, **payload: Any) -> None:
+        if self.started_row_finalized or self.started_inner_attempt <= 0:
+            return
+        self.known_final_payload.update(
+            {
+                key: value
+                for key, value in payload.items()
+                if value is not None and key != "cooldown_seconds"
+            }
+        )
+        staged = {
+            key: value
+            for key, value in self.known_final_payload.items()
+            if key not in {"status", "disposition", "inner_attempt"}
+            and value is not None
+        }
+        _emit_inner_send(
+            self.runtime,
+            inner_attempt=self.started_inner_attempt,
+            status="in_flight",
+            disposition="started",
+            attempted_provider_call=True,
+            **staged,
+        )
+
+    def acknowledge(self, seconds: float) -> None:
+        published = max(0.0, float(seconds))
+        if self.published_cooldown_seconds is None:
+            self.published_cooldown_seconds = published
+        else:
+            self.published_cooldown_seconds = max(
+                self.published_cooldown_seconds,
+                published,
+            )
+        if self.started_row_finalized or self.started_inner_attempt <= 0:
+            return
+        self.known_final_payload["cooldown_seconds"] = self.published_cooldown_seconds
+        self.note()
+
+    def emit_final(self, **payload: Any) -> None:
+        self.known_final_payload.update(payload)
+        _emit_inner_send(self.runtime, **payload)
+        self.started_row_finalized = True
+
+    def applied_cooldown_seconds(self) -> float:
+        if self.published_cooldown_seconds is None:
+            return 0.0
+        return self.published_cooldown_seconds
+
+    def settle_outstanding(self) -> None:
+        if self.started_row_finalized or self.started_inner_attempt <= 0:
+            return
+        payload: dict[str, Any] = {
+            "inner_attempt": self.started_inner_attempt,
+            "status": "cancelled",
+            "disposition": "cancelled",
+            "delay_seconds": 0.0,
+            "cooldown_seconds": self.applied_cooldown_seconds(),
+            "attempted_provider_call": True,
+        }
+        payload.update(
+            {
+                key: value
+                for key, value in self.known_final_payload.items()
+                if key != "cooldown_seconds"
+            }
+        )
+        payload["inner_attempt"] = self.started_inner_attempt
+        payload["cooldown_seconds"] = self.applied_cooldown_seconds()
+        self.emit_final(**payload)
+
+    def mark_started(self, attempt: int) -> None:
+        self.started_inner_attempt = attempt
+        self.started_row_finalized = False
+        self.known_final_payload.clear()
+        self.published_cooldown_seconds = None
+        _emit_inner_send(
+            self.runtime,
+            inner_attempt=attempt,
+            status="in_flight",
+            disposition="started",
+            attempted_provider_call=True,
         )
 
 
@@ -286,11 +385,13 @@ def get_post_failure_cooldown_seconds(runtime: Runtime) -> float:
 
 
 def get_failure_circuit_cooldown_seconds(runtime: Runtime, exc: object) -> float:
-    """Return the duration ``open_failure_circuit`` applies for *exc*.
+    """Return the proposed circuit duration for *exc*.
 
-    Owner of the circuit duration: max(post-failure floor, Retry-After,
-    reset-wait), then clamp to ``[0, 300]``. Recording sites must use this
-    value instead of inventing a parallel policy.
+    Policy owner: max(post-failure floor, Retry-After, reset-wait), then
+    clamp to ``[0, 300]``. This is the proposal ``open_failure_circuit``
+    applies; the committed remaining duration, including any longer expiry
+    already stored, is the owner's return value. Recording sites must not
+    treat this proposal as an applied cooldown.
     """
     cooldown_seconds = get_post_failure_cooldown_seconds(runtime)
     retry_after_seconds = extract_retry_after_seconds(runtime, exc)
@@ -337,18 +438,60 @@ async def open_failure_circuit(
     *,
     exc: object,
 ) -> float:
+    """Publish the failure circuit and return the committed remaining duration.
+
+    The proposal comes from ``get_failure_circuit_cooldown_seconds``. A
+    longer existing expiry is retained. The return is the remaining time
+    until that committed expiry, not the proposal.
+    """
     rate_limit_key = get_rate_limit_key(runtime, adapter_model)
-    cooldown_seconds = get_failure_circuit_cooldown_seconds(runtime, exc)
+    proposed_seconds = get_failure_circuit_cooldown_seconds(runtime, exc)
     async with runtime.rate_limit.lock:
-        until = runtime.monotonic() + cooldown_seconds
+        now = runtime.monotonic()
+        proposed_until = now + proposed_seconds
         current_until = runtime.failure_circuit_until_monotonic_by_key.get(
             rate_limit_key,
             0.0,
         )
-        if until > current_until:
-            runtime.failure_circuit_until_monotonic_by_key[rate_limit_key] = until
+        if proposed_until > current_until:
+            runtime.failure_circuit_until_monotonic_by_key[
+                rate_limit_key
+            ] = proposed_until
             bound_memory_map(runtime.failure_circuit_until_monotonic_by_key)
-    return cooldown_seconds
+            committed_until = proposed_until
+        else:
+            committed_until = current_until
+        return max(committed_until - now, 0.0)
+
+
+def _peek_failure_circuit_remaining_seconds(
+    runtime: Runtime,
+    adapter_model: Optional[str],
+) -> float:
+    rate_limit_key = get_rate_limit_key(runtime, adapter_model)
+    remaining = (
+        runtime.failure_circuit_until_monotonic_by_key.get(rate_limit_key, 0.0)
+        - runtime.monotonic()
+    )
+    return max(remaining, 0.0)
+
+
+async def _await_published_failure_circuit(
+    runtime: Runtime,
+    adapter_model: Optional[str],
+    *,
+    exc: object,
+) -> float:
+    """Return the committed circuit remaining after publication completes.
+
+    Prefer the owner's return (the committed duration, including a retained
+    longer expiry). If a callback swallows that return, read the map written
+    by the completed publication. Does not catch ``CancelledError``.
+    """
+    published = await runtime.open_failure_circuit_callback(adapter_model, exc=exc)
+    if isinstance(published, (int, float)) and not isinstance(published, bool):
+        return max(float(published), 0.0)
+    return _peek_failure_circuit_remaining_seconds(runtime, adapter_model)
 
 
 def clear_failure_circuit(
@@ -557,6 +700,89 @@ async def set_cooldown(
     )
 
 
+async def _publish_long_window_terminal(
+    runtime: Runtime,
+    exc: Exception,
+    *,
+    attempt: int,
+    adapter_model: Optional[str],
+    status_code: Optional[int],
+    reset_wait_seconds: Optional[float],
+    note: Callable[..., None],
+    emit_final: Callable[..., None],
+    acknowledge: Callable[[float], None],
+) -> None:
+    rate_limit_cooldown_seconds = min(max(reset_wait_seconds or 0.0, 30.0), 300.0)
+    note(
+        status="terminal",
+        disposition="long_window_rate_limit",
+        delay_seconds=0.0,
+        error_status_code=status_code,
+        failure_class="long_window_rate_limit",
+    )
+    await runtime.set_cooldown_callback(
+        get_cooldown_keys(runtime, model=adapter_model, exc=exc),
+        rate_limit_cooldown_seconds,
+    )
+    applied_cooldown = rate_limit_cooldown_seconds
+    acknowledge(applied_cooldown)
+    circuit_committed = await _await_published_failure_circuit(
+        runtime,
+        adapter_model,
+        exc=exc,
+    )
+    applied_cooldown = max(applied_cooldown, circuit_committed)
+    acknowledge(applied_cooldown)
+    emit_final(
+        inner_attempt=attempt,
+        status="terminal",
+        disposition="long_window_rate_limit",
+        delay_seconds=0.0,
+        cooldown_seconds=applied_cooldown,
+        error_status_code=status_code,
+        failure_class="long_window_rate_limit",
+        attempted_provider_call=True,
+    )
+
+
+async def _publish_terminal_failure(
+    runtime: Runtime,
+    exc: Exception,
+    *,
+    attempt: int,
+    adapter_model: Optional[str],
+    status_code: Optional[int],
+    note: Callable[..., None],
+    emit_final: Callable[..., None],
+    acknowledge: Callable[[float], None],
+) -> None:
+    applied_cooldown: Optional[float] = None
+    note(
+        status="terminal",
+        disposition="terminal",
+        delay_seconds=0.0,
+        error_status_code=status_code,
+        failure_class=exc.__class__.__name__,
+    )
+    if status_code == 429:
+        applied_cooldown = await _await_published_failure_circuit(
+            runtime,
+            adapter_model,
+            exc=exc,
+        )
+        acknowledge(applied_cooldown)
+    emit_final(
+        inner_attempt=attempt,
+        status="terminal",
+        disposition="terminal",
+        delay_seconds=0.0,
+        cooldown_seconds=applied_cooldown,
+        error_status_code=status_code,
+        failure_class=exc.__class__.__name__,
+        attempted_provider_call=True,
+    )
+
+
 async def _retry_loop_on_failure(
     runtime: Runtime,
     exc: Exception,
@@ -571,6 +797,7 @@ async def _retry_loop_on_failure(
     total_attempts: int,
     note_started_row: Optional[Callable[..., None]] = None,
     emit_final_row: Optional[Callable[..., None]] = None,
+    acknowledge_published_cooldown: Optional[Callable[[float], None]] = None,
 ) -> tuple[bool, float]:
     """Return (should_retry, updated_hidden_wait_seconds)."""
 
@@ -598,6 +825,10 @@ async def _retry_loop_on_failure(
             emit_final_row(**payload)
             return
         _emit_inner_send(runtime, **payload)
+
+    def _acknowledge(seconds: float) -> None:
+        if acknowledge_published_cooldown is not None:
+            acknowledge_published_cooldown(seconds)
 
     status_code = extract_exception_status_code(runtime, exc)
     provider_name = extract_provider_name(runtime, exc)
@@ -629,9 +860,6 @@ async def _retry_loop_on_failure(
         failure_class=exc.__class__.__name__,
     )
     if status_code == 429 and is_long_window:
-        rate_limit_cooldown_seconds = min(max(reset_wait_seconds or 0.0, 30.0), 300.0)
-        circuit_cooldown_seconds = get_failure_circuit_cooldown_seconds(runtime, exc)
-        cooldown_seconds = max(rate_limit_cooldown_seconds, circuit_cooldown_seconds)
         if log_warnings:
             runtime.log_warning(
                 "%s upstream attempt %s hit long-window 429 "
@@ -644,28 +872,16 @@ async def _retry_loop_on_failure(
                 raw_message,
                 reset_wait_seconds or 0.0,
             )
-        _note(
-            status="terminal",
-            disposition="long_window_rate_limit",
-            delay_seconds=0.0,
-            cooldown_seconds=cooldown_seconds,
-            error_status_code=status_code,
-            failure_class="long_window_rate_limit",
-        )
-        await runtime.set_cooldown_callback(
-            get_cooldown_keys(runtime, model=adapter_model, exc=exc),
-            rate_limit_cooldown_seconds,
-        )
-        await runtime.open_failure_circuit_callback(adapter_model, exc=exc)
-        _emit_final(
-            inner_attempt=attempt,
-            status="terminal",
-            disposition="long_window_rate_limit",
-            delay_seconds=0.0,
-            cooldown_seconds=cooldown_seconds,
-            error_status_code=status_code,
-            failure_class="long_window_rate_limit",
-            attempted_provider_call=True,
+        await _publish_long_window_terminal(
+            runtime,
+            exc,
+            attempt=attempt,
+            adapter_model=adapter_model,
+            status_code=status_code,
+            reset_wait_seconds=reset_wait_seconds,
+            note=_note,
+            emit_final=_emit_final,
+            acknowledge=_acknowledge,
         )
         return False, accumulated_hidden_wait_seconds
     try:
@@ -709,30 +925,15 @@ async def _retry_loop_on_failure(
                 provider_name,
                 raw_message,
             )
-        applied_cooldown = (
-            get_failure_circuit_cooldown_seconds(runtime, exc)
-            if status_code == 429
-            else None
-        )
-        _note(
-            status="terminal",
-            disposition="terminal",
-            delay_seconds=0.0,
-            cooldown_seconds=applied_cooldown,
-            error_status_code=status_code,
-            failure_class=exc.__class__.__name__,
-        )
-        if status_code == 429:
-            await runtime.open_failure_circuit_callback(adapter_model, exc=exc)
-        _emit_final(
-            inner_attempt=attempt,
-            status="terminal",
-            disposition="terminal",
-            delay_seconds=0.0,
-            cooldown_seconds=applied_cooldown,
-            error_status_code=status_code,
-            failure_class=exc.__class__.__name__,
-            attempted_provider_call=True,
+        await _publish_terminal_failure(
+            runtime,
+            exc,
+            attempt=attempt,
+            adapter_model=adapter_model,
+            status_code=status_code,
+            note=_note,
+            emit_final=_emit_final,
+            acknowledge=_acknowledge,
         )
         return False, accumulated_hidden_wait_seconds
     if log_warnings:
@@ -750,7 +951,6 @@ async def _retry_loop_on_failure(
         status="retrying",
         disposition="retry_backoff",
         delay_seconds=wait_seconds,
-        cooldown_seconds=wait_seconds,
         error_status_code=status_code,
         failure_class="rate_limited",
     )
@@ -758,6 +958,7 @@ async def _retry_loop_on_failure(
         get_cooldown_keys(runtime, model=adapter_model, exc=exc),
         wait_seconds,
     )
+    _acknowledge(wait_seconds)
     _emit_final(
         inner_attempt=attempt,
         status="retrying",
@@ -801,54 +1002,9 @@ async def run_retry_loop(
         use_alias_candidate_probe=use_alias_candidate_probe,
     )
     await runtime.maybe_raise_failure_circuit_open_callback(adapter_model)
-    started_inner_attempt = 0
-    started_row_finalized = True
-    known_final_payload: dict[str, Any] = {}
-
-    def _note_started_row(**payload: Any) -> None:
-        if started_row_finalized or started_inner_attempt <= 0:
-            return
-        known_final_payload.update(
-            {key: value for key, value in payload.items() if value is not None}
-        )
-        staged = {
-            key: value
-            for key, value in known_final_payload.items()
-            if key not in {"status", "disposition", "inner_attempt"}
-            and value is not None
-        }
-        _emit_inner_send(
-            runtime,
-            inner_attempt=started_inner_attempt,
-            status="in_flight",
-            disposition="started",
-            attempted_provider_call=True,
-            **staged,
-        )
-
-    def _emit_final_row(**payload: Any) -> None:
-        nonlocal started_row_finalized
-        known_final_payload.update(payload)
-        _emit_inner_send(runtime, **payload)
-        started_row_finalized = True
-
-    def _settle_outstanding_started_row() -> None:
-        if started_row_finalized or started_inner_attempt <= 0:
-            return
-        payload: dict[str, Any] = {
-            "inner_attempt": started_inner_attempt,
-            "status": "cancelled",
-            "disposition": "cancelled",
-            "delay_seconds": 0.0,
-            "cooldown_seconds": 0.0,
-            "attempted_provider_call": True,
-        }
-        payload.update(known_final_payload)
-        payload["inner_attempt"] = started_inner_attempt
-        _emit_final_row(**payload)
+    started = _StartedSendTracker(runtime)
 
     async def _before_attempt(attempt: int) -> None:
-        nonlocal started_inner_attempt, started_row_finalized
         runtime.log_debug(
             "%s upstream attempt %s/%s for model=%s",
             attempt_label,
@@ -861,16 +1017,7 @@ async def run_retry_loop(
             adapter_model=adapter_model,
             use_alias_candidate_probe=use_alias_candidate_probe,
         )
-        started_inner_attempt = attempt
-        started_row_finalized = False
-        known_final_payload.clear()
-        _emit_inner_send(
-            runtime,
-            inner_attempt=attempt,
-            status="in_flight",
-            disposition="started",
-            attempted_provider_call=True,
-        )
+        started.mark_started(attempt)
 
     async def _on_success(_result: RetryResultT, attempt: int) -> None:
         # OR-034: lazy stream construction is not provider success.  Callers
@@ -879,7 +1026,7 @@ async def run_retry_loop(
         # nonstream/transport callers keep the eager validated clear here.
         if clear_on_success:
             runtime.clear_failure_circuit_callback(adapter_model)
-        _emit_final_row(
+        started.emit_final(
             inner_attempt=attempt,
             status="succeeded",
             disposition="succeeded",
@@ -890,7 +1037,7 @@ async def run_retry_loop(
 
     async def _on_failure(exc: Exception, attempt: int) -> bool:
         nonlocal accumulated_hidden_wait_seconds
-        _note_started_row(
+        started.note(
             error_status_code=extract_exception_status_code(runtime, exc),
             failure_class=exc.__class__.__name__,
         )
@@ -905,8 +1052,9 @@ async def run_retry_loop(
             hidden_retry_budget_seconds=hidden_retry_budget_seconds,
             accumulated_hidden_wait_seconds=accumulated_hidden_wait_seconds,
             total_attempts=total_attempts,
-            note_started_row=_note_started_row,
-            emit_final_row=_emit_final_row,
+            note_started_row=started.note,
+            emit_final_row=started.emit_final,
+            acknowledge_published_cooldown=started.acknowledge,
         )
         return should_retry
 
@@ -920,7 +1068,7 @@ async def run_retry_loop(
             ),
         )
     finally:
-        _settle_outstanding_started_row()
+        started.settle_outstanding()
 
 
 _INVALID_TOOL_DETAIL_LIMIT = 200
