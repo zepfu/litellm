@@ -33,6 +33,7 @@ from .policy import (
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES,
     CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS,
+    canonicalize_openrouter_native_responses_route_family,
 )
 from .types import Payload
 
@@ -668,7 +669,11 @@ def resolve_lane_identity_hash(
     if not identity_input:
         provider = str(candidate.get("provider") or "")
         model = str(candidate.get("model") or "")
-        route_family = str(candidate.get("route_family") or "")
+        raw_route_family = candidate.get("route_family") or ""
+        route_family = str(
+            canonicalize_openrouter_native_responses_route_family(raw_route_family)
+            or raw_route_family
+        )
         identity_input = f"{provider}:{model}:{route_family}"
     return hashlib.sha256(identity_input.encode("utf-8")).hexdigest()
 

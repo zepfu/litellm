@@ -61,6 +61,7 @@ from litellm.secret_managers.credential_error_sanitizer import (
 from . import audit_persist as _aawm_audit_persist
 from . import durable
 from .audit_persist import _emit_aawm_terminal_error
+from .policy import canonicalize_openrouter_native_responses_route_family
 from .types import Payload
 
 
@@ -1424,7 +1425,7 @@ def _canonical_session_owner_provider(attrs: Mapping[str, Any]) -> str:
 
 
 def _apply_canonical_session_owner_identity(attrs: dict[str, Any]) -> None:
-    """Rewrite legacy Zen provider on write; leave other identities unchanged."""
+    """Rewrite legacy Zen provider and native OpenRouter family identities on write."""
 
     raw_provider = (_clean_optional_str(attrs.get("provider")) or "").strip().lower()
     canonical_provider = _canonical_session_owner_provider(attrs)
@@ -1433,9 +1434,20 @@ def _apply_canonical_session_owner_identity(attrs: dict[str, Any]) -> None:
         and raw_provider == _OPENCODE_ZEN_LEGACY_PROVIDER
     ):
         attrs["provider"] = canonical_provider
+    canonical_family = _canonical_session_owner_route_family(attrs)
+    if canonical_family:
+        attrs["route_family"] = canonical_family
     hosted = _hosted_provider_from_attributes(attrs)
     if hosted:
         attrs["hosted_provider"] = hosted
+
+
+def _canonical_session_owner_route_family(attrs: Mapping[str, Any]) -> str:
+    raw = (_clean_optional_str(attrs.get("route_family")) or "").strip()
+    canonical = canonicalize_openrouter_native_responses_route_family(raw)
+    if isinstance(canonical, str) and canonical.strip():
+        return canonical.strip()
+    return raw
 
 
 def _hosted_provider_from_attributes(attrs: Mapping[str, Any]) -> str:
@@ -1747,6 +1759,9 @@ def _core_owner_attributes(attributes: Mapping[str, Any]) -> Payload:
     canonical_provider = _canonical_session_owner_provider(attributes)
     if canonical_provider and "provider" in core:
         core["provider"] = canonical_provider
+    canonical_family = _canonical_session_owner_route_family(attributes)
+    if canonical_family and "route_family" in core:
+        core["route_family"] = canonical_family
     hosted = _hosted_provider_from_attributes(attributes)
     if hosted:
         core["hosted_provider"] = hosted

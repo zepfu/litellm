@@ -37,6 +37,8 @@ from litellm.secret_managers.codex_oauth_inventory import (
     load_codex_oauth_inventory,
 )
 
+from .policy import canonicalize_openrouter_native_responses_route_family
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -1098,11 +1100,12 @@ def _codex_oauth_affinity_conflicts(
         if route is None:
             return None
         normalized = route.lower()
-        return (
-            "codex_responses"
-            if normalized in managed_codex_routes
-            else normalized
-        )
+        if normalized in managed_codex_routes:
+            return "codex_responses"
+        canonical = canonicalize_openrouter_native_responses_route_family(normalized)
+        if isinstance(canonical, str) and canonical:
+            return canonical
+        return normalized
 
     left_route = _canonical_route_family(left.get("route_family"))
     right_route = _canonical_route_family(right.get("route_family"))

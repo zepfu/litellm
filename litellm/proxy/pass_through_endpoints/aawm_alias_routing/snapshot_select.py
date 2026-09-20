@@ -16,6 +16,7 @@ from .config_snapshot import (
     ScheduleWindow as _ScheduleWindow,
     active_routing_snapshot_holder as _active_routing_snapshot_holder,
 )
+from .policy import canonicalize_openrouter_native_responses_route_family
 from .request_metadata import _normalize_tui_family
 
 # CFG-008: route families that require Anthropic-native credentials. The
@@ -464,11 +465,14 @@ def _snapshot_cooldown_identity_tag(
     candidate: Mapping[str, Any],
 ) -> str:
     """Return the stable cooldown identity for one resolved alias candidate."""
+    route_family = canonicalize_openrouter_native_responses_route_family(
+        candidate["route_family"]
+    ) or candidate["route_family"]
     return "alias:{}:{}:{}:{}".format(
         owning_alias,
         candidate["provider"],
         candidate["model"],
-        candidate["route_family"],
+        route_family,
     )
 
 

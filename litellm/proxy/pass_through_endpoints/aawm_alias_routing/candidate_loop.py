@@ -109,6 +109,7 @@ from .schema_rejections import (
     resolve_schema_rejection_failure_identity,
 )
 from .admission import resolve_candidate_account_hash
+from .policy import canonicalize_openrouter_native_responses_route_family
 from .state import (
     ClaimOutcome,
     alias_routing_state,
@@ -656,7 +657,11 @@ def _default_lane_identity_hash(*, candidate: dict[str, Any]) -> str:
     if not identity_input:
         provider = str(candidate.get("provider") or "")
         model = str(candidate.get("model") or "")
-        route_family = str(candidate.get("route_family") or "")
+        raw_route_family = candidate.get("route_family") or ""
+        route_family = str(
+            canonicalize_openrouter_native_responses_route_family(raw_route_family)
+            or raw_route_family
+        )
         identity_input = f"{provider}:{model}:{route_family}"
     return hashlib.sha256(identity_input.encode("utf-8")).hexdigest()
 

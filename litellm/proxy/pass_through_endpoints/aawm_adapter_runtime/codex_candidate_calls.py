@@ -47,6 +47,9 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_persist impor
     _aawm_alias_route_healthy_json_enabled,
     _emit_aawm_terminal_error,
 )
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+    CODEX_AUTO_AGENT_OPENROUTER_RESPONSES_ROUTE_FAMILY,
+)
 from litellm.secret_managers.credential_error_sanitizer import (
     sanitize_credential_error_message,
 )
@@ -2584,6 +2587,7 @@ async def _perform_codex_auto_agent_alias_candidate_request(  # noqa: PLR0915
     from functools import partial
 
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.alias_candidate_dispatch import (
+        _reject_openrouter_alias_route_family,
         _reject_xai_alias_route_family,
     )
 
@@ -2762,7 +2766,7 @@ async def _perform_codex_auto_agent_alias_candidate_request(  # noqa: PLR0915
         route_family_handlers={
             _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER: {
                 "codex_openrouter_completion_adapter": _openrouter_completion,
-                "*": _openrouter_responses,
+                CODEX_AUTO_AGENT_OPENROUTER_RESPONSES_ROUTE_FAMILY: _openrouter_responses,
             },
             _CODEX_AUTO_AGENT_XAI_PROVIDER: {
                 "codex_xai_oauth_responses_adapter": _xai_oauth,
@@ -2770,6 +2774,11 @@ async def _perform_codex_auto_agent_alias_candidate_request(  # noqa: PLR0915
             },
         },
         unsupported_route_family_handlers={
+            _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER: partial(
+                _reject_openrouter_alias_route_family,
+                candidate=candidate,
+                ingress="codex",
+            ),
             _CODEX_AUTO_AGENT_XAI_PROVIDER: partial(
                 _reject_xai_alias_route_family,
                 candidate=candidate,
@@ -8202,6 +8211,11 @@ async def _perform_codex_auto_agent_openrouter_responses_request(
     )
     custom_headers.update(_build_openrouter_default_headers())
     _annotate_request_scope_for_adapted_access_log(request, target_url)
+    if isinstance(request_body, dict):
+        request_body = _add_route_family_logging_metadata(
+            request_body,
+            CODEX_AUTO_AGENT_OPENROUTER_RESPONSES_ROUTE_FAMILY,
+        )
 
     response = await _perform_openrouter_adapter_pass_through_request(
         adapter_model=adapter_model,

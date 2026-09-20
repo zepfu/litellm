@@ -29,6 +29,8 @@ from litellm.proxy.aawm_route_logging import (
 
 from .policy import (
     CODEX_AUTO_AGENT_NATIVE_PROVIDER as _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+    CODEX_AUTO_AGENT_OPENROUTER_RESPONSES_ROUTE_FAMILY,
+    canonicalize_openrouter_native_responses_route_family,
 )
 
 from .codex_oauth import (
@@ -84,6 +86,9 @@ def _resolve_auto_agent_alias_route_rollup_outgoing_target(
     target_url: Optional[Union[str, httpx.URL]] = None,
 ) -> Optional[str]:
     cleaned_route_family = _clean_codex_auth_value(route_family)
+    cleaned_route_family = canonicalize_openrouter_native_responses_route_family(
+        cleaned_route_family
+    ) or cleaned_route_family
     if target_url is not None:
         assert _get_anthropic_adapter_access_log_target_label is not None
         return _get_anthropic_adapter_access_log_target_label(target_url)
@@ -116,6 +121,9 @@ def _resolve_auto_agent_alias_route_rollup_outgoing_target(
         "codex_opencode_zen_adapter": "opencode.ai/zen/v1/chat/completions",
         "codex_opencode_go_adapter": "opencode.ai/zen/go/v1/chat/completions",
         "codex_openrouter_completion_adapter": "openrouter.ai/api/v1/chat/completions",
+        CODEX_AUTO_AGENT_OPENROUTER_RESPONSES_ROUTE_FAMILY: (
+            "openrouter.ai/api/v1/responses"
+        ),
         "anthropic_opencode_zen_responses_adapter": "opencode.ai/zen/v1/responses",
         "anthropic_opencode_zen_completion_adapter": "opencode.ai/zen/v1/chat/completions",
     }

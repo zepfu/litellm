@@ -14,6 +14,9 @@ from typing import TYPE_CHECKING, Any, Optional
 from fastapi import Request, Response
 
 from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+    CODEX_AUTO_AGENT_OPENROUTER_RESPONSES_ROUTE_FAMILY,
+)
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
     bind_codex_collaboration_tool_identities,
     normalize_codex_collaboration_dispatch_body,
@@ -1022,7 +1025,7 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
             session_identity=_sid,
             provider="openrouter",
             model=reserved_openrouter_model,
-            route_family="codex_auto_agent_openrouter_responses",
+            route_family=CODEX_AUTO_AGENT_OPENROUTER_RESPONSES_ROUTE_FAMILY,
         )
         try:
             _resp = await openrouter_handler(

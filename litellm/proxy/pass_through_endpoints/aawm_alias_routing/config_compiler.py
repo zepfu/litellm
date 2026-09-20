@@ -27,6 +27,7 @@ from typing import Optional
 import yaml
 
 from . import config_schema as schema
+from . import policy
 from .config_snapshot import (
     AliasReference,
     DispatchRule,
@@ -62,8 +63,9 @@ _PROVIDER_ALLOWED_ROUTE_FAMILIES: dict[str, frozenset[str]] = {
     "anthropic": frozenset({"anthropic_messages"}),
     "openrouter": frozenset(
         {
-            "codex_openrouter_completion_adapter",
-            "anthropic_openrouter_completion_adapter",
+            policy.CODEX_OPENROUTER_COMPLETION_ADAPTER_ROUTE_FAMILY,
+            policy.ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ROUTE_FAMILY,
+            policy.CODEX_AUTO_AGENT_OPENROUTER_RESPONSES_ROUTE_FAMILY,
         }
     ),
     "xai": frozenset(
@@ -301,6 +303,18 @@ _NVIDIA_NATIVE_PROVIDERS: frozenset[str] = frozenset(
         "nvidia",
     }
 )
+_OPENROUTER_CREDENTIAL_ROUTE_FAMILIES: frozenset[str] = frozenset(
+    {
+        policy.CODEX_OPENROUTER_COMPLETION_ADAPTER_ROUTE_FAMILY,
+        policy.ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ROUTE_FAMILY,
+        policy.CODEX_AUTO_AGENT_OPENROUTER_RESPONSES_ROUTE_FAMILY,
+    }
+)
+_OPENROUTER_NATIVE_PROVIDERS: frozenset[str] = frozenset(
+    {
+        "openrouter",
+    }
+)
 
 
 def _validate_cohere_credential_domain(
@@ -458,6 +472,37 @@ def _validate_nvidia_credential_domain(
         )
 
 
+def _validate_openrouter_credential_domain(
+    *,
+    provider: str,
+    model: str,
+    route_family: Optional[str],
+    anthropic_route_family: Optional[str],
+) -> None:
+    route_families = tuple(
+        value
+        for value in (route_family, anthropic_route_family)
+        if value is not None
+    )
+    uses_openrouter_credentials = any(
+        value in _OPENROUTER_CREDENTIAL_ROUTE_FAMILIES for value in route_families
+    )
+    is_openrouter_provider = provider in _OPENROUTER_NATIVE_PROVIDERS
+
+    if uses_openrouter_credentials and not is_openrouter_provider:
+        raise ConfigCompileError(
+            f"candidate model {model!r}: provider {provider!r} is incompatible "
+            "with OpenRouter-credential route family"
+        )
+    if is_openrouter_provider and any(
+        value not in _OPENROUTER_CREDENTIAL_ROUTE_FAMILIES for value in route_families
+    ):
+        raise ConfigCompileError(
+            f"candidate model {model!r}: provider {provider!r} requires "
+            "OpenRouter-native route families"
+        )
+
+
 def _format_fixed_utc_offset(offset: timedelta) -> str:
     total_minutes = int(offset.total_seconds() // 60)
     sign = "-" if total_minutes < 0 else "+"
@@ -589,6 +634,12 @@ def _compile_candidate(candidate: schema.CandidateConfig, weight: float) -> Rout
         anthropic_route_family=anthropic_rf,
     )
     _validate_nvidia_credential_domain(
+        provider=candidate.provider,
+        model=candidate.model,
+        route_family=candidate.route_family,
+        anthropic_route_family=anthropic_rf,
+    )
+    _validate_openrouter_credential_domain(
         provider=candidate.provider,
         model=candidate.model,
         route_family=candidate.route_family,

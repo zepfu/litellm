@@ -85,6 +85,21 @@ _OPENCODE_GO_FOREIGN_PREFIXES: dict[str, str] = {
 }
 
 CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY = "openrouter"
+CODEX_AUTO_AGENT_OPENROUTER_RESPONSES_ROUTE_FAMILY = (
+    "codex_auto_agent_openrouter_responses"
+)
+CODEX_OPENROUTER_COMPLETION_ADAPTER_ROUTE_FAMILY = (
+    "codex_openrouter_completion_adapter"
+)
+ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ROUTE_FAMILY = (
+    "anthropic_openrouter_completion_adapter"
+)
+_OPENROUTER_NATIVE_RESPONSES_LEGACY_ROUTE_FAMILIES = frozenset(
+    {
+        "codex_openrouter_responses",
+        "codex_openrouter_responses_adapter",
+    }
+)
 CODEX_AUTO_AGENT_XAI_LANE_KEY = "xai_grok_native"
 CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY = "xai_oauth_managed"
 CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY = "kimi_code_managed_account"
@@ -282,6 +297,27 @@ def is_reserved_openrouter_nvidia_nemotron_free_model(model: Any) -> bool:
         return False
     wildcard = candidate[len(prefix) : -len(suffix)]
     return bool(wildcard)
+
+
+def canonicalize_openrouter_native_responses_route_family(route_family: Any) -> Any:
+    """Rewrite legacy native OpenRouter Responses families to the exact Codex family.
+
+    Completion-adapter identities stay distinct. Empty or non-string values are
+    returned unchanged.
+    """
+
+    if not isinstance(route_family, str):
+        return route_family
+    cleaned = route_family.strip()
+    if not cleaned:
+        return route_family
+    lowered = cleaned.casefold()
+    if (
+        lowered == CODEX_AUTO_AGENT_OPENROUTER_RESPONSES_ROUTE_FAMILY
+        or lowered in _OPENROUTER_NATIVE_RESPONSES_LEGACY_ROUTE_FAMILIES
+    ):
+        return CODEX_AUTO_AGENT_OPENROUTER_RESPONSES_ROUTE_FAMILY
+    return route_family
 
 
 def normalize_openrouter_model_namespace(model: Any) -> Optional[str]:
@@ -608,6 +644,7 @@ def install_policy_compat_aliases(host_globals: dict[str, Any]) -> None:
 
 __all__ = [
     "ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER",
+    "ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ROUTE_FAMILY",
     "ANTHROPIC_NVIDIA_RESPONSES_ADAPTER_ALLOWED_MODELS",
     "ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS",
     "ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ALLOWED_MODELS",
@@ -642,6 +679,9 @@ __all__ = [
     "CODEX_AUTO_AGENT_OPENCODE_PROVIDER",
     "CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY",
     "CODEX_AUTO_AGENT_OPENROUTER_PROVIDER",
+    "CODEX_AUTO_AGENT_OPENROUTER_RESPONSES_ROUTE_FAMILY",
+    "CODEX_OPENROUTER_COMPLETION_ADAPTER_ROUTE_FAMILY",
+    "canonicalize_openrouter_native_responses_route_family",
     "CODEX_AUTO_AGENT_XAI_LANE_KEY",
     "CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY",
     "CODEX_AUTO_AGENT_XAI_PROVIDER",

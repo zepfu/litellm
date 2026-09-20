@@ -51,6 +51,7 @@ REGISTERED_ROUTE_FAMILIES: frozenset[str] = frozenset(
     {
         "codex_responses",
         "codex_openrouter_completion_adapter",
+        policy.CODEX_AUTO_AGENT_OPENROUTER_RESPONSES_ROUTE_FAMILY,
         "codex_grok_native_responses_adapter",
         "codex_xai_oauth_responses_adapter",
         "codex_kimi_chat_completions_adapter",
@@ -97,6 +98,7 @@ CODEX_ONLY_ROUTE_FAMILIES: frozenset[str] = frozenset(
         "codex_zai_coding_plan_chat_completions_adapter",
         "codex_opencode_go_adapter",
         "codex_nvidia_completion_adapter",
+        policy.CODEX_AUTO_AGENT_OPENROUTER_RESPONSES_ROUTE_FAMILY,
         "muse_code",
     }
 )

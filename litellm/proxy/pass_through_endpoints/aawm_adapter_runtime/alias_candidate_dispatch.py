@@ -40,6 +40,10 @@ if TYPE_CHECKING:
 
     from litellm.proxy._types import UserAPIKeyAuth
 
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+    canonicalize_openrouter_native_responses_route_family,
+)
+
 Payload = dict[str, Any]
 
 # ---------------------------------------------------------------------------
@@ -175,19 +179,20 @@ _runtime: Optional[AliasCandidateDispatchRuntime] = None
 # ---------------------------------------------------------------------------
 
 
-def _raise_xai_alias_route_family_ineligible(
+def _raise_alias_route_family_ineligible(
     *,
     candidate: Payload,
     ingress: str,
+    provider_label: str,
 ) -> Never:
-    """Reject an unregistered xAI alias route before credential preparation."""
+    """Reject an unregistered alias route before credential preparation."""
     from litellm.proxy._types import ProxyException
 
     model = str(candidate.get("model") or "")
     route_family = str(candidate.get("route_family") or "")
     message = (
         "aawm_codex_auto_agent_candidate_ineligible: "
-        "xAI alias route family is not registered for this ingress; "
+        f"{provider_label} alias route family is not registered for this ingress; "
         f"ingress={ingress} model={model} route_family={route_family}."
     )
     proxy_exc = ProxyException(
@@ -216,6 +221,19 @@ def _raise_xai_alias_route_family_ineligible(
     raise proxy_exc
 
 
+def _raise_xai_alias_route_family_ineligible(
+    *,
+    candidate: Payload,
+    ingress: str,
+) -> Never:
+    """Reject an unregistered xAI alias route before credential preparation."""
+    return _raise_alias_route_family_ineligible(
+        candidate=candidate,
+        ingress=ingress,
+        provider_label="xAI",
+    )
+
+
 async def _reject_xai_alias_route_family(
     *,
     candidate: Payload,
@@ -224,6 +242,18 @@ async def _reject_xai_alias_route_family(
     return _raise_xai_alias_route_family_ineligible(
         candidate=candidate,
         ingress=ingress,
+    )
+
+
+async def _reject_openrouter_alias_route_family(
+    *,
+    candidate: Payload,
+    ingress: str,
+) -> "Response":
+    return _raise_alias_route_family_ineligible(
+        candidate=candidate,
+        ingress=ingress,
+        provider_label="OpenRouter",
     )
 
 
@@ -245,7 +275,11 @@ async def _dispatch_auto_agent_alias_candidate_request(
     dispatch shape so provider branching does not re-grow divergent control flow.
     """
     provider = str(candidate.get("provider") or "")
-    route_family = str(candidate.get("route_family") or "")
+    raw_route_family = candidate.get("route_family") or ""
+    route_family = str(
+        canonicalize_openrouter_native_responses_route_family(raw_route_family)
+        or raw_route_family
+    )
     if route_family_handlers and provider in route_family_handlers:
         family_map = route_family_handlers[provider]
         handler = family_map.get(route_family) or family_map.get("*")
@@ -491,7 +525,7 @@ async def _perform_anthropic_auto_agent_alias_candidate_request(  # noqa: PLR091
         route_family_handlers={
             rt.provider_openrouter: {
                 "anthropic_openrouter_completion_adapter": _openrouter_completion,
-                "*": _openrouter_responses,
+                "anthropic_openrouter_responses_adapter": _openrouter_responses,
             },
             rt.provider_xai: {
                 "anthropic_xai_oauth_responses_adapter": _xai_oauth,
@@ -499,6 +533,11 @@ async def _perform_anthropic_auto_agent_alias_candidate_request(  # noqa: PLR091
             },
         },
         unsupported_route_family_handlers={
+            rt.provider_openrouter: partial(
+                _reject_openrouter_alias_route_family,
+                candidate=candidate,
+                ingress="anthropic",
+            ),
             rt.provider_xai: partial(
                 _reject_xai_alias_route_family,
                 candidate=candidate,
