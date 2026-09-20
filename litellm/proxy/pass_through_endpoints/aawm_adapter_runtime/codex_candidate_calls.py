@@ -1961,6 +1961,8 @@ if TYPE_CHECKING:
     def _is_codex_auto_agent_empty_success_responses_body(body: Any) -> bool: ...
     def _is_codex_auto_agent_malformed_tool_call_text_output(body: Any) -> bool: ...
     def _is_failed_responses_body(body: Any) -> bool: ...
+    def _is_responses_shaped_body(body: Any, **kwargs: Any) -> bool: ...
+    def _responses_body_is_unsuccessful(body: Any, **kwargs: Any) -> bool: ...
     def _join_opencode_zen_passthrough_url(base_target_url: str, endpoint: str) -> str: ...
     async def _load_opencode_zen_api_key_for_candidate(**kwargs: Any) -> str: ...
     def _merge_litellm_metadata(body: Any, **kwargs: Any) -> Any: ...
@@ -1972,6 +1974,7 @@ if TYPE_CHECKING:
     def _parse_retry_after_seconds_from_headers(headers: dict[str, Any]) -> Optional[float]: ...
     def _raise_codex_auto_agent_empty_success_response(**kwargs: Any) -> Any: ...
     def _raise_codex_auto_agent_failed_responses_payload(**kwargs: Any) -> Any: ...
+    def _raise_codex_auto_agent_invalid_responses_shape(**kwargs: Any) -> Any: ...
     def _raise_codex_auto_agent_malformed_tool_call_text_payload(**kwargs: Any) -> Any: ...
     def _raise_codex_native_openai_auto_agent_candidate_unavailable(
         exc: Exception,
@@ -8080,16 +8083,38 @@ async def _perform_codex_auto_agent_openrouter_responses_request(
             request_body=request_body if isinstance(request_body, dict) else None,
         )
     if isinstance(response, Response) and not isinstance(response, StreamingResponse):
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        if status_code < 200 or status_code >= 300:
+            return response
         try:
             response_body = json.loads(_decode_http_response_body(response.body))
         except Exception:
-            return response
-        if isinstance(response_body, dict) and _is_codex_auto_agent_empty_success_responses_body(response_body):
+            _raise_codex_auto_agent_invalid_responses_shape(
+                response_body=response.body,
+                adapter_model=adapter_model,
+                adapter="codex_auto_agent_openrouter_responses",
+                adapter_label="OpenRouter",
+            )
+        if not isinstance(response_body, dict):
+            _raise_codex_auto_agent_invalid_responses_shape(
+                response_body=response_body,
+                adapter_model=adapter_model,
+                adapter="codex_auto_agent_openrouter_responses",
+                adapter_label="OpenRouter",
+            )
+        if _responses_body_is_unsuccessful(response_body):
+            _raise_codex_auto_agent_failed_responses_payload(
+                response_body=response_body,
+                adapter_model=adapter_model,
+                adapter="codex_auto_agent_openrouter_responses",
+                adapter_label="OpenRouter",
+            )
+        if _is_codex_auto_agent_empty_success_responses_body(response_body):
             _raise_codex_auto_agent_empty_success_response(
                 response_body=response_body,
                 adapter_model=adapter_model,
             )
-        if isinstance(response_body, dict) and _is_codex_auto_agent_malformed_tool_call_text_output(response_body):
+        if _is_codex_auto_agent_malformed_tool_call_text_output(response_body):
             _raise_codex_auto_agent_malformed_tool_call_text_payload(
                 response_body=response_body,
                 adapter_model=adapter_model,
@@ -8103,8 +8128,11 @@ async def _perform_codex_auto_agent_openrouter_responses_request(
                     provider="openrouter",
                 ),
             )
-        if isinstance(response_body, dict) and _is_failed_responses_body(response_body):
-            _raise_codex_auto_agent_failed_responses_payload(
+        if (
+            response_body.get("status") != "completed"
+            or not _is_responses_shaped_body(response_body)
+        ):
+            _raise_codex_auto_agent_invalid_responses_shape(
                 response_body=response_body,
                 adapter_model=adapter_model,
                 adapter="codex_auto_agent_openrouter_responses",
