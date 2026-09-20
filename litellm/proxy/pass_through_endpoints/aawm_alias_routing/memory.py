@@ -23,6 +23,8 @@ def normalize_monotonic_cooldown_key(key: str) -> str:
     back into upstream requests.
     """
     return " ".join(key.split()).casefold()
+
+
 def bound_memory_map(
     cache: MutableMapping[MapKeyT, MapValueT],
     *,
