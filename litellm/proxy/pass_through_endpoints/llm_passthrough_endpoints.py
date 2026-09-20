@@ -1774,6 +1774,9 @@ _aawm_openrouter_quota.configure_openrouter_quota_runtime(
             "_get_openrouter_free_daily_quota_exhausted_cooldown_seconds"
         ]()
     ),
+    get_observation_environment=lambda: _get_first_secret_value(
+        _AAWM_LITELLM_ENVIRONMENT_ENV_VARS
+    ),
 )
 
 # Wave 5B: bind the state manager into cooldown_state.

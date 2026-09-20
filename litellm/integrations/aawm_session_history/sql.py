@@ -639,6 +639,7 @@ SELECT COUNT(*)::integer
 FROM public.session_history
 WHERE provider = 'openrouter'
   AND lower(COALESCE(model, '')) LIKE '%:free'
+  AND litellm_environment IS NOT DISTINCT FROM $3::text
   AND COALESCE(end_time, start_time, created_at) >= $1::timestamptz
   AND COALESCE(end_time, start_time, created_at) < $2::timestamptz
 """

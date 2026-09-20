@@ -88,6 +88,17 @@ def _build_openrouter_free_daily_observation(
         3,
     )
     remaining_pct = round(max(0.0, 100.0 - used_percentage), 3)
+    evidence = {
+        "signals": [signal],
+        "provider_fields": [],
+        "scope_note": (
+            "OpenRouter documents free-model quota as account-level; "
+            "provider does not expose current free request usage."
+        ),
+    }
+    environment = _clean_non_empty_string(context.get("environment"))
+    if environment is not None:
+        evidence["environment"] = environment
     return _finalize_rate_limit_observation(
         {
             "observed_at": context["observed_at"],
@@ -124,14 +135,7 @@ def _build_openrouter_free_daily_observation(
                 "model_scope": "openrouter_:free_shared_pool",
                 "meter_source": "local_session_history",
             },
-            "evidence": {
-                "signals": [signal],
-                "provider_fields": [],
-                "scope_note": (
-                    "OpenRouter documents free-model quota as account-level; "
-                    "provider does not expose current free request usage."
-                ),
-            },
+            "evidence": evidence,
         },
         context,
     )

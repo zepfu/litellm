@@ -2121,6 +2121,7 @@ async def _build_openrouter_free_daily_observations_for_records(
                 _AAWM_OPENROUTER_FREE_DAILY_REQUEST_COUNT_SQL,
                 day_start,
                 day_end,
+                record.get("litellm_environment"),
             )
         )
         if used_requests is None:
