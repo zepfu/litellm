@@ -9969,12 +9969,8 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
             previous_response_id=extract_opencode_go_previous_response_id(
                 adapted_request_body
             ),
-            current_messages=(
-                LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages(
-                    input=adapted_request_body.get("input", ""),
-                    responses_api_request=adapted_request_body,
-                )
-            ),
+            current_input=adapted_request_body.get("input", ""),
+            current_instructions=adapted_request_body.get("instructions"),
             request=request,
             request_body=canonical_request_body,
         )
@@ -10324,6 +10320,16 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
     # adapter cools ox-alpha-free as empty success. Client stream is
     # reconstructed from the completed body below.
     client_requested_stream = bool(request_body.get("stream"))
+    go_retained_history = await resolve_opencode_go_retained_history(
+        previous_response_id=extract_opencode_go_previous_response_id(
+            responses_api_request
+        ),
+        current_input=request_input,
+        current_instructions=responses_api_request.get("instructions"),
+        request=request,
+        request_body=canonical_request_body,
+    )
+    drop_opencode_go_previous_response_id(responses_api_request)
     completion_kwargs = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
         model=adapter_model,
         input=request_input,
@@ -10334,15 +10340,6 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
     )
     completion_kwargs["model"] = adapter_model
     completion_kwargs["stream"] = False
-    go_retained_history = await resolve_opencode_go_retained_history(
-        previous_response_id=extract_opencode_go_previous_response_id(
-            responses_api_request
-        ),
-        current_messages=completion_kwargs.get("messages") or [],
-        request=request,
-        request_body=canonical_request_body,
-    )
-    drop_opencode_go_previous_response_id(responses_api_request)
     target_base_url = _get_opencode_go_target_base()
     target_url = _join_opencode_zen_passthrough_url(
         base_target_url=target_base_url,
