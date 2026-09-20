@@ -47,6 +47,10 @@ from .schema_rejections import (
     normalize_schema_rejection,
     resolve_schema_rejection_failure_identity,
 )
+from .opencode_go_rejections import (
+    OPENCODE_GO_REJECTION_KEY,
+    extract_opencode_go_rejection,
+)
 
 _format_auto_agent_alias_timestamp: Callable[[datetime], str] = _default_format_timestamp
 _extract_auto_agent_alias_metadata_value: Optional[Callable[..., Optional[str]]] = None
@@ -197,6 +201,20 @@ def _enrich_auto_agent_alias_terminal_event_from_attempts(
                 error_code=event.get("error_code"),
             )
         )
+    go_rejection = extract_opencode_go_rejection(
+        last_attempt,
+        event,
+        provider=last_attempt.get("provider"),
+        route_family=last_attempt.get("route_family"),
+    )
+    if go_rejection is not None:
+        event[OPENCODE_GO_REJECTION_KEY] = go_rejection
+        if event.get("error_status_code") is None and go_rejection.get("status") is not None:
+            event["error_status_code"] = go_rejection["status"]
+        if not event.get("failure_class") and go_rejection.get("failure_class"):
+            event["failure_class"] = go_rejection["failure_class"]
+        if not event.get("failure_phase") and go_rejection.get("failure_phase"):
+            event["failure_phase"] = go_rejection["failure_phase"]
     return normalized_attempts
 
 
@@ -291,6 +309,15 @@ def _emit_auto_agent_alias_pre_attempt_terminal_event(  # noqa: PLR0915
         )
         if schema_rejection is not None:
             terminal_candidate[SCHEMA_REJECTION_KEY] = schema_rejection.to_dict()
+        go_rejection = extract_opencode_go_rejection(
+            detail_mapping,
+            terminal_candidate,
+            request=request,
+            provider=terminal_candidate.get("provider"),
+            route_family=terminal_candidate.get("route_family"),
+        )
+        if go_rejection is not None:
+            terminal_candidate[OPENCODE_GO_REJECTION_KEY] = go_rejection
 
         normalized_attempts = [
             copy.deepcopy(attempt)
@@ -417,6 +444,12 @@ def _emit_auto_agent_alias_pre_attempt_terminal_event(  # noqa: PLR0915
                     error_code=event.get("error_code"),
                 )
             )
+        if go_rejection is not None:
+            event[OPENCODE_GO_REJECTION_KEY] = go_rejection
+            if event.get("error_status_code") is None and go_rejection.get("status") is not None:
+                event["error_status_code"] = go_rejection["status"]
+            if not event.get("failure_class") and go_rejection.get("failure_class"):
+                event["failure_class"] = go_rejection["failure_class"]
 
         if audit_events:
             _emit_auto_agent_alias_skipped_events_once(
@@ -767,6 +800,8 @@ def install(host_globals: dict) -> None:
         ("SCHEMA_REJECTION_KEY", SCHEMA_REJECTION_KEY),
         ("SCHEMA_REJECTION_FAILURE_CLASS", SCHEMA_REJECTION_FAILURE_CLASS),
         ("SCHEMA_REJECTION_ERROR_CODE", SCHEMA_REJECTION_ERROR_CODE),
+        ("OPENCODE_GO_REJECTION_KEY", OPENCODE_GO_REJECTION_KEY),
+        ("extract_opencode_go_rejection", extract_opencode_go_rejection),
     ):
         host_globals.setdefault(_sk, _sv)
 

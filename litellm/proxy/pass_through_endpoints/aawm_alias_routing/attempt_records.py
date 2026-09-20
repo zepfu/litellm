@@ -37,6 +37,14 @@ from .schema_rejections import (
     normalize_schema_rejection,
     resolve_schema_rejection_failure_identity,
 )
+from .opencode_go_rejections import (
+    OPENCODE_GO_DIRECT_ALIAS_FAMILY,
+    OPENCODE_GO_PROVIDER,
+    OPENCODE_GO_REJECTION_KEY,
+    OPENCODE_GO_ROUTE_FAMILY,
+    attach_opencode_go_rejection,
+    normalize_opencode_go_rejection,
+)
 from .skip_identity import _auto_agent_alias_skip_identity
 
 _AAWM_ALIAS_REQUEST_CALL_ID_STATE_KEY = "aawm_alias_request_litellm_call_id"
@@ -96,6 +104,8 @@ _persist_auto_agent_alias_audit_only_events_best_effort: Optional[Callable[..., 
 from .audit_persist import (
     _aawm_alias_route_healthy_json_enabled as _default_healthy_json_enabled,
     _aawm_alias_route_verbose_json_enabled as _default_verbose_json_enabled,
+    _emit_auto_agent_alias_route_event as _default_emit_auto_agent_alias_route_event,
+    _persist_auto_agent_alias_audit_only_events_best_effort as _default_persist_audit_only_events,
 )
 
 _aawm_alias_route_verbose_json_enabled: Callable[[], bool] = _default_verbose_json_enabled
@@ -490,6 +500,78 @@ def _attach_schema_rejection_to_attempt_record(
     return diagnostic
 
 
+def _attach_opencode_go_rejection_to_attempt_record(
+    *,
+    attempt_record: dict[str, Any],
+    exc: Any = None,
+    candidate: Optional[Mapping[str, Any]] = None,
+    request: Any = None,
+    diagnostic: Optional[Mapping[str, Any]] = None,
+) -> Optional[dict[str, Any]]:
+    """Attach one bounded OpenCode Go rejection onto the attempt contract."""
+
+    return attach_opencode_go_rejection(
+        target=attempt_record,
+        request=request,
+        exc=exc,
+        candidate=candidate,
+        diagnostic=diagnostic,
+    )
+
+
+def _persist_opencode_go_direct_rejection_audit(
+    *,
+    request: Any,
+    evidence: Mapping[str, Any],
+    adapter_model: Any = None,
+    request_body: Optional[dict[str, Any]] = None,
+) -> None:
+    """Persist one terminal audit event for a direct Go rejection."""
+
+    recorded = normalize_opencode_go_rejection(evidence)
+    if recorded is None or recorded.get("call_mode") != "direct":
+        return
+    model = (
+        adapter_model
+        if isinstance(adapter_model, str) and adapter_model.strip()
+        else recorded.get("provider") or OPENCODE_GO_PROVIDER
+    )
+    event: dict[str, Any] = {
+        "alias_family": OPENCODE_GO_DIRECT_ALIAS_FAMILY,
+        "alias_model": model,
+        "provider": OPENCODE_GO_PROVIDER,
+        "model": model,
+        "route_family": OPENCODE_GO_ROUTE_FAMILY,
+        "event_type": "provider_rejection",
+        "candidate_status": "failed",
+        "failure_class": recorded.get("failure_class"),
+        "error_status_code": recorded.get("status"),
+        "failure_phase": recorded.get("failure_phase"),
+        "attempted_provider_call": True,
+        OPENCODE_GO_REJECTION_KEY: recorded,
+    }
+    _stamp_auto_agent_alias_request_identity(request=request, target=event)
+    identity = event.get("request_identity")
+    if isinstance(identity, str) and identity and recorded.get("request_identity") is None:
+        recorded = {
+            **recorded,
+            "request_identity": identity,
+            "litellm_call_id": identity,
+        }
+        event[OPENCODE_GO_REJECTION_KEY] = recorded
+    try:
+        _default_emit_auto_agent_alias_route_event(event, level="warning")
+    except Exception:
+        pass
+    try:
+        _default_persist_audit_only_events(
+            [event],
+            request_body=request_body if isinstance(request_body, dict) else None,
+        )
+    except Exception:
+        pass
+
+
 def _attach_kimi_managed_account_publication_telemetry(
     *,
     attempt_record: dict[str, Any],
@@ -716,6 +798,11 @@ def _update_codex_auto_agent_retryable_attempt_record(  # noqa: PLR0915
         )
     attempt_record.update(update)
     _attach_schema_rejection_to_attempt_record(
+        attempt_record=attempt_record,
+        exc=exc,
+        candidate=candidate,
+    )
+    _attach_opencode_go_rejection_to_attempt_record(
         attempt_record=attempt_record,
         exc=exc,
         candidate=candidate,
@@ -982,6 +1069,11 @@ def _record_auto_agent_alias_attempt_failure(
             audit_event["account_failover_limit_reached"] = True
         audit_event["request_outcome"] = "failed"
     _stamp_auto_agent_alias_request_identity(request=request, target=audit_event)
+    _attach_opencode_go_rejection_to_attempt_record(
+        attempt_record=audit_event,
+        candidate=attempt_record,
+        request=request,
+    )
     if defer_terminal_error:
         audit_event["_aawm_terminal_error_already_emitted"] = True
     _stamp_openrouter_inner_send_fields(audit_event, attempt_record)

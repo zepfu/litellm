@@ -34,6 +34,10 @@ from .schema_rejections import (
     normalize_schema_rejection,
     resolve_schema_rejection_failure_identity,
 )
+from .opencode_go_rejections import (
+    OPENCODE_GO_REJECTION_KEY,
+    extract_opencode_go_rejection,
+)
 from .skip_identity import _auto_agent_alias_skip_identity
 
 # ---------------------------------------------------------------------------
@@ -99,6 +103,16 @@ def _candidate_schema_rejection(
         route_family=candidate.get("route_family"),
     )
     return diagnostic.to_dict() if diagnostic is not None else None
+
+
+def _candidate_opencode_go_rejection(
+    candidate: Mapping[str, Any],
+) -> Optional[dict[str, Any]]:
+    return extract_opencode_go_rejection(
+        candidate,
+        provider=candidate.get("provider"),
+        route_family=candidate.get("route_family"),
+    )
 
 
 def _extract_auto_agent_alias_request_reasoning_effort(
@@ -353,6 +367,15 @@ def _build_auto_agent_alias_audit_event(  # noqa: PLR0915
                 error_code=event.get("error_code"),
             )
         )
+    go_rejection = _candidate_opencode_go_rejection(candidate)
+    if go_rejection is not None:
+        event[OPENCODE_GO_REJECTION_KEY] = go_rejection
+        if event.get("error_status_code") is None and go_rejection.get("status") is not None:
+            event["error_status_code"] = go_rejection["status"]
+        if not event.get("failure_class") and go_rejection.get("failure_class"):
+            event["failure_class"] = go_rejection["failure_class"]
+        if not event.get("failure_phase") and go_rejection.get("failure_phase"):
+            event["failure_phase"] = go_rejection["failure_phase"]
     if isinstance(error_tokens, list):
         event["error_tokens"] = error_tokens
     elif isinstance(error_tokens, set):
@@ -938,6 +961,7 @@ def install(host_globals: dict) -> None:
         ("_auto_agent_alias_int", _auto_agent_alias_int),
         ("_auto_agent_alias_cooldown_until", _auto_agent_alias_cooldown_until),
         ("_candidate_schema_rejection", _candidate_schema_rejection),
+        ("_candidate_opencode_go_rejection", _candidate_opencode_go_rejection),
         (
             "_extract_auto_agent_alias_request_reasoning_effort",
             _extract_auto_agent_alias_request_reasoning_effort,
@@ -947,6 +971,8 @@ def install(host_globals: dict) -> None:
             "resolve_schema_rejection_failure_identity",
             resolve_schema_rejection_failure_identity,
         ),
+        ("extract_opencode_go_rejection", extract_opencode_go_rejection),
+        ("OPENCODE_GO_REJECTION_KEY", OPENCODE_GO_REJECTION_KEY),
         ("_auto_agent_alias_skip_identity", _auto_agent_alias_skip_identity),
         ("SCHEMA_REJECTION_FAILURE_CLASS", SCHEMA_REJECTION_FAILURE_CLASS),
         ("SCHEMA_REJECTION_ERROR_CODE", SCHEMA_REJECTION_ERROR_CODE),

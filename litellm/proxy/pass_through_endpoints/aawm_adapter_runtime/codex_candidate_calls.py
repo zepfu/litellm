@@ -47,9 +47,19 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_persist impor
     _aawm_alias_route_healthy_json_enabled,
     _emit_aawm_terminal_error,
 )
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.attempt_records import (
+    _persist_opencode_go_direct_rejection_audit,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.opencode_go_preflight import (
     classify_opencode_go_credential_preflight_reason,
     raise_opencode_go_preflight,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.opencode_go_rejections import (
+    build_opencode_go_rejection_evidence,
+    extract_opencode_go_offending_tool_index,
+    opencode_go_tool_type,
+    opencode_go_tool_types,
+    record_opencode_go_rejection_evidence,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     CODEX_AUTO_AGENT_OPENROUTER_RESPONSES_ROUTE_FAMILY,
@@ -9807,35 +9817,15 @@ def _opencode_go_completion_call_kwargs(
 
 
 def _opencode_go_tool_type(tool: Any) -> Optional[str]:
-    if not isinstance(tool, dict):
-        return None
-    tool_type = tool.get("type")
-    if isinstance(tool_type, str) and tool_type.strip():
-        return tool_type.strip()
-    function = tool.get("function")
-    if isinstance(function, dict):
-        return "function"
-    return None
+    return opencode_go_tool_type(tool)
 
 
 def _opencode_go_tool_types(tools: Any) -> list[str]:
-    if not isinstance(tools, list):
-        return []
-    summarized: list[str] = []
-    for tool in tools:
-        tool_type = _opencode_go_tool_type(tool)
-        summarized.append(tool_type or "unknown")
-    return summarized
+    return opencode_go_tool_types(tools)
 
 
 def _extract_opencode_go_offending_tool_index(message: str) -> Optional[int]:
-    match = _OPENCODE_GO_TOOLS_INDEX_RE.search(message)
-    if match is None:
-        return None
-    try:
-        return int(match.group(1))
-    except (TypeError, ValueError):
-        return None
+    return extract_opencode_go_offending_tool_index(message)
 
 
 def _sanitize_opencode_go_error_text(message: Any, *, api_key: Any = None) -> str:
@@ -9968,35 +9958,13 @@ def _build_opencode_go_provider_rejection_evidence(
     completion_tools: Any = None,
     api_key: Any = None,
     local_timeout: bool = False,
+    request: Any = None,
+    expected_target_family: Any = "opencode",
+    failure_phase: Any = "provider_attempt",
+    call_mode: Any = None,
 ) -> dict[str, Any]:
-    advertised_types = _opencode_go_tool_types(advertised_tools)
-    completion_types = _opencode_go_tool_types(completion_tools)
     if isinstance(exc, Exception):
         status_code = extract_opencode_go_status_code(exc)
-    else:
-        status_code = None
-    raw_message = getattr(exc, "message", None)
-    if not raw_message:
-        raw_message = getattr(exc, "detail", None) or str(exc)
-    sanitized_message = _sanitize_opencode_go_error_text(
-        raw_message,
-        api_key=api_key,
-    )
-    offending_index = _extract_opencode_go_offending_tool_index(sanitized_message)
-    offending_type = None
-    if offending_index is not None:
-        if 0 <= offending_index < len(advertised_types):
-            offending_type = advertised_types[offending_index]
-        elif 0 <= offending_index < len(completion_types):
-            offending_type = completion_types[offending_index]
-    target = str(target_url or "")
-    target_url_family = (
-        "/zen/go/v1/responses"
-        if "/zen/go/v1/responses" in target
-        else _OPENCODE_GO_CHAT_COMPLETIONS_ROUTE
-    )
-    classification = None
-    if isinstance(exc, Exception):
         classification = classify_opencode_go_failure(
             exc=exc,
             url=target_url,
@@ -10006,57 +9974,38 @@ def _build_opencode_go_provider_rejection_evidence(
         )
         if classification is not None:
             apply_opencode_go_failure_classification(exc, classification)
-            if classification.origin == "client":
-                status_code = None
-            elif classification.status_code is not None:
-                status_code = classification.status_code
-    evidence = {
-        "route": "codex_opencode_go_adapter",
-        "target_url_family": target_url_family,
-        "target_url": (
-            target
-            if target_url_family in target
-            else target_url_family
-        ),
-        "error": {
-            "status": status_code if isinstance(status_code, int) else None,
-            "type": type(exc).__name__,
-            "message": sanitized_message,
-        },
-        "tool_count": len(advertised_types),
-        "tool_types": advertised_types,
-        "completion_tool_count": len(completion_types),
-        "completion_tool_types": completion_types,
-        "offending_index": offending_index,
-        "offending_type": offending_type,
-    }
-    if classification is not None:
-        evidence = {
-            **evidence,
-            **classification.to_safe_metadata(),
-        }
-    return evidence
+    return build_opencode_go_rejection_evidence(
+        target_url=target_url,
+        exc=exc,
+        advertised_tools=advertised_tools,
+        completion_tools=completion_tools,
+        api_key=api_key,
+        request=request,
+        expected_target_family=expected_target_family,
+        failure_phase=failure_phase,
+        call_mode=call_mode,
+    )
 
 
 def _record_opencode_go_provider_rejection_evidence(
     request: Any,
     evidence: dict[str, Any],
+    *,
+    exc: Any = None,
+    adapter_model: Any = None,
+    request_body: Any = None,
 ) -> dict[str, Any]:
-    recorded = dict(evidence)
-    state = getattr(request, "state", None)
-    if state is not None:
-        try:
-            setattr(state, "opencode_go_provider_rejection_evidence", recorded)
-        except Exception:
-            pass
-        extra = getattr(state, "opencode_go_logger_extra", None)
-        if not isinstance(extra, dict):
-            extra = {}
-            try:
-                setattr(state, "opencode_go_logger_extra", extra)
-            except Exception:
-                extra = {}
-        extra["opencode_go_provider_rejection"] = recorded
+    recorded = record_opencode_go_rejection_evidence(
+        request,
+        evidence,
+        exc=exc,
+    )
+    _persist_opencode_go_direct_rejection_audit(
+        request=request,
+        evidence=recorded,
+        adapter_model=adapter_model,
+        request_body=request_body if isinstance(request_body, dict) else None,
+    )
     return recorded
 
 
@@ -10547,8 +10496,18 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
                     plan.use_alias_candidate_probe
                     and isinstance(exc, (asyncio.TimeoutError, httpx.TimeoutException))
                 ),
+                request=request,
+                expected_target_family="opencode",
+                failure_phase="provider_attempt",
+                call_mode="alias" if use_alias_candidate_probe else "direct",
             )
-            _record_opencode_go_provider_rejection_evidence(request, evidence)
+            _record_opencode_go_provider_rejection_evidence(
+                request,
+                evidence,
+                exc=exc,
+                adapter_model=adapter_model,
+                request_body=canonical_request_body,
+            )
             setattr(exc, "attempted_provider_call", True)
             if evidence["error"]["status"] in {401, 403}:
                 setattr(exc, "_aawm_provider_returned", True)
@@ -10884,8 +10843,18 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
                     plan.use_alias_candidate_probe
                     and isinstance(exc, (asyncio.TimeoutError, httpx.TimeoutException))
             ),
+            request=request,
+            expected_target_family="opencode",
+            failure_phase="provider_attempt",
+            call_mode="alias" if use_alias_candidate_probe else "direct",
         )
-        _record_opencode_go_provider_rejection_evidence(request, evidence)
+        _record_opencode_go_provider_rejection_evidence(
+            request,
+            evidence,
+            exc=exc,
+            adapter_model=adapter_model,
+            request_body=canonical_request_body,
+        )
         setattr(exc, "attempted_provider_call", True)
         if evidence["error"]["status"] in {401, 403}:
             setattr(exc, "_aawm_provider_returned", True)

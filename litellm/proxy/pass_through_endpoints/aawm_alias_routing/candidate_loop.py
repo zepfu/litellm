@@ -1439,6 +1439,9 @@ async def handle_alias_route(  # noqa: PLR0915
     _attach_schema_rejection_to_attempt_record = (
         _attempt_records._attach_schema_rejection_to_attempt_record
     )
+    _attach_opencode_go_rejection_to_attempt_record = (
+        _attempt_records._attach_opencode_go_rejection_to_attempt_record
+    )
     _record_auto_agent_alias_attempt_success = getattr(
         _lpe,
         "_record_auto_agent_alias_attempt_success",
@@ -2293,6 +2296,12 @@ async def handle_alias_route(  # noqa: PLR0915
             attempt_record=last_attempt,
             exc=exc,
             candidate=candidate,
+        )
+        _attach_opencode_go_rejection_to_attempt_record(
+            attempt_record=last_attempt,
+            exc=exc,
+            candidate=candidate,
+            request=request,
         )
         terminal_exc: Optional[HTTPException] = None
         if isinstance(exc, ProviderCallReplayBlocked) or getattr(
@@ -5947,7 +5956,10 @@ def _resolve_failure_plan(
     identifies a Codex configured alias, then resolves scope/target keys
     without cooldown-map or durable writes.
     """
-    from .attempt_records import _attach_schema_rejection_to_attempt_record
+    from .attempt_records import (
+        _attach_opencode_go_rejection_to_attempt_record,
+        _attach_schema_rejection_to_attempt_record,
+    )
 
     if isinstance(exc, ProviderCallLedgerExhausted) or getattr(
         exc,
@@ -5970,6 +5982,12 @@ def _resolve_failure_plan(
         attempt_record=attempt_record,
         exc=exc,
         candidate=candidate,
+    )
+    _attach_opencode_go_rejection_to_attempt_record(
+        attempt_record=attempt_record,
+        exc=exc,
+        candidate=candidate,
+        request=request,
     )
     if _is_cursor_session_continuation_failure(exc, candidate=candidate):
         # This is loss of one retained session, not evidence against unrelated
