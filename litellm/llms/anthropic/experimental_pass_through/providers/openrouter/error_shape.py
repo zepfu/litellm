@@ -10,23 +10,20 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.types import Payloa
 _HTTP_STATUS_MIN = 100
 _HTTP_STATUS_MAX = 599
 
-# Full-string OpenRouter/HTTP status line. Digits are accepted only when a
-# status label or OpenRouter attribution names them as an HTTP status.
+# Full-string OpenRouter/HTTP status line. Digits are accepted only when
+# OpenRouter attribution names them as an HTTP status on every alternative.
 _OPENROUTER_STATUS_LINE = re.compile(
     r"""
     \A
+    openrouter
+    (?:[\s_-]+(?:completion|adapter|request|upstream|error|returned|failed))*
+    [\s:.\-]+
     (?:
-        (?:openrouter
-           (?:[\s_-]+(?:completion|adapter|request|upstream|error|returned|failed))*
-           [\s:.\-]+)?
         (?:client|server)\s+error\s+'
         (?P<httpx_status>[1-5]\d{2})
         \s+[A-Za-z][\w\- ]*'
         \s+for\s+url\s+\S+
       |
-        (?:openrouter
-           (?:[\s_-]+(?:completion|adapter|request|upstream|error|returned|failed))*
-           [\s:.\-]+)?
         (?:
             HTTP(?:/\d+\.\d+)?[\s/]+
           | status(?:[\s_-]*code)?[\s:=]+
@@ -35,9 +32,6 @@ _OPENROUTER_STATUS_LINE = re.compile(
         (?P<labeled_status>[1-5]\d{2})
         (?:\s+[A-Za-z][\w\- ]*)?
       |
-        openrouter
-        (?:[\s_-]+(?:completion|adapter|request|upstream|error|returned|failed))*
-        [\s:.\-]+
         (?P<attributed_status>[1-5]\d{2})
         (?:\s+[A-Za-z][\w\- ]*)?
     )
@@ -148,21 +142,10 @@ def _status_from_structured_fields(exc: object) -> Optional[int]:
 
 
 def _status_from_payload(payload: Mapping[str, object]) -> Optional[int]:
-    candidates: list[object] = []
     error = _mapping(payload.get("error"))
-    if error is not None:
-        candidates.extend(
-            (error.get("status_code"), error.get("status"), error.get("code"))
-        )
-        metadata = _mapping(error.get("metadata"))
-        if metadata is not None:
-            candidates.extend(
-                (metadata.get("status_code"), metadata.get("status"))
-            )
-    candidates.extend(
-        (payload.get("status_code"), payload.get("status"), payload.get("code"))
-    )
-    for value in candidates:
+    if error is None:
+        return None
+    for value in (error.get("status_code"), error.get("status"), error.get("code")):
         status = _http_status_code(value)
         if status is not None:
             return status

@@ -543,22 +543,19 @@ def _extract_adapter_error_payloads(exc: Any) -> list[Any]:
 
 
 def _extract_adapter_exception_status_code(exc: Any) -> Optional[int]:
-    for source in (exc, getattr(exc, "response", None)):
-        if source is None:
-            continue
-        for attr in ("status_code", "code"):
-            value = getattr(source, attr, None)
-            if isinstance(value, int):
-                return value
-            try:
-                if value is not None:
-                    return int(value)
-            except Exception:
-                continue
     from litellm.llms.anthropic.experimental_pass_through.providers.openrouter import (
         error_shape as _openrouter_error_shape,
     )
 
+    for source in (exc, getattr(exc, "response", None)):
+        if source is None:
+            continue
+        for attr in ("status_code", "code"):
+            status = _openrouter_error_shape._http_status_code(
+                getattr(source, attr, None)
+            )
+            if status is not None:
+                return status
     return _openrouter_error_shape.extract_exception_status_code(
         _OPENROUTER_ERROR_SHAPE_RUNTIME,
         exc,
