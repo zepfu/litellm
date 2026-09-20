@@ -41,6 +41,9 @@ services:
     image: litellm-alpha:local
     container_name: litellm-alpha
     restart: unless-stopped
+    # Durable log-gate switch. Recreate reloads this file; restart does not.
+    env_file:
+      - compose.alpha.log-gates.env
     command:
       - /usr/bin/env
       - LITELLM_KIMI_NATIVE_CONTRACT_PATH=/run/aawm/kimi-descriptor/native-contract.json
@@ -145,9 +148,7 @@ services:
       # Payload capture stays off by default; enable explicitly for debug sessions
       - AAWM_CAPTURE=${AAWM_CAPTURE:-0}
       - AAWM_CAPTURE_PASSTHROUGH_SHAPES=${AAWM_CAPTURE_PASSTHROUGH_SHAPES:-0}
-      # Cursor inbound Connect per-chunk diagnostics stay off unless an
-      # operator explicitly enables inbound debug.
-      - AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG=${AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG:-0}
+      # AAWM_CURSOR_AGENT_CLI_INBOUND_DEBUG comes from compose.alpha.log-gates.env
       - LITELLM_LOG=${LITELLM_LOG:-INFO}
       - LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT=${LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT:-1}
       - LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT=${LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT:-/home/zepfu/.claude/projects}
@@ -198,7 +199,7 @@ services:
       - AAWM_ALIAS_ROUTING_STATE_NAMESPACE=aawm-routing-alpha-v1
       # CFG-004 cooldown-clear topology gate (single-worker dev only).
       - AAWM_ALIAS_ROUTING_COOLDOWN_CLEAR_SINGLE_WORKER=${AAWM_ALIAS_ROUTING_COOLDOWN_CLEAR_SINGLE_WORKER:-1}
-      - AAWM_ALIAS_ROUTE_LOG_HEALTHY=${AAWM_ALIAS_ROUTE_LOG_HEALTHY:-0}
+      # AAWM_ALIAS_ROUTE_LOG_HEALTHY comes from compose.alpha.log-gates.env
       # Environment label for the alpha proxy process.
       - AAWM_LITELLM_ENVIRONMENT=litellm-alpha
       - AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS=${AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS:-600}
