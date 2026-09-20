@@ -6,6 +6,7 @@ import asyncio
 import time
 from dataclasses import dataclass
 from typing import (
+    Any,
     Awaitable,
     Callable,
     Iterable,
@@ -290,6 +291,134 @@ def clear_failure_circuit(
     runtime.failure_circuit_until_monotonic_by_key.pop(rate_limit_key, None)
 
 
+_ANTHROPIC_SSE_EVENT_PREFIX = "event:"
+_ANTHROPIC_STREAM_TERMINAL_EVENT = "message_stop"
+
+
+def _is_anthropic_sse_message_stop(payload: str) -> bool:
+    """Return True when *payload* contains an SSE ``event: message_stop`` line.
+
+    Only the event field is inspected.  ``data:`` JSON, tool arguments, and
+    content text that happen to include the token ``message_stop`` are not
+    terminals.
+    """
+    for raw_line in payload.splitlines():
+        line = raw_line.strip()
+        if not line.startswith(_ANTHROPIC_SSE_EVENT_PREFIX):
+            continue
+        event_name = line[len(_ANTHROPIC_SSE_EVENT_PREFIX) :].strip()
+        if event_name == _ANTHROPIC_STREAM_TERMINAL_EVENT:
+            return True
+    return False
+
+
+def _chunk_has_openai_finish_reason(chunk: object) -> bool:
+    """Return True when *chunk* is an OpenAI finish / validated-commit chunk."""
+    choices = getattr(chunk, "choices", None)
+    if choices is None and isinstance(chunk, dict):
+        choices = chunk.get("choices")
+    if not isinstance(choices, (list, tuple)):
+        return False
+    for choice in choices:
+        if isinstance(choice, dict):
+            finish_reason = choice.get("finish_reason")
+        else:
+            finish_reason = getattr(choice, "finish_reason", None)
+        if finish_reason is not None:
+            return True
+    return False
+
+
+def _is_accepted_stream_terminal(chunk: object) -> bool:
+    """Return True at a provider-authored stream success boundary.
+
+    ``perform_completion_operation`` wraps two stream kinds:
+
+    - OpenAI / ``CustomStreamWrapper``: ``ModelResponseStream`` (or dict)
+      chunks whose ``choices[].finish_reason`` is set.
+    - Anthropic: a ``message_stop`` dict envelope, or an SSE frame whose
+      event line is ``event: message_stop``.
+
+    Content or tool JSON that merely contains the token ``message_stop``
+    is not terminal.  Construction never reaches this helper.
+    """
+    if isinstance(chunk, dict):
+        if chunk.get("type") == _ANTHROPIC_STREAM_TERMINAL_EVENT:
+            return True
+    if _chunk_has_openai_finish_reason(chunk):
+        return True
+    if isinstance(chunk, (bytes, bytearray)):
+        try:
+            payload = bytes(chunk).decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+        return _is_anthropic_sse_message_stop(payload)
+    if isinstance(chunk, str):
+        return _is_anthropic_sse_message_stop(chunk)
+    return False
+
+
+class _ValidatedStreamCircuitBoundary:
+    """Lazy pass-through stream wrapper deferring the failure-circuit clear.
+
+    Construction performs no provider I/O and NEVER clears the failure
+    circuit (OR-034): stream creation alone is not provider success.  The
+    circuit is cleared exactly once, when a provider-authored accepted
+    terminal is observed (OpenAI finish / ``CustomStreamWrapper.sent_last_chunk``
+    commit, or Anthropic ``message_stop``).  Upstream failures and
+    cancellation propagate untouched, preserving the exact circuit state.
+    """
+
+    def __init__(
+        self,
+        stream: Any,
+        clear_once: Callable[[], None],
+    ) -> None:
+        self.__dict__["_stream"] = stream
+        self.__dict__["_clear_once"] = clear_once
+        self.__dict__["_circuit_cleared"] = False
+
+    def __aiter__(self) -> "_ValidatedStreamCircuitBoundary":
+        return self
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.__dict__["_stream"], name)
+
+    async def __anext__(self) -> Any:
+        stream = self.__dict__["_stream"]
+        chunk = await stream.__anext__()
+        if not self.__dict__["_circuit_cleared"] and (
+            _is_accepted_stream_terminal(chunk)
+            or getattr(stream, "sent_last_chunk", False) is True
+        ):
+            self.__dict__["_circuit_cleared"] = True
+            self.__dict__["_clear_once"]()
+        return chunk
+
+
+def _finalize_circuit_success_boundary(
+    runtime: Runtime,
+    result: Any,
+    *,
+    adapter_model: Optional[str],
+) -> Any:
+    """Apply the OR-034 success boundary for a completion-adapter result.
+
+    Lazy streams are wrapped: the circuit clears only at the validated
+    terminal boundary inside the stream (OpenAI finish / stream-commit
+    seam, or Anthropic ``message_stop``).  Materialized (nonstream)
+    results are validated commits and clear the circuit immediately,
+    exactly once.
+    """
+    if callable(getattr(result, "__anext__", None)):
+        return _ValidatedStreamCircuitBoundary(
+            result,
+            lambda: runtime.clear_failure_circuit_callback(adapter_model),
+        )
+    runtime.clear_failure_circuit_callback(adapter_model)
+    return result
+
+
 async def get_active_cooldown_seconds(
     runtime: Runtime,
     adapter_model: Optional[str],
@@ -364,6 +493,7 @@ async def run_retry_loop(
     use_alias_candidate_probe: bool = False,
     attempt_label: str,
     rate_limit_key_for_log: Optional[str] = None,
+    clear_on_success: bool = True,
 ) -> RetryResultT:
     """Run the OpenRouter retry, cooldown, and failure-circuit policy."""
     max_retries = get_max_retries(runtime)
@@ -397,7 +527,12 @@ async def run_retry_loop(
         )
 
     async def _on_success(_result: RetryResultT, _attempt: int) -> None:
-        runtime.clear_failure_circuit_callback(adapter_model)
+        # OR-034: lazy stream construction is not provider success.  Callers
+        # that return lazy streams pass clear_on_success=False and apply the
+        # validated boundary themselves (_finalize_circuit_success_boundary);
+        # nonstream/transport callers keep the eager validated clear here.
+        if clear_on_success:
+            runtime.clear_failure_circuit_callback(adapter_model)
 
     async def _on_failure(exc: Exception, attempt: int) -> bool:
         nonlocal accumulated_hidden_wait_seconds
@@ -589,13 +724,26 @@ async def perform_completion_operation(
             raise
 
     try:
-        return await run_retry_loop(
+        result = await run_retry_loop(
             runtime,
             adapter_model=adapter_model,
             operation=_provider_return_stamp_operation,
             log_warnings=log_warnings,
             use_alias_candidate_probe=use_alias_candidate_probe,
             attempt_label="OpenRouter completion adapter",
+            clear_on_success=False,
+        )
+        # OR-034: circuit success moves to the validated boundary.  A lazy
+        # stream wrapper is created without touching circuit state; the
+        # circuit clears exactly once at the accepted terminal (OpenAI
+        # finish / stream-commit, or Anthropic message_stop) or immediately
+        # for a materialized (nonstream) result.  Failures and cancellation
+        # after wrapper creation propagate and preserve the exact circuit
+        # state.
+        return _finalize_circuit_success_boundary(
+            runtime,
+            result,
+            adapter_model=adapter_model,
         )
     except Exception as exc:
         if (
@@ -703,6 +851,8 @@ async def perform_pass_through_request(
 __all__ = [
     "Runtime",
     "clear_failure_circuit",
+    "_finalize_circuit_success_boundary",
+    "_ValidatedStreamCircuitBoundary",
     "extract_error_headers",
     "extract_error_payload",
     "extract_exception_status_code",
