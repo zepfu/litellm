@@ -848,11 +848,11 @@ def _build_session_history_record_from_langfuse_trace_observation(  # noqa: PLR0
         )
     response_cost_usd = _safe_float(
         _first_non_none(
+            openrouter_usage_cost,
             _maybe_get(observation.get("costDetails"), "total"),
             observation.get("calculatedTotalCost"),
             metadata.get("litellm_response_cost"),
             metadata.get("response_cost"),
-            openrouter_usage_cost,
             trace.get("totalCost"),
         )
     )
@@ -865,7 +865,7 @@ def _build_session_history_record_from_langfuse_trace_observation(  # noqa: PLR0
         )
 
         if is_openrouter_free_model(resolved_model):
-            if response_cost_usd is None:
+            if openrouter_usage_cost is None:
                 response_cost_usd = 0.0
         elif response_cost_usd == 0:
             response_cost_usd = None
@@ -1476,7 +1476,7 @@ def _build_session_history_record(  # noqa: PLR0915
         if resolved_provider == "openrouter":
             from litellm.llms.openrouter.common_utils import openrouter_cost_status
 
-            if openrouter_known_free and response_cost_usd is None:
+            if openrouter_known_free and not provider_reported_cost:
                 response_cost_usd = 0.0
             metadata["openrouter_cost_status"] = openrouter_cost_status(
                 model=resolved_model,

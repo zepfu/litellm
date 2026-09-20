@@ -1890,13 +1890,14 @@ def _first_reported_openrouter_cost(
         authoritative_openrouter_usage_cost,
     )
 
-    return authoritative_openrouter_usage_cost(
-        _first_non_none(
-            metadata.get("usage_openrouter_cost"),
-            usage_dict.get("cost"),
-        ),
-        model,
-    )
+    for candidate in (
+        metadata.get("usage_openrouter_cost"),
+        usage_dict.get("cost"),
+    ):
+        value = authoritative_openrouter_usage_cost(candidate, model)
+        if value is not None:
+            return value
+    return None
 
 
 def _safe_json_load(value: Any, default: Any) -> Any:
