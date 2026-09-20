@@ -37,10 +37,11 @@ framework-wide under-cooling policy.
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Literal, Optional
 
 from . import failure_vocabulary as fv
 from .retry import exponential_backoff_seconds
@@ -937,3 +938,114 @@ class CooldownEvidenceGate:
         if success:
             state.attempt = 0
             state.cooled_until_monotonic = 0.0
+
+
+_ZEN_MESSAGES = {
+    "auth": "OpenCode Zen authentication failed.",
+    "billing": "OpenCode Zen billing requires attention.",
+    "quota": "OpenCode Zen usage quota is exhausted. Retry later.",
+    "rate": "OpenCode Zen rate limit reached. Retry later.",
+    "capacity": "OpenCode Zen upstream capacity is temporarily exhausted. Retry later.",
+    "model": "OpenCode Zen selected model is unavailable.",
+    "format": "OpenCode Zen does not support the requested wire format.",
+    "invalid_request": "OpenCode Zen rejected the request.",
+    "timeout": "OpenCode Zen upstream request timed out.",
+    "transient": "OpenCode Zen upstream is temporarily unavailable.",
+    "terminal": "OpenCode Zen request failed.",
+}
+
+
+def classify_zen_failure(
+    *, status_code: Optional[int], message: str = "",
+    origin: fv.Origin = "unknown", route: Literal["direct", "alias"] = "direct",
+    model_unavailable: bool = False,
+    retry_after_seconds: Optional[float] = None,
+    reset_after_seconds: Optional[float] = None,
+) -> fv.ZenFailure:
+    """Exact Zen status policy; marker refinement never overrides auth status.
+
+    Only provider-attributed errors authorize retries/fallback/cooldowns. Bare
+    404s are endpoint errors, not evidence that a configured model is disabled.
+    Public details come exclusively from a fixed vocabulary, never provider text.
+    """
+    from .policy import (
+        CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS,
+        CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS,
+    )
+
+    safe_status = status_code if type(status_code) is int and 400 <= status_code <= 599 else 502
+    text = " ".join(message.casefold().split())
+    kind: fv.ZenFailureClass = "terminal"
+    if origin == "upstream":
+        if status_code in {401, 403}:
+            kind = "auth"
+        elif status_code == 402:
+            kind = "billing"
+        elif status_code in {400, 404, 429, 500, 502, 503, 529}:
+            if status_code in {400, 404} and _any_marker(text, ("authenticationerror", "authentication_error", "invalid_api_key", "authorization_error")):
+                kind = "auth"
+            elif _any_marker(text, ("freeusagelimiterror", "free usage limit", "usage_limit_reached", "quota_exceeded", "insufficient_quota")):
+                kind = "quota"
+            elif _any_marker(text, ("creditserror", "no payment method", "add a payment method", "billing", "payment required", "payment_required")):
+                kind = "billing"
+            elif status_code in {400, 404} and "not supported for format openai" in text:
+                kind = "format"
+            elif status_code in {400, 404} and model_unavailable:
+                kind = "model"
+            elif status_code in {429, 500, 502, 503, 529} and _any_marker(text, ("model_at_capacity", "capacity_exhausted", "server_overloaded", "server_is_overloaded", "high_demand", "model_overloaded", "upstream_busy")):
+                kind = "capacity"
+            elif status_code == 429:
+                kind = "rate"
+            elif status_code in {500, 502, 503, 529}:
+                kind = "transient"
+            elif status_code == 400:
+                kind = "invalid_request"
+        elif status_code in {408, 504}:
+            kind = "timeout"
+
+    retryable = kind in {"quota", "rate", "capacity", "timeout", "transient"}
+    fallback = origin == "upstream" and route == "alias" and kind not in {"invalid_request", "terminal"}
+    scope: Literal["account", "candidate", "none"] = "account" if kind in {"auth", "billing", "quota"} else "candidate" if kind in {"rate", "capacity", "model", "format", "timeout", "transient"} else "none"
+    legacy = {
+        "auth": "candidate_unavailable", "billing": "candidate_unavailable",
+        "quota": "usage_limit_reached", "rate": "rate_limited",
+        "capacity": "capacity_exhausted", "model": "candidate_unavailable",
+        "format": "provider_format_rejected", "timeout": "upstream_timeout",
+        "transient": "upstream_transient_internal",
+    }.get(kind)
+
+    def bounded(value: Optional[float]) -> Optional[float]:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value) if math.isfinite(value) and 0 <= value <= 86400 else None
+
+    retry_after = bounded(retry_after_seconds) if retryable else None
+    reset_after = bounded(reset_after_seconds) if retryable else None
+    wait = retry_after if retry_after is not None else reset_after
+    cooldown = 0.0
+    if fallback:
+        cooldown = CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS if kind in {"timeout", "transient"} else CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS
+        if wait is not None:
+            cooldown = max(1.0, wait)
+    public_status = 429 if kind in {"quota", "rate", "capacity"} else safe_status
+    return fv.ZenFailure(
+        class_name=kind, origin=origin, route=route, status_code=safe_status,
+        public_status_code=public_status, scope=scope, retryable=retryable,
+        fallback=fallback, error_class=legacy, cooldown_seconds=cooldown,
+        retry_after_seconds=retry_after, reset_after_seconds=reset_after,
+        public_detail=_ZEN_MESSAGES[kind],
+    )
+
+
+def zen_failure_event(failure: fv.ZenFailure) -> fv.FailureEvent:
+    """Project the authoritative Zen result into the open shadow vocabulary."""
+    names = {"quota": "quota_exhausted", "rate": "rate_limit", "model": "model_unavailable", "format": "serialization", "invalid_request": "provider_4xx_other", "timeout": "transient", "terminal": "provider_4xx_other"}
+    evidence = {"status_code": str(failure.status_code)}
+    if failure.retry_after_seconds is not None:
+        evidence["retry_after_seconds"] = str(failure.retry_after_seconds)
+    return fv.FailureEvent(
+        class_name=names.get(failure.class_name, failure.class_name),
+        origin=failure.origin, confidence="structured", provider="opencode_zen",
+        scope="account" if failure.scope == "account" else "model",
+        retryable=failure.retryable or failure.fallback, evidence=evidence,
+    )

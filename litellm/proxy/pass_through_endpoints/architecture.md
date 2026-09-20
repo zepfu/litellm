@@ -732,21 +732,20 @@ under `aawm_adapter_runtime/`:
 | Codex Responses adapter recognition, direct OpenCode tools-mode preparation, and optional dispatch | `codex_dispatch.py` | 2 |
 | Anthropic-shaped adapter recognition and optional dispatch through an explicit runtime | `anthropic_dispatch.py` | 1 |
 
-The authored surface is 72 callables. Exactly 55 former god-module
+The authored surface is 71 callables. Exactly 55 former god-module
 `FunctionDef`s moved during Wave 6F extraction: 41 Anthropic adapter-call
 definitions and 14 Codex candidate-call definitions. Five Anthropic-call names
-were already compatibility assignments rather than definitions. Nine Codex
+were already compatibility assignments rather than definitions. Eight Codex
 candidate-call helpers (`_consume_opencode_zen_tools_mode_header`,
 `_build_opencode_zen_completion_call_kwargs`,
 `_perform_opencode_zen_completion_call`,
 `_prepare_opencode_zen_direct_observability_metadata`,
 `_prepare_opencode_zen_known_free_logging`,
 `_opencode_zen_callback_headers`,
-`_opencode_zen_direct_safe_retry_after`,
 `_maybe_raise_opencode_zen_direct_rate_limit`,
 `_opencode_zen_direct_stream_terminal_error`) were authored after Wave 6F
 extraction and were never god-module `FunctionDef`s; they are part of the
-current 72-callable owned surface but not part of the historical extraction
+current 71-callable owned surface but not part of the historical extraction
 count.
 `_add_route_family_logging_metadata` remains canonically owned by Wave 6D
 `observability_metadata.py`; Wave 6F installation restores that same object on
@@ -755,8 +754,43 @@ both the god module and `anthropic_adapter_calls.py`.
 The Codex dispatch surface owns `try_dispatch_codex_request` and
 `_prepare_opencode_zen_direct_tools_mode`. The candidate-call surface owns the
 last-mile direct OpenCode completion-call, known-free logging, tools-mode,
-observability, callback-header, retry-after, rate-limit, and terminal-stream
+observability, callback-header, rate-limit, and terminal-stream
 helpers listed above.
+
+OpenCode Zen failure policy (OC-013) is shared by direct HTTP/SSE delivery and
+alias fallback through `failure_vocabulary.ZenFailure`. Extraction lives in
+`error_signals.classify_opencode_zen_failure`; the Zen provider runtime translates
+exceptions without copying upstream bodies, keys, or arbitrary error strings
+into public details. Anthropic OpenCode routes attach the same cached
+`ZenFailure` on the translated `ProxyException` as Codex, passing the Anthropic
+route family instead of stamping `codex_opencode_zen_adapter`. Alias
+classification consumes that cached result only when `origin=upstream`; a
+synthetic 429 wrapper with `origin=unknown` falls through so missing-credential
+preflight stays skippable. The result retains original status and provider
+attribution separately from the direct/alias route and public status.
+
+- HTTP 401/403 is authentication failure; 402 is billing failure. Known Zen
+  billing, free-usage, and wire-format markers refine other admitted statuses.
+- Bare 400 is invalid request and bare 404 is terminal. Only a disabled or
+  unpublished model error bound to the selected model permits model fallback.
+- HTTP 429 is rate limiting unless a known quota/capacity marker refines it.
+  HTTP 408/504 is timeout; 500/502/503/529 is transient unless a known marker
+  supplies a more specific classification.
+- Direct quota/rate/capacity failures return bounded 429 details; other direct
+  errors preserve a valid upstream status, or use 502 for an invalid status.
+  Stream failures use the same fixed public vocabulary in `response.failed`.
+- Alias auth/billing/quota failures retain account resource scope in the typed
+  result. Durable publication remains limited to the selected candidate; this
+  does not introduce cross-account or cross-model cooldown fan-out. Rate,
+  capacity, and confirmed model failures also cool only the candidate.
+  Format, timeout, and transient failures use request-local exclusion.
+- Finite numeric Retry-After takes precedence over reset headers. Hints outside
+  0–86400 seconds are discarded. Alias waits use accepted hints (minimum one
+  second), otherwise existing three-hour defaults or 30 seconds for transient
+  and timeout failures. Direct delivery never publishes a cooldown.
+- Local or unattributed errors never acquire retry/fallback authority from
+  status-like text. Generic invalid-request and terminal failures do not fall
+  back or cool a candidate.
 
 `aawm_adapter_runtime.install_wave6f()` runs only after the Wave 6D and Wave 6E
 runtime callbacks are configured. It installs Anthropic adapter calls first,

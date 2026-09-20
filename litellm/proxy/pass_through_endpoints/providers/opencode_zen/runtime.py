@@ -13,7 +13,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, NoReturn, Optional
+from typing import Any, Never, NoReturn, Optional
 
 import httpx
 from starlette.requests import Request
@@ -29,6 +29,8 @@ from litellm.proxy.pass_through_endpoints.providers.common import (
     _raise_opencode_zen_auto_agent_candidate_unavailable as _common_raise_opencode_zen_unavailable,
 )
 
+
+from ...aawm_alias_routing.failure_vocabulary import ZenFailure
 
 Payload = dict[str, Any]
 
@@ -648,3 +650,54 @@ def _join_opencode_zen_passthrough_url(
             _constants._OPENCODE_ZEN_PROVIDER,
         )
     )
+
+
+
+def _extract_opencode_zen_failure(
+    exc: Exception, *, use_alias_candidate_probe: bool = False,
+    model: Optional[str] = None,
+    route_family: Optional[str] = None,
+) -> ZenFailure:
+    """Use the same typed policy for direct HTTP/SSE and alias failures."""
+    from ...aawm_alias_routing.error_signals import classify_opencode_zen_failure
+    from ...aawm_alias_routing.policy import CODEX_AUTO_AGENT_OPENCODE_PROVIDER
+
+    candidate = {
+        "provider": CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
+        "route_family": route_family or "codex_opencode_zen_adapter",
+        "model": model,
+    }
+    return classify_opencode_zen_failure(
+        exc, candidate=candidate,
+        route="alias" if use_alias_candidate_probe else "direct",
+        attempted_provider_call=getattr(exc, "attempted_provider_call", True) is not False,
+    )
+
+
+def _raise_opencode_zen_failure(
+    exc: Exception, *, use_alias_candidate_probe: bool = False,
+    model: Optional[str] = None,
+    route_family: Optional[str] = None,
+) -> Never:
+    """Translate without leaking provider bodies or replacing origin with 429."""
+    from litellm.proxy._types import ProxyException
+
+    failure = _extract_opencode_zen_failure(
+        exc,
+        use_alias_candidate_probe=use_alias_candidate_probe,
+        model=model,
+        route_family=route_family,
+    )
+    retry_after = failure.retry_after_seconds
+    headers = {"Retry-After": str(retry_after)} if retry_after is not None else None
+    mapped = ProxyException(
+        message=failure.public_detail,
+        type="rate_limit_error" if failure.public_status_code == 429 else "upstream_error",
+        param="model", code=failure.public_status_code, headers=headers,
+    )
+    mapped.status_code = failure.public_status_code
+    mapped._aawm_zen_failure = failure
+    mapped._aawm_provider_returned = failure.origin == "upstream"
+    mapped.attempted_provider_call = getattr(exc, "attempted_provider_call", True) is not False
+    mapped.detail = {"error": {"message": failure.public_detail, "code": failure.error_class or "provider_terminal_error"}}
+    raise mapped from exc

@@ -22,7 +22,7 @@ import re
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Literal, Mapping, Optional
 
 import httpx
 
@@ -38,7 +38,7 @@ from litellm.llms.anthropic.experimental_pass_through.providers.grok import (
 from .codex_oauth import _clean_codex_auth_value
 from . import classification as _classification
 from . import failure_actions as _failure_actions
-from .failure_vocabulary import OPENROUTER_CREDIT_EXHAUSTED
+from .failure_vocabulary import OPENROUTER_CREDIT_EXHAUSTED, ZenFailure
 from .lane_keys import (
     _codex_auto_agent_candidate_key,
     _CODEX_AUTO_AGENT_MALFORMED_TOOL_CALL_COOLDOWN_SECONDS,
@@ -1658,6 +1658,10 @@ def _get_codex_auto_agent_candidate_cooldown_scope(
         return "account"
     if error_class in _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES:
         return "candidate"
+    if _is_opencode_zen_candidate(candidate):
+        if error_class in {"upstream_timeout", "upstream_transient_internal", "provider_format_rejected"}:
+            return "request_local"
+        return "candidate" if error_class in {"candidate_unavailable", "usage_limit_reached", "rate_limited", "capacity_exhausted"} else "none"
     if _is_kimi_code_auto_agent_candidate(candidate):
         if (
             error_class == "kimi_code_managed_account"
@@ -2053,6 +2057,166 @@ def _is_nvidia_completion_adapter_model_unavailable_response(
 
 
 _OPENCODE_ZEN_CODEX_ROUTE_FAMILY = "codex_opencode_zen_adapter"
+
+_OPENCODE_ZEN_ROUTE_FAMILIES = frozenset({
+    _OPENCODE_ZEN_CODEX_ROUTE_FAMILY,
+    "anthropic_opencode_zen_responses_adapter",
+    "anthropic_opencode_zen_completion_adapter",
+})
+
+
+def _is_opencode_zen_candidate(candidate: Any) -> bool:
+    return isinstance(candidate, dict) and candidate.get("provider") == _CODEX_AUTO_AGENT_OPENCODE_PROVIDER and candidate.get("route_family") in _OPENCODE_ZEN_ROUTE_FAMILIES
+
+
+def _opencode_zen_exception_is_provider_attributed(exc: Any) -> bool:
+    return (
+        getattr(exc, "_aawm_provider_returned", False) is True
+        or getattr(exc, "provider_returned", False) is True
+        or isinstance(getattr(exc, "response", None), httpx.Response)
+    )
+
+
+def _opencode_zen_classification_source(exc: Any) -> Any:
+    """Prefer the original exception when a translation wrapper has no cached result."""
+    current = exc
+    seen: set[int] = set()
+    while True:
+        if _opencode_zen_exception_is_provider_attributed(current):
+            return current
+        cause = getattr(current, "__cause__", None)
+        if not isinstance(cause, BaseException) or id(cause) in seen:
+            return current
+        seen.add(id(current))
+        current = cause
+
+
+def _opencode_zen_error_blocks(exc: Any) -> list[dict[str, Any]]:
+    """Read SDK bodies and HTTP error responses in addition to proxy detail."""
+    blocks = _iter_codex_auto_agent_error_blocks(exc)
+    payloads = [getattr(exc, "body", None)]
+    response = getattr(exc, "response", None)
+    if isinstance(response, httpx.Response):
+        try:
+            payloads.append(response.json())
+        except (ValueError, httpx.ResponseNotRead):
+            pass
+    for payload in payloads:
+        if isinstance(payload, dict):
+            error = payload.get("error", payload)
+            if isinstance(error, dict):
+                blocks.append(error)
+    return blocks
+
+
+def classify_opencode_zen_failure(
+    exc: Any, *, candidate: Optional[dict[str, Any]] = None,
+    route: Literal["direct", "alias"] = "direct",
+    attempted_provider_call: bool = True,
+) -> ZenFailure:
+    """Extract only error fields; never infer HTTP status from exception prose.
+
+    Called by the Zen runtime (which establishes provider identity) or after the
+    alias candidate guard. Cached results retain original status and provenance
+    through sanitized exception translation.
+    """
+    cached = getattr(exc, "_aawm_zen_failure", None)
+    if isinstance(cached, ZenFailure) and cached.route == route and attempted_provider_call:
+        return cached
+    source = _opencode_zen_classification_source(exc)
+    cached_source = getattr(source, "_aawm_zen_failure", None)
+    if (
+        source is not exc
+        and isinstance(cached_source, ZenFailure)
+        and cached_source.route == route
+        and attempted_provider_call
+    ):
+        return cached_source
+    status_code = None
+    for status_source in (source, getattr(source, "response", None)):
+        for name in ("status_code", "code"):
+            value = getattr(status_source, name, None)
+            if isinstance(value, str) and value.isascii() and value.isdigit():
+                value = int(value)
+            if (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and 400 <= value <= 599
+            ):
+                status_code = value
+                break
+        if status_code is not None:
+            break
+    upstream = attempted_provider_call and getattr(source, "attempted_provider_call", True) is not False and (
+        _opencode_zen_exception_is_provider_attributed(source)
+    )
+    origin = "upstream" if upstream else "client" if not attempted_provider_call or getattr(source, "attempted_provider_call", None) is False else "unknown"
+    parts = []
+    for block in _opencode_zen_error_blocks(source):
+        for key in ("message", "code", "type", "reason", "name"):
+            value = block.get(key)
+            if isinstance(value, str):
+                parts.append(value)
+    for key in ("message", "code", "type"):
+        value = getattr(source, key, None)
+        if isinstance(value, str):
+            parts.append(value)
+    detail = getattr(source, "detail", None)
+    if isinstance(detail, str):
+        parts.append(detail)
+    elif isinstance(detail, dict) and isinstance(detail.get("error"), str):
+        parts.append(detail["error"])
+    model_unavailable = _is_opencode_zen_unavailable_model_response(
+        source, candidate=candidate, attempted_provider_call=attempted_provider_call,
+    )
+    headers = _extract_adapter_upstream_headers(source) if upstream else {}
+    # Parse only bounded numeric Retry-After, matching the direct Zen contract.
+    raw_retry = _get_adapter_header_value(headers, "Retry-After")
+    try:
+        retry_after = float(raw_retry) if raw_retry is not None else None
+    except (TypeError, ValueError, OverflowError):
+        retry_after = None
+    raw_reset = _get_adapter_header_value(headers, "X-RateLimit-Reset")
+    try:
+        reset_number = float(raw_reset) if raw_reset is not None else None
+    except (TypeError, ValueError, OverflowError):
+        reset_number = None
+    reset_after = (
+        _parse_rate_limit_reset_wait_seconds_from_headers(headers)
+        if reset_number is not None and math.isfinite(reset_number) and reset_number >= 0
+        else None
+    )
+    return _classification.classify_zen_failure(
+        status_code=status_code, message=" ".join(parts), origin=origin, route=route,
+        model_unavailable=model_unavailable, retry_after_seconds=retry_after,
+        reset_after_seconds=reset_after,
+    )
+
+
+def _opencode_zen_alias_failure(
+    exc: Any,
+    *,
+    candidate: Optional[dict[str, Any]] = None,
+    attempted_provider_call: bool = True,
+) -> Optional[ZenFailure]:
+    """Return provider-attributed Zen policy. Skip origin=unknown wrappers."""
+    if not _is_opencode_zen_candidate(candidate):
+        return None
+    failure = classify_opencode_zen_failure(
+        exc,
+        candidate=candidate,
+        route="alias",
+        attempted_provider_call=attempted_provider_call,
+    )
+    if failure.origin != "upstream":
+        return None
+    try:
+        setattr(exc, "_aawm_zen_failure", failure)
+    except (AttributeError, TypeError):
+        pass
+    return failure
+
+
 _OPENCODE_ZEN_MODEL_UNAVAILABLE_MESSAGE_MARKERS = (
     "model is disabled",
     "model disabled",
@@ -2240,17 +2404,17 @@ def _is_opencode_zen_unavailable_model_response(
     """
     if (
         not attempted_provider_call
-        or getattr(exc, "_aawm_provider_returned", False) is not True
+        or not (getattr(exc, "_aawm_provider_returned", False) is True or getattr(exc, "provider_returned", False) is True or isinstance(getattr(exc, "response", None), httpx.Response))
         or not isinstance(candidate, dict)
         or candidate.get("provider") != _CODEX_AUTO_AGENT_OPENCODE_PROVIDER
-        or candidate.get("route_family") != _OPENCODE_ZEN_CODEX_ROUTE_FAMILY
+        or candidate.get("route_family") not in _OPENCODE_ZEN_ROUTE_FAMILIES
         or _extract_adapter_exception_status_code(exc) not in {400, 404}
     ):
         return False
     model_variants = _opencode_zen_model_identity_variants(candidate.get("model"))
     if not model_variants:
         return False
-    for error in _iter_codex_auto_agent_error_blocks(exc):
+    for error in _opencode_zen_error_blocks(exc):
         message = error.get("message")
         if not isinstance(message, str):
             continue
@@ -2665,6 +2829,13 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         return _CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS
     if _is_codex_auto_agent_candidate_deterministically_ineligible(exc):
         return _CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_ERROR_CLASS
+    zen_failure = _opencode_zen_alias_failure(
+        exc,
+        candidate=candidate,
+        attempted_provider_call=attempted_provider_call,
+    )
+    if zen_failure is not None:
+        return zen_failure.error_class if zen_failure.fallback else None
     assert _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS is not None
     assert _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS is not None
     status_code = _extract_adapter_exception_status_code(exc)
@@ -3030,6 +3201,13 @@ def _get_codex_auto_agent_cooldown_seconds(
     candidate: Optional[dict[str, Any]] = None,
     attempted_provider_call: bool = True,
 ) -> float:
+    zen_failure = _opencode_zen_alias_failure(
+        exc,
+        candidate=candidate,
+        attempted_provider_call=attempted_provider_call,
+    )
+    if zen_failure is not None:
+        return zen_failure.cooldown_seconds
     assert _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS is not None
     xai_header_wait = _parse_xai_rate_limit_header_wait_seconds(
         exc,
@@ -3164,6 +3342,9 @@ def _get_codex_auto_agent_source_error_summary(
     *,
     status_code: Optional[int],
 ) -> str:
+    failure = getattr(exc, "_aawm_zen_failure", None)
+    if isinstance(failure, ZenFailure):
+        return failure.public_detail
     assert _get_passthrough_handled_http_error_summary is not None
     from fastapi import HTTPException
     from starlette import status as http_status
@@ -3244,6 +3425,14 @@ def build_shadow_failure_action_decision_from_exc(
     the candidate loop can stamp the same sanitized comparison fields without
     re-implementing classification inputs.
     """
+    zen_failure = _opencode_zen_alias_failure(exc, candidate=candidate)
+    if zen_failure is not None:
+        return _failure_actions.decide_shadow_failure_action(
+            _classification.zen_failure_event(zen_failure), policy=policy,
+            current_error_class=current_error_class,
+            current_cooldown_scope=current_cooldown_scope,
+            current_status=current_status,
+        )
     credit_event = _openrouter_credit_exhaustion_event(exc, candidate=candidate)
     if credit_event is not None:
         return _failure_actions.decide_shadow_failure_action(

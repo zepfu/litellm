@@ -59,6 +59,7 @@ _DEFAULT_ACTION_BY_CLASS: dict[str, FailureAction] = {
     OPENROUTER_CREDIT_EXHAUSTED: "cooldown",
     "transient": "retry_same",
     "auth": "terminal",
+    "billing": "terminal",
     "quota_exhausted": "cooldown",
     "model_unavailable": "failover",
     "provider_5xx": "failover",

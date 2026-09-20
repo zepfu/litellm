@@ -2057,11 +2057,8 @@ _HOST_FUNCTION_NAMES = (
     "_prepare_opencode_zen_known_free_logging",
     "_opencode_zen_callback_headers",
     # D1-574 OpenCode direct 429
-    "_opencode_zen_direct_safe_retry_after",
     "_maybe_raise_opencode_zen_direct_rate_limit",
     "_opencode_zen_direct_stream_terminal_error",
-    "_OPENCODE_ZEN_DIRECT_429_ERROR_CLASSES",
-    "_OPENCODE_ZEN_DIRECT_RETRY_AFTER_CEILING_SECONDS",
     "_OPENCODE_ZEN_DIRECT_PEEK_MAX_BYTES",
     # CFG-004 encrypted reasoning detection
     "_is_fernet_encrypted_token",
@@ -8863,89 +8860,33 @@ async def _handle_codex_zai_coding_plan_adapter_route(
 
 # ── D1-574: OpenCode Zen direct-route 429 preservation ─────────────
 
-_OPENCODE_ZEN_DIRECT_429_ERROR_CLASSES = frozenset(
-    {"capacity_exhausted", "rate_limited", "usage_limit_reached"}
-)
-_OPENCODE_ZEN_DIRECT_RETRY_AFTER_CEILING_SECONDS = 86400.0
 _OPENCODE_ZEN_DIRECT_PEEK_MAX_BYTES = 65536
 
 
-def _opencode_zen_direct_safe_retry_after(exc: Exception) -> Optional[str]:
-    """Extract a safe, bounded Retry-After value from upstream headers."""
-    headers = _extract_adapter_upstream_headers(exc)
-    raw_retry_after: Any = None
-    for header_name, header_value in headers.items():
-        if str(header_name).lower() == "retry-after":
-            raw_retry_after = header_value
-            break
-    if raw_retry_after is None:
-        return None
-    try:
-        raw_retry_after_seconds = float(str(raw_retry_after).strip())
-    except (TypeError, ValueError):
-        return None
-    if not (
-        0
-        <= raw_retry_after_seconds
-        <= _OPENCODE_ZEN_DIRECT_RETRY_AFTER_CEILING_SECONDS
-    ):
-        return None
-    retry_after = _parse_retry_after_seconds_from_headers(headers)
-    if retry_after is None:
-        return None
-    if not (
-        0 <= retry_after <= _OPENCODE_ZEN_DIRECT_RETRY_AFTER_CEILING_SECONDS
-    ):
-        return None
-    if retry_after == int(retry_after):
-        return str(int(retry_after))
-    return str(round(retry_after, 1))
-
-
 def _maybe_raise_opencode_zen_direct_rate_limit(exc: Exception) -> None:
-    """Raise a bounded 429 ProxyException for qualifying direct-mode failures."""
-    error_class = _classify_codex_auto_agent_retryable_exhaustion(exc)
-    if error_class not in _OPENCODE_ZEN_DIRECT_429_ERROR_CLASSES:
-        return
-    retry_after = _opencode_zen_direct_safe_retry_after(exc)
-    headers = {"Retry-After": retry_after} if retry_after is not None else None
-    raise ProxyException(
-        message=(
-            "OpenCode Zen upstream capacity is temporarily exhausted. "
-            "Retry later."
-        ),
-        type="rate_limit_error",
-        param="model",
-        code=429,
-        headers=headers,
-    ) from exc
+    """Deliver the shared typed Zen outcome without exposing provider detail."""
+    from ..providers.opencode_zen.runtime import _raise_opencode_zen_failure
+
+    _raise_opencode_zen_failure(exc)
 
 
 def _opencode_zen_direct_stream_terminal_error(exc: Exception) -> Optional[str]:
-    """Return a bounded response.failed SSE event for post-first-event failures."""
-    error_class = _classify_codex_auto_agent_retryable_exhaustion(exc)
-    if error_class not in _OPENCODE_ZEN_DIRECT_429_ERROR_CLASSES:
-        return None
+    """Render the same secret-free outcome after response headers commit."""
+    from ..providers.opencode_zen.runtime import _extract_opencode_zen_failure
+
+    failure = _extract_opencode_zen_failure(exc)
     payload = {
         "type": "response.failed",
         "response": {
-            "object": "response",
-            "status": "failed",
+            "object": "response", "status": "failed",
             "error": {
-                "type": "rate_limit_error",
-                "code": "opencode_zen_capacity_exhausted",
-                "message": (
-                    "OpenCode Zen upstream capacity is temporarily "
-                    "exhausted."
-                ),
+                "type": "rate_limit_error" if failure.public_status_code == 429 else "upstream_error",
+                "code": "opencode_zen_" + failure.class_name,
+                "message": failure.public_detail,
             },
         },
     }
-    return (
-        "event: response.failed\ndata: "
-        + json.dumps(payload, separators=(",", ":"))
-        + "\n\n"
-    )
+    return "event: response.failed\ndata: " + json.dumps(payload, separators=(",", ":")) + "\n\n"
 
 
 def _consume_opencode_zen_tools_mode_header(
@@ -9253,12 +9194,12 @@ async def _handle_codex_opencode_zen_adapter_route(
             is_known_free_direct=is_known_free_direct,
         )
     except Exception as exc:
-        if use_alias_candidate_probe and _opencode_zen_candidate_unavailable_detail(exc) is not None:
-            _raise_opencode_zen_auto_agent_candidate_unavailable(exc)
-        # D1-574: direct-mode capacity/rate-limit/usage-limit -> bounded 429
-        if not use_alias_candidate_probe:
-            _maybe_raise_opencode_zen_direct_rate_limit(exc)
-        raise
+        from ..providers.opencode_zen.runtime import _raise_opencode_zen_failure
+
+        _raise_opencode_zen_failure(
+            exc, use_alias_candidate_probe=use_alias_candidate_probe,
+            model=adapter_model,
+        )
     # D1-574: known-free OpenCode models have zero cost; supply explicit
     # response_cost so the Logging -> Langfuse path records 0.0 instead of
     # null (the generic cost lookup cannot resolve openai/<model> to the

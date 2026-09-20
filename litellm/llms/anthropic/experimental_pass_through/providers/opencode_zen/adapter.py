@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Never
 
 from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen.constants import (
     _OPENCODE_ZEN_CREDENTIAL_FAMILY,
@@ -40,6 +40,26 @@ class Runtime:
     validate_egress: Callable[..., Any]
     provider: str
     completion_provider: str
+
+
+def _raise_translated_opencode_zen_failure(
+    exc: Exception,
+    *,
+    use_alias_candidate_probe: bool,
+    adapter_model: str,
+    route_family: str,
+) -> Never:
+    """Classify the original exception and raise the shared sanitized ProxyException."""
+    from litellm.proxy.pass_through_endpoints.providers.opencode_zen.runtime import (
+        _raise_opencode_zen_failure,
+    )
+
+    _raise_opencode_zen_failure(
+        exc,
+        use_alias_candidate_probe=use_alias_candidate_probe,
+        model=adapter_model,
+        route_family=route_family,
+    )
 
 
 async def prepare_responses_route(
@@ -103,8 +123,12 @@ async def prepare_responses_route(
     )
 
     def handle_exception(exc: Exception) -> None:
-        if use_alias_candidate_probe and runtime.unavailable_detail(exc) is not None:
-            runtime.raise_candidate_unavailable(exc)
+        _raise_translated_opencode_zen_failure(
+            exc,
+            use_alias_candidate_probe=use_alias_candidate_probe,
+            adapter_model=adapter_model,
+            route_family=adapter_config.OPENCODE_ZEN_RESPONSES.adapter,
+        )
 
     return adapter_driver.ResponsesAdapterRoutePlan(
         config=adapter_config.OPENCODE_ZEN_RESPONSES,
@@ -171,8 +195,12 @@ async def prepare_completion_route(
     )
 
     def handle_exception(exc: Exception) -> None:
-        if use_alias_candidate_probe and runtime.unavailable_detail(exc) is not None:
-            runtime.raise_candidate_unavailable(exc)
+        _raise_translated_opencode_zen_failure(
+            exc,
+            use_alias_candidate_probe=use_alias_candidate_probe,
+            adapter_model=adapter_model,
+            route_family=config.route_family,
+        )
 
     return adapter_driver.CompletionAdapterRoutePlan(
         config=config,

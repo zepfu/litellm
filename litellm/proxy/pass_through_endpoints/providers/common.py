@@ -66,7 +66,7 @@ def _raise_opencode_zen_auto_agent_candidate_unavailable(
         exc,
         message=(
             "OpenCode Zen auto-agent candidate requires a valid OpenCode "
-            f"API-key credential: {exc}"
+            "API-key credential."
         ),
         error_type="rate_limit_error",
         status_code=429,
@@ -140,54 +140,19 @@ def _opencode_zen_candidate_unavailable_detail(
     *,
     runtime: Runtime,
 ) -> Optional[str]:
-    status_code = runtime.extract_status_code(exc)
+    from ..aawm_alias_routing.classification import classify_zen_failure
+
+    # This legacy probe-detail seam has no provider attribution contract. It
+    # only selects a safe message; it must not grant cooldown/retry authority.
     detail = runtime.extract_detail(exc)
     if isinstance(detail, bytes):
-        detail_text = detail.decode("utf-8", errors="ignore")
-    else:
-        detail_text = str(detail or exc)
-    detail_text = " ".join(
-        str(part)
-        for part in (
-            getattr(exc, "message", None),
-            getattr(exc, "code", None),
-            detail_text,
-            str(exc),
-        )
-        if part is not None
+        detail = detail.decode("utf-8", errors="replace")
+    failure = classify_zen_failure(
+        status_code=runtime.extract_status_code(exc),
+        message=" ".join(str(value) for value in (getattr(exc, "message", ""), getattr(exc, "code", ""), detail) if value is not None),
+        origin="upstream", route="alias",
     )
-    normalized = detail_text.lower()
-    if any(
-        marker in normalized
-        for marker in (
-            "freeusagelimiterror",
-            "free usage limit",
-            "creditserror",
-            "no payment method",
-            "add a payment method",
-            "billing",
-            "payment required",
-        )
-    ):
-        return detail_text
-    if "not supported for format openai" in normalized:
-        return detail_text
-    if status_code in {401, 402, 403} and any(
-        marker in normalized
-        for marker in (
-            "authentication",
-            "authorization",
-            "unauthorized",
-            "forbidden",
-            "invalid api key",
-            "api-key",
-            "api key",
-            "credential",
-            "opencode",
-        )
-    ):
-        return detail_text
-    return None
+    return failure.public_detail if failure.class_name in {"auth", "billing", "quota", "format"} else None
 
 
 

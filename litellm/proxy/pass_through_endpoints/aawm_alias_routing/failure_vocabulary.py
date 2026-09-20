@@ -112,3 +112,33 @@ def is_coolable(event: FailureEvent) -> bool:
     failures must never advance a candidate toward cooldown.
     """
     return event.origin == "upstream"
+
+
+ZenFailureClass = Literal[
+    "auth", "billing", "quota", "rate", "capacity", "model", "format",
+    "invalid_request", "timeout", "transient", "terminal",
+]
+
+
+@dataclass(frozen=True)
+class ZenFailure:
+    """Secret-free Zen outcome shared by direct responses and alias policy.
+
+    ``scope`` describes the failing resource, not permission to fan out durable
+    cooldowns to unrelated credentials. ``origin`` retains provider attribution;
+    ``route`` distinguishes direct delivery from alias fallback.
+    """
+
+    class_name: ZenFailureClass
+    origin: Origin
+    route: Literal["direct", "alias"]
+    status_code: int
+    public_status_code: int
+    scope: Literal["account", "candidate", "none"]
+    retryable: bool
+    fallback: bool
+    error_class: Optional[str]
+    cooldown_seconds: float
+    retry_after_seconds: Optional[float]
+    reset_after_seconds: Optional[float]
+    public_detail: str
