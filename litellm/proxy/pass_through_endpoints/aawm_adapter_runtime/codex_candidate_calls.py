@@ -2179,6 +2179,7 @@ def install(
             _reject_opencode_go_lossy_capability_adaptation_if_needed,
         ),
         ("_OPENCODE_GO_CHAT_COMPLETIONS_ROUTE", _OPENCODE_GO_CHAT_COMPLETIONS_ROUTE),
+        ("_OPENCODE_GO_INNER_COMPLETION_RETRY_KWARGS", _OPENCODE_GO_INNER_COMPLETION_RETRY_KWARGS),
         ("_OPENCODE_GO_TOOLS_INDEX_RE", _OPENCODE_GO_TOOLS_INDEX_RE),
         ("_OPENCODE_GO_NONSEMANTIC_TOOL_CHOICE", _OPENCODE_GO_NONSEMANTIC_TOOL_CHOICE),
         ("_NOUS_TOOL_CHOICE_ENUMS", _NOUS_TOOL_CHOICE_ENUMS),
@@ -9308,6 +9309,14 @@ async def _handle_codex_opencode_zen_adapter_route(
 
 _OPENCODE_GO_CHAT_COMPLETIONS_ROUTE = "/zen/go/v1/chat/completions"
 _OPENCODE_GO_TOOLS_INDEX_RE = re.compile(r"tools\[(\d+)\]")
+# OC-028: one Go wire call per handler invocation. Alias retries belong to
+# the candidate loop; inner LiteLLM wrapper retries and the OpenAI client's
+# default max_retries=2 would hide extra transport calls inside one attempt.
+# Direct Responses retries stay on pass_through pre-first-byte hidden retry.
+_OPENCODE_GO_INNER_COMPLETION_RETRY_KWARGS = {
+    "num_retries": 0,
+    "max_retries": 0,
+}
 
 
 def _opencode_go_tool_type(tool: Any) -> Optional[str]:
@@ -9807,7 +9816,10 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
                     429,
                     *_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES,
                 ],
-                caller_managed_hidden_retry=True,
+                # Alias: candidate loop owns retry, so disable hidden
+                # transport retries. Direct: keep pass_through pre-first-byte
+                # hidden retry as the observable call-boundary policy.
+                caller_managed_hidden_retry=use_alias_candidate_probe,
                 defer_session_owner_promotion=True,
             )
             if use_alias_candidate_probe:
@@ -10113,6 +10125,7 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
     )
     completion_call_kwargs = {
         **completion_kwargs,
+        **_OPENCODE_GO_INNER_COMPLETION_RETRY_KWARGS,
         "api_key": api_key,
         "api_base": f"{target_base_url.rstrip('/')}/v1",
         "litellm_metadata": litellm_metadata,
