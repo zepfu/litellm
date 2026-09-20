@@ -204,11 +204,24 @@ def _normalize_anthropic_openrouter_adapter_model_name(
     explicit_provider, candidate = _split_anthropic_adapter_provider_prefix(model)
     if explicit_provider == "nous":
         return None
-    normalized_candidate = (
-        candidate if explicit_provider == "openrouter" else _normalize_anthropic_adapter_model_name(model)
-    )
-    if normalized_candidate is None:
-        return None
+    if explicit_provider == "openrouter":
+        if candidate is None:
+            return None
+        remainder = candidate.strip()
+        if not remainder:
+            return None
+        # Canonical OpenRouter-owned IDs are openrouter/<model> with no extra
+        # slash.  That openrouter/ segment is part of the model name
+        # (openrouter/auto, openrouter/free, openrouter/elephant-alpha), not a
+        # LiteLLM transport prefix.  Third-party IDs are
+        # openrouter/<vendor>/<model>; drop exactly one outer prefix.
+        normalized_candidate = (
+            remainder if "/" in remainder else f"openrouter/{remainder}"
+        )
+    else:
+        normalized_candidate = _normalize_anthropic_adapter_model_name(model)
+        if normalized_candidate is None:
+            return None
 
     openrouter_model_aliases = {
         "free": "openrouter/free",
@@ -221,11 +234,18 @@ def _normalize_anthropic_openrouter_adapter_model_name(
 def _get_openrouter_completion_adapter_upstream_model(
     model: Any,
 ) -> Optional[str]:
-    explicit_provider, candidate = _split_anthropic_adapter_provider_prefix(model)
-    if explicit_provider == "openrouter" and candidate is not None:
-        candidate = candidate.strip()
-        return candidate or None
-    return _normalize_anthropic_adapter_model_name(model)
+    # OR-030: wire identity is the shared OpenRouter adapter normalizer.
+    # Canonical owned IDs (openrouter/auto, openrouter/free,
+    # openrouter/elephant-alpha) stay on the wire; third-party
+    # openrouter/<vendor>/<model> loses exactly one outer prefix; shorthands
+    # collapse through the same alias table.
+    explicit_provider, _candidate = _split_anthropic_adapter_provider_prefix(model)
+    if explicit_provider == "nous":
+        # "nous/" is a third-party vendor namespace on OpenRouter; the
+        # adapter-admission normalizer excludes it, but the upstream wire
+        # model is still the full requested ID.
+        return _normalize_anthropic_adapter_model_name(model)
+    return _normalize_anthropic_openrouter_adapter_model_name(model)
 
 def _normalize_opencode_zen_adapter_model_name(model: Any) -> Optional[str]:
     explicit_provider, candidate = _split_anthropic_adapter_provider_prefix(model)
