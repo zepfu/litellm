@@ -5707,3 +5707,118 @@ async def test_finalize_success_no_session_lease_returns_none_not_skipped() -> N
         )
         is False
     )
+
+
+def test_deferred_stream_bind_requires_held_or_owned_lease() -> None:
+    assert sa._session_owner_lease_requires_deferred_stream_bind(None) is False
+    no_session = sa.SessionOwnerLease(
+        session_identity=None,
+        held_reservation=False,
+        reservation_token=None,
+        released=False,
+        promoted=False,
+        decision=sa.SessionOwnerGuardDecision.NO_SESSION.value,
+        attributes={"provider": "xai", "model": "xai/grok-4.6"},
+    )
+    assert sa._session_owner_lease_requires_deferred_stream_bind(no_session) is False
+    held = sa.SessionOwnerLease(
+        session_identity="sess-held",
+        held_reservation=True,
+        reservation_token="tok-held",
+        released=False,
+        promoted=False,
+        decision=sa.SessionOwnerGuardDecision.UNOWNED_RESERVED.value,
+    )
+    assert sa._session_owner_lease_requires_deferred_stream_bind(held) is True
+    owned = sa.SessionOwnerLease(
+        session_identity="sess-owned",
+        held_reservation=False,
+        reservation_token=None,
+        released=False,
+        promoted=True,
+        decision=sa.SessionOwnerGuardDecision.COMPATIBLE_OWNER.value,
+    )
+    assert sa._session_owner_lease_requires_deferred_stream_bind(owned) is True
+
+
+def test_bind_deferred_stream_skips_wrapper_for_no_session_lease() -> None:
+    from fastapi.responses import StreamingResponse
+
+    async def _chunks():
+        yield b"data: {}\n\n"
+
+    response = StreamingResponse(_chunks(), media_type="text/event-stream")
+    original_iterator = response.body_iterator
+    original_stream_response_func = response.stream_response.__func__
+    request = MagicMock()
+    request.state = MagicMock()
+    request.state.aawm_openai_candidate_context = {
+        "provider": "xai",
+        "route_family": "codex_grok_native_responses_adapter",
+    }
+    lease = sa.SessionOwnerLease(
+        session_identity=None,
+        held_reservation=False,
+        reservation_token=None,
+        released=False,
+        promoted=False,
+        decision=sa.SessionOwnerGuardDecision.NO_SESSION.value,
+        attributes={
+            "provider": "xai",
+            "route_family": "codex_grok_native_responses_adapter",
+        },
+    )
+    bound = sa.bind_deferred_session_owner_lease_to_streaming_response(
+        response,
+        request=request,
+        lease=lease,
+    )
+    assert bound is False
+    assert response.body_iterator is original_iterator
+    assert response.stream_response.__func__ is original_stream_response_func
+    assert (
+        getattr(response, "_aawm_session_owner_deferred_finalizer_bound", False)
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_bind_deferred_stream_wraps_held_reservation() -> None:
+    from fastapi.responses import StreamingResponse
+
+    async def _chunks():
+        yield b"data: {}\n\n"
+
+    response = StreamingResponse(_chunks(), media_type="text/event-stream")
+    original_iterator = response.body_iterator
+    request = MagicMock()
+    request.state = MagicMock()
+    request.state.aawm_openai_candidate_context = {
+        "provider": "xai",
+        "route_family": "codex_grok_native_responses_adapter",
+    }
+    lease = sa.SessionOwnerLease(
+        session_identity="sess-held",
+        cache_key="owner-key-held",
+        held_reservation=True,
+        reservation_token="tok-held",
+        released=False,
+        promoted=False,
+        decision=sa.SessionOwnerGuardDecision.UNOWNED_RESERVED.value,
+        attributes={
+            "provider": "xai",
+            "route_family": "codex_grok_native_responses_adapter",
+        },
+    )
+    with patch.object(sa, "start_session_owner_lease_renewal", return_value=None):
+        bound = sa.bind_deferred_session_owner_lease_to_streaming_response(
+            response,
+            request=request,
+            lease=lease,
+        )
+    assert bound is True
+    assert response.body_iterator is not original_iterator
+    assert (
+        getattr(response, "_aawm_session_owner_deferred_finalizer_bound", False)
+        is True
+    )

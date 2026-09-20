@@ -255,6 +255,29 @@ def session_owner_deferred_skipped_promote_is_noop(
     return _clean_optional_str(lease.session_identity) is None
 
 
+def _session_owner_lease_requires_deferred_stream_bind(
+    lease: Optional[SessionOwnerLease],
+) -> bool:
+    """True when a streaming response must own deferred promotion/release.
+
+    ``no_session`` / absent leases have nothing to promote. Wrapping those
+    streams still intercepts Hypercorn's post-terminal CancelledError and
+    runs failure finalization on a completed valid Grok response.
+    """
+    if lease is None:
+        return False
+    if lease.promoted:
+        return True
+    if (
+        lease.held_reservation
+        and lease.reservation_token
+        and not lease.released
+    ):
+        return True
+    decision = str(lease.decision or "").strip().casefold()
+    return decision == SessionOwnerGuardDecision.COMPATIBLE_OWNER.value
+
+
 def session_owner_deferred_promote_should_raise(
     lease: Optional[SessionOwnerLease],
     result: Optional[SessionOwnerMutationResult],
@@ -6130,6 +6153,9 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
         response,
         success_finalizer,
     )
+    if not _session_owner_lease_requires_deferred_stream_bind(lease):
+        observe("binding", binding_outcome="no_lease")
+        return False
     if not isinstance(response, StreamingResponse):
         observe("binding", binding_outcome="not_streaming_response")
         return False
