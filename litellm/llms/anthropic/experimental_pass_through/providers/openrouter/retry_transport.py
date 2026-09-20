@@ -300,15 +300,22 @@ def _is_anthropic_sse_message_stop(payload: str) -> bool:
 
     Only the event field is inspected.  ``data:`` JSON, tool arguments, and
     content text that happen to include the token ``message_stop`` are not
-    terminals.
+    terminals.  Lines are split on CRLF, CR, and LF only, so Unicode
+    separators such as U+2028 inside JSON text are not line boundaries.
+    The field name ``event:`` is literal; at most one ASCII space after the
+    colon is removed, then the remaining value must equal ``message_stop``.
     """
-    for raw_line in payload.splitlines():
-        line = raw_line.strip()
-        if not line.startswith(_ANTHROPIC_SSE_EVENT_PREFIX):
-            continue
-        event_name = line[len(_ANTHROPIC_SSE_EVENT_PREFIX) :].strip()
-        if event_name == _ANTHROPIC_STREAM_TERMINAL_EVENT:
-            return True
+    # SSE line breaks are CRLF / CR / LF only.  ``str.splitlines()`` also
+    # splits on Unicode separators (U+0085 / U+2028 / U+2029).
+    for lf_piece in payload.split("\n"):
+        for line in lf_piece.split("\r"):
+            if not line.startswith(_ANTHROPIC_SSE_EVENT_PREFIX):
+                continue
+            value = line[len(_ANTHROPIC_SSE_EVENT_PREFIX) :]
+            if value.startswith(" "):
+                value = value[1:]
+            if value == _ANTHROPIC_STREAM_TERMINAL_EVENT:
+                return True
     return False
 
 
