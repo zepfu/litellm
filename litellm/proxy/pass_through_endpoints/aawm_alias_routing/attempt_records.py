@@ -18,6 +18,7 @@ from uuid import uuid4
 
 from fastapi import Request
 
+from . import opencode_go_preflight as _opencode_go_preflight
 from .lane_keys import _CODEX_REASONING_EFFORT_TIER_INDEX
 from .policy import (
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES,
@@ -654,6 +655,32 @@ def _update_codex_auto_agent_retryable_attempt_record(  # noqa: PLR0915
         update["candidate_status"] = candidate_status
     if ineligibility_reason is not None:
         update["ineligibility_reason"] = ineligibility_reason
+    preflight_reason = getattr(exc, "preflight_reason", None)
+    if (
+        not isinstance(preflight_reason, str)
+        or preflight_reason not in _opencode_go_preflight.OPENCODE_GO_PREFLIGHT_REASONS
+    ):
+        detail = getattr(exc, "detail", None)
+        detail_mapping = detail if isinstance(detail, Mapping) else {}
+        preflight_reason = detail_mapping.get("preflight_reason")
+    if (
+        isinstance(preflight_reason, str)
+        and preflight_reason in _opencode_go_preflight.OPENCODE_GO_PREFLIGHT_REASONS
+    ):
+        update["preflight_reason"] = preflight_reason
+    call_mode = getattr(exc, "opencode_go_call_mode", None)
+    if (
+        not isinstance(call_mode, str)
+        or call_mode not in _opencode_go_preflight.OPENCODE_GO_PREFLIGHT_CALL_MODES
+    ):
+        detail = getattr(exc, "detail", None)
+        detail_mapping = detail if isinstance(detail, Mapping) else {}
+        call_mode = detail_mapping.get("opencode_go_call_mode")
+    if (
+        isinstance(call_mode, str)
+        and call_mode in _opencode_go_preflight.OPENCODE_GO_PREFLIGHT_CALL_MODES
+    ):
+        update["opencode_go_call_mode"] = call_mode
     if is_deterministically_ineligible:
         # Deterministic candidate rejection never publishes local or durable
         # cooldown state, even if a caller carried a stale scope or duration.

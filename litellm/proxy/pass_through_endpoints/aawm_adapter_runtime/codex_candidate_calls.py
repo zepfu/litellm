@@ -47,6 +47,10 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_persist impor
     _aawm_alias_route_healthy_json_enabled,
     _emit_aawm_terminal_error,
 )
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.opencode_go_preflight import (
+    classify_opencode_go_credential_preflight_reason,
+    raise_opencode_go_preflight,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     CODEX_AUTO_AGENT_OPENROUTER_RESPONSES_ROUTE_FAMILY,
 )
@@ -2056,6 +2060,7 @@ _HOST_FUNCTION_NAMES = (
     "_handle_codex_opencode_zen_adapter_route",
     "_handle_codex_opencode_go_adapter_route",
     "_stream_opencode_go_chat_completions_response",
+    "_prepare_opencode_go_preflight_egress",
     "_build_opencode_go_provider_rejection_evidence",
     "_record_opencode_go_provider_rejection_evidence",
     "_raise_opencode_go_alias_candidate_upstream_timeout",
@@ -2121,6 +2126,8 @@ def install(
         "_raise_cursor_agent_alias_error",
         "_raise_codex_auto_agent_missing_credential_preflight",
         "_load_codex_auto_agent_opencode_zen_api_key",
+        "raise_opencode_go_preflight",
+        "classify_opencode_go_credential_preflight_reason",
         "_raise_codex_alibaba_auto_review_validation_error",
         "_validate_codex_alibaba_auto_review_completion_or_raise",
         "_validate_codex_alibaba_auto_review_response_body_or_raise",
@@ -9931,6 +9938,70 @@ async def _stream_opencode_go_chat_completions_response(  # noqa: PLR0915
         rollup_kwargs,
         adapter_label="OpenCode Go",
     )
+async def _prepare_opencode_go_preflight_egress(
+    *,
+    request: Any,
+    endpoint: str,
+    opencode_session_identity: Optional[str],
+    use_alias_candidate_probe: bool,
+) -> tuple[str, str, str, dict[str, str]]:
+    """Resolve Go target, credentials, headers, and egress guard before I/O.
+
+    Local failures are raised as no-call preflight outcomes. Provider-returned
+    authentication is never relabeled here because this helper runs before the
+    transport commitment point.
+    """
+
+    try:
+        target_base_url = _get_opencode_go_target_base()
+        target_url = _join_opencode_zen_passthrough_url(
+            base_target_url=target_base_url,
+            endpoint=endpoint,
+        )
+    except Exception as exc:
+        raise_opencode_go_preflight(
+            exc,
+            reason="invalid_target",
+            use_alias_candidate_probe=use_alias_candidate_probe,
+        )
+    try:
+        api_key = await _load_opencode_zen_api_key_for_candidate(
+            use_alias_candidate_probe=False,
+            source_family=_OPENCODE_GO_CREDENTIAL_FAMILY,
+        )
+    except (FileNotFoundError, ValueError, OSError, TypeError) as exc:
+        raise_opencode_go_preflight(
+            exc,
+            reason=classify_opencode_go_credential_preflight_reason(exc),
+            use_alias_candidate_probe=use_alias_candidate_probe,
+        )
+    try:
+        custom_headers = BaseOpenAIPassThroughHandler._assemble_headers(
+            api_key=api_key,
+            request=request,
+        )
+        if opencode_session_identity is not None:
+            custom_headers["x-opencode-session"] = opencode_session_identity
+    except Exception as exc:
+        raise_opencode_go_preflight(
+            exc,
+            reason="invalid_headers",
+            use_alias_candidate_probe=use_alias_candidate_probe,
+        )
+    try:
+        HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+            url=target_url,
+            headers=custom_headers,
+            credential_family="opencode",
+            expected_target_family="opencode",
+        )
+    except Exception as exc:
+        raise_opencode_go_preflight(
+            exc,
+            reason="egress_validation",
+            use_alias_candidate_probe=use_alias_candidate_probe,
+        )
+    return target_base_url, target_url, api_key, custom_headers
 
 
 def _raise_opencode_go_alias_candidate_upstream_timeout(
@@ -10120,26 +10191,16 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
             request_body=canonical_request_body,
         )
         drop_opencode_go_previous_response_id(adapted_request_body)
-        target_base_url = _get_opencode_go_target_base()
-        target_url = _join_opencode_zen_passthrough_url(
-            base_target_url=target_base_url,
-            endpoint="/v1/responses",
-        )
-        api_key = await _load_opencode_zen_api_key_for_candidate(
-            use_alias_candidate_probe=use_alias_candidate_probe,
-            source_family=_OPENCODE_GO_CREDENTIAL_FAMILY,
-        )
-        custom_headers = BaseOpenAIPassThroughHandler._assemble_headers(
-            api_key=api_key,
+        (
+            target_base_url,
+            target_url,
+            api_key,
+            custom_headers,
+        ) = await _prepare_opencode_go_preflight_egress(
             request=request,
-        )
-        if opencode_session_identity is not None:
-            custom_headers["x-opencode-session"] = opencode_session_identity
-        HttpPassThroughEndpointHelpers.validate_outgoing_egress(
-            url=target_url,
-            headers=custom_headers,
-            credential_family="opencode",
-            expected_target_family="opencode",
+            endpoint="/v1/responses",
+            opencode_session_identity=opencode_session_identity,
+            use_alias_candidate_probe=use_alias_candidate_probe,
         )
         _annotate_request_scope_for_adapted_access_log(
             request, httpx.URL(target_url)
@@ -10233,6 +10294,9 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
                 ),
             )
             _record_opencode_go_provider_rejection_evidence(request, evidence)
+            setattr(exc, "attempted_provider_call", True)
+            if evidence["error"]["status"] in {401, 403}:
+                setattr(exc, "_aawm_provider_returned", True)
             raise
 
         intake_context = _build_malformed_tool_call_intake_context(
@@ -10486,26 +10550,16 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
     )
     completion_kwargs["model"] = adapter_model
     completion_kwargs["stream"] = bool(client_requested_stream)
-    target_base_url = _get_opencode_go_target_base()
-    target_url = _join_opencode_zen_passthrough_url(
-        base_target_url=target_base_url,
-        endpoint="/v1/chat/completions",
-    )
-    api_key = await _load_opencode_zen_api_key_for_candidate(
-        use_alias_candidate_probe=use_alias_candidate_probe,
-        source_family=_OPENCODE_GO_CREDENTIAL_FAMILY,
-    )
-    custom_headers = BaseOpenAIPassThroughHandler._assemble_headers(
-        api_key=api_key,
+    (
+        target_base_url,
+        target_url,
+        api_key,
+        custom_headers,
+    ) = await _prepare_opencode_go_preflight_egress(
         request=request,
-    )
-    if opencode_session_identity is not None:
-        custom_headers["x-opencode-session"] = opencode_session_identity
-    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
-        url=target_url,
-        headers=custom_headers,
-        credential_family="opencode",
-        expected_target_family="opencode",
+        endpoint="/v1/chat/completions",
+        opencode_session_identity=opencode_session_identity,
+        use_alias_candidate_probe=use_alias_candidate_probe,
     )
     _annotate_request_scope_for_adapted_access_log(request, httpx.URL(target_url))
     rollup_kwargs = _build_adapted_route_rollup_kwargs(litellm_metadata)
@@ -10565,6 +10619,9 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
             ),
         )
         _record_opencode_go_provider_rejection_evidence(request, evidence)
+        setattr(exc, "attempted_provider_call", True)
+        if evidence["error"]["status"] in {401, 403}:
+            setattr(exc, "_aawm_provider_returned", True)
         raise
     if client_requested_stream:
         if not callable(stream_fn):

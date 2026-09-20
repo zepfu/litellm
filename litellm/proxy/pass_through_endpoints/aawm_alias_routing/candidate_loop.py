@@ -77,8 +77,9 @@ from litellm.secret_managers.xai_oauth_inventory import (
 )
 
 from . import codex_oauth as _codex_oauth_mod
-from . import error_signals as _error_signals
 from . import dev_fault_plan as _dev_fault_plan
+from . import error_signals as _error_signals
+from . import opencode_go_preflight as _opencode_go_preflight
 from .codex_quota_balance import snapshot_selection
 from .interfaces import (
     AliasRouteServices,
@@ -608,6 +609,28 @@ def _store_attempt_failure_state(
             failure_phase = value
             break
     attempt_record["failure_phase"] = failure_phase
+    preflight_reason = getattr(exc, "preflight_reason", None)
+    if (
+        not isinstance(preflight_reason, str)
+        or preflight_reason not in _opencode_go_preflight.OPENCODE_GO_PREFLIGHT_REASONS
+    ):
+        preflight_reason = detail_mapping.get("preflight_reason")
+    if (
+        isinstance(preflight_reason, str)
+        and preflight_reason in _opencode_go_preflight.OPENCODE_GO_PREFLIGHT_REASONS
+    ):
+        attempt_record["preflight_reason"] = preflight_reason
+    call_mode = getattr(exc, "opencode_go_call_mode", None)
+    if (
+        not isinstance(call_mode, str)
+        or call_mode not in _opencode_go_preflight.OPENCODE_GO_PREFLIGHT_CALL_MODES
+    ):
+        call_mode = detail_mapping.get("opencode_go_call_mode")
+    if (
+        isinstance(call_mode, str)
+        and call_mode in _opencode_go_preflight.OPENCODE_GO_PREFLIGHT_CALL_MODES
+    ):
+        attempt_record["opencode_go_call_mode"] = call_mode
     return attempted_provider_call
 
 

@@ -375,17 +375,20 @@ async def _load_local_opencode_auth_api_key(*, source_family: str) -> str:
         provider_auth = _select_opencode_go_provider_auth(auth_data)
     else:
         provider_auth = _select_opencode_zen_provider_auth(auth_data)
-    api_key = (
-        _clean_secret_string(provider_auth.get("key"))
-        if isinstance(provider_auth, dict)
-        else None
-    )
-    auth_type = (
-        _clean_secret_string(provider_auth.get("type"))
-        if isinstance(provider_auth, dict)
-        else None
-    )
-    if api_key is None or auth_type not in {None, "api"}:
+    if not isinstance(provider_auth, dict):
+        _raise_invalid_opencode_auth_file(
+            source_label=source_label,
+            auth_data=auth_data,
+            source_family=normalized_family,
+        )
+    api_key = _clean_secret_string(provider_auth.get("key"))
+    auth_type = _clean_secret_string(provider_auth.get("type"))
+    if auth_type not in {None, "api"}:
+        raise ValueError(
+            f"OpenCode Zen auth file configured via {source_label} "
+            "must contain provider 'opencode' with API-key auth type."
+        )
+    if api_key is None:
         _raise_invalid_opencode_auth_file(
             source_label=source_label,
             auth_data=auth_data,
