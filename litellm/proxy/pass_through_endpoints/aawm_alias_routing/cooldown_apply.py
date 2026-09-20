@@ -25,7 +25,10 @@ from fastapi import Request
 
 from .interfaces import CooldownPublicationPlan
 from .failure_vocabulary import OPENROUTER_CREDIT_EXHAUSTED
-from .lane_keys import openrouter_credit_lane_cooldown_key
+from .lane_keys import (
+    openrouter_account_lane_cooldown_key,
+    openrouter_credit_lane_cooldown_key,
+)
 from .policy import (
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES,
@@ -181,6 +184,7 @@ def _resolve_auto_agent_cooldown_publication_plan(
       - ``none`` / request-local -> no shared keys (request-local action only)
       - ``candidate`` / ``model`` -> the selected candidate key
       - Kimi ``managed_account`` -> the managed-account sentinel ONLY
+      - OpenRouter ``account`` -> hashed credential lane only (auth/shared-quota)
       - Grok account-quota -> the selected key PLUS the account-lane key
 
     Codex configured aliases use the alias-scoped N-of-M failure-evidence
@@ -226,6 +230,26 @@ def _resolve_auto_agent_cooldown_publication_plan(
         return CooldownPublicationPlan(
             memory_keys=(credit_key,), durable_keys=(credit_key,),
             duration_seconds=duration, applied_scope="account",
+        )
+    if cooldown_scope == "account":
+        # Exact OpenRouter account evidence is credential-wide, never model-wide.
+        # A missing or unhashed credential cannot safely identify a shared target.
+        account_key = openrouter_account_lane_cooldown_key(candidate, lane_key)
+        if account_key is None:
+            return CooldownPublicationPlan(
+                applied_scope="request_local",
+                duration_seconds=duration,
+                request_local_action="request_local_cooldown",
+                grok_account_quota_exhausted=grok_account_quota_exhausted,
+                kimi_failure_metadata=kimi_failure_metadata,
+            )
+        return CooldownPublicationPlan(
+            memory_keys=(account_key,),
+            durable_keys=(account_key,),
+            duration_seconds=duration,
+            applied_scope="account",
+            grok_account_quota_exhausted=grok_account_quota_exhausted,
+            kimi_failure_metadata=kimi_failure_metadata,
         )
     allow_ttl_shrink = _is_managed_openai_usage_limit_candidate(
         candidate,
@@ -430,6 +454,12 @@ async def _apply_auto_agent_alias_cooldown(
             cooldown_seconds,
         )
         return cooldown_scope
+    if cooldown_scope == "account":
+        account_key = openrouter_account_lane_cooldown_key(candidate, lane_key)
+        if account_key is not None:
+            await set_candidate_cooldown(account_key, cooldown_seconds)
+            return cooldown_scope
+        cooldown_scope = "request_local"
     if cooldown_scope == "candidate":
         await set_candidate_cooldown(
             selected_cooldown_key,

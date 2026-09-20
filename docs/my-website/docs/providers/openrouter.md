@@ -23,6 +23,24 @@ uncataloged model IDs can still be sent explicitly to OpenRouter.
   <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
 </a>
 
+## AAWM credential cooldown scope
+
+OpenRouter alias cooldowns keep four scopes distinct:
+
+- **Model endpoint** failures (no endpoints, 404) cool only that candidate.
+- **Rate** limits (attributed HTTP 429 without shared-account evidence) cool
+  only that model.
+- **Free-quota** exhaustion uses the existing durable free-daily quota path.
+- **Account** cooldowns apply only when exact provider-attributed evidence
+  proves a shared credential failure, currently structured OpenRouter HTTP
+  401/403. Broad error text is not enough.
+
+Account cooldowns use a nonreversible hashed credential lane derived from the
+effective OpenRouter API key. Sibling models on that credential are skipped;
+a different credential stays eligible. Missing credentials keep the legacy
+lane and cannot publish a shared account cooldown. Raw credentials never
+enter cooldown keys, logs, or public error details.
+
 ## AAWM credit exhaustion
 
 A provider-attributed OpenRouter HTTP 402 with a structured credit or budget

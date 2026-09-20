@@ -261,11 +261,18 @@ def _codex_auto_agent_candidate_key(
         return "h{}:{}".format(cooldown_identity_tag, base)
     return base
 
+_OPENROUTER_CREDENTIAL_LANE_RE = re.compile(r"\Aopenrouter:credential:[0-9a-f]{12}\Z")
+
+
 def resolve_openrouter_credential_lane_key() -> str:
-    """Use the same effective credential as egress; preserve missing-key lanes."""
+    """Derive a nonreversible OpenRouter credential lane from the same
+    effective credential as egress; keep missing or unconfigured keys local."""
     from ..providers.openrouter.runtime import _get_openrouter_api_key
 
-    credential = _get_openrouter_api_key()
+    try:
+        credential = _get_openrouter_api_key()
+    except RuntimeError:
+        return "openrouter"
     if not credential:
         return "openrouter"
     return "openrouter:credential:" + _hash_codex_auto_agent_lane_value(credential)
@@ -278,6 +285,18 @@ def openrouter_credit_lane_cooldown_key(candidate: dict[str, Any], lane_key: Opt
     if re.fullmatch(r"openrouter:credential:[0-9a-f]{12}", lane_key) is None:
         return None
     return "openrouter:__credit_exhausted__:" + lane_key
+
+
+def openrouter_account_lane_cooldown_key(
+    candidate: dict[str, Any],
+    lane_key: Optional[str],
+) -> Optional[str]:
+    """Credential-wide account key. Never publish under the shared default lane."""
+    if candidate.get("provider") != "openrouter" or not isinstance(lane_key, str):
+        return None
+    if _OPENROUTER_CREDENTIAL_LANE_RE.fullmatch(lane_key) is None:
+        return None
+    return "openrouter:__account__:" + lane_key
 
 
 def _resolve_codex_auto_agent_xai_lane_key(candidate: dict[str, Any]) -> str:

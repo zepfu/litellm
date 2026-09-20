@@ -1656,6 +1656,12 @@ def _get_codex_auto_agent_candidate_cooldown_scope(
         return "none"
     if error_class == OPENROUTER_CREDIT_EXHAUSTED:
         return "account"
+    if (
+        error_class == "auth"
+        and isinstance(candidate, dict)
+        and candidate.get("provider") == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER
+    ):
+        return "account"
     if error_class in _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES:
         return "candidate"
     if _is_opencode_zen_candidate(candidate):
@@ -2820,6 +2826,25 @@ def _openrouter_credit_exhaustion_event(
     return extract_credit_exhaustion_event(exc, error_shape_runtime=_OPENROUTER_ERROR_SHAPE_RUNTIME)
 
 
+def _is_openrouter_account_auth_failure(
+    exc: Any,
+    *,
+    candidate: Optional[dict[str, Any]],
+    attempted_provider_call: bool = True,
+) -> bool:
+    """Exact attributed OpenRouter 401/403. Never infer from message text."""
+    if not attempted_provider_call or not isinstance(candidate, dict):
+        return False
+    if candidate.get("provider") != _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
+        return False
+    if (
+        getattr(exc, "_aawm_provider_returned", False) is not True
+        and getattr(exc, "provider_returned", False) is not True
+    ):
+        return False
+    return _extract_adapter_exception_status_code(exc) in {401, 403}
+
+
 def _classify_codex_auto_agent_retryable_exhaustion(
     exc: Any,
     *,
@@ -2848,6 +2873,12 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         exc, candidate=candidate, attempted_provider_call=attempted_provider_call,
     ) is not None:
         return OPENROUTER_CREDIT_EXHAUSTED
+    if _is_openrouter_account_auth_failure(
+        exc,
+        candidate=candidate,
+        attempted_provider_call=attempted_provider_call,
+    ):
+        return "auth"
     tokens = _extract_codex_auto_agent_error_tokens(exc)
     if _is_codex_auto_agent_grok_account_quota_exhaustion(
         exc,
@@ -3238,7 +3269,7 @@ def _get_codex_auto_agent_cooldown_seconds(
     if error_class in _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES:
         return _resolve_alibaba_token_plan_exhaustion_cooldown_seconds()
     tokens = _extract_codex_auto_agent_error_tokens(exc)
-    if error_class in {"usage_limit_reached", OPENROUTER_CREDIT_EXHAUSTED}:
+    if error_class in {"usage_limit_reached", OPENROUTER_CREDIT_EXHAUSTED, "auth"}:
         resolved = _CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS
         if header_wait is not None:
             resolved = (
