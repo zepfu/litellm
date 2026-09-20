@@ -2262,6 +2262,36 @@ class AawmRouteRollupAccumulator:
             )
             subline = group.sublines.get(subline_key)
             subline_already_existed = subline is not None
+        elif (
+            subline is not None
+            and subline.turns <= 0
+            and turns > 0
+            and subline.status is not None
+            and subline.status != "Incomplete"
+            and subline.status
+            not in _AAWM_ROUTE_ROLLUP_REQUEST_TERMINAL_STATUS_VALUES
+        ):
+            # Live 00:43:38 order: Ineligible first, then completed Turns on
+            # the same key. Move the tagged zero-turn aside so success does
+            # not emit Turns: N [Ineligible]. Incomplete still recovers.
+            tagged_key = (
+                cleaned_model_label,
+                cleaned_effort,
+                cleaned_outgoing_target,
+                account_identity,
+                subline.status,
+            )
+            if tagged_key not in group.sublines:
+                group.sublines[tagged_key] = subline
+                try:
+                    order_index = group.subline_order.index(subline_key)
+                except ValueError:
+                    group.subline_order.append(tagged_key)
+                else:
+                    group.subline_order[order_index] = tagged_key
+            group.sublines.pop(subline_key, None)
+            subline = None
+            subline_already_existed = False
         if subline is None:
             if len(group.subline_order) >= self._max_sublines:
                 emitted_lines.extend(

@@ -487,6 +487,43 @@ class TestRouteRollupStatusValues:
         ) in lines
         assert "Turns: 3 [" not in rendered
 
+    def test_ineligible_then_success_does_not_stain_completed_nous_turns(self):
+        accumulator = aawm_route_logging.AawmRouteRollupAccumulator(
+            interval_seconds=60
+        )
+        common = {
+            "group_header_label": "litellm#Ohmypi[17.4.2]@thoth",
+            "incoming_endpoint": "/openai_passthrough/v1/responses",
+            "outgoing_target": (
+                "inference-api.nousresearch.com/v1/chat/completions"
+            ),
+            "model_label": "nous/meituan/longcat-2.0:free(basic)",
+            "effort": "low",
+        }
+        message = (
+            "Nous auto-agent candidate is incompatible with the requested "
+            "Codex contract for the selected model."
+        )
+        accumulator.record(
+            **common,
+            turns=0,
+            status="Ineligible",
+            message=message,
+        )
+        accumulator.record(**common, turns=3)
+        lines = accumulator.flush(force=True)
+        rendered = "\n".join(lines)
+        assert (
+            " - nous/meituan/longcat-2.0:free(basic):low - Turns: 3 "
+            "-> inference-api.nousresearch.com/v1/chat/completions"
+        ) in lines
+        assert (
+            " - nous/meituan/longcat-2.0:free(basic):low - Turns: 0 "
+            f"[{message}] [Ineligible] -> "
+            "inference-api.nousresearch.com/v1/chat/completions"
+        ) in lines
+        assert "Turns: 3 [" not in rendered
+
     def test_request_only_exhaustion_survives_untagged_inventory(self):
         from datetime import datetime
 
