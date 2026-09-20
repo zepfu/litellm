@@ -251,7 +251,11 @@ def maybe_raise_alias_probe_no_endpoint_unavailable(
     ):
         return
     model_label = get_rate_limit_key(runtime, adapter_model)
-    detail_text = raw_message or str(exc)
+    detail_text = _sanitize_diagnostic_text(
+        runtime,
+        raw_message if isinstance(raw_message, str) else None,
+        fallback=str(exc),
+    ) or "no endpoints found"
     runtime.raise_candidate_unavailable(
         f"OpenRouter auto-agent candidate {model_label} has no available "
         f"endpoints: {detail_text}"
@@ -282,7 +286,11 @@ def maybe_raise_alias_probe_retired_ox_alpha_unavailable(
     ):
         return
     model_label = get_rate_limit_key(runtime, adapter_model)
-    detail_text = raw_message or str(exc)
+    detail_text = _sanitize_diagnostic_text(
+        runtime,
+        raw_message if isinstance(raw_message, str) else None,
+        fallback=str(exc),
+    ) or "retired after testing period"
     runtime.raise_candidate_unavailable(
         f"OpenRouter auto-agent candidate {model_label} is retired after its "
         f"testing period: {detail_text}"
@@ -910,7 +918,7 @@ async def _retry_loop_on_failure(
                 attempt,
                 exc.__class__.__name__,
                 provider_name,
-                raw_message,
+                _sanitize_diagnostic_text(runtime, raw_message),
                 reset_wait_seconds or 0.0,
             )
         await _publish_long_window_terminal(
@@ -964,7 +972,7 @@ async def _retry_loop_on_failure(
                 status_code,
                 exc.__class__.__name__,
                 provider_name,
-                raw_message,
+                _sanitize_diagnostic_text(runtime, raw_message),
             )
         await _publish_terminal_failure(
             runtime,
@@ -985,7 +993,7 @@ async def _retry_loop_on_failure(
             attempt,
             exc.__class__.__name__,
             provider_name,
-            raw_message,
+            _sanitize_diagnostic_text(runtime, raw_message),
             wait_seconds,
         )
     _note(
@@ -1037,7 +1045,9 @@ async def run_retry_loop(
     accumulated_hidden_wait_seconds = 0.0
     wait_keys = get_wait_keys(runtime, adapter_model)
     log_model_key = (
-        rate_limit_key_for_log if rate_limit_key_for_log is not None else adapter_model
+        rate_limit_key_for_log
+        if rate_limit_key_for_log is not None
+        else get_rate_limit_key(runtime, adapter_model)
     )
     await runtime.maybe_raise_alias_probe_cooldown(
         adapter_model,
@@ -1114,7 +1124,28 @@ async def run_retry_loop(
 
 
 _INVALID_TOOL_DETAIL_LIMIT = 200
+_DIAGNOSTIC_TEXT_LIMIT = 200
 _QUOTE_CHARS = ('"', "'", "\u201c", "\u201d", "\u2018", "\u2019")
+_REDACTED_ERROR_BODY = "<redacted-error-body>"
+
+
+def _sanitize_diagnostic_text(
+    runtime: Runtime,
+    value: Optional[str],
+    *,
+    fallback: Optional[str] = None,
+) -> Optional[str]:
+    """Keep public/durable diagnostics free of secrets and raw bodies."""
+    raw = value if isinstance(value, str) and value.strip() else fallback
+    cleaned = runtime.clean_secret_string(raw)
+    if not isinstance(cleaned, str) or not cleaned.strip():
+        return None
+    compact = " ".join(cleaned.split())
+    if "{" in compact or "[" in compact:
+        return _REDACTED_ERROR_BODY
+    if len(compact) > _DIAGNOSTIC_TEXT_LIMIT:
+        return compact[: _DIAGNOSTIC_TEXT_LIMIT - 3] + "..."
+    return compact
 
 
 def _is_completion_invalid_tool_error(
@@ -1217,11 +1248,11 @@ async def perform_completion_operation(
             runtime, exc
         ):
             raw_message = extract_raw_message(runtime, exc)
-            detail_text = (
-                raw_message
-                if isinstance(raw_message, str) and raw_message
-                else str(exc)
-            )
+            detail_text = _sanitize_diagnostic_text(
+                runtime,
+                raw_message if isinstance(raw_message, str) else None,
+                fallback=str(exc),
+            ) or ""
             runtime.raise_candidate_unavailable(
                 "OpenRouter completion invalid-tool: "
                 + _bounded_completion_invalid_tool_detail(detail_text)

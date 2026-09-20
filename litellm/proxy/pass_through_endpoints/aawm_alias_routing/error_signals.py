@@ -555,9 +555,14 @@ def _extract_adapter_exception_status_code(exc: Any) -> Optional[int]:
                     return int(value)
             except Exception:
                 continue
-    if "429" in str(exc):
-        return 429
-    return None
+    from litellm.llms.anthropic.experimental_pass_through.providers.openrouter import (
+        error_shape as _openrouter_error_shape,
+    )
+
+    return _openrouter_error_shape.extract_exception_status_code(
+        _OPENROUTER_ERROR_SHAPE_RUNTIME,
+        exc,
+    )
 
 
 class _OpenRouterErrorShapeRuntime:

@@ -2,9 +2,49 @@
 
 from __future__ import annotations
 
+import re
 from typing import Callable, Iterable, Mapping, Optional, Protocol
 
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.types import Payload
+
+_HTTP_STATUS_MIN = 100
+_HTTP_STATUS_MAX = 599
+
+# Full-string OpenRouter/HTTP status line. Digits are accepted only when a
+# status label or OpenRouter attribution names them as an HTTP status.
+_OPENROUTER_STATUS_LINE = re.compile(
+    r"""
+    \A
+    (?:
+        (?:openrouter
+           (?:[\s_-]+(?:completion|adapter|request|upstream|error|returned|failed))*
+           [\s:.\-]+)?
+        (?:client|server)\s+error\s+'
+        (?P<httpx_status>[1-5]\d{2})
+        \s+[A-Za-z][\w\- ]*'
+        \s+for\s+url\s+\S+
+      |
+        (?:openrouter
+           (?:[\s_-]+(?:completion|adapter|request|upstream|error|returned|failed))*
+           [\s:.\-]+)?
+        (?:
+            HTTP(?:/\d+\.\d+)?[\s/]+
+          | status(?:[\s_-]*code)?[\s:=]+
+          | error[\s_-]*code[\s:=]+
+        )
+        (?P<labeled_status>[1-5]\d{2})
+        (?:\s+[A-Za-z][\w\- ]*)?
+      |
+        openrouter
+        (?:[\s_-]+(?:completion|adapter|request|upstream|error|returned|failed))*
+        [\s:.\-]+
+        (?P<attributed_status>[1-5]\d{2})
+        (?:\s+[A-Za-z][\w\- ]*)?
+    )
+    \Z
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
 
 class ErrorShapeRuntime(Protocol):
@@ -77,22 +117,109 @@ def _coerce_non_negative_float(value: object) -> Optional[float]:
         return None
 
 
+def _http_status_code(value: object) -> Optional[int]:
+    """Return a proven HTTP status. Reject bools and unlabeled numbers."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        status = value
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if re.fullmatch(r"[1-5]\d{2}", stripped) is None:
+            return None
+        status = int(stripped)
+    else:
+        return None
+    if _HTTP_STATUS_MIN <= status <= _HTTP_STATUS_MAX:
+        return status
+    return None
+
+
+def _status_from_structured_fields(exc: object) -> Optional[int]:
+    sources = (exc, getattr(exc, "response", None))
+    for source in sources:
+        if source is None:
+            continue
+        for attr in ("status_code", "code"):
+            status = _http_status_code(getattr(source, attr, None))
+            if status is not None:
+                return status
+    return None
+
+
+def _status_from_payload(payload: Mapping[str, object]) -> Optional[int]:
+    candidates: list[object] = []
+    error = _mapping(payload.get("error"))
+    if error is not None:
+        candidates.extend(
+            (error.get("status_code"), error.get("status"), error.get("code"))
+        )
+        metadata = _mapping(error.get("metadata"))
+        if metadata is not None:
+            candidates.extend(
+                (metadata.get("status_code"), metadata.get("status"))
+            )
+    candidates.extend(
+        (payload.get("status_code"), payload.get("status"), payload.get("code"))
+    )
+    for value in candidates:
+        status = _http_status_code(value)
+        if status is not None:
+            return status
+    return None
+
+
+def _status_from_openrouter_status_line(text: object) -> Optional[int]:
+    if not isinstance(text, str):
+        return None
+    stripped = text.strip()
+    if not stripped:
+        return None
+    candidates = [stripped]
+    first_line = stripped.splitlines()[0]
+    if first_line not in candidates:
+        candidates.append(first_line)
+    for candidate in candidates:
+        compact = " ".join(candidate.split())
+        if not compact:
+            continue
+        match = _OPENROUTER_STATUS_LINE.fullmatch(compact)
+        if match is None:
+            continue
+        groups = match.groupdict()
+        for key in ("httpx_status", "labeled_status", "attributed_status"):
+            raw = groups.get(key)
+            if raw:
+                return int(raw)
+    return None
+
+
 def extract_exception_status_code(
     runtime: ErrorShapeRuntime,
     exc: object,
 ) -> Optional[int]:
-    _ = runtime
-    for attr in ("code", "status_code"):
-        value = getattr(exc, attr, None)
-        if isinstance(value, int):
-            return value
-        try:
-            if value is not None:
-                return int(value)
-        except Exception:
-            continue
-    if "429" in str(exc):
-        return 429
+    """Parse an HTTP status from structured OpenRouter error fields.
+
+    Text is accepted only through a bounded OpenRouter-attributed status-line
+    grammar. Bare digits in model names, request IDs, or messages are not
+    HTTP statuses.
+    """
+    structured = _status_from_structured_fields(exc)
+    if structured is not None:
+        return structured
+    payload = extract_error_payload(runtime, exc)
+    if payload is not None:
+        payload_status = _status_from_payload(payload)
+        if payload_status is not None:
+            return payload_status
+    for candidate in (
+        str(exc),
+        getattr(exc, "message", None),
+        getattr(exc, "detail", None),
+    ):
+        line_status = _status_from_openrouter_status_line(candidate)
+        if line_status is not None:
+            return line_status
     return None
 
 
