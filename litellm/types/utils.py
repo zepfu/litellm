@@ -3119,6 +3119,7 @@ all_litellm_params = (
         "complete_response",
         "self",
         "_aawm_managed_xai_send_request",
+        "caller_managed_hidden_retry",
         "client",
         "rpm",
         "tpm",

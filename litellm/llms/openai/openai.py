@@ -64,6 +64,31 @@ openaiOSeriesConfig = OpenAIOSeriesConfig()
 openAIGPT5Config = OpenAIGPT5Config()
 
 
+def _caller_managed_hidden_retry(litellm_params: Optional[dict]) -> bool:
+    """True when the caller owns retry and this adapter must not 422-replay."""
+    if not isinstance(litellm_params, dict):
+        return False
+    if litellm_params.get("caller_managed_hidden_retry") is True:
+        return True
+    for key in ("litellm_metadata", "metadata"):
+        metadata = litellm_params.get(key)
+        if (
+            isinstance(metadata, dict)
+            and metadata.get("caller_managed_hidden_retry") is True
+        ):
+            return True
+    return False
+
+
+def _should_drop_unprocessable_entity_params(
+    litellm_params: Optional[dict],
+    drop_params: Optional[bool],
+) -> bool:
+    if _caller_managed_hidden_retry(litellm_params):
+        return False
+    return litellm.drop_params is True or drop_params is True
+
+
 class MistralEmbeddingConfig:
     """
     Reference: https://docs.mistral.ai/api/#operation/createEmbedding
@@ -817,7 +842,9 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                         return final_response_obj
                 except openai.UnprocessableEntityError as e:
                     ## check if body contains unprocessable params - related issue https://github.com/BerriAI/litellm/issues/4800
-                    if litellm.drop_params is True or drop_params is True:
+                    if _should_drop_unprocessable_entity_params(
+                        litellm_params, drop_params
+                    ):
                         inference_params = drop_params_from_unprocessable_entity_error(
                             e, inference_params
                         )
@@ -987,7 +1014,9 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                 return final_response_obj
             except openai.UnprocessableEntityError as e:
                 ## check if body contains unprocessable params - related issue https://github.com/BerriAI/litellm/issues/4800
-                if litellm.drop_params is True or drop_params is True:
+                if _should_drop_unprocessable_entity_params(
+                    litellm_params, drop_params
+                ):
                     data = drop_params_from_unprocessable_entity_error(e, data)
                 else:
                     raise e
@@ -1142,7 +1171,9 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                 return streamwrapper
             except openai.UnprocessableEntityError as e:
                 ## check if body contains unprocessable params - related issue https://github.com/BerriAI/litellm/issues/4800
-                if litellm.drop_params is True or drop_params is True:
+                if _should_drop_unprocessable_entity_params(
+                    litellm_params, drop_params
+                ):
                     data = drop_params_from_unprocessable_entity_error(e, data)
                 else:
                     raise e

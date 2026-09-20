@@ -9310,12 +9310,14 @@ async def _handle_codex_opencode_zen_adapter_route(
 _OPENCODE_GO_CHAT_COMPLETIONS_ROUTE = "/zen/go/v1/chat/completions"
 _OPENCODE_GO_TOOLS_INDEX_RE = re.compile(r"tools\[(\d+)\]")
 # OC-028: one Go wire call per handler invocation. Alias retries belong to
-# the candidate loop; inner LiteLLM wrapper retries and the OpenAI client's
-# default max_retries=2 would hide extra transport calls inside one attempt.
-# Direct Responses retries stay on pass_through pre-first-byte hidden retry.
+# the candidate loop; inner LiteLLM wrapper retries, the OpenAI client's
+# default max_retries=2, and the adapter's HTTP 422 drop-params replay
+# would hide extra transport calls inside one attempt. Direct Responses
+# retries stay on pass_through pre-first-byte hidden retry.
 _OPENCODE_GO_INNER_COMPLETION_RETRY_KWARGS = {
     "num_retries": 0,
     "max_retries": 0,
+    "caller_managed_hidden_retry": True,
 }
 
 
@@ -10076,6 +10078,7 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
         if key not in {"input", "model", "litellm_metadata"}
     }
     litellm_metadata = dict(request_body.get("litellm_metadata") or {})
+    litellm_metadata["caller_managed_hidden_retry"] = True
     # Console Go chat-completions must be complete-upstream. Forwarding
     # client stream=True into acompletion returns a stream wrapper; the
     # Responses transform then emits output:[] / output_tokens=0 and the
