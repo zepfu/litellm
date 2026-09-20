@@ -4869,6 +4869,10 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         if hostname == "openrouter.ai" or hostname.endswith(".openrouter.ai"):
             return "openrouter"
         if hostname == "opencode.ai" or hostname.endswith(".opencode.ai"):
+            path = (parsed_url.path or "").lower()
+            normalized_path = path if path.endswith("/") else f"{path}/"
+            if "/zen/go/" in normalized_path:
+                return "opencode_go"
             return "opencode"
         if (
             hostname == "api.x.ai"

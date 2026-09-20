@@ -2061,6 +2061,10 @@ _HOST_FUNCTION_NAMES = (
     "_handle_codex_opencode_go_adapter_route",
     "_stream_opencode_go_chat_completions_response",
     "_prepare_opencode_go_preflight_egress",
+    "_build_opencode_go_egress_headers",
+    "_build_opencode_go_egress_plan",
+    "_emit_opencode_go_plan_access_log",
+    "_opencode_go_completion_call_kwargs",
     "_build_opencode_go_provider_rejection_evidence",
     "_record_opencode_go_provider_rejection_evidence",
     "_raise_opencode_go_alias_candidate_upstream_timeout",
@@ -2201,6 +2205,11 @@ def install(
         ),
         ("_OPENCODE_GO_CHAT_COMPLETIONS_ROUTE", _OPENCODE_GO_CHAT_COMPLETIONS_ROUTE),
         ("_OPENCODE_GO_INNER_COMPLETION_RETRY_KWARGS", _OPENCODE_GO_INNER_COMPLETION_RETRY_KWARGS),
+        ("_OPENCODE_GO_AUTH_HEADER_NAMES", _OPENCODE_GO_AUTH_HEADER_NAMES),
+        ("_OPENCODE_GO_RESPONSES_IDENTITY_HEADERS", _OPENCODE_GO_RESPONSES_IDENTITY_HEADERS),
+        ("_OPENCODE_GO_BLOCKED_FORWARD_HEADERS", _OPENCODE_GO_BLOCKED_FORWARD_HEADERS),
+        ("OpenCodeGoRetryTimeoutPolicy", OpenCodeGoRetryTimeoutPolicy),
+        ("OpenCodeGoEgressPlan", OpenCodeGoEgressPlan),
         ("_OPENCODE_GO_TOOLS_INDEX_RE", _OPENCODE_GO_TOOLS_INDEX_RE),
         ("_OPENCODE_GO_NONSEMANTIC_TOOL_CHOICE", _OPENCODE_GO_NONSEMANTIC_TOOL_CHOICE),
         ("_NOUS_TOOL_CHOICE_ENUMS", _NOUS_TOOL_CHOICE_ENUMS),
@@ -9530,6 +9539,35 @@ async def _handle_codex_opencode_zen_adapter_route(
 
 
 _OPENCODE_GO_CHAT_COMPLETIONS_ROUTE = "/zen/go/v1/chat/completions"
+_OPENCODE_GO_AUTH_HEADER_NAMES = frozenset(
+    {"authorization", "api-key", "x-api-key", "proxy-authorization"}
+)
+_OPENCODE_GO_RESPONSES_IDENTITY_HEADERS = (
+    "accept",
+    "accept-encoding",
+    "content-type",
+    "traceparent",
+    "tracestate",
+    "x-aawm-session-id",
+    "x-agent-session-id",
+    "x-client-id",
+    "x-client-request-id",
+    "x-claude-session-id",
+    "x-codex-session-id",
+    "x-conversation-id",
+    "x-meta-ai-gateway-session-id",
+    "x-request-id",
+    "x-session-id",
+    "x-tbh-session-id",
+)
+_OPENCODE_GO_BLOCKED_FORWARD_HEADERS = [
+    "authorization",
+    "api-key",
+    "x-api-key",
+    "proxy-authorization",
+    "session-id",
+    "session_id",
+]
 _OPENCODE_GO_TOOLS_INDEX_RE = re.compile(r"tools\[(\d+)\]")
 # OC-028: one Go wire call per handler invocation. Alias retries belong to
 # the candidate loop; inner LiteLLM wrapper retries, the OpenAI client's
@@ -9541,6 +9579,202 @@ _OPENCODE_GO_INNER_COMPLETION_RETRY_KWARGS = {
     "max_retries": 0,
     "caller_managed_hidden_retry": True,
 }
+
+
+@dataclass(frozen=True)
+class OpenCodeGoRetryTimeoutPolicy:
+    """Retry and timeout contract for one Go wire call."""
+
+    alias_probe_timeout_seconds: float
+    caller_managed_hidden_retry: bool
+    retryable_upstream_status_codes: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class OpenCodeGoEgressPlan:
+    """Immutable Go call plan consumed by validation, logging, and transport."""
+
+    config: Any
+    canonical_model: str
+    canonical_request_body: dict[str, Any]
+    provider_bound_body: dict[str, Any]
+    target_base: str
+    target_url: str
+    api_base: str
+    api_key: str
+    headers: dict[str, str]
+    credential_family: str
+    expected_target_family: str
+    client_requested_stream: bool
+    transport_mode: str
+    retry_timeout: OpenCodeGoRetryTimeoutPolicy
+    proxy_server_request: dict[str, Any]
+    shared_session: Any
+    litellm_metadata: dict[str, Any]
+    completion_kwargs: Optional[dict[str, Any]]
+    request_input: Any
+    responses_api_request: Any
+    advertised_tools: Any
+    is_known_free_direct: bool
+    use_alias_candidate_probe: bool
+    opencode_session_identity: Optional[str]
+
+
+def _build_opencode_go_egress_headers(
+    *,
+    api_key: str,
+    request: Request,
+    session_identity: Optional[str],
+) -> dict[str, str]:
+    """Build the server-owned Go header contract.
+
+    Caller Authorization / api-key headers are never copied. Auth is
+    written once from the Go credential.
+    """
+    assembled = BaseOpenAIPassThroughHandler._assemble_headers(
+        api_key=api_key,
+        request=request,
+    )
+    headers: dict[str, str] = {}
+    for key, value in dict(assembled).items():
+        if str(key).lower() in _OPENCODE_GO_AUTH_HEADER_NAMES:
+            continue
+        headers[str(key)] = str(value)
+    headers["authorization"] = f"Bearer {api_key}"
+    headers["api-key"] = api_key
+    if session_identity is not None:
+        headers["x-opencode-session"] = session_identity
+    return headers
+
+
+def _build_opencode_go_egress_plan(
+    *,
+    request: Request,
+    canonical_model: str,
+    canonical_request_body: dict[str, Any],
+    provider_bound_body: dict[str, Any],
+    endpoint: str,
+    api_key: str,
+    client_requested_stream: bool,
+    transport_mode: str,
+    litellm_metadata: dict[str, Any],
+    completion_kwargs: Optional[dict[str, Any]],
+    request_input: Any,
+    responses_api_request: Any,
+    advertised_tools: Any,
+    is_known_free_direct: bool,
+    use_alias_candidate_probe: bool,
+    opencode_session_identity: Optional[str],
+    alias_probe_timeout_seconds: float,
+) -> OpenCodeGoEgressPlan:
+    """Materialize one Go plan and bind egress validation to it."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        adapter_config as go_adapter_config,
+    )
+
+    config = go_adapter_config.CODEX_OPENCODE_GO
+    target_base = _get_opencode_go_target_base()
+    target_url = _join_opencode_zen_passthrough_url(
+        base_target_url=target_base,
+        endpoint=endpoint,
+    )
+    headers = _build_opencode_go_egress_headers(
+        api_key=api_key,
+        request=request,
+        session_identity=opencode_session_identity,
+    )
+    retryable_source = globals().get(
+        "_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES",
+        (),
+    )
+    try:
+        retryable = tuple(dict.fromkeys((429, *tuple(retryable_source))))
+    except TypeError:
+        retryable = (429,)
+    plan = OpenCodeGoEgressPlan(
+        config=config,
+        canonical_model=canonical_model,
+        canonical_request_body=dict(canonical_request_body),
+        provider_bound_body=dict(provider_bound_body),
+        target_base=target_base,
+        target_url=target_url,
+        api_base=f"{target_base.rstrip('/')}/v1",
+        api_key=api_key,
+        headers=headers,
+        credential_family=config.credential_family,
+        expected_target_family=config.expected_target_family,
+        client_requested_stream=client_requested_stream,
+        transport_mode=transport_mode,
+        retry_timeout=OpenCodeGoRetryTimeoutPolicy(
+            alias_probe_timeout_seconds=alias_probe_timeout_seconds,
+            caller_managed_hidden_retry=True,
+            retryable_upstream_status_codes=retryable,
+        ),
+        proxy_server_request={
+            "headers": {},
+            "body": dict(canonical_request_body),
+        },
+        shared_session=_get_proxy_shared_aiohttp_session(),
+        litellm_metadata=dict(litellm_metadata),
+        completion_kwargs=(
+            dict(completion_kwargs) if isinstance(completion_kwargs, dict) else None
+        ),
+        request_input=request_input,
+        responses_api_request=responses_api_request,
+        advertised_tools=advertised_tools,
+        is_known_free_direct=is_known_free_direct,
+        use_alias_candidate_probe=use_alias_candidate_probe,
+        opencode_session_identity=opencode_session_identity,
+    )
+    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+        url=plan.target_url,
+        headers=plan.headers,
+        credential_family=plan.credential_family,
+        expected_target_family=plan.expected_target_family,
+    )
+    return plan
+
+
+def _emit_opencode_go_plan_access_log(
+    request: Request,
+    plan: OpenCodeGoEgressPlan,
+    rollup_kwargs: dict[str, Any],
+) -> None:
+    _annotate_request_scope_for_adapted_access_log(
+        request, httpx.URL(str(plan.target_url))
+    )
+    _emit_adapted_route_access_log(
+        request=request,
+        target_url=str(plan.target_url),
+        request_body=plan.canonical_request_body,
+        rollup_kwargs=rollup_kwargs,
+        adapter_label=plan.config.adapter_label,
+        provider_bound_body=plan.provider_bound_body,
+    )
+
+
+def _opencode_go_completion_call_kwargs(
+    plan: OpenCodeGoEgressPlan,
+) -> dict[str, Any]:
+    """Chat-transport kwargs from the plan without duplicate Authorization."""
+    extra_headers = {
+        key: value
+        for key, value in plan.headers.items()
+        if str(key).lower() not in _OPENCODE_GO_AUTH_HEADER_NAMES
+    }
+    completion_kwargs = plan.completion_kwargs or plan.provider_bound_body
+    call_kwargs: dict[str, Any] = {
+        **completion_kwargs,
+        **_OPENCODE_GO_INNER_COMPLETION_RETRY_KWARGS,
+        "api_key": plan.api_key,
+        "api_base": plan.api_base,
+        "litellm_metadata": plan.litellm_metadata,
+        "proxy_server_request": dict(plan.proxy_server_request),
+        "shared_session": plan.shared_session,
+    }
+    if extra_headers:
+        call_kwargs["extra_headers"] = extra_headers
+    return call_kwargs
 
 
 def _opencode_go_tool_type(tool: Any) -> Optional[str]:
@@ -9976,12 +10210,11 @@ async def _prepare_opencode_go_preflight_egress(
             use_alias_candidate_probe=use_alias_candidate_probe,
         )
     try:
-        custom_headers = BaseOpenAIPassThroughHandler._assemble_headers(
+        custom_headers = _build_opencode_go_egress_headers(
             api_key=api_key,
             request=request,
+            session_identity=opencode_session_identity,
         )
-        if opencode_session_identity is not None:
-            custom_headers["x-opencode-session"] = opencode_session_identity
     except Exception as exc:
         raise_opencode_go_preflight(
             exc,
@@ -9989,11 +10222,16 @@ async def _prepare_opencode_go_preflight_egress(
             use_alias_candidate_probe=use_alias_candidate_probe,
         )
     try:
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            adapter_config as go_adapter_config,
+        )
+
+        go_config = go_adapter_config.CODEX_OPENCODE_GO
         HttpPassThroughEndpointHelpers.validate_outgoing_egress(
             url=target_url,
             headers=custom_headers,
-            credential_family="opencode",
-            expected_target_family="opencode",
+            credential_family=go_config.credential_family,
+            expected_target_family=go_config.expected_target_family,
         )
     except Exception as exc:
         raise_opencode_go_preflight(
@@ -10202,94 +10440,79 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
             opencode_session_identity=opencode_session_identity,
             use_alias_candidate_probe=use_alias_candidate_probe,
         )
-        _annotate_request_scope_for_adapted_access_log(
-            request, httpx.URL(target_url)
-        )
-        rollup_kwargs = _build_adapted_route_rollup_kwargs(litellm_metadata)
-        _emit_adapted_route_access_log(
-            request=request,
-            target_url=target_url,
-            request_body=canonical_request_body,
-            rollup_kwargs=rollup_kwargs,
-            adapter_label="OpenCode Go",
-            provider_bound_body=adapted_request_body,
-        )
         adapted_request_body = await apply_opencode_go_retained_responses_history(
             adapted_request_body=adapted_request_body,
             decision=go_retained_history,
             adapter_model=adapter_model,
             litellm_metadata=litellm_metadata,
         )
+        plan = _build_opencode_go_egress_plan(
+            request=request,
+            canonical_model=adapter_model,
+            canonical_request_body=canonical_request_body,
+            provider_bound_body=adapted_request_body,
+            endpoint="/v1/responses",
+            api_key=api_key,
+            client_requested_stream=bool(adapted_request_body.get("stream")),
+            transport_mode="responses",
+            litellm_metadata=litellm_metadata,
+            completion_kwargs=None,
+            request_input=None,
+            responses_api_request=None,
+            advertised_tools=canonical_request_body.get("tools"),
+            is_known_free_direct=is_known_free_direct,
+            use_alias_candidate_probe=use_alias_candidate_probe,
+            opencode_session_identity=opencode_session_identity,
+            alias_probe_timeout_seconds=_go_probe_timeout_seconds,
+        )
+        target_url = plan.target_url
+        rollup_kwargs = _build_adapted_route_rollup_kwargs(plan.litellm_metadata)
+        _emit_opencode_go_plan_access_log(request, plan, rollup_kwargs)
         # Forward only request/session correlation headers. Exact auth and
         # OpenAI session markers stay server-owned to satisfy the egress guard.
-        opencode_responses_identity_headers = [
-            "accept",
-            "accept-encoding",
-            "content-type",
-            "traceparent",
-            "tracestate",
-            "x-aawm-session-id",
-            "x-agent-session-id",
-            "x-client-id",
-            "x-client-request-id",
-            "x-claude-session-id",
-            "x-codex-session-id",
-            "x-conversation-id",
-            "x-meta-ai-gateway-session-id",
-            "x-request-id",
-            "x-session-id",
-            "x-tbh-session-id",
-        ]
         try:
             response_awaitable = pass_through_request(
                 request=request,
-                target=target_url,
-                custom_headers=custom_headers,
+                target=plan.target_url,
+                custom_headers=plan.headers,
                 user_api_key_dict=user_api_key_dict,
-                custom_body=adapted_request_body,
+                custom_body=plan.provider_bound_body,
                 forward_headers=True,
-                allowed_forward_headers=opencode_responses_identity_headers,
-                allowed_pass_through_prefixed_headers=(
-                    opencode_responses_identity_headers
+                allowed_forward_headers=list(_OPENCODE_GO_RESPONSES_IDENTITY_HEADERS),
+                allowed_pass_through_prefixed_headers=list(
+                    _OPENCODE_GO_RESPONSES_IDENTITY_HEADERS
                 ),
-                blocked_pass_through_prefixed_headers=[
-                    "authorization",
-                    "api-key",
-                    "x-api-key",
-                    "proxy-authorization",
-                    "session-id",
-                    "session_id",
-                ],
-                stream=bool(adapted_request_body.get("stream")),
+                blocked_pass_through_prefixed_headers=list(
+                    _OPENCODE_GO_BLOCKED_FORWARD_HEADERS
+                ),
+                stream=plan.client_requested_stream,
                 custom_llm_provider="opencode_go",
-                egress_credential_family="opencode",
-                expected_target_family="opencode",
-                retryable_upstream_status_codes=[
-                    429,
-                    *_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES,
-                ],
-                # Alias: candidate loop owns retry, so disable hidden
-                # transport retries. Direct: keep pass_through pre-first-byte
-                # hidden retry as the observable call-boundary policy.
-                caller_managed_hidden_retry=use_alias_candidate_probe,
+                egress_credential_family=plan.credential_family,
+                expected_target_family=plan.expected_target_family,
+                retryable_upstream_status_codes=list(
+                    plan.retry_timeout.retryable_upstream_status_codes
+                ),
+                caller_managed_hidden_retry=(
+                    plan.retry_timeout.caller_managed_hidden_retry
+                ),
                 defer_session_owner_promotion=True,
             )
-            if use_alias_candidate_probe:
+            if plan.use_alias_candidate_probe:
                 response = await asyncio.wait_for(
                     response_awaitable,
-                    timeout=_go_probe_timeout_seconds,
+                    timeout=plan.retry_timeout.alias_probe_timeout_seconds,
                 )
             else:
                 response = await response_awaitable
         except Exception as exc:
             evidence = _build_opencode_go_provider_rejection_evidence(
-                target_url=target_url,
+                target_url=plan.target_url,
                 exc=exc,
-                advertised_tools=canonical_request_body.get("tools"),
-                completion_tools=adapted_request_body.get("tools"),
-                api_key=api_key,
+                advertised_tools=plan.advertised_tools,
+                completion_tools=plan.provider_bound_body.get("tools"),
+                api_key=plan.api_key,
                 local_timeout=(
-                    use_alias_candidate_probe
+                    plan.use_alias_candidate_probe
                     and isinstance(exc, (asyncio.TimeoutError, httpx.TimeoutException))
                 ),
             )
@@ -10335,11 +10558,11 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
         )
 
         provenance = build_producer_provenance_from_egress_context(
-            request_body=canonical_request_body,
+            request_body=plan.canonical_request_body,
             custom_llm_provider="opencode_go",
-            egress_credential_family="opencode",
-            expected_target_family="opencode",
-            route_family="codex_opencode_go_adapter",
+            egress_credential_family=plan.credential_family,
+            expected_target_family=plan.expected_target_family,
+            route_family=plan.config.route_family,
         )
         if isinstance(validated_response, StreamingResponse):
             original_iterator = validated_response.body_iterator
@@ -10561,30 +10784,34 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
         opencode_session_identity=opencode_session_identity,
         use_alias_candidate_probe=use_alias_candidate_probe,
     )
-    _annotate_request_scope_for_adapted_access_log(request, httpx.URL(target_url))
-    rollup_kwargs = _build_adapted_route_rollup_kwargs(litellm_metadata)
-    _emit_adapted_route_access_log(
-        request=request,
-        target_url=target_url,
-        request_body=request_body,
-        rollup_kwargs=rollup_kwargs,
-        adapter_label="OpenCode Go",
-        provider_bound_body=completion_kwargs,
-    )
     completion_kwargs = await apply_opencode_go_retained_chat_history(
         completion_kwargs=completion_kwargs,
         decision=go_retained_history,
     )
-    completion_call_kwargs = {
-        **completion_kwargs,
-        **_OPENCODE_GO_INNER_COMPLETION_RETRY_KWARGS,
-        "api_key": api_key,
-        "api_base": f"{target_base_url.rstrip('/')}/v1",
-        "litellm_metadata": litellm_metadata,
-        "extra_headers": custom_headers,
-        "timeout": build_opencode_go_stream_timeout(),
-        "shared_session": _get_proxy_shared_aiohttp_session(),
-    }
+    plan = _build_opencode_go_egress_plan(
+        request=request,
+        canonical_model=adapter_model,
+        canonical_request_body=canonical_request_body,
+        provider_bound_body=completion_kwargs,
+        endpoint="/v1/chat/completions",
+        api_key=api_key,
+        client_requested_stream=client_requested_stream,
+        transport_mode="chat_completions",
+        litellm_metadata=litellm_metadata,
+        completion_kwargs=completion_kwargs,
+        request_input=request_input,
+        responses_api_request=responses_api_request,
+        advertised_tools=advertised_tools,
+        is_known_free_direct=is_known_free_direct,
+        use_alias_candidate_probe=use_alias_candidate_probe,
+        opencode_session_identity=opencode_session_identity,
+        alias_probe_timeout_seconds=_go_probe_timeout_seconds,
+    )
+    target_url = plan.target_url
+    rollup_kwargs = _build_adapted_route_rollup_kwargs(plan.litellm_metadata)
+    _emit_opencode_go_plan_access_log(request, plan, rollup_kwargs)
+    completion_call_kwargs = _opencode_go_completion_call_kwargs(plan)
+    completion_call_kwargs["timeout"] = build_opencode_go_stream_timeout()
     perform = globals().get("_perform_opencode_zen_completion_call")
     stream_fn = globals().get("_stream_opencode_go_chat_completions_response")
     completion_response: Any = None
@@ -10592,13 +10819,18 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
         if callable(perform):
             completion_awaitable = perform(
                 completion_call_kwargs=completion_call_kwargs,
-                litellm_metadata=litellm_metadata,
+                litellm_metadata=plan.litellm_metadata,
                 accepted_trace_user_id=None,
-                is_known_free_direct=is_known_free_direct,
+                is_known_free_direct=plan.is_known_free_direct,
             )
         else:
             completion_awaitable = litellm.acompletion(**completion_call_kwargs)
-        if client_requested_stream:
+        if plan.use_alias_candidate_probe:
+            completion_response = await asyncio.wait_for(
+                completion_awaitable,
+                timeout=plan.retry_timeout.alias_probe_timeout_seconds,
+            )
+        elif client_requested_stream:
             completion_response = await asyncio.wait_for(
                 completion_awaitable,
                 timeout=OPENCODE_GO_CONNECT_TIMEOUT_SECONDS,
@@ -10608,14 +10840,14 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
     except Exception as exc:
         await close_opencode_go_stream_resource(completion_response)
         evidence = _build_opencode_go_provider_rejection_evidence(
-            target_url=target_url,
+            target_url=plan.target_url,
             exc=exc,
-            advertised_tools=advertised_tools,
-            completion_tools=completion_kwargs.get("tools"),
-            api_key=api_key,
+            advertised_tools=plan.advertised_tools,
+            completion_tools=(plan.completion_kwargs or {}).get("tools"),
+            api_key=plan.api_key,
             local_timeout=(
-                use_alias_candidate_probe
-                and isinstance(exc, (asyncio.TimeoutError, httpx.TimeoutException))
+                    plan.use_alias_candidate_probe
+                    and isinstance(exc, (asyncio.TimeoutError, httpx.TimeoutException))
             ),
         )
         _record_opencode_go_provider_rejection_evidence(request, evidence)

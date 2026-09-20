@@ -192,8 +192,8 @@ CODEX_OPENCODE_GO = AnthropicCompletionAdapterConfig(
     tag_prefix="codex-opencode-go-adapter",
     span_name="codex.opencode_go_adapter",
     target_endpoint_label="opencode_go:/zen/go/v1/chat/completions",
-    credential_family="opencode",
-    expected_target_family="opencode",
+    credential_family="opencode_go",
+    expected_target_family="opencode_go",
     custom_llm_provider="openai",
 )
 
