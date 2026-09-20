@@ -6882,7 +6882,6 @@ async def _handle_codex_cohere_chat_completions_adapter_route(
     return validated_response
 
 
-
 def _build_codex_nvidia_adapter_request_body(
     *,
     prepared_request_body: Payload,
@@ -7359,7 +7358,6 @@ async def _handle_codex_nvidia_completion_adapter_route(
         adapter_label="NVIDIA",
     )
     return validated_response
-
 
 
 async def _perform_codex_auto_agent_muse_code_responses_request(
@@ -8056,13 +8054,20 @@ def _bind_responses_stream_timeout_terminalizer(
     )
 
 
-async def _validate_codex_auto_agent_openrouter_responses_stream(
+async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR0915
     response: StreamingResponse,
     *,
     adapter_model: str,
     intake_context: Optional[dict[str, Any]] = None,
     request_body: Optional[dict[str, Any]] = None,
 ) -> StreamingResponse:
+    """Validate native OpenRouter Responses with one incremental SSE machine.
+
+    Commitment, terminal policy, latency, and route stamping follow complete
+    frames plus one bounded precommit hold. They do not depend on whether a
+    prefix peek would have exhausted.
+    """
+
     metadata: dict[str, Any] = {}
     if isinstance(request_body, dict):
         raw_metadata = request_body.get("litellm_metadata")
@@ -8079,79 +8084,389 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(
         intake_context=intake_context,
         rollup_kwargs=_build_adapted_route_rollup_kwargs(metadata),
     )
-    event_summaries: list[dict[str, Any]] = []
-    peek = await _aawm_alias_streaming.peek_streaming_response(
-        response,
-        max_chunks=_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_CHUNKS,
-        max_bytes=_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES,
-        terminalizer=_aawm_alias_streaming._get_stream_timeout_terminalizer(
-            response
-        ),
+
+    import codecs
+
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+        stamp_route_identity_in_sse_chunk,
     )
-    if not peek.exhausted:
-        return peek.response
-    try:
-        response_body = await _collect_responses_response_from_stream(
-            peek.response,
-            event_summaries=event_summaries,
+    from litellm.proxy.pass_through_endpoints.streaming_handler import (
+        PassThroughStreamingHandler,
+    )
+
+    adapter = "codex_auto_agent_openrouter_responses"
+    adapter_label = "OpenRouter"
+    identity_request_body = request_body if isinstance(request_body, dict) else None
+    event_summaries: list[dict[str, Any]] = []
+    max_chunks = _AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_CHUNKS
+    max_bytes = _AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES
+    original_iterator = response.body_iterator
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    parser_buffer = ""
+    trailing_cr = False
+    decoder_failed = False
+    committed = False
+    saw_substantive = False
+    saw_content = False
+    saw_failed = False
+    complete_frame_count = 0
+    first_error_payload: Optional[dict[str, Any]] = None
+    terminal_response: Optional[dict[str, Any]] = None
+    terminal_event_type: Optional[str] = None
+    terminal_seen = False
+    held_chunks: list[Any] = []
+    held_bytes = 0
+    empty_success_body = {
+        "model": adapter_model,
+        "status": "completed",
+        "output": [],
+    }
+    state: dict[str, Any] = {
+        "complete": False,
+        "valid": False,
+        "terminal_seen": False,
+        "terminal_status": None,
+        "invalid": False,
+        "reason": "awaiting_precommit",
+    }
+
+    def _set_state(**updates: Any) -> None:
+        state.update(updates)
+        setattr(response, "_aawm_responses_validation_state", state)
+        setattr(
+            response,
+            "_aawm_responses_validation_complete",
+            bool(state.get("complete")),
         )
-    except HTTPException as exc:
-        if (
-            exc.status_code == 502
-            and str(exc.detail) == "OpenAI Responses stream completed without a response payload."
-        ):
-            _raise_codex_auto_agent_empty_success_response(
-                response_body={
-                    "model": adapter_model,
-                    "status": "completed",
+        setattr(
+            response,
+            "_aawm_responses_validation_valid",
+            bool(state.get("valid")),
+        )
+
+    def _mark_invalid(reason: str) -> None:
+        if not state.get("invalid"):
+            state["invalid"] = True
+        _set_state(
+            complete=True,
+            valid=False,
+            reason=reason,
+        )
+
+    def _stamp(raw_chunk: Any) -> Any:
+        return stamp_route_identity_in_sse_chunk(
+            raw_chunk,
+            request_body=identity_request_body,
+        )
+
+    def _chunk_size(raw_chunk: Any) -> int:
+        if isinstance(raw_chunk, (bytes, bytearray)):
+            return len(raw_chunk)
+        if isinstance(raw_chunk, str):
+            return len(raw_chunk.encode("utf-8"))
+        return 0
+
+    def _incomplete_buffer_bytes() -> int:
+        pending = parser_buffer
+        if trailing_cr:
+            pending += "\n"
+        return len(pending.encode("utf-8"))
+
+    def _hold_exceeded() -> bool:
+        return (
+            len(held_chunks) >= max(0, max_chunks)
+            or held_bytes > max(0, max_bytes)
+            or _incomplete_buffer_bytes() > max(0, max_bytes)
+        )
+
+    def _raise_empty_success(response_body: Optional[dict[str, Any]] = None) -> None:
+        _raise_codex_auto_agent_empty_success_response(
+            response_body=response_body or empty_success_body,
+            adapter_model=adapter_model,
+            stream_event_summaries=event_summaries,
+        )
+
+    def _apply_terminal_policy(*, raise_errors: bool) -> None:
+        body = terminal_response
+        if body is None:
+            _mark_invalid("missing_terminal_response")
+            if raise_errors:
+                _raise_empty_success()
+            return
+        if _is_codex_auto_agent_empty_success_responses_body(body):
+            _mark_invalid("empty_success")
+            if raise_errors:
+                _raise_empty_success(body)
+            return
+        if _is_codex_auto_agent_malformed_tool_call_text_output(body):
+            _mark_invalid("malformed_tool_call_text")
+            if raise_errors:
+                _raise_codex_auto_agent_malformed_tool_call_text_payload(
+                    response_body=body,
+                    adapter_model=adapter_model,
+                    adapter=adapter,
+                    adapter_label=adapter_label,
+                    intake_context=intake_context,
+                    stream_event_summaries=event_summaries,
+                )
+            return
+        if _is_failed_responses_body(body):
+            _mark_invalid("failed_response")
+            if raise_errors:
+                _raise_codex_auto_agent_failed_responses_payload(
+                    response_body=body,
+                    adapter_model=adapter_model,
+                    adapter=adapter,
+                    adapter_label=adapter_label,
+                    stream_event_summaries=event_summaries,
+                )
+            return
+        _set_state(
+            complete=True,
+            valid=True,
+            terminal_seen=True,
+            terminal_status=body.get("status"),
+            reason="validated_terminal_response",
+        )
+
+    def _raise_precommit_failure() -> None:
+        body = terminal_response
+        if body is None and isinstance(first_error_payload, dict):
+            nested = first_error_payload.get("response")
+            if isinstance(nested, dict):
+                body = nested
+            else:
+                body = {
+                    "status": "failed",
+                    "error": first_error_payload,
                     "output": [],
-                },
+                }
+        if isinstance(body, dict):
+            if _is_codex_auto_agent_empty_success_responses_body(body):
+                _raise_empty_success(body)
+            if _is_codex_auto_agent_malformed_tool_call_text_output(body):
+                _raise_codex_auto_agent_malformed_tool_call_text_payload(
+                    response_body=body,
+                    adapter_model=adapter_model,
+                    adapter=adapter,
+                    adapter_label=adapter_label,
+                    intake_context=intake_context,
+                    stream_event_summaries=event_summaries,
+                )
+            _raise_codex_auto_agent_failed_responses_payload(
+                response_body=body,
                 adapter_model=adapter_model,
+                adapter=adapter,
+                adapter_label=adapter_label,
                 stream_event_summaries=event_summaries,
             )
-        raise
-    if _is_codex_auto_agent_empty_success_responses_body(response_body):
-        _raise_codex_auto_agent_empty_success_response(
-            response_body=response_body,
-            adapter_model=adapter_model,
-            stream_event_summaries=event_summaries,
+        _raise_empty_success()
+
+    def _capture_complete_frame(event_block: str) -> None:
+        nonlocal saw_substantive, saw_content, saw_failed, first_error_payload
+        nonlocal terminal_response, terminal_event_type, terminal_seen
+        nonlocal complete_frame_count
+        complete_frame_count += 1
+        frame_bytes = (event_block + "\n\n").encode("utf-8")
+        (
+            decision,
+            error_payload,
+            inspected_event_type,
+        ) = PassThroughStreamingHandler._inspect_responses_pre_commit_chunks(
+            [frame_bytes]
         )
-    if _is_codex_auto_agent_malformed_tool_call_text_output(response_body):
-        _raise_codex_auto_agent_malformed_tool_call_text_payload(
-            response_body=response_body,
-            adapter_model=adapter_model,
-            adapter="codex_auto_agent_openrouter_responses",
-            adapter_label="OpenRouter",
-            intake_context=intake_context,
-            stream_event_summaries=event_summaries,
+        if decision == "substantive":
+            saw_substantive = True
+            if inspected_event_type not in {"response.completed", "response.done"}:
+                saw_content = True
+        elif decision == "failed":
+            saw_failed = True
+            if first_error_payload is None and isinstance(error_payload, dict):
+                first_error_payload = error_payload
+        event_name: Optional[str] = None
+        data_lines: list[str] = []
+        for line in event_block.splitlines():
+            if line.startswith("event:"):
+                event_name = line.partition(":")[2].strip() or None
+            elif line.startswith("data:"):
+                data_lines.append(line.partition(":")[2].lstrip())
+        if not data_lines:
+            return
+        data_text = "\n".join(data_lines).strip()
+        if not data_text or data_text == "[DONE]":
+            return
+        try:
+            payload = json.loads(data_text)
+        except Exception:  # noqa: BLE001
+            return
+        if not isinstance(payload, dict):
+            return
+        payload_type = payload.get("type")
+        event_type = payload_type if isinstance(payload_type, str) else event_name
+        if not isinstance(event_type, str) or not event_type.strip():
+            return
+        if len(event_summaries) < 50:
+            event_summaries.append({"type": event_type})
+        if event_type not in {
+            "response.completed",
+            "response.done",
+            "response.failed",
+            "response.incomplete",
+        }:
+            return
+        if terminal_seen:
+            if committed:
+                _mark_invalid("event_after_terminal")
+            return
+        terminal_event_type = event_type
+        terminal_seen = True
+        response_payload = payload.get("response")
+        terminal_response = (
+            response_payload if isinstance(response_payload, dict) else None
         )
-    if _is_failed_responses_body(response_body):
-        _raise_codex_auto_agent_failed_responses_payload(
-            response_body=response_body,
-            adapter_model=adapter_model,
-            adapter="codex_auto_agent_openrouter_responses",
-            adapter_label="OpenRouter",
-            stream_event_summaries=event_summaries,
+        _set_state(
+            terminal_seen=True,
+            terminal_status=(
+                terminal_response.get("status")
+                if isinstance(terminal_response, dict)
+                else None
+            ),
         )
 
-    async def _replay_iterator() -> Any:
-        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
-            stamp_route_identity_in_sse_chunk,
-        )
+    def _consume_sse_text(text: str, *, final: bool = False) -> None:
+        nonlocal parser_buffer, trailing_cr
+        if decoder_failed:
+            return
+        if trailing_cr:
+            text = f"\r{text}"
+            trailing_cr = False
+        if text.endswith("\r"):
+            text = text[:-1]
+            trailing_cr = True
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        pending = parser_buffer + normalized
+        parser_buffer = ""
+        while pending:
+            delimiter_index = pending.find("\n\n")
+            if delimiter_index < 0:
+                parser_buffer = pending
+                break
+            event_block = pending[:delimiter_index]
+            pending = pending[delimiter_index + 2 :]
+            _capture_complete_frame(event_block)
+        if not final:
+            return
+        if trailing_cr:
+            parser_buffer += "\n"
+            trailing_cr = False
+        if parser_buffer:
+            _capture_complete_frame(parser_buffer)
+            parser_buffer = ""
 
-        identity_request_body = request_body if isinstance(request_body, dict) else None
-        for raw_chunk in peek.buffered_chunks:
-            yield stamp_route_identity_in_sse_chunk(
-                raw_chunk,
-                request_body=identity_request_body,
-            )
+    def _decode_chunk_text(raw_chunk: Any) -> str:
+        nonlocal decoder_failed
+        if decoder_failed:
+            return ""
+        try:
+            if isinstance(raw_chunk, bytes):
+                return decoder.decode(raw_chunk)
+            if isinstance(raw_chunk, bytearray):
+                return decoder.decode(bytes(raw_chunk))
+            if isinstance(raw_chunk, str):
+                return raw_chunk
+            return ""
+        except UnicodeDecodeError:
+            decoder_failed = True
+            return ""
 
-    return StreamingResponse(
-        _replay_iterator(),
-        headers=dict(response.headers),
-        status_code=response.status_code,
-        media_type=response.media_type or "text/event-stream",
-    )
+    def _feed_chunk(raw_chunk: Any) -> None:
+        _consume_sse_text(_decode_chunk_text(raw_chunk))
+
+    def _precommit_action() -> str:
+        if decoder_failed:
+            return "fail_empty"
+        if saw_failed and not saw_content:
+            return "fail"
+        if saw_substantive or terminal_seen:
+            return "commit"
+        if _hold_exceeded():
+            if complete_frame_count == 0:
+                return "fail_empty"
+            return "commit"
+        return "hold"
+
+    def _run_precommit_action(action: str) -> str:
+        if action == "hold":
+            return "hold"
+        if action == "fail_empty":
+            _raise_empty_success()
+            raise AssertionError("unreachable")
+        if action == "fail":
+            _raise_precommit_failure()
+            raise AssertionError("unreachable")
+        if terminal_seen and not saw_content:
+            _apply_terminal_policy(raise_errors=True)
+        elif terminal_seen:
+            _apply_terminal_policy(raise_errors=False)
+        return "commit"
+
+    _set_state()
+
+    async def _validated_iterator() -> Any:
+        nonlocal committed, decoder_failed, held_bytes
+        try:
+            async for raw_chunk in original_iterator:
+                if not committed:
+                    held_chunks.append(raw_chunk)
+                    held_bytes += _chunk_size(raw_chunk)
+                    _feed_chunk(raw_chunk)
+                    action = _run_precommit_action(_precommit_action())
+                    if action != "commit":
+                        continue
+                    committed = True
+                    if not state.get("complete"):
+                        _set_state(reason="committed")
+                    for held in held_chunks:
+                        yield _stamp(held)
+                    held_chunks.clear()
+                    continue
+                _feed_chunk(raw_chunk)
+                if terminal_seen and not state.get("complete"):
+                    _apply_terminal_policy(raise_errors=False)
+                yield _stamp(raw_chunk)
+            try:
+                _consume_sse_text(decoder.decode(b"", final=True), final=True)
+            except UnicodeDecodeError:
+                decoder_failed = True
+            if not committed:
+                action = _run_precommit_action(_precommit_action())
+                if action == "hold":
+                    _raise_empty_success()
+                    raise AssertionError("unreachable")
+                committed = True
+                for held in held_chunks:
+                    yield _stamp(held)
+                held_chunks.clear()
+            elif terminal_seen and not state.get("complete"):
+                _apply_terminal_policy(raise_errors=False)
+            elif not state.get("complete"):
+                _mark_invalid("stream_closed_before_validation")
+        except BaseException:
+            if not committed:
+                raise
+            if not state.get("complete"):
+                _mark_invalid(state.get("reason") or "invalid_stream")
+            raise
+        finally:
+            close = getattr(original_iterator, "aclose", None)
+            if callable(close):
+                try:
+                    await close()
+                except BaseException:  # noqa: BLE001,S110
+                    pass
+
+    response.body_iterator = _validated_iterator()
+    return response
 
 
 def _raise_codex_auto_agent_missing_credential_preflight(
