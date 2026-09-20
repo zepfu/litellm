@@ -9833,6 +9833,13 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
         session_affinity as _opencode_session_affinity,
     )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.opencode_go_retained_history import (
+        apply_opencode_go_retained_chat_history,
+        apply_opencode_go_retained_responses_history,
+        drop_opencode_go_previous_response_id,
+        extract_opencode_go_previous_response_id,
+        resolve_opencode_go_retained_history,
+    )
     from litellm.responses.litellm_completion_transformation.transformation import (
         LiteLLMCompletionResponsesConfig,
     )
@@ -9958,6 +9965,20 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
             removed_tool_choice=_removed_tool_choice,
         )
         litellm_metadata = dict(canonical_request_body.get("litellm_metadata") or {})
+        go_retained_history = await resolve_opencode_go_retained_history(
+            previous_response_id=extract_opencode_go_previous_response_id(
+                adapted_request_body
+            ),
+            current_messages=(
+                LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages(
+                    input=adapted_request_body.get("input", ""),
+                    responses_api_request=adapted_request_body,
+                )
+            ),
+            request=request,
+            request_body=canonical_request_body,
+        )
+        drop_opencode_go_previous_response_id(adapted_request_body)
         target_base_url = _get_opencode_go_target_base()
         target_url = _join_opencode_zen_passthrough_url(
             base_target_url=target_base_url,
@@ -9990,6 +10011,12 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
             rollup_kwargs=rollup_kwargs,
             adapter_label="OpenCode Go",
             provider_bound_body=adapted_request_body,
+        )
+        adapted_request_body = await apply_opencode_go_retained_responses_history(
+            adapted_request_body=adapted_request_body,
+            decision=go_retained_history,
+            adapter_model=adapter_model,
+            litellm_metadata=litellm_metadata,
         )
         # Forward only request/session correlation headers. Exact auth and
         # OpenAI session markers stay server-owned to satisfy the egress guard.
@@ -10307,6 +10334,15 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
     )
     completion_kwargs["model"] = adapter_model
     completion_kwargs["stream"] = False
+    go_retained_history = await resolve_opencode_go_retained_history(
+        previous_response_id=extract_opencode_go_previous_response_id(
+            responses_api_request
+        ),
+        current_messages=completion_kwargs.get("messages") or [],
+        request=request,
+        request_body=canonical_request_body,
+    )
+    drop_opencode_go_previous_response_id(responses_api_request)
     target_base_url = _get_opencode_go_target_base()
     target_url = _join_opencode_zen_passthrough_url(
         base_target_url=target_base_url,
@@ -10337,6 +10373,10 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
         rollup_kwargs=rollup_kwargs,
         adapter_label="OpenCode Go",
         provider_bound_body=completion_kwargs,
+    )
+    completion_kwargs = await apply_opencode_go_retained_chat_history(
+        completion_kwargs=completion_kwargs,
+        decision=go_retained_history,
     )
     completion_call_kwargs = {
         **completion_kwargs,
