@@ -1,0 +1,10 @@
+# Temporary Cursor-only sota alias. Cursor Grok was removed from sota-xai.
+defaults: {}
+
+aliases:
+  - name: sota-cursor
+    candidates:
+      - provider: cursor_agent
+        model: cursor_agent/cursor-grok-4.6-high
+        route_family: codex_cursor_agent_aiserver_adapter
+        priority: 100

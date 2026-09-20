@@ -4,14 +4,9 @@ aliases:
   - name: sota-xai
     multi_agent_version: v2
     candidates:
-      # CFG-038: provider-neutral Grok 4.6 order is Cursor, then native
-      # xAI OIDC, then managed xAI OAuth. Lanes stay independent; work /
-      # work-other inherit this order via alias_reference.
-      - provider: cursor_agent
-        model: cursor_agent/cursor-grok-4.6-high
-        route_family: codex_cursor_agent_aiserver_adapter
-        priority: 110
-
+      # Temporary: Cursor Grok lives on sota-cursor, not here.
+      # Remaining Grok 4.6 order is native xAI OIDC, then managed xAI OAuth.
+      # work / work-other inherit this order via alias_reference.
       - provider: xai
         model: xai/grok-4.6
         route_family: codex_grok_native_responses_adapter
