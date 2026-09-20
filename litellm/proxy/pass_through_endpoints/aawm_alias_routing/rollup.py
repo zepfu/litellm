@@ -541,10 +541,48 @@ def _record_auto_agent_alias_route_status_rollup(  # noqa: PLR0915
             and status is not None
             else {}
         )
+        candidate_outgoing_target = (
+            _clean_codex_auth_value(candidate_event.get("outgoing_target"))
+            or _resolve_auto_agent_alias_route_rollup_outgoing_target(
+                route_family=_clean_codex_auth_value(
+                    candidate_event.get("route_family")
+                ),
+                target_url=candidate_event.get("target_url"),
+            )
+            or outgoing_target
+        )
+        if (
+            candidate_event is event
+            and isinstance(candidates, list)
+        ):
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                candidate_label = _auto_agent_alias_model_rollup_label(
+                    {
+                        "model": candidate.get("model"),
+                        "alias_model": alias_model,
+                        "provider": candidate.get("provider")
+                        or event.get("provider"),
+                    }
+                )
+                if candidate_label != label:
+                    continue
+                candidate_outgoing_target = (
+                    _clean_codex_auth_value(candidate.get("outgoing_target"))
+                    or _resolve_auto_agent_alias_route_rollup_outgoing_target(
+                        route_family=_clean_codex_auth_value(
+                            candidate.get("route_family")
+                        ),
+                        target_url=candidate.get("target_url"),
+                    )
+                    or candidate_outgoing_target
+                )
+                break
         record_aawm_route_rollup(
             group_header_label=group_header_label,
             incoming_endpoint=incoming_endpoint,
-            outgoing_target=outgoing_target,
+            outgoing_target=candidate_outgoing_target,
             model_label=label,
             effort=effort,
             turns=0,

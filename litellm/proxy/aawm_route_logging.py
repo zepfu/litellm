@@ -2242,6 +2242,26 @@ class AawmRouteRollupAccumulator:
                 self._groups.pop(group_key, None)
             emitted_lines.extend(self.flush_due(now=now))
             return emitted_lines
+        if (
+            subline is not None
+            and subline.turns > 0
+            and turns <= 0
+            and normalized_status is not None
+            and normalized_status
+            not in _AAWM_ROUTE_ROLLUP_REQUEST_TERMINAL_STATUS_VALUES
+        ):
+            # Keep completed Turns unstained. Later Ineligible/Cooling Down
+            # inventory must not overwrite a successful sibling on the same
+            # model/effort/target key (live Nous contract_incompatible).
+            subline_key = (
+                cleaned_model_label,
+                cleaned_effort,
+                cleaned_outgoing_target,
+                account_identity,
+                normalized_status,
+            )
+            subline = group.sublines.get(subline_key)
+            subline_already_existed = subline is not None
         if subline is None:
             if len(group.subline_order) >= self._max_sublines:
                 emitted_lines.extend(
@@ -2580,7 +2600,7 @@ def _colorize_aawm_route_rollup_line(line: str) -> str:
         return line
     if " [Cooling Down]" in line:
         return f"{_AAWM_ROUTE_ROLLUP_BLUE}{line}{_AAWM_ROUTE_ROLLUP_RESET}"
-    if " [Failed]" in line or " [Exhausted]" in line:
+    if " [Failed]" in line or " [Exhausted]" in line or " [Ineligible]" in line:
         return f"{_AAWM_ROUTE_ROLLUP_RED}{line}{_AAWM_ROUTE_ROLLUP_RESET}"
     return line
 
@@ -3317,7 +3337,7 @@ def emit_aawm_route_status_event(
             message_line = (
                 f"{_AAWM_ROUTE_ROLLUP_BLUE}{message_line}{_AAWM_ROUTE_ROLLUP_RESET}"
             )
-        elif normalized_status in {"Failed", "Exhausted"}:
+        elif normalized_status in {"Failed", "Exhausted", "Ineligible"}:
             message_line = (
                 f"{_AAWM_ROUTE_ROLLUP_RED}{message_line}{_AAWM_ROUTE_ROLLUP_RESET}"
             )

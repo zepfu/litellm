@@ -450,6 +450,43 @@ class TestRouteRollupStatusValues:
             "redispatch] [Failed] -> codex_grok_native_responses_adapter"
         ) in failed_lines
 
+    def test_completed_nous_turn_stays_unstained_by_later_ineligible(self):
+        accumulator = aawm_route_logging.AawmRouteRollupAccumulator(
+            interval_seconds=60
+        )
+        common = {
+            "group_header_label": "litellm#Ohmypi[17.4.2]@thoth",
+            "incoming_endpoint": "/openai_passthrough/v1/responses",
+            "outgoing_target": (
+                "inference-api.nousresearch.com/v1/chat/completions"
+            ),
+            "model_label": "nous/meituan/longcat-2.0:free(basic)",
+            "effort": "low",
+        }
+        message = (
+            "Nous auto-agent candidate is incompatible with the requested "
+            "Codex contract for the selected model."
+        )
+        accumulator.record(**common, turns=3)
+        accumulator.record(
+            **common,
+            turns=0,
+            status="Ineligible",
+            message=message,
+        )
+        lines = accumulator.flush(force=True)
+        rendered = "\n".join(lines)
+        assert (
+            " - nous/meituan/longcat-2.0:free(basic):low - Turns: 3 "
+            "-> inference-api.nousresearch.com/v1/chat/completions"
+        ) in lines
+        assert (
+            " - nous/meituan/longcat-2.0:free(basic):low - Turns: 0 "
+            f"[{message}] [Ineligible] -> "
+            "inference-api.nousresearch.com/v1/chat/completions"
+        ) in lines
+        assert "Turns: 3 [" not in rendered
+
     def test_request_only_exhaustion_survives_untagged_inventory(self):
         from datetime import datetime
 
@@ -957,6 +994,76 @@ class TestRecordRouteStatusRollup:
         assert not any(line.startswith(" - alibaba(basic)") for line in lines)
         assert not any(line.startswith(" - zai(basic)") for line in lines)
         assert lines.count(" - Request: [Exhausted]") == 1
+
+    @patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.emit_aawm_route_status_event",
+    )
+    def test_nous_ineligible_keeps_nous_target_not_nvidia_event_target(
+        self,
+        mock_emit,
+        accumulator: aawm_route_logging.AawmRouteRollupAccumulator,
+    ):
+        nous_error = (
+            "Nous auto-agent candidate is incompatible with the requested "
+            "Codex contract for the selected model."
+        )
+        event = self._make_event(
+            alias_model="basic",
+            incoming_endpoint="/openai_passthrough/v1/responses",
+            model="nvidia/moonshotai/kimi-k3",
+            provider="nvidia",
+            route_family="codex_nvidia_completion_adapter",
+            event_type="candidate_retryable_failure",
+            source_error=nous_error,
+            failure_class="candidate_deterministically_ineligible",
+            candidates=[
+                {
+                    "provider": "nous",
+                    "model": "nous/meituan/longcat-2.0:free",
+                    "route_family": "codex_nous_chat_completions_adapter",
+                    "terminal_disposition": "attempted",
+                    "attempted_provider_call": False,
+                    "candidate_status": "ineligible",
+                    "ineligibility_reason": "contract_incompatible",
+                    "failure_class": "candidate_deterministically_ineligible",
+                    "source_error": nous_error,
+                },
+                {
+                    "provider": "nvidia",
+                    "model": "nvidia/moonshotai/kimi-k3",
+                    "route_family": "codex_nvidia_completion_adapter",
+                    "terminal_disposition": "attempted",
+                    "attempted_provider_call": True,
+                    "status": "ok",
+                },
+            ],
+            attempts=[
+                {
+                    "provider": "nous",
+                    "model": "nous/meituan/longcat-2.0:free",
+                    "route_family": "codex_nous_chat_completions_adapter",
+                    "status": "candidate_ineligible_no_cooldown",
+                    "candidate_status": "ineligible",
+                    "ineligibility_reason": "contract_incompatible",
+                    "failure_class": "candidate_deterministically_ineligible",
+                    "source_error": nous_error,
+                    "attempted_provider_call": False,
+                }
+            ],
+        )
+        _record_auto_agent_alias_route_status_rollup(event)
+        lines = accumulator.flush(force=True)
+        rendered = "\n".join(lines)
+        assert "integrate.api.nvidia.com" not in rendered
+        assert (
+            " - nous/meituan/longcat-2.0:free(basic):none - Turns: 0 "
+            f"[{nous_error}] [Ineligible] -> "
+            "inference-api.nousresearch.com/v1/chat/completions"
+        ) in lines
+        assert not any(
+            line.startswith(" - nvidia/moonshotai/kimi-k3") and "[Ineligible]" in line
+            for line in lines
+        )
 
     @patch(
         "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.emit_aawm_route_status_event",

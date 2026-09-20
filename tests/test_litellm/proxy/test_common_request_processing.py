@@ -4803,6 +4803,12 @@ class TestAawmRouteRollup:
                         " - grok-4.5(sota-xai):none - Turns: 0 "
                         "[The requested model 'grok-4.5' does not exist.] [Failed]"
                     ),
+                    (
+                        " - nous/meituan/longcat-2.0:free(basic):low - Turns: 0 "
+                        "[Nous auto-agent candidate is incompatible with the "
+                        "requested Codex contract for the selected model.] "
+                        "[Ineligible]"
+                    ),
                     "   - Denied: 2",
                     "     - Unsafe mutation",
                 ]
@@ -4820,6 +4826,12 @@ class TestAawmRouteRollup:
         assert (
             "\x1b[91m - grok-4.5(sota-xai):none - Turns: 0 "
             "[The requested model 'grok-4.5' does not exist.] [Failed]\x1b[0m"
+        ) in rendered
+        assert (
+            "\x1b[91m - nous/meituan/longcat-2.0:free(basic):low - Turns: 0 "
+            "[Nous auto-agent candidate is incompatible with the "
+            "requested Codex contract for the selected model.] "
+            "[Ineligible]\x1b[0m"
         ) in rendered
         assert "\x1b[93m   - Denied: 2\x1b[0m" in rendered
         assert "\x1b[93m     - Unsafe mutation\x1b[0m" in rendered
