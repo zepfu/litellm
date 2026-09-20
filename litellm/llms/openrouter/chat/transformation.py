@@ -64,7 +64,9 @@ class OpenrouterConfig(OpenAIGPTConfig):
         """
         validated_headers = dict(headers)
         auth_headers = get_openrouter_auth_headers(
-            api_key=api_key, extra_headers=validated_headers
+            api_key=api_key,
+            extra_headers=validated_headers,
+            api_base=api_base,
         )
         # Remove all case-insensitive Authorization keys before applying the
         # single resolved header so we never end up with duplicates.

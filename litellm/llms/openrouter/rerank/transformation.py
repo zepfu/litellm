@@ -88,6 +88,7 @@ class OpenRouterRerankConfig(BaseRerankConfig):
         model: str,
         api_key: Optional[str] = None,
         optional_params: Optional[dict] = None,
+        api_base: Optional[str] = None,
     ) -> dict:
         default_headers = {
             "Content-Type": "application/json",
@@ -96,7 +97,11 @@ class OpenRouterRerankConfig(BaseRerankConfig):
             "X-Title": get_secret("OR_APP_NAME") or "liteLLM",
         }
         merged_headers = {**default_headers, **headers}
-        return apply_openrouter_auth_headers(merged_headers, api_key=api_key)
+        return apply_openrouter_auth_headers(
+            merged_headers,
+            api_key=api_key,
+            api_base=api_base,
+        )
 
     def transform_rerank_request(
         self,

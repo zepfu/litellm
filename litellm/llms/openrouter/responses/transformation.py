@@ -45,6 +45,7 @@ class OpenRouterResponsesAPIConfig(OpenAIResponsesAPIConfig):
         return apply_openrouter_auth_headers(
             headers,
             api_key=litellm_params.api_key,
+            api_base=litellm_params.api_base,
         )
 
     def get_complete_url(

@@ -72,7 +72,9 @@ class OpenrouterEmbeddingConfig(BaseEmbeddingConfig):
         # Resolve auth via the shared helper. Caller Authorization is stripped
         # and never admitted; the service-owned profile supplies the credential.
         auth_headers = get_openrouter_auth_headers(
-            api_key=api_key, extra_headers=headers
+            api_key=api_key,
+            extra_headers=headers,
+            api_base=api_base,
         )
 
         # Drop any pre-existing authorization header (any casing) and apply the

@@ -280,6 +280,7 @@ class OpenRouterImageGenerationConfig(BaseImageGenerationConfig):
         auth_headers = get_openrouter_auth_headers(
             api_key=api_key,
             extra_headers=validated_headers,
+            api_base=api_base,
         )
         # Remove any pre-existing authorization key (any casing) before
         # applying the resolved header so we never end up with duplicates.

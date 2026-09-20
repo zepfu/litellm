@@ -1105,6 +1105,7 @@ class BaseLLMHTTPHandler:
             model=model,
             messages=[],
             optional_params=optional_params,
+            api_base=api_base,
             litellm_params=litellm_params,
         )
 
@@ -1251,11 +1252,15 @@ class BaseLLMHTTPHandler:
         rerank_response_context: Optional[Dict[str, Any]] = None,
     ) -> RerankResponse:
         # get config from model, custom llm provider
+        rerank_validate_kwargs: Dict[str, Any] = {}
+        if custom_llm_provider == "openrouter":
+            rerank_validate_kwargs["api_base"] = api_base
         headers = provider_config.validate_environment(
             api_key=api_key,
             headers=headers or {},
             model=model,
             optional_params=optional_rerank_params,
+            **rerank_validate_kwargs,
         )
 
         if custom_llm_provider == "openrouter":
@@ -5624,10 +5629,14 @@ class BaseLLMHTTPHandler:
             if extra_headers:
                 headers_for_validation.update(extra_headers)
 
+        image_edit_validate_kwargs: Dict[str, Any] = {}
+        if custom_llm_provider == "openrouter":
+            image_edit_validate_kwargs["api_base"] = litellm_params.api_base
         headers = image_edit_provider_config.validate_environment(
             api_key=litellm_params.api_key,
             headers=headers_for_validation,
             model=model,
+            **image_edit_validate_kwargs,
         )
         if custom_llm_provider != "openrouter" and extra_headers:
             headers.update(extra_headers)
@@ -5727,10 +5736,14 @@ class BaseLLMHTTPHandler:
             if extra_headers:
                 headers_for_validation.update(extra_headers)
 
+        image_edit_validate_kwargs: Dict[str, Any] = {}
+        if custom_llm_provider == "openrouter":
+            image_edit_validate_kwargs["api_base"] = litellm_params.api_base
         headers = image_edit_provider_config.validate_environment(
             api_key=litellm_params.api_key,
             headers=headers_for_validation,
             model=model,
+            **image_edit_validate_kwargs,
         )
         if custom_llm_provider != "openrouter" and extra_headers:
             headers.update(extra_headers)
@@ -5856,6 +5869,7 @@ class BaseLLMHTTPHandler:
             messages=[],
             optional_params=image_generation_optional_request_params,
             litellm_params=dict(litellm_params),
+            api_base=litellm_params.get("api_base"),
         )
         if custom_llm_provider != "openrouter" and extra_headers:
             headers.update(extra_headers)
@@ -5972,6 +5986,7 @@ class BaseLLMHTTPHandler:
             messages=[],
             optional_params=image_generation_optional_request_params,
             litellm_params=dict(litellm_params),
+            api_base=litellm_params.get("api_base"),
         )
         if custom_llm_provider != "openrouter" and extra_headers:
             headers.update(extra_headers)

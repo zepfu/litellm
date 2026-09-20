@@ -530,6 +530,7 @@ def get_openrouter_auth_headers(
     api_key: Optional[str] = None,
     extra_headers: Optional[Mapping[str, Any]] = None,
     *,
+    api_base: Optional[str] = None,
     policy: OpenRouterResolutionPolicy = NATIVE_POLICY,
     hooks: Optional[OpenRouterSecretHooks] = None,
 ) -> Dict[str, str]:
@@ -537,6 +538,8 @@ def get_openrouter_auth_headers(
 
     Caller Authorization is detected only to reject duplicate header names.
     It is never admitted as a credential and cannot override the service key.
+    ``api_base`` is the same request-scoped explicit base used for URL
+    resolution, so an unused environment base is not canonicalized.
 
     Raises:
       OpenRouterConfigError: if multiple Authorization headers are present, a
@@ -545,6 +548,7 @@ def get_openrouter_auth_headers(
     _reject_duplicate_authorization_headers(extra_headers)
     profile = resolve_openrouter_credential_target(
         explicit_api_key=api_key,
+        explicit_api_base=api_base,
         policy=policy,
         hooks=hooks,
     )
@@ -561,6 +565,7 @@ def apply_openrouter_auth_headers(
     headers: Mapping[str, Any],
     api_key: Optional[str] = None,
     *,
+    api_base: Optional[str] = None,
     policy: OpenRouterResolutionPolicy = NATIVE_POLICY,
     hooks: Optional[OpenRouterSecretHooks] = None,
 ) -> Dict[str, Any]:
@@ -570,6 +575,7 @@ def apply_openrouter_auth_headers(
     auth_headers = get_openrouter_auth_headers(
         api_key=api_key,
         extra_headers=validated_headers,
+        api_base=api_base,
         policy=policy,
         hooks=hooks,
     )
