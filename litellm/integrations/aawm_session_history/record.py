@@ -836,18 +836,43 @@ def _build_session_history_record_from_langfuse_trace_observation(  # noqa: PLR0
         if agent_id_source:
             metadata["agent_id_source"] = agent_id_source
     request_tags = _derive_request_tags_from_langfuse_metadata(metadata)
+    openrouter_usage_cost = None
+    if str(provider or "").strip().lower() == "openrouter":
+        from litellm.llms.openrouter.common_utils import (
+            authoritative_openrouter_usage_cost,
+        )
+
+        openrouter_usage_cost = authoritative_openrouter_usage_cost(
+            metadata.get("usage_openrouter_cost"),
+            resolved_model,
+        )
     response_cost_usd = _safe_float(
         _first_non_none(
             _maybe_get(observation.get("costDetails"), "total"),
             observation.get("calculatedTotalCost"),
             metadata.get("litellm_response_cost"),
             metadata.get("response_cost"),
-            metadata.get("usage_openrouter_cost"),
+            openrouter_usage_cost,
             trace.get("totalCost"),
         )
     )
     if str(provider or "").strip().lower() == "alibaba_token_plan":
         response_cost_usd = None
+    if str(provider or "").strip().lower() == "openrouter":
+        from litellm.llms.openrouter.common_utils import openrouter_cost_status
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+            is_openrouter_free_model,
+        )
+
+        if is_openrouter_free_model(resolved_model):
+            if response_cost_usd is None:
+                response_cost_usd = 0.0
+        elif response_cost_usd == 0:
+            response_cost_usd = None
+        metadata["openrouter_cost_status"] = openrouter_cost_status(
+            model=resolved_model,
+            response_cost=response_cost_usd,
+        )
     cache_fields = _derive_session_history_provider_cache_fields(
         provider=provider,
         model=resolved_model,
@@ -1347,9 +1372,19 @@ def _build_session_history_record(  # noqa: PLR0915
 
     response_cost_usd = None
     provider_reported_cost = False
+    openrouter_known_free = False
     if resolved_provider not in {"kimi_code", "alibaba_token_plan"}:
         if resolved_provider == "openrouter":
-            response_cost_usd = _first_reported_openrouter_cost(metadata, usage_dict)
+            from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+                is_openrouter_free_model,
+            )
+
+            openrouter_known_free = is_openrouter_free_model(resolved_model)
+            response_cost_usd = _first_reported_openrouter_cost(
+                metadata,
+                usage_dict,
+                model=resolved_model,
+            )
             provider_reported_cost = response_cost_usd is not None
         if response_cost_usd is None:
             response_cost_usd = _safe_float(
@@ -1364,15 +1399,24 @@ def _build_session_history_record(  # noqa: PLR0915
                     ),
                     metadata.get("litellm_response_cost"),
                     metadata.get("response_cost"),
-                    metadata.get("usage_openrouter_cost"),
-                    usage_dict.get("cost"),
+                    metadata.get("usage_openrouter_cost")
+                    if openrouter_known_free
+                    else None,
+                    usage_dict.get("cost") if openrouter_known_free else None,
                 )
             )
+        if (
+            resolved_provider == "openrouter"
+            and not openrouter_known_free
+            and response_cost_usd == 0
+        ):
+            response_cost_usd = None
         if (
             (
                 response_cost_usd is None
                 or (response_cost_usd == 0 and not provider_reported_cost)
             )
+            and not openrouter_known_free
             and prompt_tokens > 0
             and resolved_model != "unknown"
             and not usage_dict.get("token_count_response")
@@ -1428,6 +1472,16 @@ def _build_session_history_record(  # noqa: PLR0915
                 )
                 if bundled_response_cost is not None:
                     response_cost_usd = bundled_response_cost
+
+        if resolved_provider == "openrouter":
+            from litellm.llms.openrouter.common_utils import openrouter_cost_status
+
+            if openrouter_known_free and response_cost_usd is None:
+                response_cost_usd = 0.0
+            metadata["openrouter_cost_status"] = openrouter_cost_status(
+                model=resolved_model,
+                response_cost=response_cost_usd,
+            )
 
     permission_usage_fields = _build_permission_usage_fields(
         metadata=metadata,

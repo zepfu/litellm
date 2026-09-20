@@ -326,6 +326,7 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "anthropic_context_window_classification",
     "usage_search_units",
     "usage_openrouter_cost",
+    "openrouter_cost_status",
     "openrouter_provider",
     "openrouter_response_model",
     "aawm_local_prepare_ms",

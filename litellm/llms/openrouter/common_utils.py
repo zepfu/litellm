@@ -1,10 +1,50 @@
+import math
 from typing import Any, Dict, Mapping, Optional
 
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+    is_openrouter_free_model,
+)
+
+OPENROUTER_COST_STATUS_UNMAPPED = "unmapped"
+OPENROUTER_COST_STATUS_FREE = "free"
+OPENROUTER_COST_STATUS_PRICED = "priced"
 
 
 class OpenRouterException(BaseLLMException):
     pass
+
+
+def authoritative_openrouter_usage_cost(cost: Any, model: Any) -> Optional[float]:
+    """Return OpenRouter usage cost only when it is an authoritative price.
+
+    Positive values are provider-priced. Numeric zero is reserved for models
+    explicitly identified as free. Zero on any other model is unavailable
+    price metadata, not free, so callers must omit cost instead of recording
+    ``0.0``.
+    """
+
+    if cost is None or cost == "":
+        return None
+    try:
+        value = float(cost)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    if value == 0 and not is_openrouter_free_model(model):
+        return None
+    return value
+
+
+def openrouter_cost_status(*, model: Any, response_cost: Optional[float]) -> str:
+    """Stable OpenRouter cost status for session-history and passthrough logs."""
+
+    if is_openrouter_free_model(model):
+        return OPENROUTER_COST_STATUS_FREE
+    if response_cost is None:
+        return OPENROUTER_COST_STATUS_UNMAPPED
+    return OPENROUTER_COST_STATUS_PRICED
 
 
 class OpenRouterConfigError(ValueError):

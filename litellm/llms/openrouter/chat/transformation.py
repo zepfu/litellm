@@ -21,6 +21,7 @@ from litellm.utils import get_model_info, supports_native_cache_control
 from ...openai.chat.gpt_transformation import OpenAIGPTConfig
 from ..common_utils import (
     OpenRouterException,
+    authoritative_openrouter_usage_cost,
     get_openrouter_auth_headers,
 )
 
@@ -303,7 +304,10 @@ class OpenrouterConfig(OpenAIGPTConfig):
         try:
             response_json = raw_response.json()
             if "usage" in response_json and response_json["usage"]:
-                response_cost = response_json["usage"].get("cost")
+                response_cost = authoritative_openrouter_usage_cost(
+                    response_json["usage"].get("cost"),
+                    model,
+                )
                 if response_cost is not None:
                     # Store cost in hidden params for the cost calculator to use
                     if not hasattr(model_response, "_hidden_params"):
@@ -312,7 +316,7 @@ class OpenrouterConfig(OpenAIGPTConfig):
                         model_response._hidden_params["additional_headers"] = {}
                     model_response._hidden_params["additional_headers"][
                         "llm_provider-x-litellm-response-cost"
-                    ] = float(response_cost)
+                    ] = response_cost
         except Exception:
             # If we can't extract cost, continue without it - don't fail the response
             pass

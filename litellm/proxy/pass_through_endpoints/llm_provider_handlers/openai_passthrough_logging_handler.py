@@ -48,6 +48,12 @@ from litellm.types.utils import (
     Usage,
 )
 from litellm.utils import ModelResponse, TextCompletionResponse
+from litellm.llms.openrouter.common_utils import (
+    openrouter_cost_status,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+    is_openrouter_free_model,
+)
 
 
 # Process-lifetime caches for on-disk model price fallback.
@@ -1446,7 +1452,9 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         model: str,
         custom_llm_provider: Optional[str],
         call_type: Optional[str] = None,
-    ) -> float:
+    ) -> Optional[float]:
+        if custom_llm_provider == "openrouter" and is_openrouter_free_model(model):
+            return 0.0
         try:
             return litellm.completion_cost(
                 completion_response=completion_response,
@@ -1462,11 +1470,9 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             usage = getattr(completion_response, "usage", None)
             if not isinstance(model_info, dict) or usage is None:
                 if custom_llm_provider == "openrouter" and usage is not None:
-                    verbose_proxy_logger.debug(
-                        "OpenAI passthrough cost unavailable for unmapped OpenRouter model=%s; recording zero cost and preserving usage.",
-                        model,
+                    return OpenAIPassthroughLoggingHandler._openrouter_unmapped_passthrough_cost(
+                        model
                     )
-                    return 0.0
                 raise
             input_cost_per_token = model_info.get("input_cost_per_token")
             output_cost_per_token = model_info.get("output_cost_per_token")
@@ -1474,6 +1480,10 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 output_cost_per_token,
                 (int, float),
             ):
+                if custom_llm_provider == "openrouter" and usage is not None:
+                    return OpenAIPassthroughLoggingHandler._openrouter_unmapped_passthrough_cost(
+                        model
+                    )
                 raise
             prompt_tokens = getattr(usage, "prompt_tokens", None) or 0
             completion_tokens = getattr(usage, "completion_tokens", None) or 0
@@ -1488,6 +1498,62 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 str(exc),
             )
             return fallback_cost
+
+    @staticmethod
+    def _openrouter_unmapped_passthrough_cost(model: str) -> Optional[float]:
+        if is_openrouter_free_model(model):
+            verbose_proxy_logger.debug(
+                "OpenAI passthrough cost unavailable for OpenRouter model=%s; recording explicit zero for known-free model and preserving usage.",
+                model,
+            )
+            return 0.0
+        verbose_proxy_logger.debug(
+            "OpenAI passthrough cost unavailable for unmapped OpenRouter model=%s; omitting cost and preserving usage.",
+            model,
+        )
+        return None
+
+    @staticmethod
+    def _stamp_openrouter_cost_status(
+        *,
+        model: str,
+        custom_llm_provider: Optional[str],
+        response_cost: Optional[float],
+        kwargs: dict,
+        logging_obj: Optional[LiteLLMLoggingObj] = None,
+    ) -> None:
+        if custom_llm_provider != "openrouter":
+            return
+        status = openrouter_cost_status(model=model, response_cost=response_cost)
+        litellm_params = kwargs.get("litellm_params")
+        if not isinstance(litellm_params, dict):
+            litellm_params = {}
+            kwargs["litellm_params"] = litellm_params
+        metadata = litellm_params.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            litellm_params["metadata"] = metadata
+        metadata["openrouter_cost_status"] = status
+        if logging_obj is None:
+            return
+        details = getattr(logging_obj, "model_call_details", None)
+        if not isinstance(details, dict):
+            return
+        details_params = details.get("litellm_params")
+        if not isinstance(details_params, dict):
+            details_params = {}
+            details["litellm_params"] = details_params
+        details_metadata = details_params.get("metadata")
+        if not isinstance(details_metadata, dict):
+            details_metadata = {}
+            details_params["metadata"] = details_metadata
+        details_metadata["openrouter_cost_status"] = status
+
+    @staticmethod
+    def _format_passthrough_cost_for_log(response_cost: Optional[float]) -> str:
+        if response_cost is None:
+            return "unknown"
+        return f"${response_cost:.6f}"
 
     @staticmethod
     def is_openai_chat_completions_route(url_route: str) -> bool:
@@ -3136,6 +3202,13 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                     custom_llm_provider=custom_llm_provider,
                 )
 
+            OpenAIPassthroughLoggingHandler._stamp_openrouter_cost_status(
+                model=model,
+                custom_llm_provider=custom_llm_provider,
+                response_cost=response_cost,
+                kwargs=kwargs,
+                logging_obj=logging_obj,
+            )
             apply_passthrough_logging_contract(
                 litellm_response=litellm_model_response,
                 model=model,
@@ -3187,7 +3260,12 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 else "embeddings"
             )
             verbose_proxy_logger.debug(
-                f"OpenAI passthrough cost tracking - Endpoint: {endpoint_type}, Model: {model}, Cost: ${response_cost:.6f}"
+                "OpenAI passthrough cost tracking - Endpoint: %s, Model: %s, Cost: %s",
+                endpoint_type,
+                model,
+                OpenAIPassthroughLoggingHandler._format_passthrough_cost_for_log(
+                    response_cost
+                ),
             )
 
             return {
@@ -3535,18 +3613,26 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             # Prepare kwargs for logging
             logging_kwargs.update(
                 {
-                    "response_cost": response_cost,
                     "model": model,
                     "custom_llm_provider": custom_llm_provider,
                     "litellm_params": existing_litellm_params,
                 }
             )
+            if response_cost is not None:
+                logging_kwargs["response_cost"] = response_cost
             passthrough_logging_payload = litellm_logging_obj.model_call_details.get(
                 "passthrough_logging_payload"
             )
             if passthrough_logging_payload:
                 logging_kwargs["passthrough_logging_payload"] = passthrough_logging_payload
 
+            OpenAIPassthroughLoggingHandler._stamp_openrouter_cost_status(
+                model=model,
+                custom_llm_provider=custom_llm_provider,
+                response_cost=response_cost,
+                kwargs=logging_kwargs,
+                logging_obj=litellm_logging_obj,
+            )
             apply_passthrough_logging_contract(
                 litellm_response=complete_response,
                 model=model,
@@ -3621,7 +3707,11 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             )
 
             verbose_proxy_logger.debug(
-                f"OpenAI streaming passthrough cost tracking - Model: {model}, Cost: ${response_cost:.6f}"
+                "OpenAI streaming passthrough cost tracking - Model: %s, Cost: %s",
+                model,
+                OpenAIPassthroughLoggingHandler._format_passthrough_cost_for_log(
+                    response_cost
+                ),
             )
 
             return {

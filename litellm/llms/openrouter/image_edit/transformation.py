@@ -52,6 +52,7 @@ from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.llms.base_llm.image_edit.transformation import BaseImageEditConfig
 from litellm.llms.openrouter.common_utils import (
     OpenRouterException,
+    authoritative_openrouter_usage_cost,
     get_openrouter_auth_headers,
 )
 from litellm.secret_managers.main import get_secret_str
@@ -343,7 +344,7 @@ class OpenRouterImageEditConfig(BaseImageEditConfig):
                 total_tokens=total_tokens,
             )
 
-            cost = usage_data.get("cost")
+            cost = authoritative_openrouter_usage_cost(usage_data.get("cost"), model)
             if cost is not None:
                 if not hasattr(model_response, "_hidden_params"):
                     model_response._hidden_params = {}
@@ -351,7 +352,7 @@ class OpenRouterImageEditConfig(BaseImageEditConfig):
                     model_response._hidden_params["additional_headers"] = {}
                 model_response._hidden_params["additional_headers"][
                     "llm_provider-x-litellm-response-cost"
-                ] = float(cost)
+                ] = cost
 
             cost_details = usage_data.get("cost_details", {})
             if cost_details:

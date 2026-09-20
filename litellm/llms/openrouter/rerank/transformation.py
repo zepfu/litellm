@@ -8,7 +8,7 @@ from litellm.llms.base_llm.rerank.transformation import BaseRerankConfig
 from litellm.secret_managers.main import get_secret, get_secret_str
 from litellm.types.rerank import OptionalRerankParams, RerankRequest, RerankResponse
 
-from ..common_utils import OpenRouterException
+from ..common_utils import OpenRouterException, authoritative_openrouter_usage_cost
 
 
 class OpenRouterRerankConfig(BaseRerankConfig):
@@ -274,11 +274,14 @@ class OpenRouterRerankConfig(BaseRerankConfig):
             response._hidden_params["openrouter_response_model"] = (
                 raw_response_json.get("model")
             )
-            response_cost = usage.get("cost")
+            response_cost = authoritative_openrouter_usage_cost(
+                usage.get("cost"),
+                model,
+            )
             if response_cost is not None:
                 response._hidden_params.setdefault("additional_headers", {})[
                     "llm_provider-x-litellm-response-cost"
-                ] = float(response_cost)
+                ] = response_cost
         return response
 
     def get_error_class(

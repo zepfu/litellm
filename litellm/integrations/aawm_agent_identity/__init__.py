@@ -1884,16 +1884,19 @@ def _first_non_none(*values: Any) -> Any:
 def _first_reported_openrouter_cost(
     metadata: Dict[str, Any],
     usage_dict: Dict[str, Any],
+    model: Any = None,
 ) -> Optional[float]:
-    response_cost = _safe_float(
+    from litellm.llms.openrouter.common_utils import (
+        authoritative_openrouter_usage_cost,
+    )
+
+    return authoritative_openrouter_usage_cost(
         _first_non_none(
             metadata.get("usage_openrouter_cost"),
             usage_dict.get("cost"),
-        )
+        ),
+        model,
     )
-    if response_cost is None or response_cost < 0:
-        return None
-    return response_cost
 
 
 def _safe_json_load(value: Any, default: Any) -> Any:

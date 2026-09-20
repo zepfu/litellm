@@ -17,6 +17,7 @@ from litellm.utils import convert_to_model_response_object
 
 from ..common_utils import (
     OpenRouterException,
+    authoritative_openrouter_usage_cost,
     get_openrouter_auth_headers,
 )
 
@@ -158,11 +159,11 @@ class OpenrouterEmbeddingConfig(BaseEmbeddingConfig):
         )
 
         usage = response_json.get("usage") or {}
-        response_cost = usage.get("cost")
+        response_cost = authoritative_openrouter_usage_cost(usage.get("cost"), model)
         if response_cost is not None:
             response._hidden_params.setdefault("additional_headers", {})[
                 "llm_provider-x-litellm-response-cost"
-            ] = float(response_cost)
+            ] = response_cost
         if response_json.get("provider") is not None:
             response._hidden_params["openrouter_provider"] = response_json.get(
                 "provider"
