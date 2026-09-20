@@ -21,11 +21,12 @@ from litellm.proxy._types import ProxyException
 from litellm.secret_managers.main import get_secret_str
 
 
-_ANTHROPIC_ADAPTER_NVIDIA_API_KEY_ENV_VARS = (
-    "AAWM_NVIDIA_API_KEY",
-    "NVIDIA_NIM_API_KEY",
-    "NVIDIA_API_KEY",
-)
+NVIDIA_PROFILE_SOURCE_AAWM = "aawm"
+NVIDIA_PROFILE_SOURCE_NIM = "nim"
+NVIDIA_PROFILE_SOURCE_DEFAULT = "default"
+NVIDIA_PROFILE_SOURCE_NONE = "none"
+NVIDIA_PROFILE_TARGET_FAMILY = "nvidia"
+
 _NVIDIA_MISSING_CREDENTIAL_INELIGIBILITY_CODE = (
     "aawm_codex_auto_agent_candidate_ineligible"
 )
@@ -37,6 +38,59 @@ NVIDIA_API_BASE_VERSION_SEGMENT = "/v1"
 
 NVIDIA_TARGET_BASE_DEFAULT = "https://integrate.api.nvidia.com"
 """Canonical default NVIDIA target root, stored without a version segment."""
+
+
+@dataclass(frozen=True)
+class NvidiaProfileNamespace:
+    """One NVIDIA configuration namespace: key, optional custom base, source id."""
+
+    source: str
+    key_env: str
+    base_env: Optional[str]
+
+
+@dataclass(frozen=True)
+class NvidiaCredentialTargetProfile:
+    """Atomic NVIDIA credential-target profile. ``api_key`` is never logged."""
+
+    source: str
+    api_key: Optional[str]
+    key_env: Optional[str]
+    target_base: str
+    target_base_env: Optional[str]
+    target_family: str
+
+    def observability(self) -> dict[str, str]:
+        """Secret-safe source identity for logs, spans, and metadata."""
+
+        return {
+            "nvidia_profile_source": self.source,
+            "nvidia_profile_key_env": self.key_env or "none",
+            "nvidia_profile_target_base_env": self.target_base_env or "default",
+            "nvidia_profile_target_family": self.target_family,
+        }
+
+
+_NVIDIA_PROFILE_NAMESPACES: tuple[NvidiaProfileNamespace, ...] = (
+    NvidiaProfileNamespace(
+        source=NVIDIA_PROFILE_SOURCE_AAWM,
+        key_env="AAWM_NVIDIA_API_KEY",
+        base_env="AAWM_NVIDIA_API_BASE",
+    ),
+    NvidiaProfileNamespace(
+        source=NVIDIA_PROFILE_SOURCE_NIM,
+        key_env="NVIDIA_NIM_API_KEY",
+        base_env="NVIDIA_NIM_API_BASE",
+    ),
+    NvidiaProfileNamespace(
+        source=NVIDIA_PROFILE_SOURCE_DEFAULT,
+        key_env="NVIDIA_API_KEY",
+        base_env=None,
+    ),
+)
+_ANTHROPIC_ADAPTER_NVIDIA_API_KEY_ENV_VARS = tuple(
+    namespace.key_env for namespace in _NVIDIA_PROFILE_NAMESPACES
+)
 
 
 def _nvidia_accepted_credential_source_names() -> str:
@@ -159,9 +213,7 @@ def configure_nvidia_runtime(
 
 
 def _get_anthropic_adapter_nvidia_api_key() -> Optional[str]:
-    return _runtime_dependencies.get_first_secret_value(
-        _ANTHROPIC_ADAPTER_NVIDIA_API_KEY_ENV_VARS
-    )
+    return _resolve_nvidia_credential_target_profile().api_key
 
 
 def _require_nvidia_api_key() -> str:
@@ -175,6 +227,7 @@ def _require_nvidia_api_key() -> str:
             _nvidia_accepted_credential_source_names(),
         )
         raise NvidiaMissingCredentialError()
+    _log_nvidia_profile_observability(_resolve_nvidia_credential_target_profile())
     return api_key
 
 
@@ -219,22 +272,83 @@ def _canonical_nvidia_target_base(target_base: str) -> str:
     return cleaned.rstrip("/") or NVIDIA_TARGET_BASE_DEFAULT
 
 
-def _get_anthropic_adapter_nvidia_target_base() -> str:
-    raw_base = (
-        _runtime_dependencies.clean_secret_string(
-            _runtime_dependencies.get_env("NVIDIA_NIM_API_BASE")
-        )
-        or _runtime_dependencies.clean_secret_string(
-            _runtime_dependencies.get_env("AAWM_NVIDIA_API_BASE")
-        )
-        or NVIDIA_TARGET_BASE_DEFAULT
-    )
-    if raw_base == NVIDIA_TARGET_BASE_DEFAULT:
+def _normalized_nvidia_profile_target_base(raw_base: Optional[str]) -> str:
+    """Apply the NV-007 URL contract to one selected profile base."""
+
+    if raw_base is None or raw_base == NVIDIA_TARGET_BASE_DEFAULT:
         return NVIDIA_TARGET_BASE_DEFAULT
     violation = _nvidia_target_base_api_version_violation(raw_base)
     if violation is not None:
         raise ValueError(violation)
     return _canonical_nvidia_target_base(raw_base)
+
+
+def _empty_nvidia_credential_target_profile() -> NvidiaCredentialTargetProfile:
+    return NvidiaCredentialTargetProfile(
+        source=NVIDIA_PROFILE_SOURCE_NONE,
+        api_key=None,
+        key_env=None,
+        target_base=NVIDIA_TARGET_BASE_DEFAULT,
+        target_base_env=None,
+        target_family=NVIDIA_PROFILE_TARGET_FAMILY,
+    )
+
+
+def _resolve_nvidia_credential_target_profile() -> NvidiaCredentialTargetProfile:
+    """Select one AAWM, NIM, or default key+base profile; never mix namespaces.
+
+    Precedence is AAWM, then NIM, then default. The winning key namespace owns
+    the target: its custom base is preserved when set, otherwise the canonical
+    default is used. Bases from a different namespace are ignored so an AAWM
+    key cannot be paired with an unrelated NIM target.
+    """
+
+    for namespace in _NVIDIA_PROFILE_NAMESPACES:
+        api_key = _runtime_dependencies.clean_secret_string(
+            _runtime_dependencies.get_first_secret_value((namespace.key_env,))
+        )
+        if not api_key:
+            continue
+        raw_base = None
+        if namespace.base_env is not None:
+            raw_base = _runtime_dependencies.clean_secret_string(
+                _runtime_dependencies.get_env(namespace.base_env)
+            )
+        return NvidiaCredentialTargetProfile(
+            source=namespace.source,
+            api_key=api_key,
+            key_env=namespace.key_env,
+            target_base=_normalized_nvidia_profile_target_base(raw_base),
+            target_base_env=namespace.base_env if raw_base else None,
+            target_family=NVIDIA_PROFILE_TARGET_FAMILY,
+        )
+    return _empty_nvidia_credential_target_profile()
+
+
+def _log_nvidia_profile_observability(
+    profile: NvidiaCredentialTargetProfile,
+) -> None:
+    observability = profile.observability()
+    _runtime_dependencies.log_debug(
+        "NVIDIA credential-target profile source=%s key_env=%s "
+        "target_base_env=%s target_family=%s",
+        observability["nvidia_profile_source"],
+        observability["nvidia_profile_key_env"],
+        observability["nvidia_profile_target_base_env"],
+        observability["nvidia_profile_target_family"],
+    )
+
+
+def _nvidia_credential_target_profile_observability() -> dict[str, str]:
+    """Return the selected profile's source identity without key material."""
+
+    profile = _resolve_nvidia_credential_target_profile()
+    _log_nvidia_profile_observability(profile)
+    return profile.observability()
+
+
+def _get_anthropic_adapter_nvidia_target_base() -> str:
+    return _resolve_nvidia_credential_target_profile().target_base
 
 
 def _nvidia_api_base_from_target_base(target_base: str) -> str:

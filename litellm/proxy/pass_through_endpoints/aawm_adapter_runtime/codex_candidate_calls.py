@@ -6846,10 +6846,12 @@ def _build_codex_nvidia_adapter_request_body(
     adapter_model: str,
     upstream_model: str,
     config: "_aawm_adapter_config.AnthropicCompletionAdapterConfig",
+    profile_observability: Optional[Payload] = None,
 ) -> Payload:
     request_body = dict(prepared_request_body)
     metadata = dict(request_body.get("litellm_metadata") or {})
     tags = list(metadata.get("tags") or [])
+    profile_observability = dict(profile_observability or {})
     for tag in (
         f"route:{config.route_family}",
         config.tag_prefix,
@@ -6868,6 +6870,7 @@ def _build_codex_nvidia_adapter_request_body(
                 "adapter_model": adapter_model,
                 "upstream_model": upstream_model,
                 "stream": bool(prepared_request_body.get("stream")),
+                **profile_observability,
             },
         }
     )
@@ -6882,6 +6885,7 @@ def _build_codex_nvidia_adapter_request_body(
             "codex_adapter_model": adapter_model,
             "codex_adapter_original_model": prepared_request_body.get("model"),
             "codex_adapter_target_endpoint": config.target_endpoint_label,
+            **profile_observability,
         }
     )
     request_body["litellm_metadata"] = metadata
@@ -6942,6 +6946,9 @@ async def _prepare_codex_nvidia_completion_adapter_route(
         adapter_model=canonical_model,
         upstream_model=upstream_model,
         config=config,
+        profile_observability=(
+            _nvidia_runtime._resolve_nvidia_credential_target_profile().observability()
+        ),
     )
     request_input = request_body.get("input", "")
     responses_api_request = cast(

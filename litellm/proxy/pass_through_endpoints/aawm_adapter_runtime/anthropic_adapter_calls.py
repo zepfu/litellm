@@ -102,6 +102,7 @@ if TYPE_CHECKING:
 _AAWM_REQUEST_BODY_WALK_MAX_DEPTH = 64
 
 _ANTHROPIC_ADAPTER_NVIDIA_API_KEY_ENV_VARS: tuple[str, ...] = (
+    "AAWM_NVIDIA_API_KEY",
     "NVIDIA_NIM_API_KEY",
     "NVIDIA_API_KEY",
 )
@@ -929,7 +930,11 @@ def _get_anthropic_adapter_openrouter_api_key() -> Optional[str]:
 
 
 def _get_anthropic_adapter_nvidia_api_key() -> Optional[str]:
-    return _get_first_secret_value(_ANTHROPIC_ADAPTER_NVIDIA_API_KEY_ENV_VARS)  # noqa: F821
+    from litellm.proxy.pass_through_endpoints.providers.nvidia.runtime import (
+        _get_anthropic_adapter_nvidia_api_key as _canonical_nvidia_api_key,
+    )
+
+    return _canonical_nvidia_api_key()
 
 
 def _get_anthropic_adapter_nvidia_target_base() -> str:

@@ -8,6 +8,7 @@ from typing import Any, Callable
 from litellm.proxy.pass_through_endpoints.providers.nvidia.runtime import (
     NvidiaMissingCredentialError,
     _nvidia_api_base_from_target_base,
+    _nvidia_credential_target_profile_observability,
 )
 
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
@@ -58,6 +59,7 @@ async def prepare_completion_route(
         span_metadata_extra={
             "upstream_stream": upstream_stream,
             "fake_stream": use_fake_stream,
+            **_nvidia_credential_target_profile_observability(),
         },
     )
     api_key = runtime.get_api_key()

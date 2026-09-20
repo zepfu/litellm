@@ -431,7 +431,8 @@ router_settings:
 | AAWM_NVIDIA_ADAPTER_INNER_MAX_RETRIES | Inner retry count for AAWM NVIDIA adapter upstream calls.
 | AAWM_NVIDIA_ADAPTER_MAX_RETRIES | Maximum retry attempts for AAWM NVIDIA adapter requests.
 | AAWM_NVIDIA_ADAPTER_REQUEST_TIMEOUT_SECONDS | Request timeout in seconds for AAWM NVIDIA adapter upstream calls.
-| AAWM_NVIDIA_API_BASE | Base URL for AAWM NVIDIA adapter requests.
+| AAWM_NVIDIA_API_BASE | Base URL for the AAWM NVIDIA adapter profile. Used only when `AAWM_NVIDIA_API_KEY` wins; never mixed with a NIM key or `NVIDIA_NIM_API_BASE`.
+| AAWM_NVIDIA_API_KEY | API key for the AAWM NVIDIA adapter profile. Highest-precedence NVIDIA credential namespace; pairs only with `AAWM_NVIDIA_API_BASE` or the canonical NVIDIA default.
 | AAWM_OPENAI_ADAPTER_CLAUDE_CONTEXT_CHAR_CAP | Character cap for Claude context transformed by the AAWM OpenAI adapter.
 | AAWM_OPENROUTER_ADAPTER_BACKOFF_SECONDS | Comma-separated retry backoff schedule for AAWM OpenRouter adapter requests.
 | AAWM_OPENROUTER_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS | Hidden retry budget in seconds for AAWM OpenRouter adapter transient recovery.
@@ -916,7 +917,8 @@ router_settings:
 | NO_REDOC | Flag to disable Redoc documentation
 | NO_PROXY | List of addresses to bypass proxy
 | NON_LLM_CONNECTION_TIMEOUT | Timeout in seconds for non-LLM service connections. Default is 15
-| NVIDIA_NIM_API_BASE | Base URL for NVIDIA NIM API requests.
+| NVIDIA_API_KEY | Default NVIDIA adapter profile key. Used only when `AAWM_NVIDIA_API_KEY` and `NVIDIA_NIM_API_KEY` are absent; always pairs with the canonical NVIDIA default target, never with `AAWM_NVIDIA_API_BASE` or `NVIDIA_NIM_API_BASE`.
+| NVIDIA_NIM_API_BASE | Base URL for the NVIDIA NIM adapter profile. Used only when `NVIDIA_NIM_API_KEY` wins after AAWM; never mixed with an AAWM key or `AAWM_NVIDIA_API_BASE`.
 | OAUTH_TOKEN_INFO_ENDPOINT | Endpoint for OAuth token info retrieval
 | OPENAI_BASE_URL | Base URL for OpenAI API
 | OPENAI_API_BASE | Base URL for OpenAI API. Default is https://api.openai.com/
