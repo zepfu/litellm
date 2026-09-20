@@ -49,6 +49,7 @@ from litellm.llms.openrouter.common_utils import (
     OpenRouterException,
     authoritative_openrouter_usage_cost,
     get_openrouter_auth_headers,
+    resolve_openrouter_complete_url,
 )
 
 
@@ -256,13 +257,8 @@ class OpenRouterImageGenerationConfig(BaseImageGenerationConfig):
         OpenRouter uses chat completions endpoint for image generation.
         Default: https://openrouter.ai/api/v1/chat/completions
         """
-        if api_base:
-            if not api_base.endswith("/chat/completions"):
-                api_base = api_base.rstrip("/")
-                return f"{api_base}/chat/completions"
-            return api_base
-
-        return "https://openrouter.ai/api/v1/chat/completions"
+        _ = api_key, model, optional_params, litellm_params, stream
+        return resolve_openrouter_complete_url("chat/completions", api_base=api_base)
 
     def validate_environment(
         self,

@@ -101,6 +101,11 @@ from litellm.llms.cohere.common_utils import CohereModelInfo
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.llms.openai.chat.gpt_5_transformation import OpenAIGPT5Config
 from litellm.llms.openai_like.json_loader import JSONProviderRegistry
+from litellm.llms.openrouter.common_utils import (
+    NATIVE_POLICY,
+    openrouter_api_base_from_target_base,
+    resolve_openrouter_credential_target,
+)
 from litellm.llms.vertex_ai.common_utils import (
     VertexAIModelRoute,
     get_vertex_ai_model_route,
@@ -3369,11 +3374,12 @@ def completion(  # type: ignore # noqa: PLR0915
                 provider_config=provider_config,
             )
         elif custom_llm_provider == "openrouter":
-            api_base = (
-                api_base
-                or litellm.api_base
-                or get_secret_str("OPENROUTER_API_BASE")
-                or "https://openrouter.ai/api/v1"
+            api_base = openrouter_api_base_from_target_base(
+                resolve_openrouter_credential_target(
+                    explicit_api_key=api_key,
+                    explicit_api_base=api_base,
+                    policy=NATIVE_POLICY,
+                ).target_base
             )
 
 
@@ -5149,11 +5155,12 @@ def embedding(  # noqa: PLR0915
                 shared_session=shared_session,
             )
         elif custom_llm_provider == "openrouter":
-            api_base = (
-                api_base
-                or litellm.api_base
-                or get_secret_str("OPENROUTER_API_BASE")
-                or "https://openrouter.ai/api/v1"
+            api_base = openrouter_api_base_from_target_base(
+                resolve_openrouter_credential_target(
+                    explicit_api_key=api_key,
+                    explicit_api_base=api_base,
+                    policy=NATIVE_POLICY,
+                ).target_base
             )
 
 

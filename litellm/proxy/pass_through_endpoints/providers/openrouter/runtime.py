@@ -20,13 +20,14 @@ from fastapi import Response
 from litellm.llms.anthropic.experimental_pass_through.providers.openrouter import (
     retry_transport as _anthropic_openrouter_retry_transport,
 )
+from litellm.llms.openrouter.common_utils import (
+    OpenRouterCredentialTargetProfile,
+    OpenRouterSecretHooks,
+    SERVICE_OWNED_POLICY,
+    resolve_openrouter_credential_target,
+)
 
 _RetryResultT = TypeVar("_RetryResultT")
-
-_ANTHROPIC_ADAPTER_OPENROUTER_API_KEY_ENV_VARS = (
-    "AAWM_OPENROUTER_API_KEY",
-    "OPENROUTER_API_KEY",
-)
 
 _HOST_FUNCTION_NAMES = (
     "_get_openrouter_adapter_rate_limit_key",
@@ -630,10 +631,24 @@ def _sanitize_credit_exhaustion(exc: Exception) -> None:
     raise sanitized from None
 
 
-def _get_openrouter_api_key() -> Optional[str]:
-    return _require_runtime().get_first_secret_value(
-        _ANTHROPIC_ADAPTER_OPENROUTER_API_KEY_ENV_VARS
+def _openrouter_secret_hooks() -> OpenRouterSecretHooks:
+    runtime = _require_runtime()
+    return OpenRouterSecretHooks(
+        get_secret_str=runtime.get_secret_str,
+        getenv=runtime.getenv,
+        clean_secret_string=runtime.clean_secret_string,
     )
+
+
+def _resolve_openrouter_service_profile() -> OpenRouterCredentialTargetProfile:
+    return resolve_openrouter_credential_target(
+        policy=SERVICE_OWNED_POLICY,
+        hooks=_openrouter_secret_hooks(),
+    )
+
+
+def _get_openrouter_api_key() -> Optional[str]:
+    return _resolve_openrouter_service_profile().api_key
 
 
 def _get_anthropic_adapter_openrouter_api_key() -> Optional[str]:
@@ -641,14 +656,7 @@ def _get_anthropic_adapter_openrouter_api_key() -> Optional[str]:
 
 
 def _get_openrouter_target_base() -> str:
-    runtime = _require_runtime()
-    cleaned = (
-        runtime.clean_secret_string(runtime.getenv("OPENROUTER_API_BASE"))
-        or "https://openrouter.ai/api"
-    ).rstrip("/")
-    if cleaned.endswith("/api/v1"):
-        return cleaned[: -len("/v1")]
-    return cleaned
+    return _resolve_openrouter_service_profile().target_base
 
 
 def _get_anthropic_adapter_openrouter_target_base() -> str:

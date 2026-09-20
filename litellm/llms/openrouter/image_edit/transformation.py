@@ -54,8 +54,8 @@ from litellm.llms.openrouter.common_utils import (
     OpenRouterException,
     authoritative_openrouter_usage_cost,
     get_openrouter_auth_headers,
+    resolve_openrouter_complete_url,
 )
-from litellm.secret_managers.main import get_secret_str
 from litellm.types.images.main import ImageEditOptionalRequestParams
 from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import (
@@ -145,15 +145,8 @@ class OpenRouterImageEditConfig(BaseImageEditConfig):
         api_base: Optional[str],
         litellm_params: dict,
     ) -> str:
-        base_url = (
-            api_base
-            or get_secret_str("OPENROUTER_API_BASE")
-            or "https://openrouter.ai/api/v1"
-        )
-        base_url = base_url.rstrip("/")
-        if not base_url.endswith("/chat/completions"):
-            return f"{base_url}/chat/completions"
-        return base_url
+        _ = model, litellm_params
+        return resolve_openrouter_complete_url("chat/completions", api_base=api_base)
 
     def transform_image_edit_request(
         self,

@@ -23,6 +23,7 @@ from ..common_utils import (
     OpenRouterException,
     authoritative_openrouter_usage_cost,
     get_openrouter_auth_headers,
+    resolve_openrouter_complete_url,
 )
 
 
@@ -51,13 +52,12 @@ class OpenrouterConfig(OpenAIGPTConfig):
         api_key: Optional[str] = None,
         api_base: Optional[str] = None,
     ) -> dict:
-        """Resolve OpenRouter auth headers with strict caller-precedence.
+        """Resolve OpenRouter auth headers from the service-owned profile.
 
         Delegates to the shared ``get_openrouter_auth_headers`` helper which:
-        - preserves a valid caller-supplied Authorization header (case-insensitive
-          lookup, original casing retained) instead of overwriting with a resolved key;
-        - raises ``OpenRouterConfigError`` for malformed caller auth (no fallback);
-        - resolves keys from the shared precedence chain when no caller auth is present;
+        - rejects duplicate Authorization header names;
+        - never admits caller Authorization as a credential;
+        - resolves keys from the shared AAWM-first profile;
         - raises ``OpenRouterConfigError`` when no credential source is available.
 
         Content-Type behavior matches the inherited OpenAI implementation.
@@ -82,6 +82,18 @@ class OpenrouterConfig(OpenAIGPTConfig):
             validated_headers["Content-Type"] = "application/json"
 
         return validated_headers
+
+    def get_complete_url(
+        self,
+        api_base: Optional[str],
+        api_key: Optional[str],
+        model: str,
+        optional_params: dict,
+        litellm_params: dict,
+        stream: Optional[bool] = None,
+    ) -> str:
+        _ = api_key, model, optional_params, litellm_params, stream
+        return resolve_openrouter_complete_url("chat/completions", api_base=api_base)
 
     def get_supported_openai_params(self, model: str) -> list:
         """

@@ -19,6 +19,7 @@ from ..common_utils import (
     OpenRouterException,
     authoritative_openrouter_usage_cost,
     get_openrouter_auth_headers,
+    resolve_openrouter_complete_url,
 )
 
 if TYPE_CHECKING:
@@ -68,16 +69,14 @@ class OpenrouterEmbeddingConfig(BaseEmbeddingConfig):
         # Merge base + caller headers (caller wins for non-auth keys).
         merged_headers = {**openrouter_headers, **headers}
 
-        # Resolve auth via the shared helper. It raises OpenRouterConfigError
-        # for a malformed caller Authorization header or when no key source is
-        # available, so failures surface here before HTTP dispatch.
+        # Resolve auth via the shared helper. Caller Authorization is stripped
+        # and never admitted; the service-owned profile supplies the credential.
         auth_headers = get_openrouter_auth_headers(
             api_key=api_key, extra_headers=headers
         )
 
         # Drop any pre-existing authorization header (any casing) and apply the
-        # definitively resolved auth header, preserving caller casing when the
-        # caller supplied a valid Authorization header.
+        # definitively resolved service Authorization header.
         merged_headers = {
             k: v for k, v in merged_headers.items() if k.lower() != "authorization"
         }
@@ -94,20 +93,8 @@ class OpenrouterEmbeddingConfig(BaseEmbeddingConfig):
         litellm_params: dict,
         stream: Optional[bool] = None,
     ) -> str:
-        """
-        Get the complete URL for OpenRouter Embedding API endpoint.
-        """
-        if api_base:
-            api_base = api_base.rstrip("/")
-        else:
-            api_base = "https://openrouter.ai/api/v1"
-
-        if api_base.endswith("/embeddings"):
-            return api_base
-        if api_base.endswith("/api"):
-            api_base = f"{api_base}/v1"
-
-        return f"{api_base}/embeddings"
+        _ = api_key, model, optional_params, litellm_params, stream
+        return resolve_openrouter_complete_url("embeddings", api_base=api_base)
 
     def transform_embedding_request(
         self,

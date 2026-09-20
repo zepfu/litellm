@@ -5,10 +5,15 @@ import httpx
 import litellm
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.llms.base_llm.rerank.transformation import BaseRerankConfig
-from litellm.secret_managers.main import get_secret, get_secret_str
+from litellm.secret_managers.main import get_secret
 from litellm.types.rerank import OptionalRerankParams, RerankRequest, RerankResponse
 
-from ..common_utils import OpenRouterException, authoritative_openrouter_usage_cost
+from ..common_utils import (
+    OpenRouterException,
+    apply_openrouter_auth_headers,
+    authoritative_openrouter_usage_cost,
+    resolve_openrouter_complete_url,
+)
 
 
 class OpenRouterRerankConfig(BaseRerankConfig):
@@ -21,16 +26,7 @@ class OpenRouterRerankConfig(BaseRerankConfig):
 
     @staticmethod
     def _normalize_api_base(api_base: Optional[str]) -> str:
-        if api_base:
-            api_base = api_base.rstrip("/")
-        else:
-            api_base = "https://openrouter.ai/api/v1"
-
-        if api_base.endswith("/rerank"):
-            return api_base
-        if api_base.endswith("/api"):
-            api_base = f"{api_base}/v1"
-        return f"{api_base}/rerank"
+        return resolve_openrouter_complete_url("rerank", api_base=api_base)
 
     def get_complete_url(
         self,
@@ -38,6 +34,7 @@ class OpenRouterRerankConfig(BaseRerankConfig):
         model: str,
         optional_params: Optional[dict] = None,
     ) -> str:
+        _ = model, optional_params
         return self._normalize_api_base(api_base)
 
     def get_supported_cohere_rerank_params(self, model: str) -> list:
@@ -84,28 +81,14 @@ class OpenRouterRerankConfig(BaseRerankConfig):
         api_key: Optional[str] = None,
         optional_params: Optional[dict] = None,
     ) -> dict:
-        api_key = (
-            api_key
-            or litellm.api_key
-            or litellm.openrouter_key
-            or get_secret_str("OPENROUTER_API_KEY")
-            or get_secret_str("OR_API_KEY")
-            or get_secret_str("AAWM_OPENROUTER_API_KEY")
-        )
-        if not api_key:
-            raise ValueError(
-                "OpenRouter API key is required. Set OPENROUTER_API_KEY, "
-                "OR_API_KEY, AAWM_OPENROUTER_API_KEY, or pass api_key."
-            )
-
         default_headers = {
-            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "accept": "application/json",
             "HTTP-Referer": get_secret("OR_SITE_URL") or "https://litellm.ai",
             "X-Title": get_secret("OR_APP_NAME") or "liteLLM",
         }
-        return {**default_headers, **headers}
+        merged_headers = {**default_headers, **headers}
+        return apply_openrouter_auth_headers(merged_headers, api_key=api_key)
 
     def transform_rerank_request(
         self,
