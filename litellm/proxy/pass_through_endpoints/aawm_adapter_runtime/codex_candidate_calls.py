@@ -51,6 +51,7 @@ from litellm.secret_managers.credential_error_sanitizer import (
 )
 
 _OPENCODE_GO_ALIAS_CANDIDATE_TIMEOUT_SECONDS = 30.0
+_OPENCODE_GO_NONSEMANTIC_TOOL_CHOICE = frozenset({"auto", "none"})
 _NOUS_TOOL_CHOICE_ENUMS = frozenset({"auto", "none", "required"})
 _CURSOR_REPLAY_TTL_SECONDS = 600.0
 _CURSOR_REPLAY_MAX_SIZE = 256
@@ -2173,8 +2174,13 @@ def install(
         ("_opencode_go_tool_types", _opencode_go_tool_types),
         ("_extract_opencode_go_offending_tool_index", _extract_opencode_go_offending_tool_index),
         ("_sanitize_opencode_go_error_text", _sanitize_opencode_go_error_text),
+        (
+            "_reject_opencode_go_lossy_capability_adaptation_if_needed",
+            _reject_opencode_go_lossy_capability_adaptation_if_needed,
+        ),
         ("_OPENCODE_GO_CHAT_COMPLETIONS_ROUTE", _OPENCODE_GO_CHAT_COMPLETIONS_ROUTE),
         ("_OPENCODE_GO_TOOLS_INDEX_RE", _OPENCODE_GO_TOOLS_INDEX_RE),
+        ("_OPENCODE_GO_NONSEMANTIC_TOOL_CHOICE", _OPENCODE_GO_NONSEMANTIC_TOOL_CHOICE),
         ("_NOUS_TOOL_CHOICE_ENUMS", _NOUS_TOOL_CHOICE_ENUMS),
         ("_OPENCODE_ZEN_CREDENTIAL_FAMILY", _OPENCODE_ZEN_CREDENTIAL_FAMILY),
         ("_OPENCODE_ZEN_TARGET_FAMILY", _OPENCODE_ZEN_TARGET_FAMILY),
@@ -9343,6 +9349,121 @@ def _sanitize_opencode_go_error_text(message: Any, *, api_key: Any = None) -> st
     return sanitize_credential_error_message(text, limit=512)
 
 
+def _opencode_go_bounded_drop_types(items: Any) -> list[str]:
+    """Return unique dropped item types without names, arguments, or bodies."""
+    bounded: list[str] = []
+    seen: set[str] = set()
+    if not isinstance(items, list):
+        return bounded
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if not isinstance(item_type, str):
+            continue
+        normalized = item_type.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        bounded.append(normalized)
+    return bounded
+
+
+def _opencode_go_required_tool_choice_removed(removed_tool_choice: Any) -> bool:
+    """True when dropped tool_choice carried required or targeted semantics."""
+    if removed_tool_choice is None:
+        return False
+    if isinstance(removed_tool_choice, str):
+        normalized = removed_tool_choice.strip().lower()
+        if not normalized:
+            return False
+        return normalized not in _OPENCODE_GO_NONSEMANTIC_TOOL_CHOICE
+    return True
+
+
+def _opencode_go_semantic_adaptation_drop_reasons(
+    *,
+    unsupported_hosted_tools: Any,
+    unsupported_input_items: Any,
+    removed_tool_choice: Any,
+) -> list[str]:
+    """Classify lossy Go drops. Unknown undropped annotations stay non-fatal."""
+    reasons: list[str] = []
+    if isinstance(unsupported_hosted_tools, list) and unsupported_hosted_tools:
+        reasons.append("hosted_tools")
+    if isinstance(unsupported_input_items, list) and unsupported_input_items:
+        reasons.append("input_items")
+    if _opencode_go_required_tool_choice_removed(removed_tool_choice):
+        reasons.append("tool_choice")
+    return reasons
+
+
+def _reject_opencode_go_lossy_capability_adaptation_if_needed(
+    *,
+    adapter_model: str,
+    use_alias_candidate_probe: bool,
+    unsupported_hosted_tools: Any,
+    unsupported_input_items: Any,
+    removed_tool_choice: Any,
+) -> None:
+    """Fail closed on meaning-changing Go drops before credential or transport."""
+    reasons = _opencode_go_semantic_adaptation_drop_reasons(
+        unsupported_hosted_tools=unsupported_hosted_tools,
+        unsupported_input_items=unsupported_input_items,
+        removed_tool_choice=removed_tool_choice,
+    )
+    if not reasons:
+        return
+
+    from litellm.proxy._types import ProxyException
+
+    hosted_tool_types = _opencode_go_bounded_drop_types(unsupported_hosted_tools)
+    input_item_types = _opencode_go_bounded_drop_types(unsupported_input_items)
+    dropped_summary = ", ".join(reasons)
+    if use_alias_candidate_probe:
+        message = (
+            "OpenCode Go candidate is ineligible: request adaptation would "
+            f"silently drop {dropped_summary}; model={adapter_model}"
+        )
+    else:
+        message = (
+            "OpenCode Go request is unsupported: request adaptation would "
+            f"silently drop {dropped_summary}; model={adapter_model}"
+        )
+    proxy_exc = ProxyException(
+        message=message,
+        type="invalid_request_error",
+        param="model",
+        code=400,
+    )
+    setattr(proxy_exc, "status_code", 400)
+    setattr(proxy_exc, "candidate_status", "ineligible")
+    setattr(proxy_exc, "ineligibility_reason", "unsupported")
+    setattr(proxy_exc, "failure_phase", "candidate_preflight")
+    setattr(proxy_exc, "attempted_provider_call", False)
+    setattr(
+        proxy_exc,
+        "detail",
+        {
+            "error": {
+                "message": message,
+                "code": "aawm_codex_auto_agent_candidate_ineligible",
+            },
+            "failure_phase": "candidate_preflight",
+            "attempted_provider_call": False,
+            "dropped": {
+                "reasons": reasons,
+                "hosted_tool_types": hosted_tool_types,
+                "input_item_types": input_item_types,
+                "required_tool_choice": _opencode_go_required_tool_choice_removed(
+                    removed_tool_choice
+                ),
+            },
+        },
+    )
+    raise proxy_exc
+
+
 def _build_opencode_go_provider_rejection_evidence(
     *,
     target_url: Any,
@@ -9597,6 +9718,13 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
             adapted_request_body,
             _removed_tool_choice,
         ) = _drop_tool_choice_without_tools_from_request_body(adapted_request_body)
+        _reject_opencode_go_lossy_capability_adaptation_if_needed(
+            adapter_model=adapter_model,
+            use_alias_candidate_probe=use_alias_candidate_probe,
+            unsupported_hosted_tools=_unsupported_hosted_tools,
+            unsupported_input_items=_unsupported_input_items,
+            removed_tool_choice=_removed_tool_choice,
+        )
         litellm_metadata = dict(canonical_request_body.get("litellm_metadata") or {})
         target_base_url = _get_opencode_go_target_base()
         target_url = _join_opencode_zen_passthrough_url(
@@ -9892,10 +10020,11 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
     # Restore dispatchable tool identities before the chat-completion
     # transformation. Match the Cohere/OpenRouter Responses prep order:
     # adapt custom tools, flatten namespace tools, apply description
-    # patches, drop unsupported hosted tools and input items, then clean
-    # incompatible tool_choice. Console Go chat-completions accept only
-    # function tools. Retain the canonical (namespaced/custom) body so
-    # tool_call_restore can reconstruct Codex custom_tool_call items.
+    # patches, then inspect hosted-tool / input-item / required tool-choice
+    # drops and reject before credential or transport work. Console Go
+    # chat-completions accept only function tools. Retain the canonical
+    # (namespaced/custom) body so tool_call_restore can reconstruct Codex
+    # custom_tool_call items.
     canonical_request_body = request_body
     (
         request_body,
@@ -9921,6 +10050,13 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
         request_body,
         _removed_tool_choice,
     ) = _drop_tool_choice_without_tools_from_request_body(request_body)
+    _reject_opencode_go_lossy_capability_adaptation_if_needed(
+        adapter_model=adapter_model,
+        use_alias_candidate_probe=use_alias_candidate_probe,
+        unsupported_hosted_tools=_unsupported_hosted_tools,
+        unsupported_input_items=_unsupported_input_items,
+        removed_tool_choice=_removed_tool_choice,
+    )
     request_input = request_body.get("input", "")
     responses_api_request = {
         key: value
