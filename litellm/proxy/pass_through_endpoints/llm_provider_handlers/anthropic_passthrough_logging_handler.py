@@ -11,6 +11,10 @@ from litellm.llms.anthropic import get_anthropic_config
 from litellm.llms.anthropic.chat.handler import (
     ModelResponseIterator as AnthropicModelResponseIterator,
 )
+from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen.constants import (
+    _OPENCODE_ZEN_FREE_MODELS,
+    _OPENCODE_ZEN_PROVIDER,
+)
 from litellm.proxy._types import PassThroughEndpointLoggingTypedDict
 from litellm.proxy.auth.auth_utils import get_end_user_id_from_request_body
 from litellm.proxy.pass_through_endpoints.llm_provider_handlers.base_passthrough_logging_handler import (
@@ -28,6 +32,20 @@ if TYPE_CHECKING:
 else:
     PassThroughEndpointLogging = Any
     EndpointType = Any
+
+
+def _is_known_free_opencode_zen_model(
+    model: Any,
+    custom_llm_provider: Optional[str],
+) -> bool:
+    if custom_llm_provider != _OPENCODE_ZEN_PROVIDER or not isinstance(model, str):
+        return False
+    stem = model.strip()
+    for prefix in (f"{_OPENCODE_ZEN_PROVIDER}/", "opencode/"):
+        if stem.startswith(prefix):
+            stem = stem[len(prefix) :]
+            break
+    return stem in _OPENCODE_ZEN_FREE_MODELS
 
 
 class AnthropicPassthroughLoggingHandler:
@@ -131,28 +149,34 @@ class AnthropicPassthroughLoggingHandler:
             if custom_llm_provider and not model.startswith(f"{custom_llm_provider}/"):
                 model_for_cost = f"{custom_llm_provider}/{model}"
 
-            try:
-                response_cost = litellm.completion_cost(
-                    completion_response=litellm_model_response,
-                    model=model_for_cost,
-                    custom_llm_provider=cost_llm_provider,
-                )
-            except Exception as exc:
-                if custom_llm_provider == "opencode_zen":
-                    response_cost = AnthropicPassthroughLoggingHandler._opencode_zen_cost_fallback(
-                        litellm_model_response=litellm_model_response,
-                        model=model,
-                        original_exception=exc,
+            if _is_known_free_opencode_zen_model(model, custom_llm_provider):
+                # Known-free OpenCode Zen models cost exactly 0.0. Key that
+                # attribution from the selected Zen provider plus the
+                # authoritative free-model set, and reuse this logging object.
+                response_cost = 0.0
+            else:
+                try:
+                    response_cost = litellm.completion_cost(
+                        completion_response=litellm_model_response,
+                        model=model_for_cost,
+                        custom_llm_provider=cost_llm_provider,
                     )
-                elif cost_llm_provider == litellm.LlmProviders.ANTHROPIC.value:
-                    verbose_proxy_logger.debug(
-                        "Anthropic passthrough cost unavailable for model=%s; recording zero cost and preserving usage: %s",
-                        model,
-                        str(exc),
-                    )
-                    response_cost = 0.0
-                else:
-                    raise
+                except Exception as exc:
+                    if custom_llm_provider == "opencode_zen":
+                        response_cost = AnthropicPassthroughLoggingHandler._opencode_zen_cost_fallback(
+                            litellm_model_response=litellm_model_response,
+                            model=model,
+                            original_exception=exc,
+                        )
+                    elif cost_llm_provider == litellm.LlmProviders.ANTHROPIC.value:
+                        verbose_proxy_logger.debug(
+                            "Anthropic passthrough cost unavailable for model=%s; recording zero cost and preserving usage: %s",
+                            model,
+                            str(exc),
+                        )
+                        response_cost = 0.0
+                    else:
+                        raise
 
             apply_passthrough_logging_contract(
                 litellm_response=litellm_model_response,

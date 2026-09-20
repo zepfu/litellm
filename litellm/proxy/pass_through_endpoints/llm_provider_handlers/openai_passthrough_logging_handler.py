@@ -22,6 +22,10 @@ from litellm.litellm_core_utils.litellm_logging import (
 from litellm.completion_extras.litellm_responses_transformation.transformation import (
     LiteLLMResponsesTransformationHandler,
 )
+from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen.constants import (
+    _OPENCODE_ZEN_FREE_MODELS,
+    _OPENCODE_ZEN_PROVIDER,
+)
 from litellm.llms.openai.openai import OpenAIConfig
 from litellm.llms.openai.openai import OpenAIConfig as OpenAIConfigType
 from litellm.responses.utils import ResponseAPILoggingUtils
@@ -62,6 +66,20 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
 _MODEL_PRICE_MAP_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
 _MODEL_PRICE_DISK_MISS_CACHE: set[str] = set()
 _MODEL_PRICE_DISK_MISS_CACHE_MAXSIZE = 4096
+
+
+def _is_known_free_opencode_zen_model(
+    model: Any,
+    custom_llm_provider: Optional[str],
+) -> bool:
+    if custom_llm_provider != _OPENCODE_ZEN_PROVIDER or not isinstance(model, str):
+        return False
+    stem = model.strip()
+    for prefix in (f"{_OPENCODE_ZEN_PROVIDER}/", "opencode/"):
+        if stem.startswith(prefix):
+            stem = stem[len(prefix) :]
+            break
+    return stem in _OPENCODE_ZEN_FREE_MODELS
 
 
 class _ResponsesSSEStateTracker:
@@ -1453,6 +1471,11 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         custom_llm_provider: Optional[str],
         call_type: Optional[str] = None,
     ) -> Optional[float]:
+        if _is_known_free_opencode_zen_model(model, custom_llm_provider):
+            # Known-free OpenCode Zen models cost exactly 0.0. Key that
+            # attribution from the selected Zen provider plus the
+            # authoritative free-model set, and reuse this logging object.
+            return 0.0
         if custom_llm_provider == "openrouter" and is_openrouter_free_model(model):
             return 0.0
         try:

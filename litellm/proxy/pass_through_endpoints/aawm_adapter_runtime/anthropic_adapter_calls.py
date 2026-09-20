@@ -1503,6 +1503,14 @@ def _finalize_anthropic_completion_adapter_response(
     return response
 
 
+def _opencode_zen_known_free_models() -> frozenset:
+    from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen.constants import (
+        _OPENCODE_ZEN_FREE_MODELS,
+    )
+
+    return _OPENCODE_ZEN_FREE_MODELS
+
+
 def _build_anthropic_completion_adapter_handler_call_kwargs(
     *,
     prepared_request_body: Payload,
@@ -1585,6 +1593,7 @@ async def _perform_anthropic_completion_adapter_messages_call(  # noqa: PLR0915
     extra_handler_kwargs: Optional[Payload] = None,
     completion_stream_normalizer: Optional[Callable[[Any], Any]] = None,
     managed_xai_oauth_request: bool = False,
+    use_alias_candidate_probe: bool = False,
 ) -> Response:
     """Shared completion-adapter messages handler + response branch (RR-054 #9)."""
     from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
@@ -1620,6 +1629,27 @@ async def _perform_anthropic_completion_adapter_messages_call(  # noqa: PLR0915
         handler_extra_kwargs.update(extra_handler_kwargs)
     if managed_xai_oauth_request:
         handler_extra_kwargs[MANAGED_XAI_SEND_REQUEST_KWARG] = request
+
+    # OC-018: known-free OpenCode Zen models (direct and alias success, never
+    # alias probes) cost exactly 0.0. Pre-seed the existing acompletion
+    # logging object so stream and non-stream success preserve the zero,
+    # mirroring _prepare_opencode_zen_known_free_logging on the Codex route.
+    is_opencode_zen_known_free_direct = (
+        not use_alias_candidate_probe
+        and getattr(config, "route_family", None)
+        == _aawm_adapter_config.OPENCODE_ZEN_COMPLETION.route_family
+        and isinstance(adapter_model, str)
+        and adapter_model in _opencode_zen_known_free_models()
+    )
+    if is_opencode_zen_known_free_direct:
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
+            _prepare_opencode_zen_known_free_logging,
+        )
+
+        handler_extra_kwargs = _prepare_opencode_zen_known_free_logging(
+            completion_call_kwargs=handler_extra_kwargs,
+            is_known_free_direct=True,
+        )
 
     handler_call_kwargs = _build_anthropic_completion_adapter_handler_call_kwargs(
         prepared_request_body=prepared_request_body,
@@ -1669,6 +1699,14 @@ async def _perform_anthropic_completion_adapter_messages_call(  # noqa: PLR0915
                 tool_name_mapping=tool_name_mapping,
             )
         completion_response = await litellm.acompletion(**completion_kwargs)
+        if is_opencode_zen_known_free_direct:
+            # Supply explicit response_cost so the streaming success path
+            # records 0.0: CustomStreamWrapper.chunk_creator merges wrapper
+            # hidden params into every chunk, and _response_cost_calculator
+            # honors a non-None hidden response_cost instead of recomputing.
+            _hidden = getattr(completion_response, "_hidden_params", None)
+            if isinstance(_hidden, dict):
+                _hidden["response_cost"] = 0.0
         return LiteLLMMessagesToCompletionTransformationHandler._transform_completion_response(
             completion_response,
             model=handler_call_kwargs["model"],

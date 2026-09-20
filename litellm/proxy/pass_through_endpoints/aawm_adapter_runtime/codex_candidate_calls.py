@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from types import FunctionType
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
+import litellm
 from litellm._logging import verbose_aawm_route_logger
 from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen.constants import (
     _OPENCODE_GO_CREDENTIAL_FAMILY,

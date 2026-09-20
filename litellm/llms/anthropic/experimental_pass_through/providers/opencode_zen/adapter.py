@@ -212,6 +212,7 @@ async def prepare_completion_route(
         perform_kwargs={
             "custom_llm_provider": runtime.completion_provider,
             "model_for_upstream": adapter_model,
+            "use_alias_candidate_probe": use_alias_candidate_probe,
         },
         handle_exception=handle_exception,
     )
