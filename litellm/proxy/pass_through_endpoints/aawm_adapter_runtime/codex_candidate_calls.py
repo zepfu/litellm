@@ -9912,8 +9912,13 @@ async def _stream_opencode_go_chat_completions_response(  # noqa: PLR0915
     except BaseException:
         await close_opencode_go_stream_resource(chunk_adapter)
         raise
-    if not peek.buffered_chunks:
-        await close_opencode_go_stream_resource(peek.response)
+    peeked_first_event = bool(peek.buffered_chunks) or peek.stop_reason in {
+        "byte_limit",
+        "chunk_limit",
+        "pending_stream",
+    }
+    if not peeked_first_event:
+        await close_opencode_go_stream_resource(chunk_adapter)
         if use_alias_candidate_probe:
             _raise_opencode_go_alias_candidate_upstream_timeout(
                 asyncio.TimeoutError("OpenCode Go stream produced no first event")
