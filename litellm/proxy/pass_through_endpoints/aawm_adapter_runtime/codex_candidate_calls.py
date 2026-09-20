@@ -55,6 +55,7 @@ from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.opencode_
     extract_opencode_go_status_code,
 )
 
+# First-event / connect probe budget. Not a total-generation ceiling (OC-021).
 _OPENCODE_GO_ALIAS_CANDIDATE_TIMEOUT_SECONDS = 30.0
 _OPENCODE_GO_NONSEMANTIC_TOOL_CHOICE = frozenset({"auto", "none"})
 _NOUS_TOOL_CHOICE_ENUMS = frozenset({"auto", "none", "required"})
@@ -2050,6 +2051,7 @@ _HOST_FUNCTION_NAMES = (
     # OpenCode
     "_handle_codex_opencode_zen_adapter_route",
     "_handle_codex_opencode_go_adapter_route",
+    "_stream_opencode_go_chat_completions_response",
     "_build_opencode_go_provider_rejection_evidence",
     "_record_opencode_go_provider_rejection_evidence",
     "_raise_opencode_go_alias_candidate_upstream_timeout",
@@ -9787,13 +9789,151 @@ def _record_opencode_go_provider_rejection_evidence(
     return recorded
 
 
+async def _stream_opencode_go_chat_completions_response(  # noqa: PLR0915
+    *,
+    completion_response: Any,
+    adapter_model: str,
+    request_input: Any,
+    responses_api_request: Any,
+    litellm_metadata: dict[str, Any],
+    canonical_request_body: dict[str, Any],
+    request: Request,
+    target_url: str,
+    rollup_kwargs: dict[str, Any],
+    use_alias_candidate_probe: bool,
+    first_event_timeout_seconds: float,
+) -> Response:
+    """Peek one Go Chat Completions chunk, then stream Responses SSE incrementally."""
+    import asyncio
+
+    from fastapi.responses import StreamingResponse
+
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.opencode_go_streaming import (
+        OPENCODE_GO_FIRST_EVENT_PEEK_MAX_BYTES,
+        OPENCODE_GO_FIRST_EVENT_PEEK_MAX_CHUNKS,
+        OpenCodeGoChatCompletionsToResponsesAdapter,
+        OpenCodeGoUpstreamChunkAdapter,
+        close_opencode_go_stream_resource,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
+        _responses_sse_from_iterator,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        streaming as go_alias_streaming,
+    )
+
+    chunk_adapter = OpenCodeGoUpstreamChunkAdapter(completion_response)
+    try:
+        await asyncio.wait_for(
+            chunk_adapter.prime_first_chunk(),
+            timeout=first_event_timeout_seconds,
+        )
+    except BaseException:
+        await close_opencode_go_stream_resource(chunk_adapter)
+        raise
+
+    if chunk_adapter.exhausted_before_first_chunk:
+        await close_opencode_go_stream_resource(chunk_adapter)
+        raise_empty = globals().get("_raise_codex_auto_agent_empty_success_response")
+        if callable(raise_empty):
+            diagnostic = globals().get("_build_empty_success_responses_diagnostic")
+            if not callable(diagnostic):
+                from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.stream_collect import (
+                    _build_empty_success_responses_diagnostic as diagnostic,
+                )
+            raise_empty.__globals__.setdefault(
+                "_build_empty_success_responses_diagnostic",
+                diagnostic,
+            )
+            raise_empty(
+                response_body={
+                    "id": "resp_opencode_go",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [],
+                    "model": adapter_model,
+                },
+                adapter_model=adapter_model,
+                adapter="codex_opencode_go_adapter",
+                adapter_label="OpenCode Go",
+            )
+        raise RuntimeError("OpenCode Go stream ended before the first chunk")
+
+    responses_adapter = OpenCodeGoChatCompletionsToResponsesAdapter(
+        model=adapter_model,
+        litellm_custom_stream_wrapper=chunk_adapter,
+        request_input=request_input,
+        responses_api_request=responses_api_request,
+        litellm_metadata=litellm_metadata,
+    )
+    stream_response = StreamingResponse(
+        _responses_sse_from_iterator(
+            responses_adapter,
+            request_body=canonical_request_body,
+        ),
+        media_type="text/event-stream",
+    )
+    go_alias_streaming._bind_stream_cleanup(
+        stream_response,
+        chunk_adapter.aclose,
+    )
+    intake_builder = globals().get("_build_malformed_tool_call_intake_context")
+    intake_context = (
+        intake_builder(
+            request,
+            canonical_request_body,
+            adapter="codex_opencode_go_adapter",
+            upstream_url=target_url,
+            provider="opencode_go",
+        )
+        if callable(intake_builder)
+        else None
+    )
+    bind_timeout = globals().get("_bind_responses_stream_timeout_terminalizer")
+    if callable(bind_timeout):
+        stream_response = bind_timeout(
+            stream_response,
+            adapter_model=adapter_model,
+            adapter_label="OpenCode Go",
+            provider="opencode_go",
+            intake_context=intake_context,
+            rollup_kwargs=rollup_kwargs,
+        )
+    setattr(stream_response, "_aawm_session_owner_promotion_deferred", True)
+    try:
+        peek = await go_alias_streaming.peek_streaming_response(
+            stream_response,
+            max_chunks=OPENCODE_GO_FIRST_EVENT_PEEK_MAX_CHUNKS,
+            max_bytes=OPENCODE_GO_FIRST_EVENT_PEEK_MAX_BYTES,
+            terminalizer=go_alias_streaming._get_stream_timeout_terminalizer(
+                stream_response
+            ),
+        )
+    except BaseException:
+        await close_opencode_go_stream_resource(chunk_adapter)
+        raise
+    if not peek.buffered_chunks:
+        await close_opencode_go_stream_resource(peek.response)
+        if use_alias_candidate_probe:
+            _raise_opencode_go_alias_candidate_upstream_timeout(
+                asyncio.TimeoutError("OpenCode Go stream produced no first event")
+            )
+        raise RuntimeError("OpenCode Go stream produced no first event")
+    setattr(peek.response, "_aawm_session_owner_promotion_deferred", True)
+    return _record_adapted_completed_route_rollup_after_stream(
+        peek.response,
+        rollup_kwargs,
+        adapter_label="OpenCode Go",
+    )
+
+
 def _raise_opencode_go_alias_candidate_upstream_timeout(
     exc: Exception,
 ) -> None:
     classification = classify_opencode_go_failure(
         exc=exc,
         custom_llm_provider="opencode_go",
-        local_timeout=isinstance(exc, TimeoutError),
+        local_timeout=isinstance(exc, (TimeoutError, httpx.TimeoutException)),
     )
     if classification is not None:
         apply_opencode_go_failure_classification(exc, classification)
@@ -9813,15 +9953,14 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
     import asyncio
 
     import litellm
+    from fastapi.responses import StreamingResponse
     from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen.constants import (
         _OPENCODE_GO_FREE_MODELS,
     )
-    from fastapi.responses import StreamingResponse
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.request_build import (
         _is_empty_success_responses_body as _go_is_empty_success_responses_body,
     )
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
-        _responses_sse_from_repaired_response_body,
         _serialize_responses_adapter_response as _serialize_go_response,
     )
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.stream_collect import (
@@ -10084,7 +10223,7 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
                 api_key=api_key,
                 local_timeout=(
                     use_alias_candidate_probe
-                    and isinstance(exc, asyncio.TimeoutError)
+                    and isinstance(exc, (asyncio.TimeoutError, httpx.TimeoutException))
                 ),
             )
             _record_opencode_go_provider_rejection_evidence(request, evidence)
@@ -10314,12 +10453,13 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
     }
     litellm_metadata = dict(request_body.get("litellm_metadata") or {})
     litellm_metadata["caller_managed_hidden_retry"] = True
-    # Console Go chat-completions must be complete-upstream. Forwarding
-    # client stream=True into acompletion returns a stream wrapper; the
-    # Responses transform then emits output:[] / output_tokens=0 and the
-    # adapter cools ox-alpha-free as empty success. Client stream is
-    # reconstructed from the completed body below.
     client_requested_stream = bool(request_body.get("stream"))
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.opencode_go_streaming import (
+        OPENCODE_GO_CONNECT_TIMEOUT_SECONDS,
+        build_opencode_go_stream_timeout,
+        close_opencode_go_stream_resource,
+    )
+
     go_retained_history = await resolve_opencode_go_retained_history(
         previous_response_id=extract_opencode_go_previous_response_id(
             responses_api_request
@@ -10335,11 +10475,11 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
         input=request_input,
         responses_api_request=responses_api_request,
         custom_llm_provider="openai",
-        stream=False,
+        stream=True if client_requested_stream else False,
         metadata=litellm_metadata,
     )
     completion_kwargs["model"] = adapter_model
-    completion_kwargs["stream"] = False
+    completion_kwargs["stream"] = bool(client_requested_stream)
     target_base_url = _get_opencode_go_target_base()
     target_url = _join_opencode_zen_passthrough_url(
         base_target_url=target_base_url,
@@ -10382,8 +10522,12 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
         "api_base": f"{target_base_url.rstrip('/')}/v1",
         "litellm_metadata": litellm_metadata,
         "extra_headers": custom_headers,
+        "timeout": build_opencode_go_stream_timeout(),
+        "shared_session": _get_proxy_shared_aiohttp_session(),
     }
     perform = globals().get("_perform_opencode_zen_completion_call")
+    stream_fn = globals().get("_stream_opencode_go_chat_completions_response")
+    completion_response: Any = None
     try:
         if callable(perform):
             completion_awaitable = perform(
@@ -10394,14 +10538,15 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
             )
         else:
             completion_awaitable = litellm.acompletion(**completion_call_kwargs)
-        if use_alias_candidate_probe:
+        if client_requested_stream:
             completion_response = await asyncio.wait_for(
                 completion_awaitable,
-                timeout=_go_probe_timeout_seconds,
+                timeout=OPENCODE_GO_CONNECT_TIMEOUT_SECONDS,
             )
         else:
             completion_response = await completion_awaitable
     except Exception as exc:
+        await close_opencode_go_stream_resource(completion_response)
         evidence = _build_opencode_go_provider_rejection_evidence(
             target_url=target_url,
             exc=exc,
@@ -10410,11 +10555,44 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
             api_key=api_key,
             local_timeout=(
                 use_alias_candidate_probe
-                and isinstance(exc, asyncio.TimeoutError)
+                and isinstance(exc, (asyncio.TimeoutError, httpx.TimeoutException))
             ),
         )
         _record_opencode_go_provider_rejection_evidence(request, evidence)
         raise
+    if client_requested_stream:
+        if not callable(stream_fn):
+            stream_fn = _stream_opencode_go_chat_completions_response
+        try:
+            return await stream_fn(
+                completion_response=completion_response,
+                adapter_model=adapter_model,
+                request_input=request_input,
+                responses_api_request=responses_api_request,
+                litellm_metadata=litellm_metadata,
+                canonical_request_body=canonical_request_body,
+                request=request,
+                target_url=target_url,
+                rollup_kwargs=rollup_kwargs,
+                use_alias_candidate_probe=use_alias_candidate_probe,
+                first_event_timeout_seconds=_go_probe_timeout_seconds,
+            )
+        except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
+            evidence = _build_opencode_go_provider_rejection_evidence(
+                target_url=target_url,
+                exc=exc,
+                advertised_tools=advertised_tools,
+                completion_tools=completion_kwargs.get("tools"),
+                api_key=api_key,
+                local_timeout=(
+                    use_alias_candidate_probe
+                    and isinstance(exc, (asyncio.TimeoutError, httpx.TimeoutException))
+                ),
+            )
+            _record_opencode_go_provider_rejection_evidence(request, evidence)
+            if use_alias_candidate_probe:
+                _raise_opencode_go_alias_candidate_upstream_timeout(exc)
+            raise
     if isinstance(completion_response, dict):
         from litellm.types.utils import ModelResponse
 
@@ -10482,29 +10660,6 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
             response_body=response_body,
             adapter_model=adapter_model,
             adapter="codex_opencode_go_adapter",
-            adapter_label="OpenCode Go",
-        )
-    # ACCESS replacement is registered at emit time. A completed Go
-    # turn still has to record the rollup so the 60s flush emits
-    # litellm#Ohmypi / litellm#Codex headers. Without this, a
-    # successful PONG / child-spawn leaves a 0-byte docker-logs window.
-    if client_requested_stream:
-        identity_request_body = (
-            canonical_request_body
-            if isinstance(canonical_request_body, dict)
-            else request_body
-            if isinstance(request_body, dict)
-            else None
-        )
-        return _record_adapted_completed_route_rollup_after_stream(
-            StreamingResponse(
-                _responses_sse_from_repaired_response_body(
-                    response_body,
-                    request_body=identity_request_body,
-                ),
-                media_type="text/event-stream",
-            ),
-            rollup_kwargs,
             adapter_label="OpenCode Go",
         )
     _record_adapted_completed_route_rollup_turn(
