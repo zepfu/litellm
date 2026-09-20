@@ -54,9 +54,7 @@ class Runtime:
     rate_limit: MonotonicCooldownMap
     failure_circuit_until_monotonic_by_key: dict[str, float]
     clean_secret_string: Callable[[Optional[str]], Optional[str]]
-    extract_embedded_json_payload_candidates: Callable[
-        [object], Iterable[str]
-    ]
+    extract_embedded_json_payload_candidates: Callable[[object], Iterable[str]]
     parse_json_payloads_from_text_candidates: Callable[
         [Iterable[str]], Iterable[object]
     ]
@@ -166,30 +164,47 @@ def get_cooldown_keys(
     return get_rate_limit_key(runtime, model)
 
 
-def get_retry_wait_seconds(runtime: Runtime, exc: object, attempt: int) -> float:
-    wait_seconds = get_backoff_seconds(runtime, attempt)
+_PROVIDER_RETRY_WAIT_CAP_SECONDS = 60.0
+
+
+def _provider_retry_wait_seconds(runtime: Runtime, exc: object) -> Optional[float]:
     retry_after_seconds = extract_retry_after_seconds(runtime, exc)
     if retry_after_seconds is not None:
-        retry_after_backoff_seconds = min(
+        return min(
             max(retry_after_seconds + 1.0, 1.0),
-            60.0,
+            _PROVIDER_RETRY_WAIT_CAP_SECONDS,
         )
-        return max(wait_seconds, retry_after_backoff_seconds)
     headers = extract_error_headers(runtime, exc)
     remaining_value = get_header_value(runtime, headers, "X-RateLimit-Remaining")
     reset_wait_seconds = extract_reset_wait_seconds(runtime, exc)
     if remaining_value in {"0", "0.0"} and reset_wait_seconds is not None:
-        reset_backoff_seconds = min(max(reset_wait_seconds + 1.0, 1.0), 60.0)
-        return max(wait_seconds, reset_backoff_seconds)
-    return wait_seconds
+        return min(
+            max(reset_wait_seconds + 1.0, 1.0),
+            _PROVIDER_RETRY_WAIT_CAP_SECONDS,
+        )
+    return None
+
+
+def get_retry_wait_seconds(runtime: Runtime, exc: object, attempt: int) -> float:
+    wait_seconds = get_backoff_seconds(runtime, attempt)
+    provider_wait_seconds = _provider_retry_wait_seconds(runtime, exc)
+    if provider_wait_seconds is None:
+        return wait_seconds
+    return max(wait_seconds, provider_wait_seconds)
 
 
 def get_max_retries(runtime: Runtime) -> int:
+    """Configured inner retries after the first upstream send."""
     return retry.parse_non_negative_int_env(
         "AAWM_OPENROUTER_ADAPTER_MAX_RETRIES",
         default=3,
         getenv=runtime.getenv,
     )
+
+
+def get_total_attempts(runtime: Runtime) -> int:
+    """Hard cap on inner wire sends: one initial attempt plus configured retries."""
+    return get_max_retries(runtime) + 1
 
 
 def get_backoff_seconds(runtime: Runtime, attempt: int) -> float:
@@ -250,8 +265,7 @@ async def maybe_raise_failure_circuit_open(
     if wait_seconds > 0:
         rounded_wait = max(1, int(wait_seconds))
         runtime.log_warning(
-            "OpenRouter adapter failure circuit open for %s; "
-            "failing fast for %ss",
+            "OpenRouter adapter failure circuit open for %s; " "failing fast for %ss",
             rate_limit_key,
             rounded_wait,
         )
@@ -453,8 +467,7 @@ async def get_active_cooldown_seconds(
         )
         circuit_wait = max(
             (
-                runtime.failure_circuit_until_monotonic_by_key.get(key, 0.0)
-                - now
+                runtime.failure_circuit_until_monotonic_by_key.get(key, 0.0) - now
                 for key in candidate_keys
             ),
             default=0.0,
@@ -508,16 +521,19 @@ async def run_retry_loop(
     rate_limit_key_for_log: Optional[str] = None,
     clear_on_success: bool = True,
 ) -> RetryResultT:
-    """Run the OpenRouter retry, cooldown, and failure-circuit policy."""
-    max_retries = get_max_retries(runtime)
-    total_attempts = max_retries + 1
+    """Run the OpenRouter retry, cooldown, and failure-circuit policy.
+
+    ``AAWM_OPENROUTER_ADAPTER_MAX_RETRIES`` is the retry count after the first
+    send. ``total_attempts`` is that value plus one and is a hard cap on wire
+    calls. A configured delay budget may refuse a Retry-After/reset wait; it
+    cannot add sends past the cap.
+    """
+    total_attempts = get_total_attempts(runtime)
     hidden_retry_budget_seconds = get_hidden_retry_budget_seconds(runtime)
     accumulated_hidden_wait_seconds = 0.0
     wait_keys = get_wait_keys(runtime, adapter_model)
     log_model_key = (
-        rate_limit_key_for_log
-        if rate_limit_key_for_log is not None
-        else adapter_model
+        rate_limit_key_for_log if rate_limit_key_for_log is not None else adapter_model
     )
     await runtime.maybe_raise_alias_probe_cooldown(
         adapter_model,
@@ -559,12 +575,20 @@ async def run_retry_loop(
             hidden_retry_budget_seconds=hidden_retry_budget_seconds,
         )
         wait_seconds = get_retry_wait_seconds(runtime, exc, attempt)
-        projected_hidden_wait_seconds, within_hidden_budget = (
-            retry.projected_hidden_retry_within_budget(
-                accumulated_hidden_wait_seconds=accumulated_hidden_wait_seconds,
-                next_wait_seconds=wait_seconds,
-                hidden_retry_budget_seconds=hidden_retry_budget_seconds,
-            )
+        provider_wait_seconds = _provider_retry_wait_seconds(runtime, exc)
+        (
+            projected_hidden_wait_seconds,
+            within_hidden_budget,
+        ) = retry.projected_hidden_retry_within_budget(
+            accumulated_hidden_wait_seconds=accumulated_hidden_wait_seconds,
+            next_wait_seconds=wait_seconds,
+            hidden_retry_budget_seconds=hidden_retry_budget_seconds,
+        )
+        retries_exhausted = attempt >= total_attempts
+        delay_budget_exhausted = (
+            hidden_retry_budget_seconds > 0
+            and provider_wait_seconds is not None
+            and not within_hidden_budget
         )
         if status_code == 429 and is_long_window:
             cooldown_seconds = min(max(reset_wait_seconds or 0.0, 30.0), 300.0)
@@ -602,9 +626,7 @@ async def run_retry_loop(
             status_code=status_code,
             raw_message=raw_message,
         )
-        if status_code != 429 or (
-            attempt >= total_attempts and not within_hidden_budget
-        ):
+        if status_code != 429 or retries_exhausted or delay_budget_exhausted:
             if log_warnings:
                 runtime.log_warning(
                     "%s upstream attempt %s failed with %s "
@@ -619,15 +641,6 @@ async def run_retry_loop(
             if status_code == 429:
                 await runtime.open_failure_circuit_callback(adapter_model, exc=exc)
             return False
-        if attempt >= total_attempts and within_hidden_budget and log_warnings:
-            runtime.log_warning(
-                "%s keeping 429 hidden from client for model=%s; "
-                "hidden retry wait %.1fs/%.1fs",
-                attempt_label,
-                adapter_model,
-                projected_hidden_wait_seconds,
-                hidden_retry_budget_seconds,
-            )
         if log_warnings:
             runtime.log_warning(
                 "%s upstream attempt %s hit 429 "
@@ -674,10 +687,7 @@ def _is_completion_invalid_tool_error(
     function_text = lowered
     for quote in _QUOTE_CHARS:
         function_text = function_text.replace(quote, "")
-    return (
-        "invalid tools" in tools_text
-        and "expected function" in function_text
-    )
+    return "invalid tools" in tools_text and "expected function" in function_text
 
 
 def _bounded_completion_invalid_tool_detail(detail: str) -> str:
@@ -759,9 +769,8 @@ async def perform_completion_operation(
             adapter_model=adapter_model,
         )
     except Exception as exc:
-        if (
-            use_alias_candidate_probe
-            and _is_completion_invalid_tool_error(runtime, exc)
+        if use_alias_candidate_probe and _is_completion_invalid_tool_error(
+            runtime, exc
         ):
             raw_message = extract_raw_message(runtime, exc)
             detail_text = (
@@ -821,9 +830,7 @@ async def perform_pass_through_request(
             merge_query_params=merge_query_params,
             query_params=dict(query_params) if query_params is not None else None,
             default_query_params=(
-                dict(default_query_params)
-                if default_query_params is not None
-                else None
+                dict(default_query_params) if default_query_params is not None else None
             ),
             stream=stream,
             cost_per_request=cost_per_request,
@@ -882,6 +889,7 @@ __all__ = [
     "get_post_failure_cooldown_seconds",
     "get_rate_limit_key",
     "get_retry_wait_seconds",
+    "get_total_attempts",
     "get_wait_keys",
     "is_free_model",
     "is_long_window_rate_limit",
