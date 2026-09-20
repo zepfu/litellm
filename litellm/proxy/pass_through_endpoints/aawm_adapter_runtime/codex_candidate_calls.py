@@ -49,6 +49,10 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_persist impor
 from litellm.secret_managers.credential_error_sanitizer import (
     sanitize_credential_error_message,
 )
+from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.opencode_go import (
+    apply_opencode_go_failure_classification,
+    classify_opencode_go_failure,
+)
 
 _OPENCODE_GO_ALIAS_CANDIDATE_TIMEOUT_SECONDS = 30.0
 _OPENCODE_GO_NONSEMANTIC_TOOL_CHOICE = frozenset({"auto", "none"})
@@ -9689,6 +9693,7 @@ def _build_opencode_go_provider_rejection_evidence(
     advertised_tools: Any = None,
     completion_tools: Any = None,
     api_key: Any = None,
+    local_timeout: bool = False,
 ) -> dict[str, Any]:
     advertised_types = _opencode_go_tool_types(advertised_tools)
     completion_types = _opencode_go_tool_types(completion_tools)
@@ -9716,7 +9721,22 @@ def _build_opencode_go_provider_rejection_evidence(
         if "/zen/go/v1/responses" in target
         else _OPENCODE_GO_CHAT_COMPLETIONS_ROUTE
     )
-    return {
+    classification = None
+    if isinstance(exc, Exception):
+        classification = classify_opencode_go_failure(
+            exc=exc,
+            url=target_url,
+            custom_llm_provider="opencode_go",
+            status_code=status_code if isinstance(status_code, int) else None,
+            local_timeout=local_timeout,
+        )
+        if classification is not None:
+            apply_opencode_go_failure_classification(exc, classification)
+            if classification.origin == "client":
+                status_code = None
+            elif classification.status_code is not None:
+                status_code = classification.status_code
+    evidence = {
         "route": "codex_opencode_go_adapter",
         "target_url_family": target_url_family,
         "target_url": (
@@ -9736,6 +9756,12 @@ def _build_opencode_go_provider_rejection_evidence(
         "offending_index": offending_index,
         "offending_type": offending_type,
     }
+    if classification is not None:
+        evidence = {
+            **evidence,
+            **classification.to_safe_metadata(),
+        }
+    return evidence
 
 
 def _record_opencode_go_provider_rejection_evidence(
@@ -9763,27 +9789,14 @@ def _record_opencode_go_provider_rejection_evidence(
 def _raise_opencode_go_alias_candidate_upstream_timeout(
     exc: Exception,
 ) -> None:
-    from litellm.proxy._types import ProxyException
-
-    proxy_exc = ProxyException(
-        message="OpenCode Go alias candidate timed out upstream.",
-        type="upstream_timeout",
-        param="model",
-        code=504,
+    classification = classify_opencode_go_failure(
+        exc=exc,
+        custom_llm_provider="opencode_go",
+        local_timeout=isinstance(exc, TimeoutError),
     )
-    setattr(proxy_exc, "status_code", 504)
-    setattr(
-        proxy_exc,
-        "detail",
-        {
-            "error": {
-                "message": proxy_exc.message,
-                "type": "upstream_timeout",
-                "code": "upstream_timeout",
-            }
-        },
-    )
-    raise proxy_exc from exc
+    if classification is not None:
+        apply_opencode_go_failure_classification(exc, classification)
+    raise exc
 
 
 async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
@@ -10045,21 +10058,12 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
                 advertised_tools=canonical_request_body.get("tools"),
                 completion_tools=adapted_request_body.get("tools"),
                 api_key=api_key,
+                local_timeout=(
+                    use_alias_candidate_probe
+                    and isinstance(exc, asyncio.TimeoutError)
+                ),
             )
             _record_opencode_go_provider_rejection_evidence(request, evidence)
-            if use_alias_candidate_probe:
-                if (
-                    isinstance(exc, asyncio.TimeoutError)
-                    or evidence["error"]["status"] == 408
-                ):
-                    _raise_opencode_go_alias_candidate_upstream_timeout(exc)
-                from litellm.proxy.pass_through_endpoints.providers.common import (
-                    _opencode_go_candidate_unavailable_detail,
-                    _raise_opencode_go_auto_agent_candidate_unavailable,
-                )
-
-                if _opencode_go_candidate_unavailable_detail(exc) is not None:
-                    _raise_opencode_go_auto_agent_candidate_unavailable(exc)
             raise
 
         intake_context = _build_malformed_tool_call_intake_context(
@@ -10366,21 +10370,12 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
             advertised_tools=advertised_tools,
             completion_tools=completion_kwargs.get("tools"),
             api_key=api_key,
+            local_timeout=(
+                use_alias_candidate_probe
+                and isinstance(exc, asyncio.TimeoutError)
+            ),
         )
         _record_opencode_go_provider_rejection_evidence(request, evidence)
-        if use_alias_candidate_probe:
-            if (
-                isinstance(exc, asyncio.TimeoutError)
-                or evidence["error"]["status"] == 408
-            ):
-                _raise_opencode_go_alias_candidate_upstream_timeout(exc)
-            from litellm.proxy.pass_through_endpoints.providers.common import (
-                _opencode_go_candidate_unavailable_detail,
-                _raise_opencode_go_auto_agent_candidate_unavailable,
-            )
-
-            if _opencode_go_candidate_unavailable_detail(exc) is not None:
-                _raise_opencode_go_auto_agent_candidate_unavailable(exc)
         raise
     if isinstance(completion_response, dict):
         from litellm.types.utils import ModelResponse

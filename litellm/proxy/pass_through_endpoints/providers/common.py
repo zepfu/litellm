@@ -13,6 +13,10 @@ from litellm.proxy._types import ProxyException
 from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.openai import (
     _is_known_openai_model_not_found_response,
 )
+from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.opencode_go import (
+    apply_opencode_go_failure_classification,
+    classify_opencode_go_failure,
+)
 
 
 @dataclass(frozen=True)
@@ -76,63 +80,25 @@ def _raise_opencode_zen_auto_agent_candidate_unavailable(
 def _opencode_go_candidate_unavailable_detail(
     exc: Exception,
 ) -> Optional[str]:
-    status_code = getattr(exc, "status_code", None)
-    if status_code is None:
-        status_code = getattr(getattr(exc, "response", None), "status_code", None)
-    try:
-        normalized_status_code = int(status_code)
-    except (TypeError, ValueError):
-        return None
-    if normalized_status_code not in {401, 403}:
-        return None
-
-    detail = getattr(exc, "detail", None)
-    if isinstance(detail, bytes):
-        detail_text = detail.decode("utf-8", errors="ignore")
-    elif isinstance(detail, (dict, list)):
-        detail_text = json.dumps(detail, sort_keys=True, default=str)
-    elif detail is not None:
-        detail_text = str(detail)
-    else:
-        detail_text = str(exc)
-    exception_text = " ".join(
-        str(part)
-        for part in (
-            getattr(exc, "message", None),
-            detail_text,
-            str(exc),
-        )
-        if part is not None
+    classification = classify_opencode_go_failure(
+        exc=exc,
+        custom_llm_provider="opencode_go",
     )
-    normalized = " ".join(exception_text.lower().split())
-    if normalized_status_code == 403:
-        if not all(
-            marker in normalized
-            for marker in (
-                "this model collects data used to improve its quality",
-                "requires explicit opt in",
-            )
-        ):
-            return None
-        return exception_text
-    if "model ox-alpha-free is not supported" not in normalized:
+    if classification is None or classification.kind != "unsupported_model":
         return None
-    return exception_text
+    return classification.public_detail
 
 
 def _raise_opencode_go_auto_agent_candidate_unavailable(
     exc: Exception,
 ) -> Never:
-    detail = _opencode_go_candidate_unavailable_detail(exc) or str(exc)
-    _raise_candidate_unavailable(
-        exc,
-        message=(
-            "OpenCode Go auto-agent candidate does not support ox-alpha-free: "
-            f"{detail}"
-        ),
-        error_type="rate_limit_error",
-        status_code=429,
+    classification = classify_opencode_go_failure(
+        exc=exc,
+        custom_llm_provider="opencode_go",
     )
+    if classification is not None:
+        apply_opencode_go_failure_classification(exc, classification)
+    raise exc
 
 
 def _opencode_zen_candidate_unavailable_detail(

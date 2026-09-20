@@ -55,6 +55,10 @@ from litellm.proxy.aawm_route_logging import (
 from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.cohere import (
     classify_cohere_failure,
 )
+from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.opencode_go import (
+    apply_opencode_go_failure_classification,
+    classify_opencode_go_failure,
+)
 from litellm.llms.xai.managed_send_counter import (
     get_managed_xai_actual_send_counter,
     get_or_create_managed_xai_actual_send_counter,
@@ -688,6 +692,8 @@ _CODEX_COHERE_ROUTE_FAMILY = "codex_cohere_chat_completions_adapter"
 _CODEX_COHERE_CHAT_V2_URL = httpx.URL("https://api.cohere.com/v2/chat")
 _CODEX_ZAI_CODING_PLAN_PROVIDER = "zai_coding_plan"
 _CODEX_ZAI_CODING_PLAN_ROUTE_FAMILY = "codex_zai_coding_plan_chat_completions_adapter"
+_CODEX_OPENCODE_GO_PROVIDER = "opencode_go"
+_CODEX_OPENCODE_GO_ROUTE_FAMILY = "codex_opencode_go_adapter"
 
 
 def _accepts_excluded_candidate_keys(select_candidate_fn: Any) -> bool:
@@ -1070,6 +1076,41 @@ def _classify_codex_cohere_candidate_failure(
         "provider_5xx": "provider_terminal_error",
         "transient": "provider_terminal_error",
     }.get(classification.failure_class)
+
+
+def _classify_codex_opencode_go_candidate_failure(
+    exc: Exception,
+    *,
+    candidate: Optional[dict[str, Any]],
+    attempted_provider_call: bool = False,
+) -> Optional[str]:
+    """Map typed OpenCode Go failures onto the shared Codex retry vocabulary."""
+
+    if (
+        not isinstance(candidate, dict)
+        or candidate.get("provider") != _CODEX_OPENCODE_GO_PROVIDER
+        or candidate.get("route_family")
+        not in (None, _CODEX_OPENCODE_GO_ROUTE_FAMILY)
+    ):
+        return None
+
+    stamped_provider_returned = getattr(exc, "_aawm_provider_returned", None)
+    classification = classify_opencode_go_failure(
+        exc=exc,
+        custom_llm_provider=str(candidate.get("provider") or ""),
+        status_code=_error_signals._extract_adapter_exception_status_code(exc),
+        attempted_provider_call=attempted_provider_call,
+        provider_returned=(
+            stamped_provider_returned
+            if isinstance(stamped_provider_returned, bool)
+            else None
+        ),
+        local_timeout=getattr(exc, "_aawm_failure_origin", None) == "client",
+    )
+    if classification is None:
+        return None
+    apply_opencode_go_failure_classification(exc, classification)
+    return classification.failure_class
 
 
 _ZAI_CODING_PLAN_KIND_TO_ERROR_CLASS = {
@@ -4493,6 +4534,14 @@ async def handle_alias_route(  # noqa: PLR0915
                         )
                     if early_pre_commit_error_class is None:
                         early_pre_commit_error_class = (
+                            _classify_codex_opencode_go_candidate_failure(
+                                probe_failure_exc,
+                                candidate=candidate,
+                                attempted_provider_call=attempted_provider_call,
+                            )
+                        )
+                    if early_pre_commit_error_class is None:
+                        early_pre_commit_error_class = (
                             _classify_codex_auto_agent_retryable_exhaustion(
                                 probe_failure_exc,
                                 candidate=candidate,
@@ -5059,6 +5108,12 @@ async def handle_alias_route(  # noqa: PLR0915
                     )
                 if error_class is None:
                     error_class = _classify_codex_zai_coding_plan_candidate_failure(
+                        failure_exc,
+                        candidate=candidate,
+                        attempted_provider_call=attempted_provider_call,
+                    )
+                if error_class is None:
+                    error_class = _classify_codex_opencode_go_candidate_failure(
                         failure_exc,
                         candidate=candidate,
                         attempted_provider_call=attempted_provider_call,
@@ -5944,6 +5999,12 @@ def _resolve_failure_plan(
         )
     if error_class is None:
         error_class = _classify_codex_zai_coding_plan_candidate_failure(
+            exc,
+            candidate=candidate,
+            attempted_provider_call=attempted_provider_call,
+        )
+    if error_class is None:
+        error_class = _classify_codex_opencode_go_candidate_failure(
             exc,
             candidate=candidate,
             attempted_provider_call=attempted_provider_call,

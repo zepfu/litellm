@@ -20,6 +20,10 @@ from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.chatgpt_c
 from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.cohere import (
     classify_cohere_failure,
 )
+from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.opencode_go import (
+    apply_opencode_go_failure_classification,
+    classify_opencode_go_failure,
+)
 from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.openai import (
     _get_openai_invalid_encrypted_content_error_summary,
     _get_openai_invalid_encrypted_content_failure_kind,
@@ -376,6 +380,38 @@ def _classify_cohere_known_failure(
     )
 
 
+def _classify_opencode_go_known_failure(
+    *,
+    request: Request,
+    url: Optional[httpx.URL],
+    custom_llm_provider: Optional[str],
+    status_code: Optional[int],
+    exc: Exception,
+) -> Optional[PassthroughProviderFailureClassification]:
+    del request
+    classification = classify_opencode_go_failure(
+        exc=exc,
+        url=url,
+        custom_llm_provider=custom_llm_provider,
+        status_code=status_code,
+    )
+    if classification is None:
+        return None
+    apply_opencode_go_failure_classification(exc, classification)
+    return PassthroughProviderFailureClassification(
+        name=f"opencode_go_{classification.kind}",
+        failure_kind=classification.kind,
+        log_message=(
+            "Pass through endpoint surfaced classified OpenCode Go failure "
+            "status=%s"
+        ),
+        log_error_summary=classification.public_detail,
+        failure_class=classification.failure_class,
+        cooldown_scope=classification.scope,
+        advance_fresh_candidate=True,
+    )
+
+
 # Ordered data-driven registry. First matching classifier wins (short-circuit).
 PASSTHROUGH_PROVIDER_FAILURE_CLASSIFIERS: Sequence[ProviderFailureClassifier] = (
     _classify_grok_billing_timeout_cancel,
@@ -389,6 +425,7 @@ PASSTHROUGH_PROVIDER_FAILURE_CLASSIFIERS: Sequence[ProviderFailureClassifier] = 
     _classify_openai_invalid_encrypted_content,
     _classify_openai_model_not_found,
     _classify_cohere_known_failure,
+    _classify_opencode_go_known_failure,
     _classify_anthropic_known_failure,
 )
 
