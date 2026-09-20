@@ -32,7 +32,9 @@ environment is empty or absent. That preserves unstamped historical rows
 without a migration and still prevents configured environments from reading
 one another. The process cache slot remains a ``(Optional[float], float)``
 tuple; a module-local identity shadow invalidates it when any bound dimension
-changes.
+changes. Each lookup resolves one six-way identity under the quota lock and
+reuses that same tuple for the injected fetch, SQL arguments, and cache
+publication.
 """
 
 from __future__ import annotations
@@ -82,6 +84,7 @@ _get_free_daily_quota_exhausted_cooldown_seconds: Optional[
 ] = None
 _get_observation_environment: Optional[Callable[[], Optional[str]]] = None
 _quota_cache_identity: Optional[_OpenRouterDurableQuotaIdentity] = None
+_quota_lookup_identity: Optional[_OpenRouterDurableQuotaIdentity] = None
 
 
 def configure_openrouter_quota_runtime(
@@ -105,6 +108,7 @@ def configure_openrouter_quota_runtime(
     global _fetch_quota_row
     global _get_free_daily_quota_exhausted_cooldown_seconds
     global _get_observation_environment, _quota_cache_identity
+    global _quota_lookup_identity
     _get_quota_cache = get_quota_cache
     _set_quota_cache = set_quota_cache
     _quota_lock = quota_lock
@@ -117,12 +121,14 @@ def configure_openrouter_quota_runtime(
     )
     _get_observation_environment = get_observation_environment
     _quota_cache_identity = None
+    _quota_lookup_identity = None
 
 
 def _reset_openrouter_free_daily_quota_cache() -> None:
-    global _quota_cache_identity
+    global _quota_cache_identity, _quota_lookup_identity
     assert _set_quota_cache is not None
     _quota_cache_identity = None
+    _quota_lookup_identity = None
     _set_quota_cache((None, 0.0))
 
 
@@ -187,12 +193,33 @@ def _openrouter_durable_quota_identity() -> _OpenRouterDurableQuotaIdentity:
 # ---------------------------------------------------------------------------
 
 
-async def _fetch_openrouter_free_daily_quota_row() -> Optional[Any]:
-    """Direct DB fetch bound to the complete durable-quota identity."""
-    identity = _openrouter_durable_quota_identity()
+async def _fetch_openrouter_quota_row_with_identity(
+    identity: _OpenRouterDurableQuotaIdentity,
+) -> Optional[Any]:
+    """Invoke the injected fetch while binding ``identity`` for SQL arguments."""
+    global _quota_lookup_identity
+    assert _fetch_quota_row is not None
+    _quota_lookup_identity = identity
+    try:
+        return await _fetch_quota_row()
+    finally:
+        _quota_lookup_identity = None
+
+
+async def _fetch_openrouter_free_daily_quota_row(
+    identity: Optional[_OpenRouterDurableQuotaIdentity] = None,
+) -> Optional[Any]:
+    """Direct DB fetch bound to the complete durable-quota identity.
+
+    SQL arguments use the lookup-attempt identity. The injected fetch seam is
+    zero-arg, so the cooldown binds that tuple before calling it. This function
+    does not recapture ``get_observation_environment``.
+    """
+    lookup_identity = identity if identity is not None else _quota_lookup_identity
+    assert lookup_identity is not None
     assert _get_dynamic_injection_pool is not None
     pool = await _get_dynamic_injection_pool()
-    provider, quota_key, client, account_hash, source, environment = identity
+    provider, quota_key, client, account_hash, source, environment = lookup_identity
     return await pool.fetchrow(
         """
         SELECT expected_reset_at, remaining_pct
@@ -246,7 +273,7 @@ async def _get_openrouter_free_daily_quota_exhausted_cooldown_seconds() -> float
         reset_at_ts: Optional[float] = None
         try:
             row = await asyncio.wait_for(
-                _fetch_quota_row(),
+                _fetch_openrouter_quota_row_with_identity(identity),
                 timeout=_OPENROUTER_DURABLE_QUOTA_LOOKUP_TIMEOUT_SECONDS,
             )
             if row is not None:
