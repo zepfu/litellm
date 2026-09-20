@@ -19,6 +19,10 @@ from typing import (
 from fastapi import HTTPException, Response
 
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import retry
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.memory import (
+    bound_memory_map,
+    normalize_monotonic_cooldown_key,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     is_openrouter_free_model,
 )
@@ -82,7 +86,9 @@ class Runtime:
 
 def get_rate_limit_key(runtime: Runtime, model: Optional[str]) -> str:
     cleaned_model = runtime.clean_secret_string(model)
-    return cleaned_model or "__default__"
+    if not cleaned_model:
+        return "__default__"
+    return normalize_monotonic_cooldown_key(cleaned_model)
 
 
 def is_free_model(runtime: Runtime, model: Optional[str]) -> bool:
@@ -281,6 +287,7 @@ async def open_failure_circuit(
         )
         if until > current_until:
             runtime.failure_circuit_until_monotonic_by_key[rate_limit_key] = until
+            bound_memory_map(runtime.failure_circuit_until_monotonic_by_key)
 
 
 def clear_failure_circuit(
@@ -487,7 +494,6 @@ async def set_cooldown(
         runtime.rate_limit,
         rate_limit_keys,
         wait_seconds,
-        max_size=None,
     )
 
 

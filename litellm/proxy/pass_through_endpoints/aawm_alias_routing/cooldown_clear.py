@@ -45,6 +45,7 @@ from .durable import (
     inspect_identity_set,
     verify_aawm_alias_routing_durable_absence,
 )
+from .memory import normalize_monotonic_cooldown_key
 from .snapshot_select import (
     _resolve_snapshot_alias_candidates,
     get_active_routing_snapshot,
@@ -942,8 +943,9 @@ def _derive_openrouter_rate_limit_keys(
 
     Finding 2: for active OpenRouter candidates, derive exactly the same
     adapter and upstream model rate-limit keys as retry_transport.  Uses
-    the same ``clean_secret_string`` normalization (strip + quote removal)
-    and the same ``get_completion_model`` upstream resolution.
+    ``normalize_monotonic_cooldown_key`` so clear targets match the
+    wait/set/circuit funnel, plus the same ``get_completion_model``
+    upstream resolution.
 
     Returns an empty list when no candidate is an OpenRouter provider.
     Never uses identity_hash as a cooldown key.
@@ -962,7 +964,7 @@ def _derive_openrouter_rate_limit_keys(
             ident.model
         )
         if adapter_model:
-            cleaned = adapter_model.strip()
+            cleaned = normalize_monotonic_cooldown_key(adapter_model)
             if cleaned:
                 keys.add(cleaned)
         # Upstream model key (same as retry_transport get_active_cooldown_seconds).
@@ -970,7 +972,7 @@ def _derive_openrouter_rate_limit_keys(
             ident.model
         )
         if upstream_model:
-            cleaned_up = upstream_model.strip()
+            cleaned_up = normalize_monotonic_cooldown_key(upstream_model)
             if cleaned_up:
                 keys.add(cleaned_up)
     return sorted(keys)
