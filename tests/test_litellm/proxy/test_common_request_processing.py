@@ -3856,6 +3856,49 @@ class TestAawmRouteRollup:
             "no-provider-egress"
         ) in flushed
 
+    def test_request_only_exhaustion_survives_later_untagged_inventory(self):
+        from datetime import datetime
+
+        from litellm.proxy.aawm_route_logging import (
+            AawmRouteRollupAccumulator,
+            _AawmRouteRollupOriginIdentity,
+        )
+
+        now = datetime(2026, 9, 19, 23, 46, 57)
+        accumulator = AawmRouteRollupAccumulator(interval_seconds=60)
+        header = "litellm#Ohmypi[17.4.2]@thoth"
+        endpoint = "/openai_passthrough/v1/responses"
+        emitted = accumulator.record(
+            group_header_label=header,
+            incoming_endpoint=endpoint,
+            outgoing_target="candidate_selection",
+            model_label="cursor_agent/cursor-grok-4.6-high(sota-xai)",
+            effort="none",
+            turns=0,
+            request_status="Exhausted",
+            origin_identity=_AawmRouteRollupOriginIdentity(
+                litellm_call_id="exhausted-call"
+            ),
+            now=now,
+        )
+        emitted.extend(
+            accumulator.record(
+                group_header_label=header,
+                incoming_endpoint=endpoint,
+                outgoing_target="candidate_selection",
+                model_label="cursor_agent/cursor-grok-4.6-high(sota-xai)",
+                effort="none",
+                turns=0,
+                origin_identity=_AawmRouteRollupOriginIdentity(
+                    litellm_call_id="inventory-call"
+                ),
+                now=now,
+            )
+        )
+        emitted.extend(accumulator.flush(force=True, now=now))
+        assert " - Request: [Exhausted]" in emitted
+        assert not any("Turns: 0" in line for line in emitted)
+
     def test_route_rollup_completed_and_failure_paths_preserve_effort(
         self,
         monkeypatch,

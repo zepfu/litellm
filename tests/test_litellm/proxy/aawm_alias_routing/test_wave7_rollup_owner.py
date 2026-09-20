@@ -450,6 +450,47 @@ class TestRouteRollupStatusValues:
             "redispatch] [Failed] -> codex_grok_native_responses_adapter"
         ) in failed_lines
 
+    def test_request_only_exhaustion_survives_untagged_inventory(self):
+        from datetime import datetime
+
+        now = datetime(2026, 9, 19, 23, 22, 51)
+        accumulator = aawm_route_logging.AawmRouteRollupAccumulator(
+            interval_seconds=60
+        )
+        common = {
+            "group_header_label": "litellm#Ohmypi[17.4.2]@thoth",
+            "incoming_endpoint": "/openai_passthrough/v1/responses",
+            "model_label": "cursor_agent/cursor-grok-4.6-high(sota-xai)",
+            "effort": "none",
+            "turns": 0,
+            "now": now,
+        }
+        exhausted_identity = aawm_route_logging._AawmRouteRollupOriginIdentity(
+            litellm_call_id="exhausted-call"
+        )
+        inventory_identity = aawm_route_logging._AawmRouteRollupOriginIdentity(
+            litellm_call_id="inventory-call"
+        )
+
+        emitted = accumulator.record(
+            **common,
+            outgoing_target="candidate_selection",
+            request_status="Exhausted",
+            origin_identity=exhausted_identity,
+        )
+        emitted.extend(
+            accumulator.record(
+                **common,
+                outgoing_target="candidate_selection",
+                origin_identity=inventory_identity,
+            )
+        )
+        emitted.extend(accumulator.flush(force=True, now=now))
+
+        assert " - Request: [Exhausted]" in emitted
+        assert not any("Turns: 0" in line for line in emitted)
+        assert not any(line.startswith(" - cursor_agent/") for line in emitted)
+
 
 class TestRequestScopedTerminalRollupState:
     @staticmethod

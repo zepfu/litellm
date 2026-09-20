@@ -2235,7 +2235,10 @@ class AawmRouteRollupAccumulator:
                         else None
                     ),
                 )
-            elif not group.sublines:
+            elif (
+                not group.sublines
+                and group.effective_request_terminal_state() is None
+            ):
                 self._groups.pop(group_key, None)
             emitted_lines.extend(self.flush_due(now=now))
             return emitted_lines
