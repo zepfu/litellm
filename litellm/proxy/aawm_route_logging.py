@@ -1865,6 +1865,21 @@ class _AawmRouteRollupSubline:
     denied_reviews: int = 0
     denied_rationales: list[str] = field(default_factory=list)
 
+    def has_flushable_activity(self) -> bool:
+        """True when the subline is a completed turn or a tagged/status row.
+
+        Untagged ``Turns: 0`` inventory siblings (effort-split or
+        candidate-selection rows with no status/message) are not operator
+        visible and must not flush as if they were failed turns.
+        """
+        return (
+            self.turns > 0
+            or self.status is not None
+            or bool(self.message)
+            or self.approved_reviews > 0
+            or self.denied_reviews > 0
+        )
+
     def register_origin_identity(
         self,
         identity: _AawmRouteRollupOriginIdentity,
@@ -2056,6 +2071,7 @@ class _AawmRouteRollupGroup:
             )
             for subline_key in self.subline_order
             if subline_key in self.sublines
+            and self.sublines[subline_key].has_flushable_activity()
         ]
 
 
@@ -2198,6 +2214,31 @@ class AawmRouteRollupAccumulator:
         )
         subline = group.sublines.get(subline_key)
         subline_already_existed = subline is not None
+        barren_zero_turn = (
+            turns <= 0
+            and normalized_status is None
+            and not cleaned_message
+        )
+        if barren_zero_turn and subline is None:
+            if (
+                normalized_request_status
+                in _AAWM_ROUTE_ROLLUP_REQUEST_TERMINAL_STATUS_VALUES
+            ):
+                group.event_sequence += 1
+                group.record_request_terminal_status(
+                    status=normalized_request_status,
+                    sequence=group.event_sequence,
+                    message=None,
+                    request_identity=(
+                        origin_identity.litellm_call_id
+                        if origin_identity is not None
+                        else None
+                    ),
+                )
+            elif not group.sublines:
+                self._groups.pop(group_key, None)
+            emitted_lines.extend(self.flush_due(now=now))
+            return emitted_lines
         if subline is None:
             if len(group.subline_order) >= self._max_sublines:
                 emitted_lines.extend(
@@ -2395,12 +2436,13 @@ class AawmRouteRollupAccumulator:
         remove: bool,
     ) -> list[str]:
         request_terminal_state = group.effective_request_terminal_state()
-        if not group.sublines and request_terminal_state is None:
+        sublines = group.ordered_sublines()
+        if not sublines and request_terminal_state is None:
             return []
         lines = _format_aawm_route_rollup_lines(
             group_header_label=group.group_header_label,
             incoming_endpoint=group.incoming_endpoint,
-            sublines=group.ordered_sublines(),
+            sublines=sublines,
             request_outcome=(
                 request_terminal_state.status
                 if request_terminal_state is not None

@@ -383,6 +383,73 @@ class TestRouteRollupStatusValues:
         )
         assert any(line.endswith("gpt-5.4:low - Turns: 1") for line in lines)
 
+    def test_completed_turn_omits_untagged_zero_turn_effort_sibling(self):
+        accumulator = aawm_route_logging.AawmRouteRollupAccumulator(
+            interval_seconds=60
+        )
+        common = {
+            "group_header_label": "litellm#Ohmypi[17.4.2]@thoth",
+            "incoming_endpoint": "/openai_passthrough/v1/responses",
+            "model_label": "cursor_agent/cursor-grok-4.6-high(sota-xai)",
+        }
+        run_target = "agentn.global.api5.cursor.sh/agent.v1.AgentService/Run"
+
+        accumulator.record(
+            **common,
+            outgoing_target=run_target,
+            effort="none",
+            turns=13,
+        )
+        accumulator.record(
+            **common,
+            outgoing_target=run_target,
+            effort="xhigh",
+            turns=0,
+        )
+        accumulator.record(
+            **common,
+            outgoing_target="candidate_selection",
+            effort="none",
+            turns=0,
+            request_status="Exhausted",
+        )
+
+        exhausted_lines = accumulator.flush(force=True)
+        exhausted_rendered = "\n".join(exhausted_lines)
+        assert (
+            " - cursor_agent/cursor-grok-4.6-high(sota-xai):none - Turns: 13 "
+            f"-> {run_target}"
+        ) in exhausted_lines
+        assert "Turns: 13" in exhausted_rendered
+        assert " - Request: [Exhausted]" in exhausted_lines
+        assert ":xhigh - Turns: 0" not in exhausted_rendered
+        assert "candidate_selection" not in exhausted_rendered
+        assert not any(
+            "Turns: 0" in line and "[Failed]" not in line and "[Exhausted]" not in line
+            for line in exhausted_lines
+            if line.startswith(" - ")
+        )
+
+        accumulator.record(
+            group_header_label=common["group_header_label"],
+            incoming_endpoint=common["incoming_endpoint"],
+            outgoing_target="codex_grok_native_responses_adapter",
+            model_label="xai/grok-4.6(sota-xai)",
+            effort="none",
+            turns=0,
+            status="Failed",
+            message=(
+                "LiteLLM Proxy: HTTP 409 session-owner mismatch requires "
+                "redispatch"
+            ),
+        )
+        failed_lines = accumulator.flush(force=True)
+        assert (
+            " - xai/grok-4.6(sota-xai):none - Turns: 0 "
+            "[LiteLLM Proxy: HTTP 409 session-owner mismatch requires "
+            "redispatch] [Failed] -> codex_grok_native_responses_adapter"
+        ) in failed_lines
+
 
 class TestRequestScopedTerminalRollupState:
     @staticmethod

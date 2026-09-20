@@ -3762,6 +3762,100 @@ class TestAawmRouteRollup:
             " - gpt-5.5:high - Turns: 2",
         ]
 
+    def test_route_rollup_omits_untagged_zero_turn_sibling_keeps_tagged_409(
+        self,
+    ):
+        from datetime import datetime
+
+        from litellm.proxy.aawm_route_logging import AawmRouteRollupAccumulator
+
+        now = datetime(2026, 9, 19, 23, 22, 51)
+        accumulator = AawmRouteRollupAccumulator(interval_seconds=60)
+        header = "litellm#Ohmypi[17.4.2]@thoth"
+        endpoint = "/openai_passthrough/v1/responses"
+        cursor_label = "cursor_agent/cursor-grok-4.6-high(sota-xai)"
+        run_target = "agentn.global.api5.cursor.sh/agent.v1.AgentService/Run"
+
+        accumulator.record(
+            group_header_label=header,
+            incoming_endpoint=endpoint,
+            outgoing_target=run_target,
+            model_label=cursor_label,
+            effort="none",
+            turns=13,
+            now=now,
+        )
+        accumulator.record(
+            group_header_label=header,
+            incoming_endpoint=endpoint,
+            outgoing_target=run_target,
+            model_label=cursor_label,
+            effort="xhigh",
+            turns=0,
+            now=now,
+        )
+        accumulator.record(
+            group_header_label=header,
+            incoming_endpoint=endpoint,
+            outgoing_target="api.z.ai/api/coding/paas/v4/chat/completions",
+            model_label="zai_coding_plan/glm-5.3-flash(work)",
+            effort="max",
+            turns=2,
+            now=now,
+        )
+        accumulator.record(
+            group_header_label=header,
+            incoming_endpoint=endpoint,
+            outgoing_target="api.z.ai/api/coding/paas/v4/chat/completions",
+            model_label="zai_coding_plan/glm-5.3-flash(work)",
+            effort="xhigh",
+            turns=0,
+            now=now,
+        )
+        accumulator.record(
+            group_header_label=header,
+            incoming_endpoint=endpoint,
+            outgoing_target="no-provider-egress",
+            model_label="xai/grok-4.6",
+            effort="none",
+            turns=0,
+            status="Failed",
+            message=(
+                "LiteLLM Proxy: HTTP 409 session-owner mismatch requires "
+                "redispatch; redispatch_required=true; "
+                "attempted_provider_call=true; reason=skipped"
+            ),
+            now=now,
+        )
+
+        flushed = accumulator.flush(force=True, now=now)
+        rendered = "\n".join(flushed)
+        assert flushed[0] == (
+            "20260919 23:22:51 litellm#Ohmypi[17.4.2]@thoth "
+            "/openai_passthrough/v1/responses"
+        )
+        assert (
+            f" - {cursor_label}:none - Turns: 13 -> {run_target}"
+        ) in flushed
+        assert (
+            " - zai_coding_plan/glm-5.3-flash(work):max - Turns: 2 -> "
+            "api.z.ai/api/coding/paas/v4/chat/completions"
+        ) in flushed
+        assert ":xhigh - Turns: 0" not in rendered
+        assert not any(
+            line.startswith(" - ")
+            and "Turns: 0" in line
+            and "[Failed]" not in line
+            for line in flushed
+        )
+        assert (
+            " - xai/grok-4.6:none - Turns: 0 "
+            "[LiteLLM Proxy: HTTP 409 session-owner mismatch requires "
+            "redispatch; redispatch_required=true; "
+            "attempted_provider_call=true; reason=skipped] [Failed] -> "
+            "no-provider-egress"
+        ) in flushed
+
     def test_route_rollup_completed_and_failure_paths_preserve_effort(
         self,
         monkeypatch,
