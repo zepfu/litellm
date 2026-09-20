@@ -216,10 +216,14 @@ def _get_anthropic_adapter_nvidia_api_key() -> Optional[str]:
     return _resolve_nvidia_credential_target_profile().api_key
 
 
-def _require_nvidia_api_key() -> str:
-    """Return a usable NVIDIA credential or fail before any provider I/O."""
+def _require_nvidia_api_key(profile: NvidiaCredentialTargetProfile) -> str:
+    """Validate a retained NVIDIA profile or fail before any provider I/O.
 
-    api_key = _get_anthropic_adapter_nvidia_api_key()
+    Callers must resolve one request-local ``NvidiaCredentialTargetProfile``
+    and pass that same object. This check does not resolve again.
+    """
+
+    api_key = profile.api_key
     if not api_key:
         _runtime_dependencies.log_debug(
             "Direct NVIDIA credential resolution failed: accepted env vars "
@@ -227,7 +231,7 @@ def _require_nvidia_api_key() -> str:
             _nvidia_accepted_credential_source_names(),
         )
         raise NvidiaMissingCredentialError()
-    _log_nvidia_profile_observability(_resolve_nvidia_credential_target_profile())
+    _log_nvidia_profile_observability(profile)
     return api_key
 
 
@@ -339,11 +343,11 @@ def _log_nvidia_profile_observability(
     )
 
 
-def _nvidia_credential_target_profile_observability() -> dict[str, str]:
-    """Return the selected profile's source identity without key material."""
+def _nvidia_credential_target_profile_observability(
+    profile: NvidiaCredentialTargetProfile,
+) -> dict[str, str]:
+    """Return the retained profile's source identity without key material."""
 
-    profile = _resolve_nvidia_credential_target_profile()
-    _log_nvidia_profile_observability(profile)
     return profile.observability()
 
 

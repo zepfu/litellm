@@ -6,9 +6,10 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from litellm.proxy.pass_through_endpoints.providers.nvidia.runtime import (
-    NvidiaMissingCredentialError,
+    NvidiaCredentialTargetProfile,
     _nvidia_api_base_from_target_base,
     _nvidia_credential_target_profile_observability,
+    _require_nvidia_api_key,
 )
 
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
@@ -24,8 +25,7 @@ class Runtime:
 
     should_force_fake_stream: Callable[..., Any]
     prepare_request_body: Callable[..., Any]
-    get_api_key: Callable[..., Any]
-    get_target_base: Callable[..., Any]
+    get_credential_target_profile: Callable[[], NvidiaCredentialTargetProfile]
     validate_egress: Callable[..., Any]
     perform_operation: Callable[..., Any]
     get_timeout_seconds: Callable[..., Any]
@@ -49,6 +49,7 @@ async def prepare_completion_route(
     )
     upstream_stream = client_requested_stream and not use_fake_stream
     config = adapter_config.NVIDIA_COMPLETION
+    profile = runtime.get_credential_target_profile()
     prepared_request_body = runtime.prepare_request_body(
         prepared_request_body,
         adapter_model=adapter_model,
@@ -59,13 +60,11 @@ async def prepare_completion_route(
         span_metadata_extra={
             "upstream_stream": upstream_stream,
             "fake_stream": use_fake_stream,
-            **_nvidia_credential_target_profile_observability(),
+            **_nvidia_credential_target_profile_observability(profile),
         },
     )
-    api_key = runtime.get_api_key()
-    if not api_key:
-        raise NvidiaMissingCredentialError()
-    target_base_url = runtime.get_target_base()
+    api_key = _require_nvidia_api_key(profile)
+    target_base_url = profile.target_base
     api_base = _nvidia_api_base_from_target_base(str(target_base_url))
     target_url = f"{api_base}/chat/completions"
     runtime.validate_egress(

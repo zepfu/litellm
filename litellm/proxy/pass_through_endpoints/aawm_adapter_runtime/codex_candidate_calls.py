@@ -6941,14 +6941,13 @@ async def _prepare_codex_nvidia_completion_adapter_route(
         _drop_tool_choice_without_tools_from_request_body(adapted_request_body)
     )
     config = _aawm_adapter_config.CODEX_NVIDIA_COMPLETION
+    profile = _nvidia_runtime._resolve_nvidia_credential_target_profile()
     request_body = _build_codex_nvidia_adapter_request_body(
         prepared_request_body=adapted_request_body,
         adapter_model=canonical_model,
         upstream_model=upstream_model,
         config=config,
-        profile_observability=(
-            _nvidia_runtime._resolve_nvidia_credential_target_profile().observability()
-        ),
+        profile_observability=profile.observability(),
     )
     request_input = request_body.get("input", "")
     responses_api_request = cast(
@@ -6982,9 +6981,9 @@ async def _prepare_codex_nvidia_completion_adapter_route(
             litellm_completion_request=completion_kwargs,
         )
 
-    api_key = _nvidia_runtime._require_nvidia_api_key()
+    api_key = _nvidia_runtime._require_nvidia_api_key(profile)
 
-    target_base_url = _nvidia_runtime._get_anthropic_adapter_nvidia_target_base()
+    target_base_url = profile.target_base
     api_base = _nvidia_runtime._nvidia_api_base_from_target_base(str(target_base_url))
     target_url = f"{api_base}/chat/completions"
     HttpPassThroughEndpointHelpers.validate_outgoing_egress(

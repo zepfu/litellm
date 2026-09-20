@@ -2435,8 +2435,9 @@ _ANTHROPIC_GROK_PROVIDER_RUNTIME = _anthropic_grok_provider.Runtime(
 _ANTHROPIC_NVIDIA_PROVIDER_RUNTIME = _anthropic_nvidia_provider.Runtime(
     should_force_fake_stream=lambda model: (_should_force_fake_stream_for_nvidia_adapter_model(model)),
     prepare_request_body=lambda body, **kwargs: (_prepare_anthropic_completion_adapter_request_body(body, **kwargs)),
-    get_api_key=lambda: _get_anthropic_adapter_nvidia_api_key(),
-    get_target_base=lambda: _get_anthropic_adapter_nvidia_target_base(),
+    get_credential_target_profile=lambda: (
+        _wave6b_nvidia_runtime._resolve_nvidia_credential_target_profile()
+    ),
     validate_egress=lambda **kwargs: (HttpPassThroughEndpointHelpers.validate_outgoing_egress(**kwargs)),
     perform_operation=lambda **kwargs: (_perform_nvidia_completion_adapter_operation(**kwargs)),
     get_timeout_seconds=lambda model: (_get_nvidia_adapter_request_timeout_seconds(model)),
