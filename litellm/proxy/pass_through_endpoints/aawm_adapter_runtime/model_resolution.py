@@ -258,13 +258,13 @@ def _normalize_opencode_zen_adapter_model_name(model: Any) -> Optional[str]:
 
 
 def _normalize_opencode_go_adapter_model_name(model: Any) -> Optional[str]:
-    explicit_provider, candidate = _split_anthropic_adapter_provider_prefix(model)
-    if explicit_provider != _OPENCODE_GO_PROVIDER or candidate is None:  # noqa: F821
-        return None
-    normalized_candidate = candidate.strip()
-    if normalized_candidate in _OPENCODE_GO_FREE_MODELS:  # noqa: F821
-        return normalized_candidate
-    return None
+    # Binding-safe: install() rebinds this function into host_globals, so a
+    # module-imported helper name would disappear from the visible namespace.
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+        normalize_opencode_go_adapter_model_name as _normalize_go_adapter_model_name,
+    )
+
+    return _normalize_go_adapter_model_name(model)
 
 def _normalize_kimi_code_chat_completions_adapter_model_name(
     model: Any,

@@ -52,6 +52,38 @@ CODEX_AUTO_AGENT_OPENCODE_PROVIDER = OPENCODE_ZEN_PROVIDER
 CODEX_AUTO_AGENT_OPENCODE_GO_PROVIDER = OPENCODE_GO_PROVIDER
 ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER = "anthropic"
 
+# Authoritative OpenCode Go namespace and catalog allowlist. Cost-map rows
+# with litellm_provider=opencode_go are stored as opencode/<id>; compiled
+# snapshots and the live Go handler use the bare <id> only.
+OPENCODE_GO_MODEL_PREFIXES = frozenset({"opencode_go", "opencode-go"})
+OPENCODE_GO_ALLOWED_MODELS = frozenset(
+    {
+        "muse-spark-1.3-contributor",
+        "omen-alpha",
+        "ox-alpha-free",
+    }
+)
+_OPENCODE_GO_FOREIGN_PREFIXES: dict[str, str] = {
+    "alibaba_token_plan": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+    "anthropic": ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER,
+    "chatgpt": CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+    "cohere": CODEX_AUTO_AGENT_COHERE_PROVIDER,
+    "cursor_agent": CODEX_AUTO_AGENT_CURSOR_AGENT_PROVIDER,
+    "kimi_code": CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
+    "muse_code": CODEX_AUTO_AGENT_MUSE_CODE_PROVIDER,
+    "nous": CODEX_AUTO_AGENT_NOUS_PROVIDER,
+    "nvidia": CODEX_AUTO_AGENT_NVIDIA_PROVIDER,
+    "nvidia_nim": CODEX_AUTO_AGENT_NVIDIA_PROVIDER,
+    "opencode": OPENCODE_ZEN_PROVIDER,
+    "opencode-zen": OPENCODE_ZEN_PROVIDER,
+    "opencode_zen": OPENCODE_ZEN_PROVIDER,
+    "openai": CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+    "openrouter": CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
+    "xai": CODEX_AUTO_AGENT_XAI_PROVIDER,
+    "zai_coding_plan": CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER,
+    "zen": OPENCODE_ZEN_PROVIDER,
+}
+
 CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY = "openrouter"
 CODEX_AUTO_AGENT_XAI_LANE_KEY = "xai_grok_native"
 CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY = "xai_oauth_managed"
@@ -344,6 +376,119 @@ def nvidia_completion_adapter_upstream_model(model: Any) -> Optional[str]:
     _prefix, _separator, model_id = canonical.partition("/")
     return model_id or None
 
+
+def _parse_opencode_go_model(
+    model: Any,
+) -> tuple[str, Optional[str], Optional[str], Optional[str]]:
+    """Classify a Go model spelling without rewriting foreign namespaces.
+
+    Returns ``(kind, canonical, claimed_prefix, foreign_provider)``.
+    ``kind`` is one of ``empty``, ``bare``, ``go_prefixed``, ``doubled``,
+    ``cross_provider``, or ``unsupported``.
+    """
+
+    if not isinstance(model, str):
+        return ("empty", None, None, None)
+    cleaned = model.strip()
+    if not cleaned:
+        return ("empty", None, None, None)
+    if "/" not in cleaned:
+        if cleaned in OPENCODE_GO_ALLOWED_MODELS:
+            return ("bare", cleaned, None, None)
+        return ("unsupported", cleaned, None, None)
+
+    prefix, remainder = cleaned.split("/", 1)
+    prefix = prefix.strip()
+    remainder = remainder.strip()
+    if prefix in OPENCODE_GO_MODEL_PREFIXES:
+        if not remainder:
+            return ("empty", None, prefix, None)
+        nested_prefix, nested_sep, _nested_rest = remainder.partition("/")
+        nested_prefix = nested_prefix.strip()
+        if nested_sep:
+            if nested_prefix in OPENCODE_GO_MODEL_PREFIXES:
+                return ("doubled", None, prefix, None)
+            foreign = _OPENCODE_GO_FOREIGN_PREFIXES.get(nested_prefix)
+            if foreign is not None:
+                return ("cross_provider", None, prefix, foreign)
+            return ("unsupported", remainder, prefix, None)
+        if remainder in OPENCODE_GO_ALLOWED_MODELS:
+            return ("go_prefixed", remainder, prefix, None)
+        return ("unsupported", remainder, prefix, None)
+
+    foreign = _OPENCODE_GO_FOREIGN_PREFIXES.get(prefix)
+    if foreign is not None:
+        return ("cross_provider", None, prefix, foreign)
+    return ("unsupported", cleaned, None, None)
+
+
+def canonicalize_opencode_go_alias_model(model: Any) -> str:
+    """Return the canonical bare Go upstream id for an alias candidate.
+
+    Approved bare catalog ids and a single ``opencode_go/`` or
+    ``opencode-go/`` prefix compile to the same bare id. Empty,
+    unsupported, doubled, or cross-provider spellings raise ``ValueError``
+    with a migration diagnostic. Foreign provider namespaces are not
+    rewritten.
+    """
+
+    kind, canonical, claimed_prefix, foreign_provider = _parse_opencode_go_model(
+        model
+    )
+    rendered = model.strip() if isinstance(model, str) else model
+    if kind in {"bare", "go_prefixed"} and canonical is not None:
+        return canonical
+    if kind == "empty":
+        if claimed_prefix is not None:
+            raise ValueError(
+                f"OpenCode Go model {rendered!r} has an empty suffix after "
+                f"{claimed_prefix!r}; use a bare catalog id "
+                f"({', '.join(sorted(OPENCODE_GO_ALLOWED_MODELS))}) or a "
+                "single opencode_go/<id> or opencode-go/<id> prefix"
+            )
+        raise ValueError(
+            "OpenCode Go model is empty; use a bare catalog id "
+            f"({', '.join(sorted(OPENCODE_GO_ALLOWED_MODELS))}) or a "
+            "single opencode_go/<id> or opencode-go/<id> prefix"
+        )
+    if kind == "doubled":
+        raise ValueError(
+            f"OpenCode Go model {rendered!r} has a doubled Go prefix; "
+            "use a single opencode_go/ or opencode-go/ prefix, or the bare "
+            "catalog id"
+        )
+    if kind == "cross_provider":
+        raise ValueError(
+            f"OpenCode Go model {rendered!r} uses {claimed_prefix!r}, "
+            f"which is the {foreign_provider!r} namespace; do not rewrite "
+            "other providers. Use a bare Go catalog id or a single "
+            "opencode_go/<id> or opencode-go/<id> prefix"
+        )
+    raise ValueError(
+        f"OpenCode Go model {rendered!r} is not in the Go catalog "
+        f"allowlist {sorted(OPENCODE_GO_ALLOWED_MODELS)}; migrate to a "
+        "listed bare id or a single opencode_go/<id> or opencode-go/<id> "
+        "prefix"
+    )
+
+
+def normalize_opencode_go_adapter_model_name(model: Any) -> Optional[str]:
+    """Return the canonical bare Go id when a Go namespace is claimed.
+
+    Direct requests must use ``opencode_go/<id>`` or ``opencode-go/<id>``.
+    Bare catalog ids return ``None`` so they do not steal default
+    pass-through. Invalid Go claims return ``None`` (fail-closed direct
+    handling is a separate item).
+    """
+
+    kind, canonical, _claimed_prefix, _foreign_provider = _parse_opencode_go_model(
+        model
+    )
+    if kind == "go_prefixed" and canonical is not None:
+        return canonical
+    return None
+
+
 # Generic compatibility publication for the pass-through integration module.
 COMPAT_ALIAS_MAP: dict[str, str] = {
     "_CODEX_AUTO_AGENT_NATIVE_PROVIDER": "CODEX_AUTO_AGENT_NATIVE_PROVIDER",
@@ -443,6 +588,9 @@ COMPAT_ALIAS_MAP: dict[str, str] = {
     "_normalize_nvidia_completion_adapter_model_name": (
         "normalize_nvidia_completion_adapter_model_name"
     ),
+    "_normalize_opencode_go_adapter_model_name": (
+        "normalize_opencode_go_adapter_model_name"
+    ),
 }
 COMPAT_ALIAS_COUNT = len(COMPAT_ALIAS_MAP)
 
@@ -502,15 +650,19 @@ __all__ = [
     "KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_COMPATIBILITY_MAPPINGS",
     "NVIDIA_COMPLETION_ADAPTER_ALLOWED_MODELS",
     "NVIDIA_COMPLETION_ADAPTER_MODEL_ALIASES",
+    "OPENCODE_GO_ALLOWED_MODELS",
+    "OPENCODE_GO_MODEL_PREFIXES",
     "OPENCODE_GO_PROVIDER",
     "OPENCODE_ZEN_PROVIDER",
     "OPENROUTER_FREE_DAILY_QUOTA_MODELS",
+    "canonicalize_opencode_go_alias_model",
     "install_policy_compat_aliases",
     "is_openrouter_free_model",
     "is_reserved_openrouter_nvidia_nemotron_free_model",
     "normalize_alibaba_token_plan_adapter_model_name",
     "normalize_kimi_code_chat_completions_adapter_model_name",
     "normalize_nvidia_completion_adapter_model_name",
+    "normalize_opencode_go_adapter_model_name",
     "normalize_openrouter_model_namespace",
     "normalize_zai_coding_plan_adapter_model_name",
     "nvidia_completion_adapter_upstream_model",

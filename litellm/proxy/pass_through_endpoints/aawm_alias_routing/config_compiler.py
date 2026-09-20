@@ -37,6 +37,10 @@ from .config_snapshot import (
     RoutingSnapshot,
     ScheduleWindow,
 )
+from .policy import (
+    OPENCODE_GO_PROVIDER,
+    canonicalize_opencode_go_alias_model,
+)
 
 
 class ConfigCompileError(Exception):
@@ -590,9 +594,17 @@ def _compile_candidate(candidate: schema.CandidateConfig, weight: float) -> Rout
         route_family=candidate.route_family,
         anthropic_route_family=anthropic_rf,
     )
+    compiled_model = candidate.model
+    if candidate.provider == OPENCODE_GO_PROVIDER:
+        try:
+            compiled_model = canonicalize_opencode_go_alias_model(candidate.model)
+        except ValueError as exc:
+            raise ConfigCompileError(
+                f"candidate model {candidate.model!r}: {exc}"
+            ) from exc
     return RoutingCandidate(
         provider=candidate.provider,
-        model=candidate.model,
+        model=compiled_model,
         route_family=candidate.route_family,
         priority=candidate.priority,
         weight=weight,
