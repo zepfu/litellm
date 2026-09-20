@@ -89,7 +89,7 @@ class Runtime:
     get_completion_model: Callable[[Optional[str]], Optional[str]]
     pass_through_request: Callable[..., Awaitable[Response]]
     wait_for_cooldown: Callable[..., Awaitable[None]]
-    set_cooldown_callback: Callable[..., Awaitable[None]]
+    set_cooldown_callback: Callable[..., Awaitable[Any]]
     maybe_raise_failure_circuit_open_callback: Callable[..., Awaitable[None]]
     open_failure_circuit_callback: Callable[..., Awaitable[Any]]
     clear_failure_circuit_callback: Callable[[Optional[str]], None]
@@ -688,16 +688,56 @@ async def wait_for_cooldown_if_needed(
     )
 
 
+def _peek_rate_cooldown_remaining_seconds(
+    runtime: Runtime,
+    rate_limit_keys: str | Sequence[str],
+) -> float:
+    keys = retry.normalize_cooldown_keys(rate_limit_keys)
+    remaining = max(
+        (
+            runtime.rate_limit.until_monotonic_by_key.get(key, 0.0)
+            - runtime.monotonic()
+            for key in keys
+        ),
+        default=0.0,
+    )
+    return max(remaining, 0.0)
+
+
 async def set_cooldown(
     runtime: Runtime,
     rate_limit_keys: str | Sequence[str],
     wait_seconds: float,
-) -> None:
+) -> float:
+    """Publish the rate cooldown and return the committed remaining duration.
+
+    The proposal is *wait_seconds*. A longer existing expiry is retained by
+    ``MonotonicCooldownMap.extend``. The return is remaining time until that
+    committed expiry, not the proposal.
+    """
     await retry.set_monotonic_cooldown_map(
         runtime.rate_limit,
         rate_limit_keys,
         wait_seconds,
     )
+    return _peek_rate_cooldown_remaining_seconds(runtime, rate_limit_keys)
+
+
+async def _await_published_rate_cooldown(
+    runtime: Runtime,
+    rate_limit_keys: str | Sequence[str],
+    wait_seconds: float,
+) -> float:
+    """Return the committed rate remaining after publication completes.
+
+    Prefer the owner's return (the committed duration, including a retained
+    longer expiry). If a callback swallows that return, read the map written
+    by the completed publication. Does not catch ``CancelledError``.
+    """
+    published = await runtime.set_cooldown_callback(rate_limit_keys, wait_seconds)
+    if isinstance(published, (int, float)) and not isinstance(published, bool):
+        return max(float(published), 0.0)
+    return _peek_rate_cooldown_remaining_seconds(runtime, rate_limit_keys)
 
 
 async def _publish_long_window_terminal(
@@ -720,11 +760,12 @@ async def _publish_long_window_terminal(
         error_status_code=status_code,
         failure_class="long_window_rate_limit",
     )
-    await runtime.set_cooldown_callback(
+    rate_committed = await _await_published_rate_cooldown(
+        runtime,
         get_cooldown_keys(runtime, model=adapter_model, exc=exc),
         rate_limit_cooldown_seconds,
     )
-    applied_cooldown = rate_limit_cooldown_seconds
+    applied_cooldown = rate_committed
     acknowledge(applied_cooldown)
     circuit_committed = await _await_published_failure_circuit(
         runtime,
@@ -954,17 +995,18 @@ async def _retry_loop_on_failure(
         error_status_code=status_code,
         failure_class="rate_limited",
     )
-    await runtime.set_cooldown_callback(
+    rate_committed = await _await_published_rate_cooldown(
+        runtime,
         get_cooldown_keys(runtime, model=adapter_model, exc=exc),
         wait_seconds,
     )
-    _acknowledge(wait_seconds)
+    _acknowledge(rate_committed)
     _emit_final(
         inner_attempt=attempt,
         status="retrying",
         disposition="retry_backoff",
         delay_seconds=wait_seconds,
-        cooldown_seconds=wait_seconds,
+        cooldown_seconds=rate_committed,
         error_status_code=status_code,
         failure_class="rate_limited",
         attempted_provider_call=True,
