@@ -88,6 +88,7 @@ async def prepare_completion_route(
         target_url=target_url,
         api_key=api_key,
         api_base=api_base,
+        client_requested_stream=client_requested_stream,
         perform_kwargs={
             "custom_llm_provider": runtime.provider,
             "model_for_upstream": adapter_model,
