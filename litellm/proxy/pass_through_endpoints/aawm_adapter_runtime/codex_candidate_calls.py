@@ -6959,21 +6959,48 @@ async def _prepare_codex_nvidia_completion_adapter_route(
         },
     )
     litellm_metadata = dict(request_body.get("litellm_metadata") or {})
+    client_requested_stream = bool(request_body.get("stream"))
+    use_fake_stream = (
+        client_requested_stream
+        and _nvidia_runtime._should_force_fake_stream_for_nvidia_adapter_model(
+            upstream_model
+        )
+    )
+    upstream_stream = client_requested_stream and not use_fake_stream
+    timeout_seconds = _nvidia_runtime._get_nvidia_adapter_request_timeout_seconds(
+        upstream_model
+    )
+    inner_max_retries = _nvidia_runtime._get_nvidia_adapter_inner_max_retries()
     completion_kwargs = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
         model=upstream_model,
         input=request_input,
         responses_api_request=responses_api_request,
         custom_llm_provider=config.custom_llm_provider,
-        stream=bool(request_body.get("stream")),
+        stream=upstream_stream,
         metadata=litellm_metadata,
     )
     completion_kwargs.update(
         {
             "metadata": litellm_metadata,
             "custom_llm_provider": config.custom_llm_provider,
-            "num_retries": 0,
+            "num_retries": inner_max_retries,
+            "timeout": timeout_seconds,
+            "stream": upstream_stream,
         }
     )
+    spans = list(litellm_metadata.get("langfuse_spans") or [])
+    if spans and isinstance(spans[-1], dict):
+        span_meta = dict(spans[-1].get("metadata") or {})
+        span_meta["upstream_stream"] = upstream_stream
+        span_meta["fake_stream"] = use_fake_stream
+        span_meta["request_timeout_seconds"] = timeout_seconds
+        spans[-1] = {**spans[-1], "metadata": span_meta}
+        litellm_metadata["langfuse_spans"] = spans
+    litellm_metadata["codex_nvidia_retry_owner"] = "nvidia_runtime"
+    litellm_metadata["codex_nvidia_fake_stream"] = use_fake_stream
+    litellm_metadata["codex_nvidia_request_timeout_seconds"] = timeout_seconds
+    litellm_metadata["codex_nvidia_inner_max_retries"] = inner_max_retries
+    request_body["litellm_metadata"] = litellm_metadata
     previous_response_id = responses_api_request.get("previous_response_id")
     if isinstance(previous_response_id, str) and previous_response_id:
         completion_kwargs = await LiteLLMCompletionResponsesConfig.async_responses_api_session_handler(
@@ -6998,13 +7025,14 @@ async def _prepare_codex_nvidia_completion_adapter_route(
         target_url=target_url,
         api_key=api_key,
         api_base=api_base,
-        client_requested_stream=bool(request_body.get("stream")),
+        client_requested_stream=client_requested_stream,
         perform_kwargs={
             "completion_kwargs": completion_kwargs,
             "request_input": request_input,
             "responses_api_request": responses_api_request,
             "litellm_metadata": litellm_metadata,
             "upstream_model": upstream_model,
+            "fake_stream": use_fake_stream,
         },
     )
 
@@ -7024,7 +7052,11 @@ async def _perform_codex_nvidia_completion_adapter_call(
     responses_api_request: ResponsesAPIOptionalRequestParams,
     litellm_metadata: Payload,
     upstream_model: str,
+    fake_stream: bool = False,
 ) -> Response:
+    from litellm.proxy.pass_through_endpoints.providers.nvidia import (
+        runtime as _nvidia_runtime,
+    )
     from litellm.responses.litellm_completion_transformation.streaming_iterator import (
         LiteLLMCompletionStreamingIterator,
     )
@@ -7052,18 +7084,99 @@ async def _perform_codex_nvidia_completion_adapter_call(
     )
     if isinstance(getattr(_watermark_egress, "body", None), dict):
         completion_kwargs = _watermark_egress.body
-    completion_response = await litellm.acompletion(
-        **completion_kwargs,
-        api_key=api_key,
-        api_base=api_base,
-        litellm_metadata=litellm_metadata,
-        proxy_server_request={
-            "headers": {},
-            "body": prepared_request_body,
-        },
-        shared_session=_get_proxy_shared_aiohttp_session(),
-    )
+    attempt_accounting: dict[str, int] = {}
+
+    async def _operation() -> Any:
+        return await litellm.acompletion(
+            **completion_kwargs,
+            api_key=api_key,
+            api_base=api_base,
+            litellm_metadata=litellm_metadata,
+            proxy_server_request={
+                "headers": {},
+                "body": prepared_request_body,
+            },
+            shared_session=_get_proxy_shared_aiohttp_session(),
+        )
+
+    try:
+        completion_response = (
+            await _nvidia_runtime._perform_nvidia_completion_adapter_operation(
+                adapter_model=upstream_model,
+                operation=_operation,
+                attempt_accounting=attempt_accounting,
+            )
+        )
+    except Exception as exc:
+        _nvidia_runtime._stamp_nvidia_attempt_accounting(
+            exc,
+            logical_candidate_count=attempt_accounting.get(
+                "nvidia_logical_candidate_count", 1
+            ),
+            wire_attempt_count=attempt_accounting.get(
+                "nvidia_wire_attempt_count", 0
+            ),
+        )
+        if isinstance(litellm_metadata, dict):
+            _nvidia_runtime._stamp_nvidia_attempt_accounting(
+                litellm_metadata,
+                logical_candidate_count=attempt_accounting.get(
+                    "nvidia_logical_candidate_count", 1
+                ),
+                wire_attempt_count=attempt_accounting.get(
+                    "nvidia_wire_attempt_count", 0
+                ),
+            )
+        raise
+    if isinstance(litellm_metadata, dict):
+        _nvidia_runtime._stamp_nvidia_attempt_accounting(
+            litellm_metadata,
+            logical_candidate_count=attempt_accounting.get(
+                "nvidia_logical_candidate_count", 1
+            ),
+            wire_attempt_count=attempt_accounting.get(
+                "nvidia_wire_attempt_count", 0
+            ),
+        )
     if client_requested_stream:
+        if fake_stream and getattr(completion_response, "choices", None) is not None:
+            responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+                chat_completion_response=completion_response,
+                request_input=request_input,
+                responses_api_request=responses_api_request,
+            )
+            response_body: dict[str, Any] = {}
+            serialize = globals().get("_serialize_responses_adapter_response")
+            if callable(serialize):
+                try:
+                    loaded = json.loads(serialize(responses_api_response))
+                except (TypeError, ValueError):
+                    loaded = None
+                if isinstance(loaded, dict):
+                    response_body = loaded
+            if not response_body and isinstance(responses_api_response, dict):
+                response_body = dict(responses_api_response)
+            if not response_body:
+                dump = getattr(responses_api_response, "model_dump", None)
+                payload = dump(mode="json") if callable(dump) else None
+                if isinstance(payload, dict):
+                    response_body = payload
+            fake_stream_body = (
+                prepared_request_body
+                if isinstance(prepared_request_body, dict)
+                else (
+                    {"litellm_metadata": litellm_metadata}
+                    if isinstance(litellm_metadata, dict)
+                    else None
+                )
+            )
+            return StreamingResponse(
+                _responses_sse_from_repaired_response_body(
+                    response_body,
+                    request_body=fake_stream_body,
+                ),
+                media_type="text/event-stream",
+            )
         return StreamingResponse(
             _responses_sse_from_iterator(
                 LiteLLMCompletionStreamingIterator(

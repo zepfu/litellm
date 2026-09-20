@@ -412,6 +412,22 @@ def _get_nvidia_adapter_inner_max_retries() -> int:
     return max(0, parsed)
 
 
+def _nvidia_adapter_fake_stream_identities(
+    adapter_model: Optional[str],
+) -> set[str]:
+    """Return Codex-prefixed and upstream model identities for fake-stream matching."""
+
+    if not adapter_model:
+        return set()
+    identities = {adapter_model}
+    prefix = "nvidia/"
+    if adapter_model.startswith(prefix):
+        remainder = adapter_model[len(prefix) :]
+        if remainder:
+            identities.add(remainder)
+    return identities
+
+
 def _should_force_fake_stream_for_nvidia_adapter_model(
     adapter_model: Optional[str],
 ) -> bool:
@@ -426,7 +442,10 @@ def _should_force_fake_stream_for_nvidia_adapter_model(
         normalized_models = {
             item.strip() for item in configured_models.split(",") if item.strip()
         }
-    return bool(adapter_model and adapter_model in normalized_models)
+    return any(
+        identity in normalized_models
+        for identity in _nvidia_adapter_fake_stream_identities(adapter_model)
+    )
 
 
 def _extract_nvidia_adapter_exception_status_code(
@@ -462,16 +481,78 @@ def _get_nvidia_adapter_retry_wait_seconds(attempt: int) -> float:
     return min(float(2 ** max(0, attempt - 1)), 8.0)
 
 
+def _stamp_nvidia_attempt_accounting(
+    target: Any,
+    *,
+    logical_candidate_count: int,
+    wire_attempt_count: int,
+) -> None:
+    """Expose one logical candidate versus the wire attempts used for it."""
+
+    if target is None:
+        return
+    if isinstance(target, dict):
+        target["nvidia_logical_candidate_count"] = logical_candidate_count
+        target["nvidia_wire_attempt_count"] = wire_attempt_count
+        return
+    setattr(target, "nvidia_logical_candidate_count", logical_candidate_count)
+    setattr(target, "nvidia_wire_attempt_count", wire_attempt_count)
+
+
+def _nvidia_terminal_http_exception(
+    exc: Exception,
+    *,
+    status_code: Optional[int],
+    logical_candidate_count: int,
+    wire_attempt_count: int,
+) -> HTTPException:
+    """Raise-ready HTTPException with sanitized logs already emitted by caller."""
+
+    http_exc = HTTPException(
+        status_code=status_code or 502,
+        detail=str(exc),
+    )
+    setattr(http_exc, "attempted_provider_call", True)
+    setattr(http_exc, "nvidia_same_provider_retries_exhausted", True)
+    _stamp_nvidia_attempt_accounting(
+        http_exc,
+        logical_candidate_count=logical_candidate_count,
+        wire_attempt_count=wire_attempt_count,
+    )
+    return http_exc
+
+
 async def _perform_nvidia_completion_adapter_operation(
     *,
     adapter_model: Optional[str],
     operation: Callable[[], Awaitable[Any]],
+    attempt_accounting: Optional[dict[str, int]] = None,
 ) -> Any:
+    """Own same-provider NVIDIA retries for both direct and alias Codex paths.
+
+    One logical candidate maps to this loop. LiteLLM inner retries stay at the
+    configured inner budget (default 0) so they do not multiply with this owner.
+    Alias execution counts candidates separately and must not replay this loop
+    after exhaustion or after output is committed.
+    """
+
     max_retries = _get_nvidia_adapter_max_retries()
     total_attempts = max_retries + 1
+    logical_candidate_count = 1
     attempt = 0
+    accounting = attempt_accounting if attempt_accounting is not None else {}
+    _stamp_nvidia_attempt_accounting(
+        accounting,
+        logical_candidate_count=logical_candidate_count,
+        wire_attempt_count=0,
+    )
     while True:
         attempt += 1
+        _stamp_nvidia_attempt_accounting(
+            accounting,
+            logical_candidate_count=logical_candidate_count,
+            wire_attempt_count=attempt,
+        )
         _runtime_dependencies.log_debug(
             "NVIDIA completion adapter upstream attempt %s/%s for model=%s",
             attempt,
@@ -479,33 +560,54 @@ async def _perform_nvidia_completion_adapter_operation(
             adapter_model,
         )
         try:
-            return await operation()
+            result = await operation()
+        except asyncio.CancelledError:
+            _stamp_nvidia_attempt_accounting(
+                accounting,
+                logical_candidate_count=logical_candidate_count,
+                wire_attempt_count=attempt,
+            )
+            raise
         except Exception as exc:
             status_code = _extract_nvidia_adapter_exception_status_code(exc)
-            raw_message = str(exc)
+            output_committed = bool(
+                getattr(exc, "nvidia_output_committed", False)
+                or getattr(exc, "terminal_wire_committed", False)
+            )
             if (
-                status_code
+                output_committed
+                or status_code
                 not in _ANTHROPIC_ADAPTER_NVIDIA_RETRYABLE_STATUS_CODES
                 or attempt >= total_attempts
             ):
                 _runtime_dependencies.log_warning(
-                    "NVIDIA completion adapter upstream attempt %s failed with %s (%s, raw=%s) and will not be retried",
+                    "NVIDIA completion adapter upstream attempt %s failed with %s (%s) and will not be retried",
                     attempt,
                     status_code,
                     exc.__class__.__name__,
-                    raw_message,
                 )
-                raise HTTPException(
-                    status_code=status_code or 502,
-                    detail=raw_message,
+                http_exc = _nvidia_terminal_http_exception(
+                    exc,
+                    status_code=status_code,
+                    logical_candidate_count=logical_candidate_count,
+                    wire_attempt_count=attempt,
                 )
+                raise http_exc from exc
             wait_seconds = _get_nvidia_adapter_retry_wait_seconds(attempt)
             _runtime_dependencies.log_warning(
-                "NVIDIA completion adapter upstream attempt %s hit %s (%s, raw=%s); backoff %.1fs",
+                "NVIDIA completion adapter upstream attempt %s hit %s (%s); backoff %.1fs",
                 attempt,
                 status_code,
                 exc.__class__.__name__,
-                raw_message,
                 wait_seconds,
             )
+            # Injected sleep remains the cancellation-aware wait; do not wrap
+            # it in Exception handling or a committed-output replay.
             await _runtime_dependencies.sleep(wait_seconds)
+            continue
+        _stamp_nvidia_attempt_accounting(
+            accounting,
+            logical_candidate_count=logical_candidate_count,
+            wire_attempt_count=attempt,
+        )
+        return result
