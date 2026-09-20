@@ -709,3 +709,74 @@ def test_disabled_facade_catalog_handler_is_not_found(
     assert response.status_code == 404
     assert response.json() == {"detail": "Not Found"}
     assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_muse_candidate_upstream_400_does_not_copy_content_length(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi import Request
+
+    upstream_message = (
+        'only `"auto"` is supported for `tool_choice`. '
+        '`"none"`, `"required"`, and named function choices are not currently '
+        "supported"
+    )
+    upstream_body = json.dumps({"error": {"message": upstream_message}}).encode(
+        "utf-8"
+    )
+    _set_upstream(
+        monkeypatch,
+        lambda request: httpx.Response(
+            400,
+            content=upstream_body,
+            headers={
+                "content-type": "application/json",
+                "retry-after": "2",
+                "x-request-id": "muse-req-1",
+            },
+            request=request,
+        ),
+    )
+    monkeypatch.setattr(
+        muse_code_gateway,
+        "load_muse_code_server_bearer",
+        lambda: "muse-host-bearer",
+    )
+    request = Request(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/openai_passthrough/v1/responses",
+            "raw_path": b"/openai_passthrough/v1/responses",
+            "query_string": b"",
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"user-agent", b"codex-cli/0.144.6"),
+            ],
+            "client": ("127.0.0.1", 1234),
+            "server": ("testserver", 80),
+        }
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await muse_code_gateway.proxy_muse_code_responses_candidate(
+            request,
+            {
+                "model": "muse-spark-1.3-contributor",
+                "input": "hi",
+                "tool_choice": "required",
+            },
+        )
+
+    exc = caught.value
+    assert exc.status_code == 400
+    assert upstream_message in str(exc.detail)
+    header_names = {name.lower() for name in (exc.headers or {})}
+    assert "content-length" not in header_names
+    assert (exc.headers or {}).get("retry-after") == "2"
+    assert (exc.headers or {}).get("x-request-id") == "muse-req-1"
+    assert (exc.headers or {}).get("content-type") == "application/json"

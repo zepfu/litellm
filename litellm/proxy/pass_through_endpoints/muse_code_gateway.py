@@ -1343,6 +1343,10 @@ async def proxy_muse_code_responses_candidate(
     # Direct gateway callers receive upstream statuses as Responses. Alias
     # candidates must raise them so the existing retry/fallback loop owns them.
     if not 200 <= response.status_code < 300:
+        # Starlette Response auto-sets Content-Length for the upstream body.
+        # The rewritten FastAPI detail is shorter; copying that length makes
+        # Hypercorn/h11 raise LocalProtocolError after the handled 400.
+        candidate_headers = _get_response_headers(httpx.Headers(response.headers))
         exc = HTTPException(
             status_code=response.status_code,
             detail={
@@ -1353,7 +1357,7 @@ async def proxy_muse_code_responses_candidate(
                     )
                 }
             },
-            headers=dict(response.headers),
+            headers=candidate_headers or None,
         )
         setattr(exc, "attempted_provider_call", True)
         setattr(exc, "_aawm_provider_returned", True)
