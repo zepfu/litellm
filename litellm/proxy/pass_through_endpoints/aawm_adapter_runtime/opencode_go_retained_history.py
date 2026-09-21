@@ -202,20 +202,31 @@ def _as_message_mapping(message: Any) -> dict[str, Any]:
     return mapping
 
 
-def _item_has_structural_form(mapping: Mapping[str, Any]) -> bool:
+def _item_has_required_fields(mapping: Mapping[str, Any]) -> bool:
     item_type = mapping.get("type")
-    if isinstance(item_type, str) and item_type:
-        return True
+    type_name = item_type if isinstance(item_type, str) and item_type else ""
     role = mapping.get("role")
-    if isinstance(role, str) and role.strip():
+    role_name = role.strip() if isinstance(role, str) else ""
+    has_content = "content" in mapping and mapping.get("content") is not None
+    raw_calls = mapping.get("tool_calls")
+    has_tool_calls = isinstance(raw_calls, list) and bool(raw_calls)
+    if type_name in _UNSUPPORTED_NATIVE_TYPES:
         return True
-    if mapping.get("tool_calls"):
+    if type_name in {"function_call", "function_call_output"}:
         return True
-    if mapping.get("tool_call_id") is not None or mapping.get("call_id") is not None:
+    if has_tool_calls:
         return True
-    if "content" in mapping or "output" in mapping or "arguments" in mapping:
+    if role_name == "tool" or mapping.get("tool_call_id") is not None:
         return True
-    return False
+    if role_name == "assistant":
+        return has_content or has_tool_calls
+    if type_name == "message" or role_name:
+        return has_content
+    return has_content
+
+
+def _item_has_structural_form(mapping: Mapping[str, Any]) -> bool:
+    return _item_has_required_fields(mapping)
 
 
 def _require_interpretable_item_mapping(raw_item: Any) -> dict[str, Any]:
@@ -608,12 +619,16 @@ def _validate_instruction_content(content: Any) -> None:
             if "image_url" in block or "file" in block:
                 _raise_unsupported_retained_history()
             if "text" in block:
+                if not isinstance(block.get("text"), str):
+                    _raise_unsupported_retained_history()
                 continue
             _raise_unsupported_retained_history()
         if (
             not isinstance(block_type, str)
             or block_type not in _INSTRUCTION_CONTENT_TYPES
         ):
+            _raise_unsupported_retained_history()
+        if not isinstance(block.get("text"), str):
             _raise_unsupported_retained_history()
 
 
@@ -826,6 +841,8 @@ def _native_items_from_assistant_chat(message: Mapping[str, Any]) -> list[dict[s
     raw_calls = message.get("tool_calls")
     if not isinstance(raw_calls, list):
         if not items:
+            if content is None:
+                _raise_previous_response_unavailable()
             items.append(
                 {
                     "type": "message",
@@ -894,11 +911,14 @@ def _native_items_from_chat_messages(messages: Sequence[Any]) -> tuple[list[dict
         if role_name == "assistant":
             items.extend(_native_items_from_assistant_chat(mapping))
             continue
+        content = mapping.get("content")
+        if content is None:
+            _raise_previous_response_unavailable()
         items.append(
             {
                 "type": "message",
                 "role": role_name or "user",
-                "content": _native_content_from_chat_content(mapping.get("content")),
+                "content": _native_content_from_chat_content(content),
             }
         )
     return items, instructions
@@ -971,12 +991,15 @@ def _native_items_from_input(
             items.extend(_native_items_from_assistant_chat(mapping))
             continue
         if item_type in {None, "message"}:
-            _validate_lossless_content(mapping.get("content"))
+            content = mapping.get("content")
+            if content is None:
+                _raise_previous_response_unavailable()
+            _validate_lossless_content(content)
             items.append(
                 {
                     "type": "message",
                     "role": role_name or "user",
-                    "content": _clone_item(mapping.get("content")),
+                    "content": _clone_item(content),
                 }
             )
             continue
@@ -1077,8 +1100,7 @@ async def _native_history_from_spend_logs(
         output_items, output_instructions = _output_native_items_from_spend_log(
             spend_log
         )
-        turn_items = list(request_items) + list(output_items)
-        items = _compose_retained_items(items, turn_items)
+        items = _compose_retained_items(items, request_items, output_items)
         instructions = _merge_instructions(
             instructions, request_instructions, output_instructions
         )
@@ -1161,27 +1183,44 @@ def _native_semantic_key(item: Any) -> tuple[Any, ...]:
     )
 
 
+def _request_restates_retained_history(
+    existing_keys: Sequence[Any],
+    request_keys: Sequence[Any],
+) -> bool:
+    if not existing_keys or not request_keys:
+        return False
+    existing_len = len(existing_keys)
+    return (
+        len(request_keys) >= existing_len
+        and request_keys[:existing_len] == list(existing_keys)
+    )
+
+
 def _compose_retained_items(
     existing: Sequence[Any],
-    incoming: Sequence[Any],
+    request_items: Sequence[Any],
+    output_items: Sequence[Any],
 ) -> list[Any]:
-    if not incoming:
-        return [_clone_item(item) for item in existing]
+    # Decide whether the request restates history before appending output.
+    # New output must not complete an apparent cumulative prefix.
+    cloned_output = [_clone_item(item) for item in output_items]
+    if not request_items:
+        return [_clone_item(item) for item in existing] + cloned_output
     if not existing:
-        return [_clone_item(item) for item in incoming]
+        return [_clone_item(item) for item in request_items] + cloned_output
     existing_keys = [_native_semantic_key(item) for item in existing]
+    request_keys = [_native_semantic_key(item) for item in request_items]
+    if _request_restates_retained_history(existing_keys, request_keys):
+        return [_clone_item(item) for item in request_items] + cloned_output
+    incoming = list(request_items) + list(output_items)
     incoming_keys = [_native_semantic_key(item) for item in incoming]
     existing_len = len(existing_keys)
     incoming_len = len(incoming_keys)
-    # Cumulative-prefix replay restates the whole history and adds a suffix.
-    # Equal-length identical content is a new record, not the same occurrence.
-    if incoming_len > existing_len and incoming_keys[:existing_len] == existing_keys:
-        return [_clone_item(item) for item in incoming]
     if incoming_len < existing_len and existing_keys[:incoming_len] == incoming_keys:
         _raise_previous_response_unavailable()
-    overlap_limit = min(existing_len, incoming_len)
+    overlap_limit = min(existing_len, len(request_keys))
     for k in range(1, overlap_limit):
-        if existing_keys[-k:] == incoming_keys[:k]:
+        if existing_keys[-k:] == request_keys[:k]:
             _raise_previous_response_unavailable()
     return [_clone_item(item) for item in existing] + [
         _clone_item(item) for item in incoming
