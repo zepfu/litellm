@@ -202,8 +202,60 @@ def _as_message_mapping(message: Any) -> dict[str, Any]:
     return mapping
 
 
+def _optional_string_item_type(item_type: Any) -> Optional[str]:
+    if item_type is None:
+        return None
+    if not isinstance(item_type, str):
+        _raise_previous_response_unavailable()
+    return item_type
+
+
+def _function_name(mapping: Mapping[str, Any]) -> Optional[str]:
+    function = mapping.get("function")
+    function_map = function if isinstance(function, Mapping) else {}
+    name = function_map.get("name")
+    if isinstance(name, str):
+        return name
+    top = mapping.get("name")
+    return top if isinstance(top, str) else None
+
+
+def _function_arguments(mapping: Mapping[str, Any]) -> tuple[bool, Any]:
+    function = mapping.get("function")
+    function_map = function if isinstance(function, Mapping) else {}
+    arguments = function_map.get("arguments")
+    if arguments is None:
+        arguments = mapping.get("arguments")
+    return arguments is not None, arguments
+
+
+def _has_function_call_payload(mapping: Mapping[str, Any]) -> bool:
+    name = _function_name(mapping)
+    has_arguments, _ = _function_arguments(mapping)
+    return name is not None and has_arguments
+
+
+def _has_tool_result_payload(mapping: Mapping[str, Any]) -> bool:
+    return mapping.get("output") is not None or mapping.get("content") is not None
+
+
+def _assistant_tool_calls_have_required_payload(raw_calls: Any) -> bool:
+    if not isinstance(raw_calls, list) or not raw_calls:
+        return False
+    for tool_call in raw_calls:
+        if not _has_function_call_payload(_as_message_mapping(tool_call)):
+            return False
+    return True
+
+
+def _text_block_has_representable_text(block: Mapping[str, Any]) -> bool:
+    return isinstance(block.get("text"), str)
+
+
 def _item_has_required_fields(mapping: Mapping[str, Any]) -> bool:
     item_type = mapping.get("type")
+    if item_type is not None and not isinstance(item_type, str):
+        return False
     type_name = item_type if isinstance(item_type, str) and item_type else ""
     role = mapping.get("role")
     role_name = role.strip() if isinstance(role, str) else ""
@@ -212,12 +264,14 @@ def _item_has_required_fields(mapping: Mapping[str, Any]) -> bool:
     has_tool_calls = isinstance(raw_calls, list) and bool(raw_calls)
     if type_name in _UNSUPPORTED_NATIVE_TYPES:
         return True
-    if type_name in {"function_call", "function_call_output"}:
-        return True
+    if type_name == "function_call":
+        return _has_function_call_payload(mapping)
+    if type_name == "function_call_output":
+        return _has_tool_result_payload(mapping)
     if has_tool_calls:
-        return True
+        return _assistant_tool_calls_have_required_payload(raw_calls)
     if role_name == "tool" or mapping.get("tool_call_id") is not None:
-        return True
+        return _has_tool_result_payload(mapping)
     if role_name == "assistant":
         return has_content or has_tool_calls
     if type_name == "message" or role_name:
@@ -598,10 +652,15 @@ def _validate_lossless_content(content: Any) -> None:
         block_type = block.get("type")
         if block_type is None:
             if "text" in block or "image_url" in block or "file" in block:
+                if "text" in block and not _text_block_has_representable_text(block):
+                    _raise_previous_response_unavailable()
                 continue
             _raise_unsupported_retained_history()
         if not isinstance(block_type, str) or block_type not in _SUPPORTED_CONTENT_TYPES:
             _raise_unsupported_retained_history()
+        if block_type in {"text", "input_text", "output_text"}:
+            if not _text_block_has_representable_text(block):
+                _raise_previous_response_unavailable()
 
 
 def _validate_instruction_content(content: Any) -> None:
@@ -691,12 +750,14 @@ def _native_content_from_chat_content(content: Any) -> Any:
             continue
         block_map = dict(block)
         block_type = block_map.get("type")
-        if block_type in {"text", "output_text"}:
-            native_blocks.append(
-                {"type": "input_text", "text": block_map.get("text", "")}
-            )
+        if isinstance(block_type, str) and block_type in {"text", "output_text"}:
+            if not _text_block_has_representable_text(block_map):
+                _raise_previous_response_unavailable()
+            native_blocks.append({"type": "input_text", "text": block_map.get("text")})
             continue
         if block_type == "input_text":
+            if not _text_block_has_representable_text(block_map):
+                _raise_previous_response_unavailable()
             native_blocks.append(block_map)
             continue
         if block_type == "image_url":
@@ -747,8 +808,14 @@ def _chat_content_from_native_content(content: Any) -> Any:
             continue
         block_map = dict(block)
         block_type = block_map.get("type")
-        if block_type in {"input_text", "output_text", "text"}:
-            chat_blocks.append({"type": "text", "text": block_map.get("text", "")})
+        if isinstance(block_type, str) and block_type in {
+            "input_text",
+            "output_text",
+            "text",
+        }:
+            if not _text_block_has_representable_text(block_map):
+                _raise_previous_response_unavailable()
+            chat_blocks.append({"type": "text", "text": block_map.get("text")})
             continue
         if block_type == "input_image":
             image_url = block_map.get("image_url") or block_map.get("url")
@@ -791,6 +858,8 @@ def _function_call_output_canonical_id(mapping: Mapping[str, Any]) -> Optional[s
 
 
 def _canonicalize_function_call_item(mapping: Mapping[str, Any]) -> dict[str, Any]:
+    if not _has_function_call_payload(mapping):
+        _raise_previous_response_unavailable()
     item = _clone_item(mapping)
     if not isinstance(item, dict):
         item = dict(mapping)
@@ -801,15 +870,16 @@ def _canonicalize_function_call_item(mapping: Mapping[str, Any]) -> dict[str, An
 
 
 def _canonicalize_function_call_output_item(mapping: Mapping[str, Any]) -> dict[str, Any]:
+    if not _has_tool_result_payload(mapping):
+        _raise_previous_response_unavailable()
     item = _clone_item(mapping)
     if not isinstance(item, dict):
         item = dict(mapping)
     item["type"] = "function_call_output"
     call_id = _function_call_output_canonical_id(item)
     item["call_id"] = call_id if call_id is not None else ""
-    if "output" not in item:
-        output = item.get("content")
-        item["output"] = output if output is not None else ""
+    if item.get("output") is None:
+        item["output"] = item.get("content")
     return item
 
 
@@ -853,22 +923,18 @@ def _native_items_from_assistant_chat(message: Mapping[str, Any]) -> list[dict[s
         return items
     for tool_call in raw_calls:
         mapping = _as_message_mapping(tool_call)
-        function = mapping.get("function")
-        function_map = function if isinstance(function, Mapping) else {}
-        name = function_map.get("name")
-        if not isinstance(name, str):
-            name = mapping.get("name") if isinstance(mapping.get("name"), str) else ""
-        arguments = function_map.get("arguments")
-        if arguments is None:
-            arguments = mapping.get("arguments")
+        name = _function_name(mapping)
+        has_arguments, arguments = _function_arguments(mapping)
+        if name is None or not has_arguments:
+            _raise_previous_response_unavailable()
         items.append(
             _canonicalize_function_call_item(
                 {
                     "type": "function_call",
                     "call_id": _function_call_canonical_id(mapping),
                     "id": mapping.get("id"),
-                    "name": name or "",
-                    "arguments": arguments if arguments is not None else "",
+                    "name": name,
+                    "arguments": arguments,
                 }
             )
         )
@@ -882,8 +948,8 @@ def _native_items_from_chat_messages(messages: Sequence[Any]) -> tuple[list[dict
         mapping = _require_interpretable_item_mapping(message)
         role = mapping.get("role")
         role_name = role.strip() if isinstance(role, str) else ""
-        item_type = mapping.get("type")
-        if isinstance(item_type, str) and item_type in _UNSUPPORTED_NATIVE_TYPES:
+        item_type = _optional_string_item_type(mapping.get("type"))
+        if item_type in _UNSUPPORTED_NATIVE_TYPES:
             _raise_unsupported_retained_history()
         if role_name in {"system", "developer"}:
             instructions = _merge_instructions(
@@ -894,13 +960,15 @@ def _native_items_from_chat_messages(messages: Sequence[Any]) -> tuple[list[dict
             output = mapping.get("content")
             if output is None:
                 output = mapping.get("output")
+            if output is None:
+                _raise_previous_response_unavailable()
             items.append(
                 _canonicalize_function_call_output_item(
                     {
                         "type": "function_call_output",
                         "call_id": _function_call_output_canonical_id(mapping),
                         "tool_call_id": mapping.get("tool_call_id"),
-                        "output": output if output is not None else "",
+                        "output": output,
                     }
                 )
             )
@@ -964,8 +1032,8 @@ def _native_items_from_input(
     items: list[dict[str, Any]] = []
     for raw_item in parsed:
         mapping = _require_interpretable_item_mapping(raw_item)
-        item_type = mapping.get("type")
-        if isinstance(item_type, str) and item_type in _UNSUPPORTED_NATIVE_TYPES:
+        item_type = _optional_string_item_type(mapping.get("type"))
+        if item_type in _UNSUPPORTED_NATIVE_TYPES:
             _raise_unsupported_retained_history()
         role = mapping.get("role")
         role_name = role.strip() if isinstance(role, str) else ""
