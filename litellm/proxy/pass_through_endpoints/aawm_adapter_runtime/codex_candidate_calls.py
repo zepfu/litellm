@@ -6986,6 +6986,7 @@ async def _prepare_codex_nvidia_completion_adapter_route(
             "num_retries": inner_max_retries,
             "timeout": timeout_seconds,
             "stream": upstream_stream,
+            "caller_managed_hidden_retry": True,
         }
     )
     spans = list(litellm_metadata.get("langfuse_spans") or [])
@@ -6996,10 +6997,14 @@ async def _prepare_codex_nvidia_completion_adapter_route(
         span_meta["request_timeout_seconds"] = timeout_seconds
         spans[-1] = {**spans[-1], "metadata": span_meta}
         litellm_metadata["langfuse_spans"] = spans
+    litellm_metadata["caller_managed_hidden_retry"] = True
     litellm_metadata["codex_nvidia_retry_owner"] = "nvidia_runtime"
     litellm_metadata["codex_nvidia_fake_stream"] = use_fake_stream
     litellm_metadata["codex_nvidia_request_timeout_seconds"] = timeout_seconds
     litellm_metadata["codex_nvidia_inner_max_retries"] = inner_max_retries
+    litellm_metadata[
+        _nvidia_runtime.NVIDIA_LOWER_LEVEL_HTTP_ATTEMPT_COUNT_KEY
+    ] = 0
     request_body["litellm_metadata"] = litellm_metadata
     previous_response_id = responses_api_request.get("previous_response_id")
     if isinstance(previous_response_id, str) and previous_response_id:
@@ -7084,20 +7089,36 @@ async def _perform_codex_nvidia_completion_adapter_call(
     )
     if isinstance(getattr(_watermark_egress, "body", None), dict):
         completion_kwargs = _watermark_egress.body
+    if isinstance(completion_kwargs, dict):
+        completion_kwargs["caller_managed_hidden_retry"] = True
+    if isinstance(litellm_metadata, dict):
+        litellm_metadata["caller_managed_hidden_retry"] = True
     attempt_accounting: dict[str, int] = {}
 
     async def _operation() -> Any:
-        return await litellm.acompletion(
-            **completion_kwargs,
-            api_key=api_key,
-            api_base=api_base,
+        try:
+            result = await litellm.acompletion(
+                **completion_kwargs,
+                api_key=api_key,
+                api_base=api_base,
+                litellm_metadata=litellm_metadata,
+                proxy_server_request={
+                    "headers": {},
+                    "body": prepared_request_body,
+                },
+                shared_session=_get_proxy_shared_aiohttp_session(),
+            )
+        except Exception:
+            _nvidia_runtime._copy_nvidia_lower_level_http_attempts(
+                litellm_metadata=litellm_metadata,
+                attempt_accounting=attempt_accounting,
+            )
+            raise
+        _nvidia_runtime._copy_nvidia_lower_level_http_attempts(
             litellm_metadata=litellm_metadata,
-            proxy_server_request={
-                "headers": {},
-                "body": prepared_request_body,
-            },
-            shared_session=_get_proxy_shared_aiohttp_session(),
+            attempt_accounting=attempt_accounting,
         )
+        return result
 
     try:
         completion_response = (

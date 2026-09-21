@@ -64,6 +64,12 @@ openaiOSeriesConfig = OpenAIOSeriesConfig()
 openAIGPT5Config = OpenAIGPT5Config()
 
 
+# NVIDIA completion adapter opt-in: seed this key to 0 on litellm_metadata
+# so actual HTTP attempts (SDK retries included) can be counted without
+# multiplying by the configured inner budget.
+_NVIDIA_LOWER_LEVEL_HTTP_ATTEMPT_COUNT_KEY = "nvidia_lower_level_http_attempt_count"
+
+
 def _caller_managed_hidden_retry(litellm_params: Optional[dict]) -> bool:
     """True when the caller owns retry and this adapter must not 422-replay."""
     if not isinstance(litellm_params, dict):
@@ -78,6 +84,50 @@ def _caller_managed_hidden_retry(litellm_params: Optional[dict]) -> bool:
         ):
             return True
     return False
+
+
+def _openai_http_attempts_from_raw_response(raw_response: Any) -> int:
+    retries_taken = getattr(raw_response, "retries_taken", None)
+    try:
+        if retries_taken is not None:
+            return max(1, int(retries_taken) + 1)
+    except (TypeError, ValueError):
+        pass
+    return 1
+
+
+def _openai_http_attempts_from_exception(exc: BaseException) -> int:
+    request = getattr(exc, "request", None)
+    headers = getattr(request, "headers", None)
+    if headers is not None:
+        raw = headers.get("x-stainless-retry-count")
+        try:
+            if raw is not None:
+                return max(1, int(raw) + 1)
+        except (TypeError, ValueError):
+            pass
+    return 1
+
+
+def _accumulate_nvidia_lower_level_http_attempts(
+    litellm_params: Optional[dict],
+    *,
+    attempts: int,
+) -> None:
+    """Add actual HTTP attempts onto NVIDIA-opted-in litellm_metadata."""
+    if attempts <= 0 or not isinstance(litellm_params, dict):
+        return
+    metadata = litellm_params.get("litellm_metadata")
+    if not isinstance(metadata, dict):
+        return
+    if _NVIDIA_LOWER_LEVEL_HTTP_ATTEMPT_COUNT_KEY not in metadata:
+        return
+    prior = metadata.get(_NVIDIA_LOWER_LEVEL_HTTP_ATTEMPT_COUNT_KEY)
+    try:
+        prior_n = int(prior) if prior is not None else 0
+    except (TypeError, ValueError):
+        prior_n = 0
+    metadata[_NVIDIA_LOWER_LEVEL_HTTP_ATTEMPT_COUNT_KEY] = prior_n + attempts
 
 
 def _should_drop_unprocessable_entity_params(
@@ -457,6 +507,7 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
         - call chat.completions.create by default
         """
         start_time = time.time()
+        raw_response = None
         try:
             raw_response = (
                 await openai_aclient.chat.completions.with_raw_response.create(
@@ -475,13 +526,33 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                     status_code=500,
                     message=f"Empty or invalid response from LLM endpoint. Received: {response!r}. Check the reverse proxy or model server configuration.",
                 )
+            _accumulate_nvidia_lower_level_http_attempts(
+                getattr(logging_obj, "litellm_params", None),
+                attempts=_openai_http_attempts_from_raw_response(raw_response),
+            )
             return headers, response
         except openai.APITimeoutError as e:
             end_time = time.time()
             time_delta = round(end_time - start_time, 2)
             e.message += f" - timeout value={timeout}, time taken={time_delta} seconds"
+            _accumulate_nvidia_lower_level_http_attempts(
+                getattr(logging_obj, "litellm_params", None),
+                attempts=(
+                    _openai_http_attempts_from_raw_response(raw_response)
+                    if raw_response is not None
+                    else _openai_http_attempts_from_exception(e)
+                ),
+            )
             raise e
         except Exception as e:
+            _accumulate_nvidia_lower_level_http_attempts(
+                getattr(logging_obj, "litellm_params", None),
+                attempts=(
+                    _openai_http_attempts_from_raw_response(raw_response)
+                    if raw_response is not None
+                    else _openai_http_attempts_from_exception(e)
+                ),
+            )
             raise e
 
     @track_llm_api_timing()

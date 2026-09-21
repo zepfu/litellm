@@ -39,6 +39,9 @@ NVIDIA_API_BASE_VERSION_SEGMENT = "/v1"
 NVIDIA_TARGET_BASE_DEFAULT = "https://integrate.api.nvidia.com"
 """Canonical default NVIDIA target root, stored without a version segment."""
 
+NVIDIA_LOWER_LEVEL_HTTP_ATTEMPT_COUNT_KEY = "nvidia_lower_level_http_attempt_count"
+"""Opt-in metadata key. Seed to 0 so openai.py can record actual HTTP attempts."""
+
 
 @dataclass(frozen=True)
 class NvidiaProfileNamespace:
@@ -481,6 +484,69 @@ def _get_nvidia_adapter_retry_wait_seconds(attempt: int) -> float:
     return min(float(2 ** max(0, attempt - 1)), 8.0)
 
 
+def _nvidia_recorded_lower_level_attempts(source: Any) -> Optional[int]:
+    """Read recorded inner HTTP attempts without using the configured budget."""
+
+    if source is None:
+        return None
+    candidates: list[Any] = []
+    if isinstance(source, dict):
+        candidates.append(source.get(NVIDIA_LOWER_LEVEL_HTTP_ATTEMPT_COUNT_KEY))
+        metadata = source.get("litellm_metadata")
+        if isinstance(metadata, dict):
+            candidates.append(metadata.get(NVIDIA_LOWER_LEVEL_HTTP_ATTEMPT_COUNT_KEY))
+    else:
+        candidates.append(
+            getattr(source, NVIDIA_LOWER_LEVEL_HTTP_ATTEMPT_COUNT_KEY, None)
+        )
+        hidden = getattr(source, "_hidden_params", None)
+        if isinstance(hidden, dict):
+            candidates.append(hidden.get(NVIDIA_LOWER_LEVEL_HTTP_ATTEMPT_COUNT_KEY))
+    for raw in candidates:
+        if raw is None:
+            continue
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if parsed >= 0:
+            return parsed
+    return None
+
+
+def _copy_nvidia_lower_level_http_attempts(
+    *,
+    litellm_metadata: Any,
+    attempt_accounting: dict[str, int],
+) -> None:
+    """Copy openai.py-recorded HTTP attempts onto runtime accounting."""
+
+    recorded = _nvidia_recorded_lower_level_attempts(litellm_metadata)
+    if recorded is None:
+        recorded = _nvidia_recorded_lower_level_attempts(attempt_accounting)
+    if recorded is None:
+        return
+    attempt_accounting[NVIDIA_LOWER_LEVEL_HTTP_ATTEMPT_COUNT_KEY] = recorded
+
+
+def _nvidia_operation_wire_delta(
+    accounting: dict[str, int],
+    recorded_before: int,
+    payload: Any = None,
+) -> int:
+    """Return actual lower-level attempts for one operation(); default 1."""
+
+    recorded_after = _nvidia_recorded_lower_level_attempts(accounting)
+    if recorded_after is None:
+        recorded_after = _nvidia_recorded_lower_level_attempts(payload)
+    if recorded_after is None:
+        return 1
+    delta = recorded_after - recorded_before
+    if delta <= 0:
+        return 1
+    return delta
+
+
 def _stamp_nvidia_attempt_accounting(
     target: Any,
     *,
@@ -540,6 +606,7 @@ async def _perform_nvidia_completion_adapter_operation(
     total_attempts = max_retries + 1
     logical_candidate_count = 1
     attempt = 0
+    wire_attempt_count = 0
     accounting = attempt_accounting if attempt_accounting is not None else {}
     _stamp_nvidia_attempt_accounting(
         accounting,
@@ -548,11 +615,7 @@ async def _perform_nvidia_completion_adapter_operation(
     )
     while True:
         attempt += 1
-        _stamp_nvidia_attempt_accounting(
-            accounting,
-            logical_candidate_count=logical_candidate_count,
-            wire_attempt_count=attempt,
-        )
+        recorded_before = _nvidia_recorded_lower_level_attempts(accounting) or 0
         _runtime_dependencies.log_debug(
             "NVIDIA completion adapter upstream attempt %s/%s for model=%s",
             attempt,
@@ -562,13 +625,24 @@ async def _perform_nvidia_completion_adapter_operation(
         try:
             result = await operation()
         except asyncio.CancelledError:
+            wire_attempt_count += _nvidia_operation_wire_delta(
+                accounting, recorded_before
+            )
             _stamp_nvidia_attempt_accounting(
                 accounting,
                 logical_candidate_count=logical_candidate_count,
-                wire_attempt_count=attempt,
+                wire_attempt_count=wire_attempt_count,
             )
             raise
         except Exception as exc:
+            wire_attempt_count += _nvidia_operation_wire_delta(
+                accounting, recorded_before, payload=exc
+            )
+            _stamp_nvidia_attempt_accounting(
+                accounting,
+                logical_candidate_count=logical_candidate_count,
+                wire_attempt_count=wire_attempt_count,
+            )
             status_code = _extract_nvidia_adapter_exception_status_code(exc)
             output_committed = bool(
                 getattr(exc, "nvidia_output_committed", False)
@@ -590,7 +664,7 @@ async def _perform_nvidia_completion_adapter_operation(
                     exc,
                     status_code=status_code,
                     logical_candidate_count=logical_candidate_count,
-                    wire_attempt_count=attempt,
+                    wire_attempt_count=wire_attempt_count,
                 )
                 raise http_exc from exc
             wait_seconds = _get_nvidia_adapter_retry_wait_seconds(attempt)
@@ -605,9 +679,12 @@ async def _perform_nvidia_completion_adapter_operation(
             # it in Exception handling or a committed-output replay.
             await _runtime_dependencies.sleep(wait_seconds)
             continue
+        wire_attempt_count += _nvidia_operation_wire_delta(
+            accounting, recorded_before, payload=result
+        )
         _stamp_nvidia_attempt_accounting(
             accounting,
             logical_candidate_count=logical_candidate_count,
-            wire_attempt_count=attempt,
+            wire_attempt_count=wire_attempt_count,
         )
         return result

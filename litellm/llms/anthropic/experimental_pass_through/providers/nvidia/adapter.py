@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from litellm.proxy.pass_through_endpoints.providers.nvidia.runtime import (
+    NVIDIA_LOWER_LEVEL_HTTP_ATTEMPT_COUNT_KEY,
     NvidiaCredentialTargetProfile,
+    _copy_nvidia_lower_level_http_attempts,
     _nvidia_api_base_from_target_base,
     _nvidia_credential_target_profile_observability,
     _require_nvidia_api_key,
@@ -73,11 +75,34 @@ async def prepare_completion_route(
         credential_family=config.credential_family,
         expected_target_family=config.expected_target_family,
     )
+    litellm_metadata = prepared_request_body.get("litellm_metadata")
+    if not isinstance(litellm_metadata, dict):
+        litellm_metadata = {}
+        prepared_request_body["litellm_metadata"] = litellm_metadata
+    litellm_metadata["caller_managed_hidden_retry"] = True
+    litellm_metadata[NVIDIA_LOWER_LEVEL_HTTP_ATTEMPT_COUNT_KEY] = 0
+    attempt_accounting: dict[str, int] = {}
 
     async def operation_wrapper(operation: Any) -> Any:
+        async def _counted_operation() -> Any:
+            try:
+                result = await operation()
+            except Exception:
+                _copy_nvidia_lower_level_http_attempts(
+                    litellm_metadata=litellm_metadata,
+                    attempt_accounting=attempt_accounting,
+                )
+                raise
+            _copy_nvidia_lower_level_http_attempts(
+                litellm_metadata=litellm_metadata,
+                attempt_accounting=attempt_accounting,
+            )
+            return result
+
         return await runtime.perform_operation(
             adapter_model=adapter_model,
-            operation=operation,
+            operation=_counted_operation,
+            attempt_accounting=attempt_accounting,
         )
 
     return adapter_driver.CompletionAdapterRoutePlan(
@@ -95,5 +120,8 @@ async def prepare_completion_route(
             "max_retries": runtime.get_inner_max_retries(),
             "operation_wrapper": operation_wrapper,
             "fake_stream": use_fake_stream,
+            "extra_handler_kwargs": {
+                "caller_managed_hidden_retry": True,
+            },
         },
     )
