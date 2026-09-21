@@ -1105,7 +1105,6 @@ def _classify_codex_opencode_go_candidate_failure(
             if isinstance(stamped_provider_returned, bool)
             else None
         ),
-        local_timeout=getattr(exc, "_aawm_failure_origin", None) == "client",
     )
     if classification is None:
         return None

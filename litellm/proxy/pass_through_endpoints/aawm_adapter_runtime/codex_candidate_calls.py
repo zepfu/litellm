@@ -52,6 +52,7 @@ from litellm.secret_managers.credential_error_sanitizer import (
 from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.opencode_go import (
     apply_opencode_go_failure_classification,
     classify_opencode_go_failure,
+    extract_opencode_go_status_code,
 )
 
 _OPENCODE_GO_ALIAS_CANDIDATE_TIMEOUT_SECONDS = 30.0
@@ -9697,10 +9698,10 @@ def _build_opencode_go_provider_rejection_evidence(
 ) -> dict[str, Any]:
     advertised_types = _opencode_go_tool_types(advertised_tools)
     completion_types = _opencode_go_tool_types(completion_tools)
-    status_code = getattr(exc, "status_code", None)
-    if not isinstance(status_code, int) or status_code <= 0:
-        response = getattr(exc, "response", None)
-        status_code = getattr(response, "status_code", None)
+    if isinstance(exc, Exception):
+        status_code = extract_opencode_go_status_code(exc)
+    else:
+        status_code = None
     raw_message = getattr(exc, "message", None)
     if not raw_message:
         raw_message = getattr(exc, "detail", None) or str(exc)
@@ -9727,7 +9728,7 @@ def _build_opencode_go_provider_rejection_evidence(
             exc=exc,
             url=target_url,
             custom_llm_provider="opencode_go",
-            status_code=status_code if isinstance(status_code, int) else None,
+            status_code=status_code,
             local_timeout=local_timeout,
         )
         if classification is not None:

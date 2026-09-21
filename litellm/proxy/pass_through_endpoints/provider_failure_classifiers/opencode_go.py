@@ -68,6 +68,12 @@ _ACCOUNT_CODES: frozenset[str] = frozenset(
         "model_not_supported_for_account",
     }
 )
+_CANONICAL_STRUCTURED_CODES: frozenset[str] = (
+    _UNSUPPORTED_MODEL_CODES | _UNSUPPORTED_CONTRACT_CODES | _ACCOUNT_CODES
+)
+_HTTP_STATUS_MIN = 100
+_HTTP_STATUS_MAX = 599
+_HTTP_STATUS_DIGIT_COUNT = 3
 _UNSUPPORTED_MODEL_STATUSES: frozenset[int] = frozenset({400, 404})
 _AUTH_STATUSES: frozenset[int] = frozenset({401, 403})
 _PUBLIC_DETAIL: dict[str, str] = {
@@ -143,7 +149,7 @@ class OpenCodeGoFailureClassification:
             "scope": self.scope,
             "retryable": self.retryable,
             "public_detail": self.public_detail,
-            "structured_code": self.structured_code,
+            "structured_code": _canonical_structured_code(self.structured_code),
         }
 
 
@@ -171,21 +177,41 @@ def apply_opencode_go_failure_classification(
     setattr(exc, "_aawm_opencode_go_failure", classification.to_safe_metadata())
 
 
+def coerce_opencode_go_http_status(value: Any) -> Optional[int]:
+    """Return a proven HTTP status. Never raises. Reject bools and out-of-range ints."""
+
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if (
+            len(stripped) != _HTTP_STATUS_DIGIT_COUNT
+            or not stripped.isascii()
+            or not stripped.isdigit()
+        ):
+            return None
+        try:
+            parsed = int(stripped, 10)
+        except ValueError:
+            return None
+    else:
+        return None
+    if _HTTP_STATUS_MIN <= parsed <= _HTTP_STATUS_MAX:
+        return parsed
+    return None
+
+
 def extract_opencode_go_status_code(exc: Exception) -> Optional[int]:
     """Return a numeric HTTP status from exception attributes, never from message text."""
 
     for source in (exc, getattr(exc, "response", None)):
         if source is None:
             continue
-        value = getattr(source, "status_code", None)
-        if isinstance(value, bool):
-            continue
-        if isinstance(value, int) and 100 <= value <= 599:
-            return value
-        if isinstance(value, str) and value.strip().isdigit():
-            parsed = int(value.strip())
-            if 100 <= parsed <= 599:
-                return parsed
+        parsed = coerce_opencode_go_http_status(getattr(source, "status_code", None))
+        if parsed is not None:
+            return parsed
     return None
 
 
@@ -213,21 +239,21 @@ def classify_opencode_go_failure(
     if not provider and (url is None or not is_opencode_go_url(url)):
         return None
 
-    resolved_status = status_code if isinstance(status_code, int) else None
+    resolved_status = coerce_opencode_go_http_status(status_code)
     if resolved_status is None:
         resolved_status = extract_opencode_go_status_code(exc)
     structured_codes = _structured_error_codes(exc)
-    stamped_origin = getattr(exc, "_aawm_failure_origin", None)
     stamped_provider_returned = getattr(exc, "_aawm_provider_returned", None)
     if provider_returned is None:
         if isinstance(stamped_provider_returned, bool):
             provider_returned = stamped_provider_returned
         else:
             provider_returned = resolved_status is not None
-    if local_timeout or stamped_origin == "client":
-        is_local_timeout = resolved_status != 408
-    else:
-        is_local_timeout = resolved_status != 408 and _is_local_timeout_exception(exc)
+    is_local_timeout = resolved_status != 408 and (
+        local_timeout is True
+        or _stamped_local_timeout_kind(exc)
+        or _is_local_timeout_exception(exc)
+    )
 
     if resolved_status == 408:
         return _classification(
@@ -340,14 +366,26 @@ def _classification(
         scope=_KIND_TO_SCOPE[kind],
         retryable=kind in _RETRYABLE_KINDS,
         public_detail=_PUBLIC_DETAIL[kind],
-        structured_code=structured_code,
+        structured_code=_canonical_structured_code(structured_code),
     )
+
+
+def _stamped_local_timeout_kind(exc: Exception) -> bool:
+    stamped = getattr(exc, "_aawm_opencode_go_failure", None)
+    return isinstance(stamped, dict) and stamped.get("kind") == "local_timeout"
 
 
 def _is_local_timeout_exception(exc: Exception) -> bool:
     if isinstance(exc, TimeoutError):
         return True
     return isinstance(exc, httpx.TimeoutException)
+
+
+def _canonical_structured_code(value: Any) -> Optional[str]:
+    token = _normalize_structured_token(value)
+    if token is None or token not in _CANONICAL_STRUCTURED_CODES:
+        return None
+    return token
 
 
 def _normalize_structured_token(value: Any) -> Optional[str]:
@@ -379,7 +417,7 @@ def _structured_error_codes(exc: Exception) -> list[str]:
     seen: set[str] = set()
 
     def _add(value: Any) -> None:
-        token = _normalize_structured_token(value)
+        token = _canonical_structured_code(value)
         if token is None or token in seen:
             return
         seen.add(token)
@@ -399,7 +437,7 @@ def _structured_error_codes(exc: Exception) -> list[str]:
 
 
 def _first_code(tokens: list[str]) -> Optional[str]:
-    return tokens[0] if tokens else None
+    return _first_matching_code(tokens, _CANONICAL_STRUCTURED_CODES)
 
 
 def _first_matching_code(
@@ -419,6 +457,7 @@ __all__ = [
     "OpenCodeGoFailureClassification",
     "apply_opencode_go_failure_classification",
     "classify_opencode_go_failure",
+    "coerce_opencode_go_http_status",
     "extract_opencode_go_status_code",
     "is_opencode_go_url",
 ]
