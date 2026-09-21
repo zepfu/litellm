@@ -56,6 +56,13 @@ _SUPPORTED_CONTENT_TYPES = frozenset(
         "input_file",
     }
 )
+_INSTRUCTION_CONTENT_TYPES = frozenset(
+    {
+        "text",
+        "input_text",
+        "output_text",
+    }
+)
 _UNSUPPORTED_NATIVE_TYPES = frozenset(
     {
         "computer_call",
@@ -157,6 +164,14 @@ def _raise_unsupported_retained_history() -> Never:
     )
 
 
+def _raise_previous_response_unavailable() -> Never:
+    _raise_retained_history_rejection(
+        message=_UNAVAILABLE_MESSAGE,
+        status_code=400,
+        reason="previous_response_id_unavailable",
+    )
+
+
 def _as_message_mapping(message: Any) -> dict[str, Any]:
     if isinstance(message, Mapping):
         return dict(message)
@@ -184,6 +199,33 @@ def _as_message_mapping(message: Any) -> dict[str, Any]:
     ):
         if hasattr(message, key):
             mapping[key] = getattr(message, key)
+    return mapping
+
+
+def _item_has_structural_form(mapping: Mapping[str, Any]) -> bool:
+    item_type = mapping.get("type")
+    if isinstance(item_type, str) and item_type:
+        return True
+    role = mapping.get("role")
+    if isinstance(role, str) and role.strip():
+        return True
+    if mapping.get("tool_calls"):
+        return True
+    if mapping.get("tool_call_id") is not None or mapping.get("call_id") is not None:
+        return True
+    if "content" in mapping or "output" in mapping or "arguments" in mapping:
+        return True
+    return False
+
+
+def _require_interpretable_item_mapping(raw_item: Any) -> dict[str, Any]:
+    if raw_item is None:
+        _raise_previous_response_unavailable()
+    if isinstance(raw_item, Mapping) and not raw_item:
+        _raise_previous_response_unavailable()
+    mapping = _as_message_mapping(raw_item)
+    if not mapping or not _item_has_structural_form(mapping):
+        _raise_previous_response_unavailable()
     return mapping
 
 
@@ -236,12 +278,13 @@ def _tag_list(value: Any) -> list[str]:
     return []
 
 
-def _first_token(mapping: Mapping[str, Any], keys: Sequence[str]) -> Optional[str]:
+def _tokens_from_mapping(mapping: Mapping[str, Any], keys: Sequence[str]) -> list[str]:
+    tokens: list[str] = []
     for key in keys:
         token = _account_token(mapping.get(key))
         if token is not None:
-            return token
-    return None
+            tokens.append(token)
+    return tokens
 
 
 def _tokens_from_mappings(
@@ -252,9 +295,7 @@ def _tokens_from_mappings(
     for mapping in mappings:
         if not isinstance(mapping, Mapping):
             continue
-        token = _first_token(mapping, keys)
-        if token is not None:
-            tokens.append(token)
+        tokens.extend(_tokens_from_mapping(mapping, keys))
     return tokens
 
 
@@ -276,15 +317,29 @@ def _collapse_identity_kind(tokens: Sequence[str]) -> Optional[str]:
     return unique[0]
 
 
-def _content_key(value: Any) -> str:
+def _content_key(value: Any) -> tuple[str, str]:
     if value is None:
-        return ""
+        return ("none", "")
     if isinstance(value, str):
-        return value
+        return ("str", value)
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            return ("bytes", value.decode("utf-8"))
+        except Exception:
+            return ("bytes", "")
     try:
-        return json.dumps(value, sort_keys=True, default=str, ensure_ascii=True)
+        dumped = json.dumps(value, sort_keys=True, default=str, ensure_ascii=True)
     except (TypeError, ValueError):
-        return ""
+        return ("unserializable", type(value).__name__)
+    if isinstance(value, Mapping):
+        return ("map", dumped)
+    if isinstance(value, list):
+        return ("list", dumped)
+    if isinstance(value, bool):
+        return ("bool", dumped)
+    if isinstance(value, (int, float)):
+        return ("number", dumped)
+    return ("other", dumped)
 
 
 def _clone_item(value: Any) -> Any:
@@ -496,6 +551,9 @@ def _reject_cross_owner_history(
         request=request,
         request_body=request_body,
     )
+    spend_hashes: list[str] = []
+    spend_lanes: list[str] = []
+    spend_keys: list[str] = []
     for spend_log in spend_logs:
         spend_identity = _spend_log_owner_identity(spend_log)
         if not _identities_bind(spend_identity, current_identity):
@@ -504,6 +562,16 @@ def _reject_cross_owner_history(
                 status_code=409,
                 reason="cross_account_history",
             )
+        spend_hash, spend_lane, spend_key = spend_identity
+        if spend_hash is not None:
+            spend_hashes.append(spend_hash)
+        if spend_lane is not None:
+            spend_lanes.append(spend_lane)
+        if spend_key is not None:
+            spend_keys.append(spend_key)
+    _collapse_identity_kind(spend_hashes)
+    _collapse_identity_kind(spend_lanes)
+    _collapse_identity_kind(spend_keys)
 
 
 def _validate_lossless_content(content: Any) -> None:
@@ -525,6 +593,30 @@ def _validate_lossless_content(content: Any) -> None:
             _raise_unsupported_retained_history()
 
 
+def _validate_instruction_content(content: Any) -> None:
+    if content is None or isinstance(content, str):
+        return
+    if not isinstance(content, list):
+        _raise_unsupported_retained_history()
+    for block in content:
+        if isinstance(block, str):
+            continue
+        if not isinstance(block, Mapping):
+            _raise_unsupported_retained_history()
+        block_type = block.get("type")
+        if block_type is None:
+            if "image_url" in block or "file" in block:
+                _raise_unsupported_retained_history()
+            if "text" in block:
+                continue
+            _raise_unsupported_retained_history()
+        if (
+            not isinstance(block_type, str)
+            or block_type not in _INSTRUCTION_CONTENT_TYPES
+        ):
+            _raise_unsupported_retained_history()
+
+
 def _instruction_content_for_validation(value: Any) -> Any:
     if value is None or isinstance(value, str):
         return value
@@ -538,7 +630,7 @@ def _instruction_content_for_validation(value: Any) -> Any:
 def _instructions_text(value: Any) -> Optional[str]:
     if value is None:
         return None
-    _validate_lossless_content(_instruction_content_for_validation(value))
+    _validate_instruction_content(_instruction_content_for_validation(value))
     if isinstance(value, str):
         return value if value else None
     if isinstance(value, list):
@@ -706,7 +798,7 @@ def _canonicalize_function_call_output_item(mapping: Mapping[str, Any]) -> dict[
     return item
 
 
-def _tool_call_payload(tool_call: Any) -> tuple[str, str, str]:
+def _tool_call_payload(tool_call: Any) -> tuple[str, str, tuple[str, str]]:
     mapping = _as_message_mapping(tool_call)
     call_id = _function_call_canonical_id(mapping) or ""
     function = mapping.get("function")
@@ -770,7 +862,7 @@ def _native_items_from_chat_messages(messages: Sequence[Any]) -> tuple[list[dict
     items: list[dict[str, Any]] = []
     instructions: Optional[str] = None
     for message in messages:
-        mapping = _as_message_mapping(message)
+        mapping = _require_interpretable_item_mapping(message)
         role = mapping.get("role")
         role_name = role.strip() if isinstance(role, str) else ""
         item_type = mapping.get("type")
@@ -851,7 +943,7 @@ def _native_items_from_input(
         _raise_unsupported_retained_history()
     items: list[dict[str, Any]] = []
     for raw_item in parsed:
-        mapping = _as_message_mapping(raw_item)
+        mapping = _require_interpretable_item_mapping(raw_item)
         item_type = mapping.get("type")
         if isinstance(item_type, str) and item_type in _UNSUPPORTED_NATIVE_TYPES:
             _raise_unsupported_retained_history()
@@ -890,14 +982,6 @@ def _native_items_from_input(
             continue
         _raise_unsupported_retained_history()
     return items, collected_instructions
-
-
-def _raise_previous_response_unavailable() -> Never:
-    _raise_retained_history_rejection(
-        message=_UNAVAILABLE_MESSAGE,
-        status_code=400,
-        reason="previous_response_id_unavailable",
-    )
 
 
 def _parsed_response_mapping(response: Any) -> Mapping[str, Any]:
@@ -993,15 +1077,15 @@ async def _native_history_from_spend_logs(
         output_items, output_instructions = _output_native_items_from_spend_log(
             spend_log
         )
-        items = _compose_retained_items(items, request_items)
-        items = _compose_retained_items(items, output_items)
+        turn_items = list(request_items) + list(output_items)
+        items = _compose_retained_items(items, turn_items)
         instructions = _merge_instructions(
             instructions, request_instructions, output_instructions
         )
     return items, instructions
 
 
-def _function_name_and_arguments(item: Mapping[str, Any]) -> tuple[str, str]:
+def _function_name_and_arguments(item: Mapping[str, Any]) -> tuple[str, tuple[str, str]]:
     function = item.get("function")
     function_map = function if isinstance(function, Mapping) else {}
     name = function_map.get("name")
@@ -1089,23 +1173,18 @@ def _compose_retained_items(
     incoming_keys = [_native_semantic_key(item) for item in incoming]
     existing_len = len(existing_keys)
     incoming_len = len(incoming_keys)
-    if (
-        incoming_len >= existing_len
-        and incoming_keys[:existing_len] == existing_keys
-    ):
+    # Cumulative-prefix replay restates the whole history and adds a suffix.
+    # Equal-length identical content is a new record, not the same occurrence.
+    if incoming_len > existing_len and incoming_keys[:existing_len] == existing_keys:
         return [_clone_item(item) for item in incoming]
-    if (
-        existing_len >= incoming_len
-        and existing_keys[:incoming_len] == incoming_keys
-    ):
-        return [_clone_item(item) for item in existing]
-    overlap = 0
-    for k in range(min(existing_len, incoming_len), 0, -1):
+    if incoming_len < existing_len and existing_keys[:incoming_len] == incoming_keys:
+        _raise_previous_response_unavailable()
+    overlap_limit = min(existing_len, incoming_len)
+    for k in range(1, overlap_limit):
         if existing_keys[-k:] == incoming_keys[:k]:
-            overlap = k
-            break
+            _raise_previous_response_unavailable()
     return [_clone_item(item) for item in existing] + [
-        _clone_item(item) for item in incoming[overlap:]
+        _clone_item(item) for item in incoming
     ]
 
 
