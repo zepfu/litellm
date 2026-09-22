@@ -872,33 +872,113 @@ def _claim_zen_auth_flight_unlocked(
     return task
 
 
+def _entry_published_during_probe_unlocked(
+    path_key: str,
+    snapshot: Optional[_ZenAuthCacheEntry],
+    now: float,
+) -> Optional[_ZenAuthCacheEntry]:
+    """Return an entry another caller stored while a generation probe ran."""
+
+    cached = _zen_auth_cache.get(path_key)
+    if cached is None or cached is snapshot:
+        return None
+    if not _zen_auth_entry_is_fresh(cached, cached.generation, now):
+        return None
+    _zen_auth_cache.move_to_end(path_key)
+    return cached
+
+
+@dataclass(frozen=True)
+class _ZenAuthLoadChoice:
+    entry: Optional[_ZenAuthCacheEntry] = None
+    task: "Optional[asyncio.Task[_ZenAuthCacheEntry]]" = None
+    generation: Optional[_ZenAuthGeneration] = None
+    missed: bool = False
+
+
+async def _revalidate_published_zen_auth(
+    path: Path,
+    source_label: str,
+    path_key: str,
+) -> _ZenAuthLoadChoice:
+    """Stat outside the lock. A probe that started earlier must not evict this entry."""
+
+    async with _get_zen_auth_lock():
+        snapshot = _zen_auth_cache.get(path_key)
+    generation = await _current_zen_auth_generation(path, source_label, path_key)
+    async with _get_zen_auth_lock():
+        cached = _fresh_zen_auth_unlocked(path_key, generation, time.monotonic())
+        if cached is not None:
+            return _ZenAuthLoadChoice(entry=cached, generation=generation)
+        published_during = _entry_published_during_probe_unlocked(
+            path_key,
+            snapshot,
+            time.monotonic(),
+        )
+        if published_during is not None:
+            return _ZenAuthLoadChoice(
+                entry=published_during,
+                generation=published_during.generation,
+            )
+        task = _join_zen_auth_flight_unlocked(path_key)
+        if task is None:
+            task = _claim_zen_auth_flight_unlocked(path, source_label, path_key)
+        return _ZenAuthLoadChoice(task=task, generation=generation)
+
+
+async def _observe_zen_auth_probe(
+    path: Path,
+    source_label: str,
+    path_key: str,
+    *,
+    allow_claim: bool,
+) -> _ZenAuthLoadChoice:
+    async with _get_zen_auth_lock():
+        snapshot = _zen_auth_cache.get(path_key)
+    generation = await _current_zen_auth_generation(path, source_label, path_key)
+    async with _get_zen_auth_lock():
+        published = _entry_published_during_probe_unlocked(
+            path_key,
+            snapshot,
+            time.monotonic(),
+        )
+        if published is None:
+            cached = _fresh_zen_auth_unlocked(path_key, generation, time.monotonic())
+            if cached is not None:
+                return _ZenAuthLoadChoice(entry=cached, generation=generation)
+            task = _join_zen_auth_flight_unlocked(path_key)
+            if task is not None:
+                return _ZenAuthLoadChoice(task=task, generation=generation)
+            if not allow_claim:
+                return _ZenAuthLoadChoice(missed=True, generation=generation)
+            task = _claim_zen_auth_flight_unlocked(path, source_label, path_key)
+            return _ZenAuthLoadChoice(task=task, generation=generation)
+    return await _revalidate_published_zen_auth(path, source_label, path_key)
+
+
 async def _load_cached_zen_file_api_key() -> str:
     path, source_label = await asyncio.to_thread(_resolve_zen_auth_load_inputs_sync)
     path_key = _zen_auth_cache_key(path)
     for _attempt in range(_ZEN_AUTH_READ_ATTEMPTS):
-        generation = await _current_zen_auth_generation(path, source_label, path_key)
-        async with _get_zen_auth_lock():
-            cached = _fresh_zen_auth_unlocked(path_key, generation, time.monotonic())
-            if cached is not None:
-                return cached.reveal()
-            task = _join_zen_auth_flight_unlocked(path_key)
-        if task is None:
-            # The file may have been replaced, and another caller may already
-            # have read that replacement, after the preliminary stat above.
-            generation = await _current_zen_auth_generation(
+        choice = await _observe_zen_auth_probe(
+            path,
+            source_label,
+            path_key,
+            allow_claim=False,
+        )
+        if choice.missed:
+            choice = await _observe_zen_auth_probe(
                 path,
                 source_label,
                 path_key,
+                allow_claim=True,
             )
-            async with _get_zen_auth_lock():
-                cached = _fresh_zen_auth_unlocked(
-                    path_key,
-                    generation,
-                    time.monotonic(),
-                )
-                if cached is not None:
-                    return cached.reveal()
-                task = _claim_zen_auth_flight_unlocked(path, source_label, path_key)
+        if choice.entry is not None:
+            return choice.entry.reveal()
+        task = choice.task
+        generation = choice.generation
+        if task is None or generation is None:
+            continue
         result = await asyncio.shield(task)
         if result.generation == generation:
             return result.reveal()
