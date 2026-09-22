@@ -299,6 +299,55 @@ def openrouter_account_lane_cooldown_key(
     return "openrouter:__account__:" + lane_key
 
 
+_COHERE_UNSCOPED_CREDENTIAL_SENTINEL = "cohere"
+_COHERE_CREDENTIAL_LANE_RE = re.compile(r"\Acohere:credential:[0-9a-f]{12}\Z")
+
+
+def resolve_cohere_credential_lane_sentinel(
+    credential: Optional[str] = None,
+) -> str:
+    """Return a one-way Cohere credential sentinel.
+
+    An omitted credential resolves the canonical runtime key. An explicit
+    credential is fingerprinted and discarded. Missing, blank, or unreadable
+    credentials stay on an unscoped sentinel that cannot publish a shared
+    cooldown. The result never contains credential material.
+    """
+
+    resolved = credential
+    if credential is None:
+        # Deferred: cohere runtime imports proxy types, and this module is
+        # loaded before the proxy finishes importing.
+        from ..providers.cohere.runtime import _get_cohere_api_key
+
+        try:
+            resolved = _get_cohere_api_key()
+        except Exception:
+            return _COHERE_UNSCOPED_CREDENTIAL_SENTINEL
+    if not isinstance(resolved, str) or resolved == "":
+        return _COHERE_UNSCOPED_CREDENTIAL_SENTINEL
+    fingerprint = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:12]
+    return "cohere:credential:" + fingerprint
+
+
+def cohere_credential_lane_cooldown_key(
+    candidate: dict[str, Any],
+    sentinel: Optional[str],
+) -> Optional[str]:
+    """Shared Cohere cooldown key for one hashed credential sentinel.
+
+    Same-key siblings use this key. A different fingerprint, an unscoped
+    sentinel, or any other provider returns None so those candidates stay
+    independent. The key contains only the truncated digest.
+    """
+
+    if candidate.get("provider") != "cohere" or not isinstance(sentinel, str):
+        return None
+    if _COHERE_CREDENTIAL_LANE_RE.fullmatch(sentinel) is None:
+        return None
+    return "cohere:__credential__:" + sentinel
+
+
 def _resolve_codex_auto_agent_xai_lane_key(candidate: dict[str, Any]) -> str:
     route_family = str(candidate.get("route_family") or "")
     if route_family in {

@@ -31,8 +31,10 @@ from . import cooldown_state as _cooldown_state
 from . import codex_quota_balance as _codex_quota_balance
 from .cooldown_state import _attach_aawm_alias_routing_state_sources
 from .lane_keys import (
+    cohere_credential_lane_cooldown_key,
     openrouter_account_lane_cooldown_key,
     openrouter_credit_lane_cooldown_key,
+    resolve_cohere_credential_lane_sentinel,
     resolve_openrouter_credential_lane_key,
     _codex_auto_agent_candidate_key,
     _resolve_anthropic_auto_agent_native_cooldown_lane_key,
@@ -1879,6 +1881,38 @@ async def _apply_openrouter_account_lane_cooldown(
     if skip_reason is None:
         skip_reason = "credential_account_cooldown"
     return cooldown_seconds, cooldown_state_source, skip_reason, "account"
+
+
+async def _apply_cohere_credential_lane_cooldown(
+    *,
+    candidate: dict[str, Any],
+    cooldown_seconds: float,
+    cooldown_state_source: Optional[str],
+    skip_reason: Optional[str],
+    get_active_cooldown_state: Callable[[str], Awaitable[tuple[float, str]]],
+) -> tuple[float, Optional[str], Optional[str], Optional[str]]:
+    """Suppress sibling Cohere models that share one hashed credential sentinel.
+
+    Reads the existing alias cooldown store. A missing fingerprint, a different
+    credential, or a non-Cohere candidate does not inherit the cooldown. RPM
+    remains on the model key and is not consulted here.
+    """
+
+    if candidate.get("provider") != "cohere":
+        return cooldown_seconds, cooldown_state_source, skip_reason, None
+    sentinel = resolve_cohere_credential_lane_sentinel()
+    key = cohere_credential_lane_cooldown_key(candidate, sentinel)
+    if key is None:
+        return cooldown_seconds, cooldown_state_source, skip_reason, None
+    seconds, source = await get_active_cooldown_state(key)
+    if seconds <= 0:
+        return cooldown_seconds, cooldown_state_source, skip_reason, None
+    if seconds > cooldown_seconds:
+        cooldown_seconds = seconds
+        cooldown_state_source = source
+    if skip_reason is None:
+        skip_reason = "cohere_credential_cooldown"
+    return cooldown_seconds, cooldown_state_source, skip_reason, "credential"
 
 
 async def _apply_kimi_code_managed_account_lane_cooldown(
@@ -3887,6 +3921,18 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         cooldown_seconds,
         cooldown_state_source,
         skip_reason,
+        cohere_credential_cooldown_scope,
+    ) = await _apply_cohere_credential_lane_cooldown(
+        candidate=candidate,
+        cooldown_seconds=cooldown_seconds,
+        cooldown_state_source=cooldown_state_source,
+        skip_reason=skip_reason,
+        get_active_cooldown_state=active_cooldown_state,
+    )
+    (
+        cooldown_seconds,
+        cooldown_state_source,
+        skip_reason,
     ) = await _apply_codex_auto_agent_alibaba_token_plan_account_cooldown(
         candidate=candidate,
         cooldown_seconds=cooldown_seconds,
@@ -4009,6 +4055,8 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         state["cooldown_scope"] = managed_account_cooldown_scope
     if openrouter_account_cooldown_scope is not None:
         state["cooldown_scope"] = openrouter_account_cooldown_scope
+    if cohere_credential_cooldown_scope is not None:
+        state["cooldown_scope"] = cohere_credential_cooldown_scope
     if quota_state.get("cohere_quota_observations"):
         state["cohere_quota_observations"] = quota_state[
             "cohere_quota_observations"
@@ -7716,6 +7764,7 @@ def install(host_globals: dict) -> None:
         "resolve_openrouter_credential_lane_key",
         "_get_openrouter_account_lane_cooldown_state",
         "_apply_openrouter_account_lane_cooldown",
+        "_apply_cohere_credential_lane_cooldown",
         "_apply_openrouter_credit_lane_cooldown",
         "_is_finite_number",
         "_cohere_observation_exhausted",

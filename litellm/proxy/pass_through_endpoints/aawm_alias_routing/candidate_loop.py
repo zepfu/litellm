@@ -36,6 +36,7 @@ import copy
 import hashlib
 import inspect
 import time
+import weakref
 from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence
 
 import httpx
@@ -93,6 +94,10 @@ from .interfaces import (
     MatchProviderAttributedModelUnavailableFn,
     RecordCodexFailureEvidenceFn,
     ResolveCooldownPublicationFn,
+)
+from .lane_keys import (
+    cohere_credential_lane_cooldown_key,
+    resolve_cohere_credential_lane_sentinel,
 )
 from .durable import get_aawm_alias_routing_state_namespace
 from .policy import CODEX_AUTO_AGENT_OPENROUTER_PROVIDER
@@ -718,6 +723,9 @@ def _active_lane_identity_hash(*, candidate: dict[str, Any]) -> str:
 _CODEX_COHERE_PROVIDER = "cohere"
 _CODEX_COHERE_ROUTE_FAMILY = "codex_cohere_chat_completions_adapter"
 _CODEX_COHERE_CHAT_V2_URL = httpx.URL("https://api.cohere.com/v2/chat")
+_COHERE_COOLDOWN_SCOPE_DECISIONS = frozenset({"credential", "candidate", "none"})
+_COHERE_COOLDOWN_SCOPE_ATTR = "_aawm_cohere_cooldown_scope"
+_cohere_cooldown_scopes: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _CODEX_ZAI_CODING_PLAN_PROVIDER = "zai_coding_plan"
 _CODEX_ZAI_CODING_PLAN_ROUTE_FAMILY = "codex_zai_coding_plan_chat_completions_adapter"
 _CODEX_OPENCODE_GO_PROVIDER = "opencode_go"
@@ -1054,6 +1062,70 @@ def _emit_validated_redispatch_terminal_event(
     return True
 
 
+def _remember_cohere_cooldown_scope(exc: Exception, scope: str) -> None:
+    """Remember a Cohere scope decision without storing credential material."""
+
+    if scope not in _COHERE_COOLDOWN_SCOPE_DECISIONS:
+        return
+    try:
+        setattr(exc, _COHERE_COOLDOWN_SCOPE_ATTR, scope)
+    except (AttributeError, TypeError):
+        pass
+    try:
+        _cohere_cooldown_scopes[exc] = scope
+    except TypeError:
+        return
+
+
+def _recall_cohere_cooldown_scope(exc: Exception) -> Optional[str]:
+    scope = _cohere_cooldown_scopes.get(exc)
+    if scope not in _COHERE_COOLDOWN_SCOPE_DECISIONS:
+        scope = getattr(exc, _COHERE_COOLDOWN_SCOPE_ATTR, None)
+    if scope in _COHERE_COOLDOWN_SCOPE_DECISIONS:
+        return scope
+    return None
+
+
+def _apply_cohere_credential_cooldown_scope(
+    plan: CooldownPublicationPlan,
+    *,
+    candidate: dict[str, Any],
+    scope: Optional[str],
+    cooldown_seconds: float,
+) -> CooldownPublicationPlan:
+    """Publish key-wide Cohere failures on the credential sentinel only.
+
+    Candidate scope keeps the model key from the existing resolver. Credential
+    scope replaces that key so one model's RPM limit cannot cool its siblings,
+    and a different credential or provider does not share the sentinel. No-scope
+    decisions publish nothing. Duration stays whatever the existing resolver
+    already computed.
+    """
+
+    if scope is None or candidate.get("provider") != _CODEX_COHERE_PROVIDER:
+        return plan
+    preserved = {
+        "grok_account_quota_exhausted": plan.grok_account_quota_exhausted,
+        "kimi_failure_metadata": plan.kimi_failure_metadata,
+    }
+    if scope == "candidate":
+        return plan
+    if scope == "none":
+        return CooldownPublicationPlan(applied_scope="none", **preserved)
+    sentinel = resolve_cohere_credential_lane_sentinel()
+    cooldown_key = cohere_credential_lane_cooldown_key(candidate, sentinel)
+    duration = max(0.0, float(cooldown_seconds))
+    if cooldown_key is None or duration <= 0:
+        return CooldownPublicationPlan(applied_scope="none", **preserved)
+    return CooldownPublicationPlan(
+        memory_keys=(cooldown_key,),
+        durable_keys=(cooldown_key,),
+        duration_seconds=duration,
+        applied_scope="credential",
+        **preserved,
+    )
+
+
 def _classify_codex_cohere_candidate_failure(
     exc: Exception,
     *,
@@ -1087,11 +1159,10 @@ def _classify_codex_cohere_candidate_failure(
         route_family=str(candidate.get("route_family") or ""),
         selected_upstream_model=selected_upstream_model or None,
     )
-    if (
-        classification is None
-        or classification.cooldown_scope != "candidate"
-        or not classification.advance_fresh_candidate
-    ):
+    if classification is None:
+        return None
+    _remember_cohere_cooldown_scope(exc, classification.cooldown_scope)
+    if not classification.advance_fresh_candidate:
         return None
     if classification.name == "cohere_timeout_connectivity":
         return "upstream_timeout"
@@ -6118,16 +6189,21 @@ def _resolve_failure_plan(
                 cooldown_seconds if error_class == "usage_limit_reached" else None
             ),
         )
-    plan = resolve_cooldown_publication_fn(
-        request=request,
+    plan = _apply_cohere_credential_cooldown_scope(
+        resolve_cooldown_publication_fn(
+            request=request,
+            candidate=candidate,
+            lane_key=selection.get("lane_key"),
+            selected_cooldown_key=selection["cooldown_key"],
+            cooldown_seconds=cooldown_seconds,
+            error_class=error_class,
+            grok_account_quota_exhausted=grok_account_quota_exhausted,
+            kimi_failure_metadata=kimi_failure_metadata,
+            codex_failure_evidence_alias=codex_failure_evidence_alias,
+        ),
         candidate=candidate,
-        lane_key=selection.get("lane_key"),
-        selected_cooldown_key=selection["cooldown_key"],
+        scope=_recall_cohere_cooldown_scope(exc),
         cooldown_seconds=cooldown_seconds,
-        error_class=error_class,
-        grok_account_quota_exhausted=grok_account_quota_exhausted,
-        kimi_failure_metadata=kimi_failure_metadata,
-        codex_failure_evidence_alias=codex_failure_evidence_alias,
     )
     if getattr(plan, "applied_scope", "none") != "none":
         attempt_record["cooldown_seconds"] = round(
