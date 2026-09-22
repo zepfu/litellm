@@ -309,6 +309,46 @@ def _extract_rate_limit_account_hash(
             if isinstance(selected_account_hash, str) and selected_account_hash:
                 return selected_account_hash
 
+    # Zen quota keys follow the selected provider account. Caller hashes stay
+    # on the request and are not substituted for that fingerprint.
+    credential_family = str(metadata.get("credential_family") or "").strip().lower()
+    route_text = " ".join(
+        str(value).strip().lower()
+        for value in (
+            selected_route_family,
+            metadata.get("passthrough_route_family"),
+            metadata.get("route_family"),
+            metadata.get("codex_auto_agent_selected_route_family"),
+            metadata.get("anthropic_auto_agent_selected_route_family"),
+        )
+        if value is not None and str(value).strip()
+    )
+    provider_name = str(selected_provider or "").strip().lower()
+    is_opencode_go = (
+        credential_family == "opencode_go"
+        or provider_name == "opencode_go"
+        or "opencode_go" in route_text
+        or "opencode-go" in route_text
+    )
+    is_opencode_zen = not is_opencode_go and (
+        metadata.get("opencode_zen") is True
+        or credential_family == "opencode_zen"
+        or provider_name == "opencode_zen"
+        or "opencode_zen" in route_text
+        or "opencode-zen" in route_text
+    )
+    if is_opencode_zen:
+        hash_sources = [metadata]
+        litellm_params = kwargs.get("litellm_params")
+        if isinstance(litellm_params, dict):
+            nested_litellm_metadata = litellm_params.get("litellm_metadata")
+            if isinstance(nested_litellm_metadata, dict):
+                hash_sources.append(nested_litellm_metadata)
+        for source in hash_sources:
+            selected_account_hash = source.get("provider_account_hash")
+            if isinstance(selected_account_hash, str) and selected_account_hash.strip():
+                return selected_account_hash.strip()
+
     headers = _extract_headers_from_kwargs(kwargs)
     user_api_key_dict = kwargs.get("user_api_key_dict") or kwargs.get("user_api_key")
     candidates = [
