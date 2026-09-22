@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Callable
 
 from hv2.artifact import (
@@ -35,6 +36,7 @@ from hv2.drivers import driver_for
 from hv2.errors import PlanError
 from hv2.instance import inspect_instance
 from hv2.load_config import as_str_list
+from hv2.plan import _prompt_text
 from hv2.pane import (
     _latest_prompt_echo_index,
     _pane_exact_pong,
@@ -427,6 +429,49 @@ def _step_tui_catalog(plan: RunPlan, **_: Any) -> dict[str, Any]:
     )
 
 
+def _model_turn_settings(
+    plan: RunPlan,
+    select: dict[str, Any],
+    model: str,
+    *,
+    default_prompt: str,
+    default_tools: bool,
+    default_pass_mode: str,
+    default_reply_needles: list[str],
+) -> tuple[str, bool, str, list[str]]:
+    """Apply a per-alias model override without changing the TUI default."""
+
+    raw = select.get("model_overrides")
+    override = raw.get(model) if isinstance(raw, dict) else None
+    if not isinstance(override, dict):
+        return (
+            default_pass_mode,
+            default_tools,
+            default_prompt,
+            list(default_reply_needles),
+        )
+    pass_mode = str(override.get("pass_mode") or default_pass_mode)
+    tools = (
+        bool(override.get("tools_for_model"))
+        if "tools_for_model" in override
+        else default_tools
+    )
+    prompt = default_prompt
+    prompt_name = override.get("prompt")
+    if isinstance(prompt_name, str) and prompt_name.strip():
+        prompt = _prompt_text(
+            plan.config,
+            prompt_name.strip(),
+            {"home": str(Path.home()), "repo": ""},
+        )
+    reply = list(default_reply_needles)
+    if isinstance(override.get("reply_needles"), list):
+        parsed = as_str_list(override.get("reply_needles"))
+        if parsed:
+            reply = parsed
+    return pass_mode, tools, prompt, reply
+
+
 def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915
     if not plan.tui:
         raise PlanError("model kind requires --tui")
@@ -449,17 +494,29 @@ def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915
     )
     send_text = ""
     for model in plan.models:
+        model_pass_mode, model_tools, model_prompt, model_reply_needles = (
+            _model_turn_settings(
+                plan,
+                select,
+                model,
+                default_prompt=prompt,
+                default_tools=tools,
+                default_pass_mode=pass_mode,
+                default_reply_needles=reply_needles,
+            )
+        )
         argv = driver.launch_argv(model)
         driver.assert_no_print_flags(argv)
         if plan.tui not in {"grok", "muse"} and ("-p" in argv or "--print" in argv):
             failures.append(f"refusing print-mode argv for {model}")
             continue
-        launched = driver.ensure_session(model, tools=tools)
+        launched = driver.ensure_session(model, tools=model_tools)
         row = {
             "model": model,
             "selector": driver.model_selector(model),
             "argv": launched.get("argv") or argv,
-            "prompt": prompt.strip(),
+            "prompt": model_prompt.strip(),
+            "pass_mode": model_pass_mode,
             "session": launched.get("session"),
             "launch_ok": launched.get("ok"),
             "selected": launched.get("selected"),
@@ -475,7 +532,7 @@ def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915
         after_echo_index = None
         if hasattr(driver, "send_prompt_and_wait"):
             waited = driver.send_prompt_and_wait(
-                prompt.strip(), reply_needles=reply_needles
+                model_prompt.strip(), reply_needles=model_reply_needles
             )
             sent = waited.get("send") or {}
             pane = str(waited.get("pane") or "")
@@ -484,7 +541,7 @@ def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915
             if plan.tui == 'codex' and after_echo_index is None:
                 after_echo_index = -1
         else:
-            sent = driver.send_keys(prompt.strip())
+            sent = driver.send_keys(model_prompt.strip())
             row["idle"] = driver.wait_until_idle()
             pane = driver.capture_pane()
         row["send"] = sent
@@ -498,25 +555,25 @@ def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915
                 f"pane for {model} does not show selector {selector}"
             )
         exact_pong = _pane_exact_pong(
-            pane, prompt, after_echo_index=after_echo_index
+            pane, model_prompt, after_echo_index=after_echo_index
         )
         provider_404 = bool(
             provider_404_needles
             and _pane_has_any(
                 pane,
                 provider_404_needles,
-                prompt=prompt.strip(),
+                prompt=model_prompt.strip(),
                 after_echo_index=after_echo_index,
             )
         )
         tool_tokens = standalone_pass_tokens or (
-            pass_needles if pass_mode == "tool_command" else []
+            pass_needles if model_pass_mode == "tool_command" else []
         )
         tool_pass = bool(
             tool_tokens
             and _pane_tool_command_pass(
                 pane,
-                prompt.strip(),
+                model_prompt.strip(),
                 tool_tokens,
                 after_echo_index=after_echo_index,
             )
@@ -524,7 +581,7 @@ def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915
         row["exact_pong"] = exact_pong
         row["provider_404"] = provider_404
         row["tool_pass"] = tool_pass
-        if pass_mode == "tool_command":
+        if model_pass_mode == "tool_command":
             completed = bool(row.get("idle")) and tool_pass
             miss = (
                 f"TUI turn for {model} did not reach an idle tool-bearing "

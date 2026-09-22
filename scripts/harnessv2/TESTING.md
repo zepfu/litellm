@@ -488,7 +488,7 @@ From `config/tuis.yaml`:
 | Forbid | `-p`, `--print`, `--profile`, `exec` |
 | Model tools | on (not `--no-tools` PONG) |
 | Orchestration tools | on |
-| Model pass | standalone `hv2-codex-child` **and** a current-turn child spawn plus `Ran date` / `Ran pwd` context with compatible stdout after `spawn_agent` with `model=basic` and a non-empty message (Codex may prefix the token with `• `). Local `/root/hv2_child_*` or `/root/hv2_codex_child*` chrome, a workspace path alone, or a token with no stdout, is not a pass. Provider 404 needles do not pass Codex `tool_command`. Do not spawn ChatGPT-unsupported child models (`qwen`/`kimi`/`deepseek`/`grok`/`moonshot`). Leftover trust-nux `Working with untrusted contents` is not a busy needle; in-flight work is `Working (`. |
+| Model pass | standalone `hv2-codex-child` **and** a current-turn child spawn plus `Ran date` / `Ran pwd` context with compatible stdout after `spawn_agent` with `model=basic` and a non-empty message (Codex may prefix the token with `• `). Local `/root/hv2_child_*` or `/root/hv2_codex_child*` chrome, a workspace path alone, or a token with no stdout, is not a pass. Provider 404 needles do not pass Codex `tool_command`. Do not spawn ChatGPT-unsupported child models (`qwen`/`kimi`/`deepseek`/`grok`/`moonshot`). Leftover trust-nux `Working with untrusted contents` is not a busy needle; in-flight work is `Working (`. `sota-zai` and `provider-zai_coding_plan` override this walk: exact `PONG`, tools off. A `basic` child in that Z.AI session is a session-owner 409, not Z.AI acceptance. |
 
 `--tui grok` and `--tui opencode` remain stubs. `--tui claude` stays out
 of scope and is excluded from current closeout (do not select or run;

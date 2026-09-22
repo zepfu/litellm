@@ -233,6 +233,21 @@ tuis:
       tools_for_model: true
       tools_for_orchestration: true
       pass_mode: tool_command
+      # sota-zai is a Z.AI session. The basic-child tool walk 409s because
+      # that child is a different owner. Judge the Z.AI reply itself.
+      model_overrides:
+        sota-zai:
+          pass_mode: exact_pong
+          tools_for_model: false
+          prompt: pong
+          reply_needles:
+            - PONG
+        provider-zai_coding_plan:
+          pass_mode: exact_pong
+          tools_for_model: false
+          prompt: pong
+          reply_needles:
+            - PONG
       spawn_evidence: codex_parallel_child_tools
       standalone_pass_tokens:
         - hv2-codex-child
