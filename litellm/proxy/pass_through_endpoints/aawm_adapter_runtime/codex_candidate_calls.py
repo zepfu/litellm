@@ -8103,6 +8103,7 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
     original_iterator = response.body_iterator
     decoder = codecs.getincrementaldecoder("utf-8")()
     parser_buffer = ""
+    parser_original_bytes = 0
     trailing_cr = False
     decoder_failed = False
     committed = False
@@ -8164,17 +8165,38 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
         )
 
     def _incomplete_buffer_bytes() -> int:
-        pending = parser_buffer
+        incomplete = parser_original_bytes
         if trailing_cr:
-            pending += "\n"
-        return len(pending.encode("utf-8"))
+            incomplete += 1
+        return incomplete
 
     def _hold_exceeded() -> bool:
         return (
             len(held_chunks) >= max(0, max_chunks)
-            or held_bytes > max(0, max_bytes)
-            or _incomplete_buffer_bytes() > max(0, max_bytes)
+            or (held_bytes + _incomplete_buffer_bytes()) > max(0, max_bytes)
         )
+
+    def _normalize_sse_text(text: str) -> tuple[str, list[int]]:
+        normalized_chars: list[str] = []
+        original_widths: list[int] = []
+        index = 0
+        length = len(text)
+        while index < length:
+            char = text[index]
+            if char == "\r" and index + 1 < length and text[index + 1] == "\n":
+                normalized_chars.append("\n")
+                original_widths.append(2)
+                index += 2
+                continue
+            if char == "\r":
+                normalized_chars.append("\n")
+                original_widths.append(1)
+                index += 1
+                continue
+            normalized_chars.append(char)
+            original_widths.append(len(char.encode("utf-8")))
+            index += 1
+        return "".join(normalized_chars), original_widths
 
     def _raise_empty_success(response_body: Optional[dict[str, Any]] = None) -> None:
         _raise_codex_auto_agent_empty_success_response(
@@ -8261,7 +8283,7 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
             )
         _raise_empty_success()
 
-    def _capture_complete_frame(event_block: str) -> None:
+    def _capture_complete_frame(event_block: str, original_frame_bytes: int) -> None:
         nonlocal saw_substantive, saw_content, saw_failed, first_error_payload
         nonlocal terminal_response, terminal_event_type, terminal_seen
         nonlocal complete_frame_count, held_bytes
@@ -8269,8 +8291,8 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
             return
         complete_frame_count += 1
         try:
+            held_bytes += original_frame_bytes
             frame_bytes = (event_block + "\n\n").encode("utf-8")
-            held_bytes += len(frame_bytes)
             (
                 decision,
                 error_payload,
@@ -8338,7 +8360,7 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
             _note_precommit_frame_boundary()
 
     def _consume_sse_text(text: str, *, final: bool = False) -> None:
-        nonlocal parser_buffer, trailing_cr
+        nonlocal parser_buffer, parser_original_bytes, trailing_cr
         if decoder_failed or frozen_precommit_action in {"fail", "fail_empty"}:
             return
         if trailing_cr:
@@ -8347,32 +8369,54 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
         if text.endswith("\r"):
             text = text[:-1]
             trailing_cr = True
-        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-        pending = parser_buffer + normalized
+        normalized, new_original_widths = _normalize_sse_text(text)
+        leftover_text = parser_buffer
+        leftover_original_bytes = parser_original_bytes
+        leftover_chars = len(leftover_text)
+        pending = leftover_text + normalized
         parser_buffer = ""
+        parser_original_bytes = 0
+        new_consumed_chars = 0
         while pending:
             delimiter_index = pending.find("\n\n")
             if delimiter_index < 0:
                 parser_buffer = pending
+                parser_original_bytes = leftover_original_bytes + sum(
+                    new_original_widths[new_consumed_chars:]
+                )
                 break
             event_block = pending[:delimiter_index]
-            pending = pending[delimiter_index + 2 :]
-            _capture_complete_frame(event_block)
+            frame_chars = delimiter_index + 2
+            from_new = frame_chars - leftover_chars
+            original_frame_bytes = leftover_original_bytes + sum(
+                new_original_widths[
+                    new_consumed_chars : new_consumed_chars + from_new
+                ]
+            )
+            leftover_chars = 0
+            leftover_original_bytes = 0
+            new_consumed_chars += from_new
+            pending = pending[frame_chars:]
+            _capture_complete_frame(event_block, original_frame_bytes)
             if frozen_precommit_action in {"fail", "fail_empty"}:
                 parser_buffer = ""
+                parser_original_bytes = 0
                 pending = ""
                 break
         if not final:
             return
         if frozen_precommit_action in {"fail", "fail_empty"}:
             parser_buffer = ""
+            parser_original_bytes = 0
             return
         if trailing_cr:
             parser_buffer += "\n"
+            parser_original_bytes += 1
             trailing_cr = False
         if parser_buffer:
-            _capture_complete_frame(parser_buffer)
+            _capture_complete_frame(parser_buffer, parser_original_bytes)
             parser_buffer = ""
+            parser_original_bytes = 0
 
     def _decode_chunk_text(raw_chunk: Any) -> str:
         nonlocal decoder_failed
