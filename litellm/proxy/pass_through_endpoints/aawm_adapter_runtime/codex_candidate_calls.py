@@ -28,6 +28,7 @@ import litellm
 from litellm._logging import verbose_aawm_route_logger
 from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen.constants import (
     _OPENCODE_GO_CREDENTIAL_FAMILY,
+    _OPENCODE_GO_TARGET_FAMILY,
     _OPENCODE_ZEN_CREDENTIAL_FAMILY,
     _OPENCODE_ZEN_TARGET_FAMILY,
 )
@@ -2235,6 +2236,13 @@ def install(
         if publish_to_module:
             _mod[_name] = _rebound
         host_globals[_name] = _rebound
+    # Runtime imports this module through the adapter package, so the Go
+    # loader is bound here rather than at module import.
+    from litellm.proxy.pass_through_endpoints.providers.opencode_zen.runtime import (
+        _load_opencode_go_api_key,
+    )
+
+    _mod["_load_opencode_go_api_key"] = _load_opencode_go_api_key
     for _name, _value in (
         (
             "prepare_cohere_v2_strict_completion_kwargs",
@@ -2273,6 +2281,8 @@ def install(
         ("_OPENCODE_ZEN_CREDENTIAL_FAMILY", _OPENCODE_ZEN_CREDENTIAL_FAMILY),
         ("_OPENCODE_ZEN_TARGET_FAMILY", _OPENCODE_ZEN_TARGET_FAMILY),
         ("_OPENCODE_GO_CREDENTIAL_FAMILY", _OPENCODE_GO_CREDENTIAL_FAMILY),
+        ("_OPENCODE_GO_TARGET_FAMILY", _OPENCODE_GO_TARGET_FAMILY),
+        ("_load_opencode_go_api_key", _load_opencode_go_api_key),
     ):
         host_globals.setdefault(_name, _value)
 
@@ -10414,7 +10424,7 @@ def _build_opencode_go_provider_rejection_evidence(
     api_key: Any = None,
     local_timeout: bool = False,
     request: Any = None,
-    expected_target_family: Any = "opencode",
+    expected_target_family: Any = _OPENCODE_GO_TARGET_FAMILY,
     failure_phase: Any = "provider_attempt",
     call_mode: Any = None,
 ) -> dict[str, Any]:
@@ -10634,10 +10644,15 @@ async def _prepare_opencode_go_preflight_egress(
             use_alias_candidate_probe=use_alias_candidate_probe,
         )
     try:
-        api_key = await _load_opencode_zen_api_key_for_candidate(
-            use_alias_candidate_probe=False,
-            source_family=_OPENCODE_GO_CREDENTIAL_FAMILY,
-        )
+        # Host publish wins after install(). The import is deferred because
+        # the OpenCode runtime package imports this module. There is no
+        # fallback to the Zen candidate loader or auth_data["opencode"].
+        load_go_key = globals().get("_load_opencode_go_api_key")
+        if not callable(load_go_key):
+            from litellm.proxy.pass_through_endpoints.providers.opencode_zen.runtime import (
+                _load_opencode_go_api_key as load_go_key,
+            )
+        api_key = await load_go_key()
     except (FileNotFoundError, ValueError, OSError, TypeError) as exc:
         raise_opencode_go_preflight(
             exc,
@@ -10954,7 +10969,7 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
                     and isinstance(exc, (asyncio.TimeoutError, httpx.TimeoutException))
                 ),
                 request=request,
-                expected_target_family="opencode",
+                expected_target_family=plan.expected_target_family,
                 failure_phase="provider_attempt",
                 call_mode="alias" if use_alias_candidate_probe else "direct",
             )
@@ -11301,7 +11316,7 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
                     and isinstance(exc, (asyncio.TimeoutError, httpx.TimeoutException))
             ),
             request=request,
-            expected_target_family="opencode",
+            expected_target_family=plan.expected_target_family,
             failure_phase="provider_attempt",
             call_mode="alias" if use_alias_candidate_probe else "direct",
         )

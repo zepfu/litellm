@@ -7,6 +7,7 @@ into the host module while retaining live monkeypatch lookups.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -65,6 +66,7 @@ _HOST_FUNCTION_NAMES = (
     "_get_opencode_go_target_base",
     "_get_opencode_zen_auth_file_path",
     "_load_local_opencode_zen_api_key",
+    "_load_opencode_go_api_key",
     "_load_opencode_zen_api_key_for_candidate",
     "_build_opencode_zen_headers",
     "_add_opencode_zen_logging_metadata",
@@ -293,10 +295,93 @@ def _select_opencode_zen_provider_auth(auth_data: Any) -> Any:
 
 
 def _select_opencode_go_provider_auth(auth_data: Any) -> Any:
-    """Preserve historical OpenCode Go selection: Go entry, else Zen entry."""
-    if not isinstance(auth_data, dict):
+    """OC-019: Go selects only the ``opencode-go`` auth entry.
+
+    Never fall back to ``opencode``. A missing entry is returned as None
+    so the caller fails closed. The Zen/general entry is not read, copied,
+    or returned.
+    """
+    if not isinstance(auth_data, dict) or "opencode-go" not in auth_data:
         return None
-    return auth_data.get("opencode-go") or auth_data.get("opencode")
+    return auth_data.get("opencode-go")
+
+
+def _get_opencode_go_auth_file_path() -> Optional[Path]:
+    """Resolve the auth file used for OpenCode Go entry selection.
+
+    A configured Go auth-file variable is authoritative. Otherwise the
+    shared OpenCode auth file may be read, and only its ``opencode-go``
+    entry is eligible.
+    """
+    for env_name in _constants._OPENCODE_GO_AUTH_FILE_ENV_VARS:
+        value = _clean_secret_string(os.getenv(env_name))
+        if value:
+            candidate = Path(value).expanduser()
+            if not candidate.is_file():
+                raise ValueError(
+                    f"OpenCode Go auth file configured via {env_name} "
+                    "is missing or not a regular file."
+                )
+            return candidate
+    try:
+        return _get_opencode_zen_auth_file_path()
+    except ValueError as exc:
+        message = str(exc)
+        zen_prefix = "OpenCode Zen auth file"
+        if message.startswith(zen_prefix):
+            message = "OpenCode Go auth file" + message[len(zen_prefix) :]
+        raise ValueError(message) from None
+
+
+def _opencode_go_credential_fingerprint(api_key: str) -> str:
+    """Non-reversible id for the selected Go credential.
+
+    The cache namespace and target family are part of the material, so the
+    same secret text under the Zen family would not share this fingerprint.
+    The raw key is not returned.
+    """
+    namespace = _constants._OPENCODE_GO_CREDENTIAL_CACHE_NAMESPACE
+    target_family = _constants._OPENCODE_GO_TARGET_FAMILY
+    return hashlib.sha256(
+        f"{namespace}\0{target_family}\0{api_key}".encode("utf-8")
+    ).hexdigest()
+
+
+def _bind_opencode_go_credential_identity(api_key: str) -> str:
+    """Return the Go key only when its identity stays on the Go family."""
+    fingerprint = _opencode_go_credential_fingerprint(api_key)
+    if (
+        _constants._OPENCODE_GO_CREDENTIAL_CACHE_NAMESPACE
+        != _constants._OPENCODE_GO_CREDENTIAL_FAMILY
+        or _constants._OPENCODE_GO_TARGET_FAMILY
+        != _constants._OPENCODE_GO_CREDENTIAL_FAMILY
+        or len(fingerprint) != 64
+    ):
+        raise ValueError(
+            "OpenCode Go credential fingerprint, target family, and "
+            "cache namespace must stay on the Go credential family."
+        )
+    return api_key
+
+
+def _raise_invalid_opencode_go_auth_file(
+    *,
+    source_label: str,
+    auth_data: Any = None,
+) -> NoReturn:
+    has_go_entry = isinstance(auth_data, dict) and "opencode-go" in auth_data
+    has_general_entry = isinstance(auth_data, dict) and "opencode" in auth_data
+    if has_general_entry and not has_go_entry:
+        raise ValueError(
+            f"OpenCode Go auth file configured via {source_label} "
+            "contains only an OpenCode ('opencode') credential, "
+            "which is not valid for OpenCode Go. OpenCode Go "
+            "requires provider 'opencode-go' with API-key auth."
+        )
+    raise ValueError(
+        f"OpenCode Go auth file configured via {source_label} "
+        "must contain provider 'opencode-go' with API-key auth."
+    )
 
 
 def _raise_invalid_opencode_auth_file(
@@ -307,10 +392,9 @@ def _raise_invalid_opencode_auth_file(
 ) -> NoReturn:
     normalized_family = str(source_family or "").strip().casefold()
     if normalized_family == _constants._OPENCODE_GO_CREDENTIAL_FAMILY:
-        # Go error text stays historically generic so Go behavior is unchanged.
-        raise ValueError(
-            f"OpenCode Zen auth file configured via {source_label} "
-            "must contain provider 'opencode' with API-key auth."
+        _raise_invalid_opencode_go_auth_file(
+            source_label=source_label,
+            auth_data=auth_data,
         )
     zen_entry_present = isinstance(auth_data, dict) and "opencode" in auth_data
     has_go_entry = isinstance(auth_data, dict) and "opencode-go" in auth_data
@@ -330,6 +414,10 @@ def _raise_invalid_opencode_auth_file(
 
 
 async def _load_local_opencode_auth_api_key(*, source_family: str) -> str:
+    normalized_family = str(source_family or "").strip().casefold()
+    if normalized_family == _constants._OPENCODE_GO_CREDENTIAL_FAMILY:
+        return await _load_opencode_go_api_key()
+
     explicit_key = _get_first_secret_value(
         _constants._OPENCODE_ZEN_API_KEY_ENV_VARS
     )
@@ -370,11 +458,7 @@ async def _load_local_opencode_auth_api_key(*, source_family: str) -> str:
             "does not contain valid JSON."
         ) from None
 
-    normalized_family = str(source_family or "").strip().casefold()
-    if normalized_family == _constants._OPENCODE_GO_CREDENTIAL_FAMILY:
-        provider_auth = _select_opencode_go_provider_auth(auth_data)
-    else:
-        provider_auth = _select_opencode_zen_provider_auth(auth_data)
+    provider_auth = _select_opencode_zen_provider_auth(auth_data)
     if not isinstance(provider_auth, dict):
         _raise_invalid_opencode_auth_file(
             source_label=source_label,
@@ -404,10 +488,91 @@ async def _load_local_opencode_zen_api_key() -> str:
     )
 
 
-async def _load_local_opencode_go_api_key() -> str:
-    return await _load_local_opencode_auth_api_key(
-        source_family=_constants._OPENCODE_GO_CREDENTIAL_FAMILY,
+async def _load_opencode_go_api_key() -> str:
+    """Load an OpenCode Go API key from Go-specific sources only.
+
+    Explicit keys come from Go environment names. A shared auth file may
+    be read, but only ``auth_data["opencode-go"]`` is selected. The
+    Zen/general ``auth_data["opencode"]`` entry is never read, copied, or
+    removed. A missing or malformed Go entry fails closed. Credential
+    fingerprint, target family, and cache namespace stay on ``opencode_go``.
+    """
+    explicit_key = _get_first_secret_value(
+        _constants._OPENCODE_GO_API_KEY_ENV_VARS
     )
+    if explicit_key is not None:
+        return _bind_opencode_go_credential_identity(explicit_key)
+
+    configured_source: Optional[str] = None
+    for env_name in (
+        *_constants._OPENCODE_GO_AUTH_FILE_ENV_VARS,
+        *_constants._OPENCODE_ZEN_AUTH_FILE_ENV_VARS,
+    ):
+        if _clean_secret_string(os.getenv(env_name)):
+            configured_source = env_name
+            break
+
+    auth_path = _get_opencode_go_auth_file_path()
+    if auth_path is None:
+        raise FileNotFoundError(
+            "OpenCode Go auth file not found. Expected "
+            "'~/.local/share/opencode/auth.json' or set "
+            "'LITELLM_OPENCODE_GO_AUTH_FILE'."
+        )
+
+    source_label = configured_source or "default"
+
+    try:
+        raw_text = auth_path.read_text(encoding="utf-8")
+    except Exception:
+        raise ValueError(
+            f"OpenCode Go auth file configured via {source_label} "
+            "is not readable."
+        ) from None
+
+    try:
+        auth_data = json.loads(raw_text)
+    except Exception:
+        raise ValueError(
+            f"OpenCode Go auth file configured via {source_label} "
+            "does not contain valid JSON."
+        ) from None
+
+    provider_auth = _select_opencode_go_provider_auth(auth_data)
+    if not isinstance(provider_auth, dict):
+        _raise_invalid_opencode_go_auth_file(
+            source_label=source_label,
+            auth_data=auth_data,
+        )
+    raw_key = provider_auth.get("key")
+    raw_type = provider_auth.get("type")
+    if (raw_key is not None and not isinstance(raw_key, str)) or (
+        raw_type is not None and not isinstance(raw_type, str)
+    ):
+        _raise_invalid_opencode_go_auth_file(
+            source_label=source_label,
+            auth_data=auth_data,
+        )
+    api_key = _clean_secret_string(raw_key if isinstance(raw_key, str) else None)
+    auth_type = _clean_secret_string(
+        raw_type if isinstance(raw_type, str) else None
+    )
+    if auth_type not in {None, "api"}:
+        raise ValueError(
+            f"OpenCode Go auth file configured via {source_label} "
+            "must contain provider 'opencode-go' with API-key auth type."
+        )
+    if api_key is None:
+        _raise_invalid_opencode_go_auth_file(
+            source_label=source_label,
+            auth_data=auth_data,
+        )
+    assert api_key is not None
+    return _bind_opencode_go_credential_identity(api_key)
+
+
+async def _load_local_opencode_go_api_key() -> str:
+    return await _load_opencode_go_api_key()
 
 
 async def _load_opencode_zen_api_key_for_candidate(
