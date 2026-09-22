@@ -10653,7 +10653,7 @@ async def _prepare_opencode_go_preflight_egress(
                 _load_opencode_go_api_key as load_go_key,
             )
         api_key = await load_go_key()
-    except (FileNotFoundError, ValueError, OSError, TypeError) as exc:
+    except (FileNotFoundError, ValueError, OSError, TypeError, RuntimeError) as exc:
         raise_opencode_go_preflight(
             exc,
             reason=classify_opencode_go_credential_preflight_reason(exc),
