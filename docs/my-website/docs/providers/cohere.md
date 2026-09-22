@@ -9,9 +9,10 @@ import TabItem from '@theme/TabItem';
 Direct Cohere alias failures use one explicit cooldown scope:
 
 - **Credential** — authentication (HTTP 401/403), billing exhaustion (HTTP 402),
-  and monthly quota exhaustion. A 429 that only mentions a trial, including
-  "free trial", "trial limit", or "trial usage" together with a per-minute rate
-  limit, stays candidate-scoped.
+  and monthly quota or capacity exhaustion. A 429 that only mentions a trial,
+  including "free trial", "trial limit", or "trial usage", or that names the
+  monthly trial plan beside an explicit per-minute rate limit, stays
+  candidate-scoped.
 - **Candidate** — per-model limits such as RPM, plus model-unavailable and
   ordinary provider failures. One model's RPM limit does not cool its siblings.
 - **None** — request validation and cancellation. These do not publish a cooldown.
