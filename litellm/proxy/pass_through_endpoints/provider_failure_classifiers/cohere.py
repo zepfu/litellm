@@ -24,15 +24,16 @@ COHERE_API_HOSTS: frozenset[str] = frozenset(
 _COHERE_CHAT_V2_PATH = "/v2/chat"
 _COHERE_CODEX_ROUTE_FAMILY = "codex_cohere_chat_completions_adapter"
 
-# The exhausted noun must be the monthly allowance. A per-minute quota that is
-# exhausted "on the monthly trial plan" does not match.
+# The exhausted noun must be the monthly allowance. The reverse clause may
+# include only a determiner, so an RPM exhaustion verb cannot reach a separate
+# monthly quota, capacity, or limit across an arbitrary word span.
 _MONTHLY_ALLOWANCE_EXHAUSTION_RE = re.compile(
     r"monthly(?:\s+trial)?\s+(?:quota|capacity|limit)"
     r"(?:\s+(?:is|was|has|been|the|your)){0,4}"
     r"\s+(?:exhausted|exhaustion|exceeded|reached|depleted)"
     r"|"
     r"(?:exhausted|exhaustion|exceeded|reached|depleted)"
-    r"(?:\s+\w+){0,5}"
+    r"(?:\s+(?:your|the|our|their|its|my|his|her|a|an|this|that))?"
     r"\s+monthly(?:\s+trial)?\s+(?:quota|capacity|limit)"
 )
 _COHERE_MODEL_TOKEN = r"""['"]?(?P<model>[^\s,'";]+)['"]?"""
@@ -348,10 +349,10 @@ def _cohere_text_has_monthly_quota_exhaustion(text: str) -> bool:
     """Credential scope requires exhaustion of the monthly quota or capacity.
 
     A monthly-trial plan name is not that evidence. Exhausting an explicitly
-    per-minute quota, including "rpm quota exhausted" or "requests per minute
-    quota is exhausted" on the monthly trial plan, stays candidate-scoped.
-    "monthly trial quota exhausted" and other monthly-quota or monthly-capacity
-    exhaustion stay credential-scoped.
+    per-minute quota, including on the monthly trial plan or beside a separate
+    monthly-usage figure, stays candidate-scoped. "monthly trial quota
+    exhausted" and other monthly-quota or monthly-capacity exhaustion stay
+    credential-scoped.
     """
 
     if "monthly" not in text:
