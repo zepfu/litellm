@@ -33,6 +33,8 @@ from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen.con
 )
 from litellm.llms.cohere.chat.v2_transformation import (
     prepare_cohere_v2_strict_completion_kwargs,
+    restore_cohere_responses_function_parameters,
+    shield_cohere_responses_function_parameters,
 )
 from litellm.llms.xai.route_descriptors import (
     GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
@@ -2207,6 +2209,14 @@ def install(
         (
             "prepare_cohere_v2_strict_completion_kwargs",
             prepare_cohere_v2_strict_completion_kwargs,
+        ),
+        (
+            "restore_cohere_responses_function_parameters",
+            restore_cohere_responses_function_parameters,
+        ),
+        (
+            "shield_cohere_responses_function_parameters",
+            shield_cohere_responses_function_parameters,
         ),
         ("apply_request_watermark_egress", apply_request_watermark_egress),
         ("load_text_watermark_config", load_text_watermark_config),
@@ -6657,13 +6667,20 @@ async def _prepare_codex_cohere_chat_completions_adapter_route(
         },
     )
     litellm_metadata = dict(request_body.get("litellm_metadata") or {})
+    shielded_responses_request, preserved_parameters = (
+        shield_cohere_responses_function_parameters(responses_api_request)
+    )
     completion_kwargs = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
         model=upstream_model,
         input=request_input,
-        responses_api_request=responses_api_request,
+        responses_api_request=shielded_responses_request,
         custom_llm_provider=_CODEX_AUTO_AGENT_COHERE_PROVIDER,
         stream=bool(request_body.get("stream")),
         metadata=litellm_metadata,
+    )
+    completion_kwargs = restore_cohere_responses_function_parameters(
+        completion_kwargs,
+        preserved_parameters,
     )
     completion_kwargs = _strip_strict_from_cohere_completion_tools(completion_kwargs)
     completion_kwargs.update(
