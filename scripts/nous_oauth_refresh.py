@@ -153,20 +153,43 @@ def _jwt_numeric_claim(value: Any) -> Optional[float]:
     return number if math.isfinite(number) else None
 
 
+def _proportional_refresh_threshold_seconds(
+    lifetime: float, *, min_seconds: float
+) -> float:
+    """Lead time strictly inside a known positive lifetime.
+
+    Use the larger of the absolute floor and half the lifetime when the floor
+    is already inside the lifetime, so a long lease does not refresh later
+    than that floor. Otherwise use half the lifetime. A short or degraded
+    lease, including the 300-second fallback, then becomes due around its
+    midpoint instead of at issuance.
+    """
+    half_lifetime = lifetime * 0.5
+    floor = float(min_seconds)
+    if math.isfinite(floor) and 0.0 < floor < lifetime:
+        return max(floor, half_lifetime)
+    return half_lifetime
+
+
 def _refresh_threshold_seconds(
     *,
     expires_in: Any = None,
     access_token: Optional[str] = None,
     min_seconds: float = DEFAULT_NOUS_OAUTH_REFRESH_MIN_SECONDS,
 ) -> float:
-    """Return proportional refresh threshold (max of min or half-life)."""
+    """Return a refresh lead time for the issued lifetime.
+
+    Unknown or non-positive lifetimes keep the absolute floor. A known
+    positive lifetime uses a proportional lead time strictly inside that
+    lifetime.
+    """
     lifetime = _issued_lifetime_seconds(
         expires_in=expires_in,
         access_token=access_token,
     )
-    if lifetime is None or lifetime <= 0:
+    if lifetime is None or lifetime <= 0 or not math.isfinite(lifetime):
         return float(min_seconds)
-    return max(float(min_seconds), lifetime * 0.5)
+    return _proportional_refresh_threshold_seconds(lifetime, min_seconds=min_seconds)
 
 
 @dataclass(frozen=True)
@@ -751,14 +774,14 @@ def _refresh_threshold_metadata(
     min_seconds: float = DEFAULT_NOUS_OAUTH_REFRESH_MIN_SECONDS,
 ) -> tuple[float, str, bool]:
     lifetime, source, degraded = _record_lifetime_metadata(record)
-    if lifetime is None:
+    if lifetime is None or lifetime <= 0 or not math.isfinite(lifetime):
         return (
             float(min_seconds),
             _LIFETIME_SOURCE_DEGRADED,
             True,
         )
     return (
-        max(float(min_seconds), lifetime * 0.5),
+        _proportional_refresh_threshold_seconds(lifetime, min_seconds=min_seconds),
         source or _LIFETIME_SOURCE_DEGRADED,
         degraded,
     )
@@ -794,9 +817,9 @@ def _credential_needs_refresh(
 ) -> bool:
     """Return True when the credential should be refreshed.
 
-    Uses the proportional half-life threshold derived from the credential's
-    own ``expires_in`` and ``access_token``, falling back to the passed
-    ``buffer_seconds`` when no lifetime metadata is available.
+    Uses a proportional lead time strictly inside a known positive lifetime,
+    including a degraded-lifetime fallback. The absolute ``buffer_seconds``
+    floor is reserved for unknown lifetime.
     """
     expires_at, unavailable = _earliest_expiry_with_status(record)
     if unavailable or expires_at is None:
