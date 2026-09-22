@@ -8163,13 +8163,6 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
             request_body=identity_request_body,
         )
 
-    def _chunk_size(raw_chunk: Any) -> int:
-        if isinstance(raw_chunk, (bytes, bytearray)):
-            return len(raw_chunk)
-        if isinstance(raw_chunk, str):
-            return len(raw_chunk.encode("utf-8"))
-        return 0
-
     def _incomplete_buffer_bytes() -> int:
         pending = parser_buffer
         if trailing_cr:
@@ -8271,12 +8264,13 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
     def _capture_complete_frame(event_block: str) -> None:
         nonlocal saw_substantive, saw_content, saw_failed, first_error_payload
         nonlocal terminal_response, terminal_event_type, terminal_seen
-        nonlocal complete_frame_count
+        nonlocal complete_frame_count, held_bytes
         if frozen_precommit_action in {"fail", "fail_empty"}:
             return
         complete_frame_count += 1
         try:
             frame_bytes = (event_block + "\n\n").encode("utf-8")
+            held_bytes += len(frame_bytes)
             (
                 decision,
                 error_payload,
@@ -8462,12 +8456,11 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
     _set_state()
 
     async def _validated_iterator() -> Any:
-        nonlocal committed, decoder_failed, held_bytes
+        nonlocal committed, decoder_failed
         try:
             async for raw_chunk in original_iterator:
                 if not committed:
                     held_chunks.append(raw_chunk)
-                    held_bytes += _chunk_size(raw_chunk)
                     _feed_chunk(raw_chunk)
                     action = _run_precommit_action(_precommit_action())
                     if action != "commit":
