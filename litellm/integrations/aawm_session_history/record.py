@@ -1055,6 +1055,11 @@ def _build_session_history_record(  # noqa: PLR0915
         metadata = {}
         litellm_params["metadata"] = metadata
         kwargs["litellm_params"] = litellm_params
+    if isinstance(litellm_params, dict):
+        _restore_selected_zen_account_metadata(
+            metadata,
+            litellm_params.get("litellm_metadata"),
+        )
     for identity_key in ("canonical_thread_id", "parent_thread_id"):
         if metadata.get(identity_key) is None:
             for source in _iter_litellm_metadata_sources(kwargs, metadata):

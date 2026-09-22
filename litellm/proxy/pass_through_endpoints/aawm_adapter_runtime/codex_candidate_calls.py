@@ -9833,6 +9833,17 @@ async def _handle_codex_opencode_zen_adapter_route(
         request_metadata,
         completion_metadata,
     )
+    if not use_alias_candidate_probe:
+        (
+            globals().get("_bind_direct_zen_caller_identity")
+            or (lambda *_args: None)
+        )(
+            user_api_key_dict,
+            request,
+            litellm_metadata,
+            request_metadata,
+            completion_metadata,
+        )
     custom_headers = BaseOpenAIPassThroughHandler._assemble_headers(
         api_key=api_key,
         request=request,
