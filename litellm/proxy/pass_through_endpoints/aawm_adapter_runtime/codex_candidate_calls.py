@@ -10375,6 +10375,7 @@ def _build_opencode_go_provider_rejection_evidence(
     failure_phase: Any = "provider_attempt",
     call_mode: Any = None,
 ) -> dict[str, Any]:
+    classification = None
     if isinstance(exc, Exception):
         status_code = extract_opencode_go_status_code(exc)
         classification = classify_opencode_go_failure(
@@ -10396,6 +10397,7 @@ def _build_opencode_go_provider_rejection_evidence(
         expected_target_family=expected_target_family,
         failure_phase=failure_phase,
         call_mode=call_mode,
+        classification=classification,
     )
 
 

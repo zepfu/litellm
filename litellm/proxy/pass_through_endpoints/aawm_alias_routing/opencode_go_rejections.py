@@ -43,6 +43,16 @@ _PHASES = frozenset(
     }
 )
 _CALL_MODES = frozenset({"alias", "direct"})
+_ALIAS_FAILURE_CLASSES = frozenset(
+    {
+        "local_timeout",
+        "upstream_timeout",
+        "candidate_unavailable",
+        "provider_terminal_error",
+        "rate_limited",
+        "upstream_transient_internal",
+    }
+)
 _FAILURE_CLASSES = frozenset(
     {
         "auth",
@@ -52,7 +62,49 @@ _FAILURE_CLASSES = frozenset(
         "provider_4xx_other",
         "unknown",
     }
+) | _ALIAS_FAILURE_CLASSES
+_SAFE_KINDS = frozenset(
+    {
+        "local_timeout",
+        "provider_timeout",
+        "unsupported_model",
+        "unsupported_contract",
+        "auth",
+        "account",
+        "rate_limit",
+        "transient",
+        "provider_4xx_other",
+        "provider_5xx",
+    }
 )
+_SAFE_ORIGINS = frozenset({"client", "upstream"})
+_SAFE_SCOPES = frozenset({"candidate", "account", "request_local"})
+_SAFE_PUBLIC_DETAILS = frozenset(
+    {
+        "OpenCode Go local timeout",
+        "OpenCode Go provider timeout",
+        "OpenCode Go model is unsupported",
+        "OpenCode Go contract is unsupported",
+        "OpenCode Go authentication failed",
+        "OpenCode Go account restriction",
+        "OpenCode Go rate limit",
+        "OpenCode Go transient failure",
+        "OpenCode Go provider request failed",
+        "OpenCode Go provider error",
+    }
+)
+_KIND_TO_FAILURE_CLASS = {
+    "local_timeout": "transient",
+    "provider_timeout": "transient",
+    "unsupported_model": "provider_4xx_other",
+    "unsupported_contract": "provider_4xx_other",
+    "auth": "auth",
+    "account": "auth",
+    "rate_limit": "rate_limit",
+    "transient": "transient",
+    "provider_4xx_other": "provider_4xx_other",
+    "provider_5xx": "provider_5xx",
+}
 _KNOWN_TARGET_PATHS = {
     OPENCODE_GO_CHAT_COMPLETIONS_PATH: OPENCODE_GO_EXPECTED_TARGET_FAMILY,
     OPENCODE_GO_RESPONSES_PATH: OPENCODE_GO_EXPECTED_TARGET_FAMILY,
@@ -82,6 +134,14 @@ _ALLOWED_EVIDENCE_KEYS = frozenset(
         "litellm_call_id",
         "originating_attempt_id",
         "error",
+        "kind",
+        "origin",
+        "provider_returned",
+        "status_code",
+        "scope",
+        "retryable",
+        "public_detail",
+        "structured_code",
     }
 )
 _FORBIDDEN_EVIDENCE_KEYS = frozenset(
@@ -158,6 +218,126 @@ def _safe_failure_class(value: Any) -> str:
     if isinstance(value, str) and value.strip() in _FAILURE_CLASSES:
         return value.strip()
     return "unknown"
+
+
+def _safe_kind(value: Any) -> Optional[str]:
+    if isinstance(value, str) and value.strip() in _SAFE_KINDS:
+        return value.strip()
+    return None
+
+
+def _safe_origin(value: Any) -> Optional[str]:
+    if isinstance(value, str) and value.strip() in _SAFE_ORIGINS:
+        return value.strip()
+    return None
+
+
+def _safe_scope(value: Any) -> Optional[str]:
+    if isinstance(value, str) and value.strip() in _SAFE_SCOPES:
+        return value.strip()
+    return None
+
+
+def _safe_optional_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+def _safe_public_detail(value: Any) -> Optional[str]:
+    if isinstance(value, str) and value in _SAFE_PUBLIC_DETAILS:
+        return value
+    return None
+
+
+def _safe_structured_code(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    token = value.strip()
+    if not token or _FAMILY_RE.fullmatch(token) is None:
+        return None
+    return token
+
+
+def _classification_mapping(classification: Any) -> Optional[dict[str, Any]]:
+    if classification is None:
+        return None
+    if isinstance(classification, Mapping):
+        payload = dict(classification)
+    else:
+        to_safe = getattr(classification, "to_safe_metadata", None)
+        if not callable(to_safe):
+            return None
+        payload = to_safe()
+        if not isinstance(payload, Mapping):
+            return None
+        payload = dict(payload)
+    return payload or None
+
+
+def _authoritative_status(
+    *,
+    classification: Optional[Mapping[str, Any]],
+    extracted_status: Optional[int],
+) -> Optional[int]:
+    if classification is None:
+        return extracted_status
+    if _safe_origin(classification.get("origin")) == "client":
+        return None
+    classified = _bounded_status(classification.get("status_code"))
+    if classified is not None:
+        return classified
+    return extracted_status
+
+
+def _authoritative_failure_class(
+    *,
+    classification: Optional[Mapping[str, Any]],
+    status: Optional[int],
+    exc: Any,
+) -> str:
+    if classification is None:
+        return _failure_class_from_status(status=status, exc=exc)
+    alias = classification.get("failure_class")
+    if isinstance(alias, str) and alias.strip() in _FAILURE_CLASSES:
+        return alias.strip()
+    kind = _safe_kind(classification.get("kind"))
+    mapped = _KIND_TO_FAILURE_CLASS.get(kind) if kind is not None else None
+    if mapped is not None:
+        return mapped
+    return _failure_class_from_status(status=status, exc=exc)
+
+
+def _copy_classification_metadata(
+    normalized: dict[str, Any],
+    payload: Mapping[str, Any],
+) -> None:
+    kind = _safe_kind(payload.get("kind"))
+    if kind is not None:
+        normalized["kind"] = kind
+    origin = _safe_origin(payload.get("origin"))
+    if origin is not None:
+        normalized["origin"] = origin
+    provider_returned = _safe_optional_bool(payload.get("provider_returned"))
+    if provider_returned is not None:
+        normalized["provider_returned"] = provider_returned
+    if "status_code" in payload:
+        normalized["status_code"] = _bounded_status(payload.get("status_code"))
+    scope = _safe_scope(payload.get("scope"))
+    if scope is not None:
+        normalized["scope"] = scope
+    retryable = _safe_optional_bool(payload.get("retryable"))
+    if retryable is not None:
+        normalized["retryable"] = retryable
+    public_detail = _safe_public_detail(payload.get("public_detail"))
+    if public_detail is not None:
+        normalized["public_detail"] = public_detail
+    if "structured_code" in payload:
+        normalized["structured_code"] = _safe_structured_code(
+            payload.get("structured_code")
+        )
 
 
 def _safe_identity(value: Any) -> Optional[str]:
@@ -363,18 +543,25 @@ def build_opencode_go_rejection_evidence(
     expected_target_family: Any = OPENCODE_GO_EXPECTED_TARGET_FAMILY,
     failure_phase: Any = "provider_attempt",
     call_mode: Any = None,
+    classification: Any = None,
 ) -> dict[str, Any]:
     """Build one secret-safe Go rejection record.
 
     ``advertised_tools`` and ``api_key`` are accepted for call-site
     compatibility only. Tool identity is resolved against the final
     provider-bound ``completion_tools`` list. Keys, URLs, and exception
-    payloads are never copied into the result.
+    payloads are never copied into the result. An OC-026 classification
+    is authoritative for status and safe-metadata fields when present.
     """
 
     _ = advertised_tools, api_key
     provider_bound_types = opencode_go_tool_types(completion_tools)
-    status = _exception_status(exc)
+    extracted_status = _exception_status(exc)
+    classification_payload = _classification_mapping(classification)
+    status = _authoritative_status(
+        classification=classification_payload,
+        extracted_status=extracted_status,
+    )
     index = extract_opencode_go_offending_tool_index(_exception_index_source(exc))
     tool_index, tool_type = _provider_bound_tool_index_and_type(
         index=index,
@@ -383,7 +570,11 @@ def build_opencode_go_rejection_evidence(
     actual_target_path = _bounded_target_path(target_url)
     identity = _bind_request_identity(request)
     originating_attempt_id = _new_originating_attempt_id()
-    failure_class = _failure_class_from_status(status=status, exc=exc)
+    failure_class = _authoritative_failure_class(
+        classification=classification_payload,
+        status=status,
+        exc=exc,
+    )
     evidence: dict[str, Any] = {
         "provider": OPENCODE_GO_PROVIDER,
         "route_family": OPENCODE_GO_ROUTE_FAMILY,
@@ -416,6 +607,11 @@ def build_opencode_go_rejection_evidence(
         evidence["request_identity"] = identity
         evidence["litellm_call_id"] = identity
     evidence["originating_attempt_id"] = originating_attempt_id
+    if classification_payload is not None:
+        evidence = {**evidence, **classification_payload}
+        evidence["status"] = status
+        evidence["error"] = {"status": status}
+        evidence["failure_class"] = failure_class
     return normalize_opencode_go_rejection(evidence) or evidence
 
 
@@ -529,6 +725,7 @@ def normalize_opencode_go_rejection(
         normalized["offending_type"] = tool_type
     if tool_types:
         normalized["tool_types"] = tool_types
+    _copy_classification_metadata(normalized, payload)
     normalized = _with_correlation_ids(normalized, payload, identity)
     return {key: value for key, value in normalized.items() if key in _ALLOWED_EVIDENCE_KEYS}
 
