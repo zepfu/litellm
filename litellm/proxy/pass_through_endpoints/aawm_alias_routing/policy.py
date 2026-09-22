@@ -7,7 +7,8 @@ quota, allowlist, and adapter-capability policy shared by runtime components.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Any, Literal, Optional
 
 # Default cooldowns for auto-agent alias candidates.
 CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS = 3 * 60 * 60.0
@@ -458,6 +459,41 @@ def _parse_opencode_go_model(
     return ("unsupported", cleaned, None, None)
 
 
+OpencodeGoDirectDisposition = Literal["unclaimed", "supported", "empty", "unsupported"]
+
+
+@dataclass(frozen=True)
+class OpencodeGoDirectNamespace:
+    """A direct Go prefix claim, kept separate from catalog support.
+
+    ``claimed_prefix`` is set only for ``opencode_go`` or ``opencode-go``.
+    Bare catalog ids and foreign namespaces stay ``unclaimed``. ``supported``
+    carries the canonical bare suffix; ``empty`` and ``unsupported`` do not.
+    """
+
+    disposition: OpencodeGoDirectDisposition
+    canonical_model: Optional[str]
+    claimed_prefix: Optional[str]
+
+
+def recognize_opencode_go_direct_namespace(model: Any) -> OpencodeGoDirectNamespace:
+    """Recognize either direct Go prefix without applying alias precedence.
+
+    Support is the ``supported`` disposition only. Callers that own direct
+    routing must reject ``empty`` and ``unsupported`` before egress. This
+    does not rewrite foreign namespaces or reserve bare catalog ids.
+    """
+
+    kind, canonical, claimed_prefix, _foreign_provider = _parse_opencode_go_model(model)
+    if claimed_prefix not in OPENCODE_GO_MODEL_PREFIXES:
+        return OpencodeGoDirectNamespace("unclaimed", None, None)
+    if kind == "go_prefixed" and canonical is not None:
+        return OpencodeGoDirectNamespace("supported", canonical, claimed_prefix)
+    if kind == "empty":
+        return OpencodeGoDirectNamespace("empty", None, claimed_prefix)
+    return OpencodeGoDirectNamespace("unsupported", None, claimed_prefix)
+
+
 def canonicalize_opencode_go_alias_model(model: Any) -> str:
     """Return the canonical bare Go upstream id for an alias candidate.
 
@@ -509,19 +545,17 @@ def canonicalize_opencode_go_alias_model(model: Any) -> str:
 
 
 def normalize_opencode_go_adapter_model_name(model: Any) -> Optional[str]:
-    """Return the canonical bare Go id when a Go namespace is claimed.
+    """Return the canonical bare Go id for a supported direct Go prefix.
 
     Direct requests must use ``opencode_go/<id>`` or ``opencode-go/<id>``.
     Bare catalog ids return ``None`` so they do not steal default
-    pass-through. Invalid Go claims return ``None`` (fail-closed direct
-    handling is a separate item).
+    pass-through. Empty and unsupported claims also return ``None`` here;
+    direct routing rejects those dispositions before egress.
     """
 
-    kind, canonical, _claimed_prefix, _foreign_provider = _parse_opencode_go_model(
-        model
-    )
-    if kind == "go_prefixed" and canonical is not None:
-        return canonical
+    recognized = recognize_opencode_go_direct_namespace(model)
+    if recognized.disposition == "supported":
+        return recognized.canonical_model
     return None
 
 
@@ -693,6 +727,8 @@ __all__ = [
     "OPENCODE_GO_ALLOWED_MODELS",
     "OPENCODE_GO_MODEL_PREFIXES",
     "OPENCODE_GO_PROVIDER",
+    "OpencodeGoDirectNamespace",
+    "OpencodeGoDirectDisposition",
     "OPENCODE_ZEN_PROVIDER",
     "OPENROUTER_FREE_DAILY_QUOTA_MODELS",
     "canonicalize_opencode_go_alias_model",
@@ -703,6 +739,7 @@ __all__ = [
     "normalize_kimi_code_chat_completions_adapter_model_name",
     "normalize_nvidia_completion_adapter_model_name",
     "normalize_opencode_go_adapter_model_name",
+    "recognize_opencode_go_direct_namespace",
     "normalize_openrouter_model_namespace",
     "normalize_zai_coding_plan_adapter_model_name",
     "nvidia_completion_adapter_upstream_model",

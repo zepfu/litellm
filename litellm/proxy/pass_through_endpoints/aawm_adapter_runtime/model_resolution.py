@@ -9,6 +9,12 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Optional
 
+from litellm.proxy._types import ProxyException
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+    OPENCODE_GO_MODEL_PREFIXES,
+    recognize_opencode_go_direct_namespace,
+)
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -257,6 +263,92 @@ def _normalize_opencode_zen_adapter_model_name(model: Any) -> Optional[str]:
     return None
 
 
+_OPENCODE_GO_DIRECT_NAMESPACE_PHASE = "opencode_go_direct_namespace_pre_egress"
+_OPENCODE_GO_DIRECT_NAMESPACE_CODE = "opencode_go_direct_namespace_unsupported"
+_OPENCODE_GO_DIRECT_REJECTED_SUFFIXES = frozenset({"empty", "unsupported"})
+
+
+class OpencodeGoDirectNamespaceUnsupported(ProxyException):
+    """Bounded pre-egress rejection for a claimed but unusable Go suffix.
+
+    Raised before any Go request and before default OpenAI pass-through.
+    Prefix and suffix class are closed values; the raw model is omitted.
+    """
+
+    def __init__(self, *, suffix_class: str, claimed_prefix: str) -> None:
+        bounded_suffix = (
+            suffix_class
+            if suffix_class in _OPENCODE_GO_DIRECT_REJECTED_SUFFIXES
+            else "unsupported"
+        )
+        bounded_prefix = (
+            claimed_prefix
+            if claimed_prefix in OPENCODE_GO_MODEL_PREFIXES
+            else "opencode_go"
+        )
+        if bounded_suffix == "empty":
+            message = "OpenCode Go model suffix is empty."
+        else:
+            message = "OpenCode Go model is unsupported."
+        fields = {
+            "code": _OPENCODE_GO_DIRECT_NAMESPACE_CODE,
+            "failure_phase": _OPENCODE_GO_DIRECT_NAMESPACE_PHASE,
+            "attempted_provider_call": False,
+            "suffix_class": bounded_suffix,
+            "claimed_prefix": bounded_prefix,
+        }
+        super().__init__(
+            message=message,
+            type="invalid_request_error",
+            param="model",
+            code=400,
+            provider_specific_fields=fields,
+        )
+        setattr(self, "status_code", 400)
+        setattr(self, "failure_phase", _OPENCODE_GO_DIRECT_NAMESPACE_PHASE)
+        setattr(self, "attempted_provider_call", False)
+        setattr(
+            self,
+            "detail",
+            {
+                "error": {
+                    "message": message,
+                    "type": "invalid_request_error",
+                    "param": "model",
+                    "code": _OPENCODE_GO_DIRECT_NAMESPACE_CODE,
+                },
+                "failure_phase": _OPENCODE_GO_DIRECT_NAMESPACE_PHASE,
+                "attempted_provider_call": False,
+                "suffix_class": bounded_suffix,
+                "claimed_prefix": bounded_prefix,
+            },
+        )
+
+
+def _opencode_go_direct_model_or_reject(model: Any) -> Optional[str]:
+    """Return a supported bare Go id, or reject a claimed bad suffix.
+
+    Unclaimed names, including bare catalog ids, return ``None``. Callers
+    must run alias resolution before this direct check.
+    """
+
+    recognized = recognize_opencode_go_direct_namespace(model)
+    if (
+        recognized.disposition == "supported"
+        and recognized.canonical_model is not None
+    ):
+        return recognized.canonical_model
+    if (
+        recognized.disposition in _OPENCODE_GO_DIRECT_REJECTED_SUFFIXES
+        and recognized.claimed_prefix is not None
+    ):
+        raise OpencodeGoDirectNamespaceUnsupported(
+            suffix_class=recognized.disposition,
+            claimed_prefix=recognized.claimed_prefix,
+        )
+    return None
+
+
 def _normalize_opencode_go_adapter_model_name(model: Any) -> Optional[str]:
     # Binding-safe: install() rebinds this function into host_globals, so a
     # module-imported helper name would disappear from the visible namespace.
@@ -328,7 +420,15 @@ def _resolve_codex_opencode_go_adapter_model(
 ) -> Optional[str]:
     if not _is_openai_responses_endpoint(endpoint):
         return None
-    return _normalize_opencode_go_adapter_model_name(request_body.get("model"))
+    # Binding-safe: install() rebinds this function into host_globals, so the
+    # rejection helper must be imported locally rather than looked up there.
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+        model_resolution as _go_model_resolution,
+    )
+
+    return _go_model_resolution._opencode_go_direct_model_or_reject(
+        request_body.get("model")
+    )
 
 
 def _resolve_codex_nous_chat_completions_adapter_model(
