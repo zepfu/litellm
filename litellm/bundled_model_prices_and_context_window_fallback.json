@@ -10177,6 +10177,7 @@
         },
         "provider_specific_entry": {
             "cohere": {
+                "supports_forced_tool_choice": true,
                 "aawm_reference_pricing": {
                     "schema_version": 1,
                     "status": "unpriced",
@@ -10362,6 +10363,11 @@
         "max_tokens": 8000,
         "mode": "chat",
         "output_cost_per_token": 1e-05,
+        "provider_specific_entry": {
+            "cohere": {
+                "supports_forced_tool_choice": true
+            }
+        },
         "supports_function_calling": true,
         "supports_tool_choice": true
     },
@@ -10436,6 +10442,11 @@
         "max_tokens": 4096,
         "mode": "chat",
         "output_cost_per_token": 3.75e-08,
+        "provider_specific_entry": {
+            "cohere": {
+                "supports_forced_tool_choice": true
+            }
+        },
         "source": "https://docs.cohere.com/v2/docs/command-r7b",
         "supports_function_calling": true,
         "supports_tool_choice": true
