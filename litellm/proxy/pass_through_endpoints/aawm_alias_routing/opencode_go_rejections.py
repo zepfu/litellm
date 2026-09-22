@@ -286,10 +286,7 @@ def _authoritative_status(
         return extracted_status
     if _safe_origin(classification.get("origin")) == "client":
         return None
-    classified = _bounded_status(classification.get("status_code"))
-    if classified is not None:
-        return classified
-    return extracted_status
+    return _bounded_status(classification.get("status_code"))
 
 
 def _authoritative_failure_class(
@@ -307,7 +304,7 @@ def _authoritative_failure_class(
     mapped = _KIND_TO_FAILURE_CLASS.get(kind) if kind is not None else None
     if mapped is not None:
         return mapped
-    return _failure_class_from_status(status=status, exc=exc)
+    return "unknown"
 
 
 def _copy_classification_metadata(
@@ -551,13 +548,17 @@ def build_opencode_go_rejection_evidence(
     compatibility only. Tool identity is resolved against the final
     provider-bound ``completion_tools`` list. Keys, URLs, and exception
     payloads are never copied into the result. An OC-026 classification
-    is authoritative for status and safe-metadata fields when present.
+    is authoritative for status, including None, and for safe-metadata
+    fields when present. Raw exception status is reconstructed only when
+    no classification is present.
     """
 
     _ = advertised_tools, api_key
     provider_bound_types = opencode_go_tool_types(completion_tools)
-    extracted_status = _exception_status(exc)
     classification_payload = _classification_mapping(classification)
+    extracted_status = (
+        _exception_status(exc) if classification_payload is None else None
+    )
     status = _authoritative_status(
         classification=classification_payload,
         extracted_status=extracted_status,
