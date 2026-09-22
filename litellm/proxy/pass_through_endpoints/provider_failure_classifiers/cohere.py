@@ -57,6 +57,21 @@ _RATE_LIMIT_MARKERS: tuple[str, ...] = (
     "requests per minute",
     "rpm",
 )
+# Declared retryable upstream statuses. 408/504 are timeout statuses. The
+# remaining codes are the shared transient set plus declared 520. Other 5xx,
+# including 501, stay terminal. HTTP 499 is intentionally absent.
+_COHERE_TIMEOUT_STATUS_CODES: frozenset[int] = frozenset({408, 504})
+_COHERE_TRANSIENT_RETRY_STATUS_CODES: frozenset[int] = frozenset(
+    {500, 502, 503, 520, 529}
+)
+_COHERE_UNSUPPORTED_OPERATION_MARKERS: tuple[str, ...] = (
+    "unsupported operation",
+    "unsupported_operation",
+    "not implemented",
+    "not_implemented",
+    "operation not supported",
+    "operation is not supported",
+)
 
 
 @dataclass(frozen=True)
@@ -224,6 +239,42 @@ def _has_structured_model_unavailable_evidence(
     return False
 
 
+def _is_cohere_unsupported_operation(text: str) -> bool:
+    return any(marker in text for marker in _COHERE_UNSUPPORTED_OPERATION_MARKERS)
+
+
+def _classify_cohere_retryable_status(
+    *,
+    status_code: Optional[int],
+    text: str,
+) -> Optional[CohereFailureClassification]:
+    """Map declared timeout and transient statuses onto the shared retry class.
+
+    Unsupported-operation responses stay unclassified here so the caller can
+    retain them as terminal. Transport exceptions are classified earlier.
+    """
+
+    if status_code in _COHERE_TIMEOUT_STATUS_CODES:
+        if _is_cohere_unsupported_operation(text):
+            return None
+        return CohereFailureClassification(
+            name="cohere_timeout_status",
+            failure_kind="cohere_timeout_status",
+            failure_class="transient",
+            log_error_summary="Cohere timeout status",
+        )
+    if status_code in _COHERE_TRANSIENT_RETRY_STATUS_CODES:
+        if _is_cohere_unsupported_operation(text):
+            return None
+        return CohereFailureClassification(
+            name="cohere_transient_upstream",
+            failure_kind="cohere_transient_upstream",
+            failure_class="transient",
+            log_error_summary="Cohere transient upstream failure",
+        )
+    return None
+
+
 def classify_cohere_failure(
     *,
     url: Optional[httpx.URL],
@@ -302,6 +353,12 @@ def classify_cohere_failure(
             failure_class="provider_4xx_other",
             log_error_summary="Cohere provider request failed",
         )
+    retryable_status = _classify_cohere_retryable_status(
+        status_code=status_code,
+        text=text,
+    )
+    if retryable_status is not None:
+        return retryable_status
     if status_code is not None and 500 <= status_code <= 599:
         failure_class = "provider_5xx"
     elif any(marker in text for marker in _RATE_LIMIT_MARKERS):
