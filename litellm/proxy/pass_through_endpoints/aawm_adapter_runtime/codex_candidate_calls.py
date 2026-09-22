@@ -31,6 +31,9 @@ from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen.con
     _OPENCODE_ZEN_CREDENTIAL_FAMILY,
     _OPENCODE_ZEN_TARGET_FAMILY,
 )
+from litellm.llms.cohere.chat.v2_transformation import (
+    prepare_cohere_v2_strict_completion_kwargs,
+)
 from litellm.llms.xai.route_descriptors import (
     GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
     GROK_NATIVE_OAUTH_ROUTE_FAMILY,
@@ -2201,6 +2204,10 @@ def install(
             _mod[_name] = _rebound
         host_globals[_name] = _rebound
     for _name, _value in (
+        (
+            "prepare_cohere_v2_strict_completion_kwargs",
+            prepare_cohere_v2_strict_completion_kwargs,
+        ),
         ("apply_request_watermark_egress", apply_request_watermark_egress),
         ("load_text_watermark_config", load_text_watermark_config),
         ("_get_runtime_text_watermark_config", _get_runtime_text_watermark_config),
@@ -2236,24 +2243,13 @@ def install(
 def _strip_strict_from_cohere_completion_tools(
     completion_kwargs: dict[str, Any],
 ) -> dict[str, Any]:
-    """Remove function-tool strict flags without changing caller-owned data."""
-    tools = completion_kwargs.get("tools")
-    if not isinstance(tools, list):
-        return completion_kwargs
+    """Preserve requested strictness for the Cohere V2 transformer.
 
-    from copy import deepcopy
-
-    sanitized_kwargs = dict(completion_kwargs)
-    sanitized_tools = deepcopy(tools)
-    for tool in sanitized_tools:
-        if not isinstance(tool, dict) or tool.get("type") != "function":
-            continue
-        tool.pop("strict", None)
-        function = tool.get("function")
-        if isinstance(function, dict):
-            function.pop("strict", None)
-    sanitized_kwargs["tools"] = sanitized_tools
-    return sanitized_kwargs
+    Mixed strictness fails before completion. All-strict flags stay in place so
+    the transformer can set ``strict_tools``. All-nonstrict OpenAI flags are
+    removed without mutating caller-owned tools.
+    """
+    return prepare_cohere_v2_strict_completion_kwargs(completion_kwargs)
 
 
 def _maybe_wrap_xai_passthrough_responses_stream(

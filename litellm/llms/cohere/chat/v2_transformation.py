@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Iterator, List, Optional, 
 import httpx
 
 import litellm
+from litellm.exceptions import UnsupportedParamsError
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.types.llms.cohere import CohereV2ChatResponse
 from litellm.types.llms.openai import (
@@ -26,6 +27,125 @@ if TYPE_CHECKING:
     LiteLLMLoggingObj = _LiteLLMLoggingObj
 else:
     LiteLLMLoggingObj = Any
+
+
+class CohereV2StrictToolsError(UnsupportedParamsError):
+    """Unrepresentable Cohere function strictness. Raised before provider egress."""
+
+    attempted_provider_call = False
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message=message, llm_provider="cohere")
+        self.attempted_provider_call = False
+
+
+def _tool_strict_flags(tool: Any) -> List[bool]:
+    """Read OpenAI strict flags without treating a missing flag as strict."""
+    if not isinstance(tool, dict):
+        return []
+    flags: List[bool] = []
+    if "strict" in tool:
+        flags.append(_coerce_strict_flag(tool.get("strict")))
+    function = tool.get("function")
+    if isinstance(function, dict) and "strict" in function:
+        flags.append(_coerce_strict_flag(function.get("strict")))
+    if any(flags) and not all(flags):
+        raise CohereV2StrictToolsError(
+            "Cohere strict_tools cannot represent conflicting strict flags on one function."
+        )
+    return flags
+
+
+def _coerce_strict_flag(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    raise CohereV2StrictToolsError(
+        "Cohere strict_tools cannot represent a non-boolean function strict flag."
+    )
+
+
+def _tool_declares_strict_key(tool: Any) -> bool:
+    if not isinstance(tool, dict):
+        return False
+    if "strict" in tool:
+        return True
+    function = tool.get("function")
+    return isinstance(function, dict) and "strict" in function
+
+
+def resolve_cohere_v2_strict_tools(tools: List[Any]) -> bool:
+    """Return whether every tool requested strict function semantics.
+
+    Absent and false flags are not strict. A mix of strict and non-strict
+    tools cannot be represented by Cohere's request-level ``strict_tools``
+    boolean, so that combination fails before egress.
+    """
+    if not tools:
+        return False
+    requested = [
+        all(flags) if flags else False
+        for flags in (_tool_strict_flags(tool) for tool in tools)
+    ]
+    if any(requested) and not all(requested):
+        raise CohereV2StrictToolsError(
+            "Cohere strict_tools cannot represent mixed function strictness."
+        )
+    return all(requested)
+
+
+def _strip_openai_function_strict(tools: List[Any]) -> List[Any]:
+    """Drop OpenAI strict flags. Leave the function schema otherwise unchanged."""
+    stripped_tools = deepcopy(tools)
+    for tool in stripped_tools:
+        if not isinstance(tool, dict):
+            continue
+        tool.pop("strict", None)
+        function = tool.get("function")
+        if isinstance(function, dict):
+            function.pop("strict", None)
+    return stripped_tools
+
+
+def apply_cohere_v2_strict_tools(request_data: dict) -> dict:
+    """Translate requested function strictness onto Cohere ``strict_tools``."""
+    tools = request_data.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return request_data
+    if not any(_tool_declares_strict_key(tool) for tool in tools):
+        return request_data
+
+    strict_tools = resolve_cohere_v2_strict_tools(tools)
+    updated = {
+        **request_data,
+        "tools": _strip_openai_function_strict(tools),
+    }
+    if strict_tools:
+        updated["strict_tools"] = True
+    else:
+        updated.pop("strict_tools", None)
+    return updated
+
+
+def prepare_cohere_v2_strict_completion_kwargs(
+    completion_kwargs: dict,
+) -> dict:
+    """Fail mixed strictness before completion and keep strict=true visible.
+
+    All-strict flags stay on the tools so the V2 transformer can set
+    ``strict_tools``. All-nonstrict flags are removed here so Cohere does not
+    receive the OpenAI field. Caller-owned tool objects are not mutated.
+    """
+    tools = completion_kwargs.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return completion_kwargs
+    if resolve_cohere_v2_strict_tools(tools):
+        return completion_kwargs
+    return {
+        **completion_kwargs,
+        "tools": _strip_openai_function_strict(tools),
+    }
 
 
 class CohereV2ChatConfig(OpenAIGPTConfig):
@@ -181,7 +301,7 @@ class CohereV2ChatConfig(OpenAIGPTConfig):
             headers,
         )
 
-        return data
+        return apply_cohere_v2_strict_tools(data)
 
     async def async_transform_request(
         self,
@@ -191,13 +311,16 @@ class CohereV2ChatConfig(OpenAIGPTConfig):
         litellm_params: dict,
         headers: dict,
     ) -> dict:
-        return await super().async_transform_request(
+        data = await super().async_transform_request(
             model=model,
             messages=self._project_messages_for_cohere_v2(messages),
             optional_params=optional_params,
             litellm_params=litellm_params,
             headers=headers,
         )
+        if not isinstance(data, dict):
+            return data
+        return apply_cohere_v2_strict_tools(data)
 
     @staticmethod
     def _project_messages_for_cohere_v2(
