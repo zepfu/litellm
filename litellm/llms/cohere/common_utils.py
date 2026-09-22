@@ -1,5 +1,7 @@
+import hashlib
 import json
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+import re
+from typing import Any, Dict, List, Literal, NoReturn, Optional, Tuple, Union
 
 from litellm.llms.base_llm.base_utils import BaseLLMModelInfo
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
@@ -15,6 +17,263 @@ from litellm.types.utils import (
 class CohereError(BaseLLMException):
     def __init__(self, status_code, message):
         super().__init__(status_code=status_code, message=message)
+
+
+class CohereStreamDiagnostic(ValueError):
+    """Bounded Cohere stream-parse diagnostic.
+
+    The message records parse stage, event type, event index, byte count, and
+    a payload hash. The payload itself is not stored on the exception.
+    """
+
+
+_COHERE_DIAGNOSTIC_PREFIX = "Cohere stream diagnostic "
+_COHERE_PARSE_STAGES = frozenset({"framing", "event-schema", "argument-assembly"})
+_COHERE_DIAGNOSTIC_REASONS = frozenset(
+    {
+        "unsupported_type",
+        "invalid_encoding",
+        "malformed_json",
+        "non_object_event",
+        "unconsumed_sse",
+        "missing_message_end",
+        "event_schema",
+        "argument_assembly",
+        "receive_error",
+        "provider_terminal",
+        "unspecified",
+    }
+)
+_COHERE_EVENT_TYPES = frozenset(
+    {
+        "message-start",
+        "content-start",
+        "content-delta",
+        "content-end",
+        "tool-plan-delta",
+        "tool-call-start",
+        "tool-call-delta",
+        "tool-call-end",
+        "citation-start",
+        "citation-end",
+        "message-end",
+    }
+)
+_COHERE_EVENT_INDEX_RE = re.compile(r"\A-?\d{1,12}\Z")
+_COHERE_PROVIDER_ERROR_TOKEN_RE = re.compile(r"\A[A-Za-z0-9_.:-]{1,64}\Z")
+_COHERE_PROVIDER_ERROR_PREFIXES = (
+    "Cohere streaming error: ",
+    "Cohere streaming terminated with ",
+)
+
+
+def _cohere_json_default(value: Any) -> str:
+    return f"<{type(value).__name__}>"
+
+
+def _cohere_payload_bytes(payload: Any) -> bytes:
+    if payload is None:
+        return b""
+    if isinstance(payload, bytes):
+        return payload
+    if isinstance(payload, bytearray):
+        return bytes(payload)
+    if isinstance(payload, memoryview):
+        return payload.tobytes()
+    if isinstance(payload, str):
+        return payload.encode("utf-8", errors="replace")
+    try:
+        rendered = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=_cohere_json_default,
+        )
+    except (TypeError, ValueError):
+        return b""
+    return rendered.encode("utf-8", errors="replace")
+
+
+def _bounded_event_type(value: Any) -> str:
+    if isinstance(value, str) and value in _COHERE_EVENT_TYPES:
+        return value
+    return "unknown"
+
+
+def _bounded_event_index(value: Any) -> str:
+    if isinstance(value, bool) or value is None:
+        return "none"
+    if isinstance(value, int):
+        rendered = str(value)
+    elif isinstance(value, str):
+        rendered = value.strip()
+    else:
+        return "none"
+    if _COHERE_EVENT_INDEX_RE.fullmatch(rendered):
+        return rendered
+    return "none"
+
+
+def _cohere_event_type(payload: Any) -> str:
+    if isinstance(payload, dict):
+        return _bounded_event_type(payload.get("type"))
+    return "unknown"
+
+
+def _cohere_event_index(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return "none"
+    if "index" in payload:
+        return _bounded_event_index(payload.get("index"))
+    delta = payload.get("delta")
+    if not isinstance(delta, dict):
+        return "none"
+    message = delta.get("message")
+    if not isinstance(message, dict):
+        return "none"
+    tool_calls = message.get("tool_calls")
+    candidate: Any = None
+    if isinstance(tool_calls, dict):
+        candidate = tool_calls.get("index")
+    elif (
+        isinstance(tool_calls, list) and tool_calls and isinstance(tool_calls[0], dict)
+    ):
+        candidate = tool_calls[0].get("index")
+    if candidate is None:
+        return "none"
+    return _bounded_event_index(candidate)
+
+
+def _cohere_stream_diagnostic(
+    *,
+    stage: str,
+    payload: Any,
+    reason: str,
+    event_type: Optional[str] = None,
+    event_index: Any = None,
+) -> str:
+    if stage not in _COHERE_PARSE_STAGES:
+        stage = "event-schema"
+    if reason not in _COHERE_DIAGNOSTIC_REASONS:
+        reason = "unspecified"
+    bounded_type = (
+        _bounded_event_type(event_type)
+        if event_type is not None
+        else _cohere_event_type(payload)
+    )
+    bounded_index = (
+        _bounded_event_index(event_index)
+        if event_index is not None
+        else _cohere_event_index(payload)
+    )
+    raw = _cohere_payload_bytes(payload)
+    digest = hashlib.sha256(raw).hexdigest()
+    return (
+        f"{_COHERE_DIAGNOSTIC_PREFIX}"
+        f"stage={stage} "
+        f"event_type={bounded_type} "
+        f"event_index={bounded_index} "
+        f"byte_count={len(raw)} "
+        f"payload_sha256={digest} "
+        f"reason={reason}"
+    )
+
+
+def _raise_detached(exc: BaseException) -> NoReturn:
+    """Raise ``exc`` without a cause or context that could retain payload bytes."""
+    try:
+        raise exc
+    except BaseException as raised:
+        raised.__context__ = None
+        raised.__cause__ = None
+        raised.__suppress_context__ = True
+        raise
+
+
+def _raise_cohere_diagnostic(
+    *,
+    stage: str,
+    payload: Any,
+    reason: str,
+    event_type: Optional[str] = None,
+    event_index: Any = None,
+) -> NoReturn:
+    _raise_detached(
+        CohereStreamDiagnostic(
+            _cohere_stream_diagnostic(
+                stage=stage,
+                payload=payload,
+                reason=reason,
+                event_type=event_type,
+                event_index=event_index,
+            )
+        )
+    )
+
+
+def _cohere_provider_error_token(native_error: Any) -> Optional[str]:
+    if not isinstance(native_error, dict):
+        return None
+    for key in ("code", "type"):
+        token = native_error.get(key)
+        if isinstance(token, str) and _COHERE_PROVIDER_ERROR_TOKEN_RE.fullmatch(token):
+            return token
+    return None
+
+
+def _safe_provider_failure_message(message: str) -> bool:
+    if not message.startswith(_COHERE_PROVIDER_ERROR_PREFIXES):
+        return False
+    if len(message) > 280 or "\n" in message or "\r" in message:
+        return False
+    if "{" in message or "}" in message:
+        return False
+    return True
+
+
+def _cohere_public_failure_message(
+    exc: BaseException,
+    *,
+    payload: Any,
+    stage: str,
+    reason: str,
+) -> str:
+    if isinstance(exc, CohereStreamDiagnostic):
+        return str(exc)
+    if isinstance(exc, UnicodeDecodeError):
+        return _cohere_stream_diagnostic(
+            stage="framing",
+            payload=payload,
+            reason="invalid_encoding",
+        )
+    message = str(exc)
+    if _safe_provider_failure_message(message):
+        return message
+    return _cohere_stream_diagnostic(
+        stage=stage,
+        payload=payload,
+        reason=reason,
+    )
+
+
+def _raise_cohere_runtime(
+    exc: BaseException,
+    *,
+    payload: Any,
+    stage: str,
+    reason: str,
+) -> NoReturn:
+    _raise_detached(
+        RuntimeError(
+            _cohere_public_failure_message(
+                exc,
+                payload=payload,
+                stage=stage,
+                reason=reason,
+            )
+        )
+    )
 
 
 class CohereModelInfo(BaseLLMModelInfo):
@@ -160,7 +419,11 @@ class ModelResponseIterator:
             return returned_chunk
 
         except json.JSONDecodeError:
-            raise ValueError(f"Failed to decode JSON from chunk: {chunk}")
+            _raise_cohere_diagnostic(
+                stage="framing",
+                payload=chunk,
+                reason="malformed_json",
+            )
 
     # Sync iterator
     def __iter__(self):
@@ -171,15 +434,25 @@ class ModelResponseIterator:
             chunk = self.response_iterator.__next__()
         except StopIteration:
             raise StopIteration
-        except ValueError as e:
-            raise RuntimeError(f"Error receiving chunk from stream: {e}")
+        except ValueError as exc:
+            _raise_cohere_runtime(
+                exc,
+                payload=None,
+                stage="framing",
+                reason="receive_error",
+            )
 
         try:
             return self.convert_str_chunk_to_generic_chunk(chunk=chunk)
         except StopIteration:
             raise StopIteration
-        except ValueError as e:
-            raise RuntimeError(f"Error parsing chunk: {e},\nReceived chunk: {chunk}")
+        except ValueError as exc:
+            _raise_cohere_runtime(
+                exc,
+                payload=chunk,
+                stage="event-schema",
+                reason="event_schema",
+            )
 
     def convert_str_chunk_to_generic_chunk(self, chunk: str) -> GenericStreamingChunk:
         """
@@ -189,12 +462,26 @@ class ModelResponseIterator:
         """
         str_line = chunk
         if isinstance(chunk, bytes):  # Handle binary data
-            str_line = chunk.decode("utf-8")  # Convert bytes to string
+            try:
+                str_line = chunk.decode("utf-8")  # Convert bytes to string
+            except UnicodeDecodeError:
+                _raise_cohere_diagnostic(
+                    stage="framing",
+                    payload=chunk,
+                    reason="invalid_encoding",
+                )
             index = str_line.find("data:")
             if index != -1:
                 str_line = str_line[index:]
 
-        data_json = json.loads(str_line)
+        try:
+            data_json = json.loads(str_line)
+        except json.JSONDecodeError:
+            _raise_cohere_diagnostic(
+                stage="framing",
+                payload=str_line,
+                reason="malformed_json",
+            )
         return self.chunk_parser(chunk=data_json)
 
     # Async iterator
@@ -207,15 +494,25 @@ class ModelResponseIterator:
             chunk = await self.async_response_iterator.__anext__()
         except StopAsyncIteration:
             raise StopAsyncIteration
-        except ValueError as e:
-            raise RuntimeError(f"Error receiving chunk from stream: {e}")
+        except ValueError as exc:
+            _raise_cohere_runtime(
+                exc,
+                payload=None,
+                stage="framing",
+                reason="receive_error",
+            )
 
         try:
             return self.convert_str_chunk_to_generic_chunk(chunk=chunk)
         except StopAsyncIteration:
             raise StopAsyncIteration
-        except ValueError as e:
-            raise RuntimeError(f"Error parsing chunk: {e},\nReceived chunk: {chunk}")
+        except ValueError as exc:
+            _raise_cohere_runtime(
+                exc,
+                payload=chunk,
+                stage="event-schema",
+                reason="event_schema",
+            )
 
 
 class CohereV2ModelResponseIterator:
@@ -266,21 +563,36 @@ class CohereV2ModelResponseIterator:
 
     def _extract_sse_payloads(self, chunk: Union[str, bytes, dict]) -> List[str]:
         if isinstance(chunk, bytes):
-            chunk = chunk.decode("utf-8")
+            try:
+                chunk = chunk.decode("utf-8")
+            except UnicodeDecodeError:
+                _raise_cohere_diagnostic(
+                    stage="framing",
+                    payload=chunk,
+                    reason="invalid_encoding",
+                )
         if isinstance(chunk, dict):
-            return [json.dumps(chunk, ensure_ascii=False)]
+            try:
+                return [json.dumps(chunk, ensure_ascii=False)]
+            except (TypeError, ValueError):
+                _raise_cohere_diagnostic(
+                    stage="event-schema",
+                    payload=chunk,
+                    reason="event_schema",
+                )
         if not isinstance(chunk, str):
-            raise ValueError(f"Unsupported Cohere stream chunk type: {type(chunk)}")
+            _raise_cohere_diagnostic(
+                stage="framing",
+                payload=None,
+                reason="unsupported_type",
+            )
 
         if not chunk.strip():
             return []
 
-        if not any(
-            line.strip().startswith("data:") for line in chunk.splitlines()
-        ):
+        if not any(line.strip().startswith("data:") for line in chunk.splitlines()):
             if all(
-                not line.strip()
-                or line.strip().startswith((":", "event:"))
+                not line.strip() or line.strip().startswith((":", "event:"))
                 for line in chunk.splitlines()
             ):
                 return []
@@ -309,9 +621,17 @@ class CohereV2ModelResponseIterator:
 
     def _validate_stream_end(self) -> None:
         if self._pending_sse_payloads:
-            raise ValueError("Cohere stream ended with unconsumed SSE data")
+            _raise_cohere_diagnostic(
+                stage="framing",
+                payload="\n".join(self._pending_sse_payloads),
+                reason="unconsumed_sse",
+            )
         if not self._message_end_received:
-            raise ValueError("Cohere stream ended without a native message-end event")
+            _raise_cohere_diagnostic(
+                stage="framing",
+                payload=b"",
+                reason="missing_message_end",
+            )
 
     def _parse_sse_json(
         self, chunk: Optional[Union[str, bytes, dict]] = None
@@ -328,11 +648,19 @@ class CohereV2ModelResponseIterator:
 
         try:
             parsed_chunk = json.loads(payload)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Malformed Cohere stream JSON: {e.msg}") from e
+        except json.JSONDecodeError:
+            _raise_cohere_diagnostic(
+                stage="framing",
+                payload=payload,
+                reason="malformed_json",
+            )
 
         if not isinstance(parsed_chunk, dict):
-            raise ValueError(f"Expected Cohere stream event object, got {parsed_chunk!r}")
+            _raise_cohere_diagnostic(
+                stage="event-schema",
+                payload=parsed_chunk,
+                reason="non_object_event",
+            )
         return parsed_chunk
 
     @staticmethod
@@ -348,7 +676,9 @@ class CohereV2ModelResponseIterator:
             return [call for call in tool_calls if isinstance(call, dict)]
         return []
 
-    def _resolve_tool_index(self, chunk: dict, tool_call: dict, position: int = 0) -> int:
+    def _resolve_tool_index(
+        self, chunk: dict, tool_call: dict, position: int = 0
+    ) -> int:
         tool_id = tool_call.get("id") or tool_call.get("call_id")
         if isinstance(tool_id, str) and tool_id in self._tool_call_indexes:
             return self._tool_call_indexes[tool_id]
@@ -405,16 +735,30 @@ class CohereV2ModelResponseIterator:
         function = tool_call.get("function", {}) or {}
         tool_id = tool_call.get("id") or tool_call.get("call_id")
         name = function.get("name") or tool_call.get("name")
-        arguments = self._stringify_tool_fragment(
-            function.get("arguments", tool_call.get("arguments"))
-        )
+        try:
+            arguments = self._stringify_tool_fragment(
+                function.get("arguments", tool_call.get("arguments"))
+            )
+        except (TypeError, ValueError):
+            _raise_cohere_diagnostic(
+                stage="argument-assembly",
+                payload=chunk,
+                reason="argument_assembly",
+            )
 
         if tool_id:
             state["id"] = tool_id
             self._tool_call_indexes[str(tool_id)] = tool_index
         if name:
             state["name"] = name
-        state["arguments"] += arguments
+        try:
+            state["arguments"] += arguments
+        except (TypeError, ValueError):
+            _raise_cohere_diagnostic(
+                stage="argument-assembly",
+                payload=chunk,
+                reason="argument_assembly",
+            )
 
         return {
             "id": state["id"],
@@ -440,9 +784,16 @@ class CohereV2ModelResponseIterator:
         function = tool_call.get("function", {}) or {}
         tool_id = tool_call.get("id") or tool_call.get("call_id")
         name = function.get("name") or tool_call.get("name")
-        arguments = self._stringify_tool_fragment(
-            function.get("arguments", tool_call.get("arguments"))
-        )
+        try:
+            arguments = self._stringify_tool_fragment(
+                function.get("arguments", tool_call.get("arguments"))
+            )
+        except (TypeError, ValueError):
+            _raise_cohere_diagnostic(
+                stage="argument-assembly",
+                payload=chunk,
+                reason="argument_assembly",
+            )
 
         if tool_id:
             state["id"] = tool_id
@@ -450,7 +801,14 @@ class CohereV2ModelResponseIterator:
         if name:
             state["name"] = name
         if arguments:
-            state["arguments"] = arguments
+            try:
+                state["arguments"] = arguments
+            except (TypeError, ValueError):
+                _raise_cohere_diagnostic(
+                    stage="argument-assembly",
+                    payload=chunk,
+                    reason="argument_assembly",
+                )
 
         return {
             "id": state["id"],
@@ -503,15 +861,37 @@ class CohereV2ModelResponseIterator:
             else ""
         )
         native_error = delta.get("error")
-        if native_error:
-            error_message = str(native_error).strip()
+        if isinstance(native_error, str):
+            error_message = " ".join(native_error.split())
             if error_message:
-                raise CohereError(
-                    status_code=(
-                        408 if normalized_finish_reason == "TIMEOUT" else 500
-                    ),
-                    message=f"Cohere streaming error: {error_message}",
+                if (
+                    len(error_message) <= 240
+                    and "{" not in error_message
+                    and "}" not in error_message
+                ):
+                    raise CohereError(
+                        status_code=(
+                            408 if normalized_finish_reason == "TIMEOUT" else 500
+                        ),
+                        message=f"Cohere streaming error: {error_message}",
+                    )
+                _raise_cohere_diagnostic(
+                    stage="event-schema",
+                    payload=chunk,
+                    reason="provider_terminal",
                 )
+        elif native_error:
+            provider_token = _cohere_provider_error_token(native_error)
+            if provider_token is not None:
+                raise CohereError(
+                    status_code=(408 if normalized_finish_reason == "TIMEOUT" else 500),
+                    message=f"Cohere streaming error: {provider_token}",
+                )
+            _raise_cohere_diagnostic(
+                stage="event-schema",
+                payload=chunk,
+                reason="provider_terminal",
+            )
 
         if normalized_finish_reason in {"ERROR", "TIMEOUT"}:
             raise CohereError(
@@ -583,9 +963,7 @@ class CohereV2ModelResponseIterator:
                     usage,
                     raw_finish_reason,
                 ) = self._parse_message_end(chunk)
-                provider_specific_fields = {
-                    "native_finish_reason": raw_finish_reason
-                }
+                provider_specific_fields = {"native_finish_reason": raw_finish_reason}
 
             # Handle citations in any chunk type (fallback)
             if "citations" in chunk:
@@ -603,8 +981,25 @@ class CohereV2ModelResponseIterator:
                 provider_specific_fields=provider_specific_fields,
             )
 
-        except Exception as e:
-            raise ValueError(f"Failed to parse v2 chunk: {e}, chunk: {chunk}")
+        except CohereStreamDiagnostic:
+            raise
+        except CohereError as exc:
+            message = str(exc)
+            if message.startswith(_COHERE_DIAGNOSTIC_PREFIX):
+                _raise_detached(CohereStreamDiagnostic(message))
+            if _safe_provider_failure_message(message):
+                _raise_detached(ValueError(message))
+            _raise_cohere_diagnostic(
+                stage="event-schema",
+                payload=chunk,
+                reason="provider_terminal",
+            )
+        except Exception:
+            _raise_cohere_diagnostic(
+                stage="event-schema",
+                payload=chunk,
+                reason="event_schema",
+            )
 
     # Sync iterator
     def __iter__(self):
@@ -622,11 +1017,21 @@ class CohereV2ModelResponseIterator:
             except StopIteration:
                 try:
                     self._validate_stream_end()
-                except ValueError as e:
-                    raise RuntimeError(f"Error parsing stream termination: {e}") from e
+                except ValueError as exc:
+                    _raise_cohere_runtime(
+                        exc,
+                        payload=None,
+                        stage="framing",
+                        reason="missing_message_end",
+                    )
                 raise StopIteration
-            except ValueError as e:
-                raise RuntimeError(f"Error receiving chunk from stream: {e}")
+            except ValueError as exc:
+                _raise_cohere_runtime(
+                    exc,
+                    payload=chunk,
+                    stage="framing",
+                    reason="receive_error",
+                )
 
             try:
                 if parsed_chunk is None:
@@ -634,8 +1039,13 @@ class CohereV2ModelResponseIterator:
                 return self.chunk_parser(chunk=parsed_chunk)
             except StopIteration:
                 raise StopIteration
-            except ValueError as e:
-                raise RuntimeError(f"Error parsing chunk: {e},\nReceived chunk: {chunk}")
+            except ValueError as exc:
+                _raise_cohere_runtime(
+                    exc,
+                    payload=chunk if chunk is not None else parsed_chunk,
+                    stage="event-schema",
+                    reason="event_schema",
+                )
 
     def convert_str_chunk_to_generic_chunk(
         self, chunk: Union[str, bytes, dict]
@@ -667,17 +1077,32 @@ class CohereV2ModelResponseIterator:
             except StopIteration:
                 try:
                     self._validate_stream_end()
-                except ValueError as e:
-                    raise RuntimeError(f"Error parsing stream termination: {e}") from e
+                except ValueError as exc:
+                    _raise_cohere_runtime(
+                        exc,
+                        payload=None,
+                        stage="framing",
+                        reason="missing_message_end",
+                    )
                 raise StopAsyncIteration
             except StopAsyncIteration:
                 try:
                     self._validate_stream_end()
-                except ValueError as e:
-                    raise RuntimeError(f"Error parsing stream termination: {e}") from e
+                except ValueError as exc:
+                    _raise_cohere_runtime(
+                        exc,
+                        payload=None,
+                        stage="framing",
+                        reason="missing_message_end",
+                    )
                 raise StopAsyncIteration
-            except ValueError as e:
-                raise RuntimeError(f"Error receiving chunk from stream: {e}")
+            except ValueError as exc:
+                _raise_cohere_runtime(
+                    exc,
+                    payload=chunk,
+                    stage="framing",
+                    reason="receive_error",
+                )
 
             try:
                 if parsed_chunk is None:
@@ -686,10 +1111,20 @@ class CohereV2ModelResponseIterator:
             except StopIteration:
                 try:
                     self._validate_stream_end()
-                except ValueError as e:
-                    raise RuntimeError(f"Error parsing stream termination: {e}") from e
+                except ValueError as exc:
+                    _raise_cohere_runtime(
+                        exc,
+                        payload=None,
+                        stage="framing",
+                        reason="missing_message_end",
+                    )
                 raise StopAsyncIteration
             except StopAsyncIteration:
                 raise StopAsyncIteration
-            except ValueError as e:
-                raise RuntimeError(f"Error parsing chunk: {e},\nReceived chunk: {chunk}")
+            except ValueError as exc:
+                _raise_cohere_runtime(
+                    exc,
+                    payload=chunk if chunk is not None else parsed_chunk,
+                    stage="event-schema",
+                    reason="event_schema",
+                )
