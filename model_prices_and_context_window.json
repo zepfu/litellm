@@ -41898,7 +41898,9 @@
         "supports_vision": true,
         "supports_web_search": true,
         "verified": "2026-09-22",
-        "unsupported_input_item_types": []
+        "unsupported_input_item_types": [
+            "reasoning"
+        ]
     },
     "xai/grok-4.5": {
         "litellm_provider": "xai",
@@ -42067,7 +42069,9 @@
         "supports_vision": true,
         "supports_web_search": true,
         "verified": "2026-09-22",
-        "unsupported_input_item_types": []
+        "unsupported_input_item_types": [
+            "reasoning"
+        ]
     },
     "oa_xai/grok-4.5": {
         "litellm_provider": "xai",

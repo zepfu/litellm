@@ -304,6 +304,7 @@ async def prepare_oa_xai_request(
     data["custom_llm_provider"] = "xai"
     decoded_previous_response_id = _decode_previous_response_id_in_place(data)
     removed_input_items = _drop_xai_unsupported_input_items_in_place(data)
+    _unwrap_xai_encrypted_content_in_place(data)
 
     existing_litellm_metadata = data.get("litellm_metadata")
     litellm_metadata = (
@@ -348,6 +349,19 @@ async def prepare_oa_xai_request(
         )
 
     return True
+
+
+def _unwrap_xai_encrypted_content_in_place(data: Dict[str, Any]) -> None:
+    """Restore native ciphertext before managed xAI OAuth egress."""
+
+    input_items = data.get("input")
+    if not isinstance(input_items, list):
+        return
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+        unwrap_encrypted_content_wrappers_in_place,
+    )
+
+    unwrap_encrypted_content_wrappers_in_place(input_items)
 
 
 def _decode_previous_response_id_in_place(data: Dict[str, Any]) -> bool:

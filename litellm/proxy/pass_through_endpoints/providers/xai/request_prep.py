@@ -58,6 +58,9 @@ from litellm.llms.xai.route_descriptors import (
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
     normalize_codex_collaboration_dispatch_body,
 )
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+    unwrap_encrypted_content_wrappers_in_place,
+)
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.secret_managers.main import get_secret_str as _get_secret_str
 from litellm.types.llms.openai import ResponsesAPIOptionalRequestParams
@@ -1277,6 +1280,9 @@ async def _prepare_grok_native_oauth_passthrough_request(
     else:
         _sanitize_grok_native_function_call_arguments_in_place(prepared_body)
         _rewrite_grok_native_unsupported_input_items_in_place(prepared_body)
+    input_items = prepared_body.get("input")
+    if isinstance(input_items, list):
+        unwrap_encrypted_content_wrappers_in_place(input_items)
     _lower_xai_instructions_to_input(prepared_body)
     runtime._sanitize_xai_responses_request_body_in_place(prepared_body)
     (

@@ -410,6 +410,15 @@ def _pane_has_any(
             continue
         # A supplied watermark applies to every needle, including 404 text.
         # Stale matches before the current-turn scan start cannot pass.
+        if token == _GROK_TOOL_PASS_TOKEN and prompt is not None:
+            if _pane_has_current_turn_pass_token(
+                pane,
+                prompt,
+                _GROK_TOOL_PASS_TOKEN,
+                after_echo_index=after_echo_index,
+            ):
+                return True
+            continue
         if token not in sent:
             return True
         # Needle is inside the sent prompt (H-6). Still accept a standalone

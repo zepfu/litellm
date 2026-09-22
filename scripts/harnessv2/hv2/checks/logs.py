@@ -24,7 +24,7 @@ _CODEX_ROLLUP_IDENTITY = re.compile(
     r"\S+#Codex\[[^\]\s]+\]@\S+",
 )
 _GROK_ROLLUP_IDENTITY = re.compile(
-    r"(?:^|\s)(?:Grok|grok-shell)\[[^\]\s]+\]@\S+",
+    r"(?:^|\s)(?:Grok|grok-shell)\[[^\]\s]+\]@\S+|\S+#Grok\[[^\]\s]+\]@\S+",
 )
 _TUI_ROLLUP_IDENTITY = {
     "ohmypi": (_OHMYPI_ROLLUP_IDENTITY, "Ohmypi"),
@@ -223,12 +223,18 @@ def scan_log_text(
         )
         has_identity = any(identity_re.search(hit) for hit in rollup_hits)
         other_tui_re = None
+        extra_other = None
         if str(tui or "") == "codex":
             other_tui_re = _OHMYPI_ROLLUP_IDENTITY
+            extra_other = _GROK_ROLLUP_IDENTITY
         elif str(tui or "") == "ohmypi":
             other_tui_re = _CODEX_ROLLUP_IDENTITY
+            extra_other = _GROK_ROLLUP_IDENTITY
         elif str(tui or "") == "grok":
             other_tui_re = _CODEX_ROLLUP_IDENTITY
+            extra_other = _OHMYPI_ROLLUP_IDENTITY
+        if extra_other is not None and not has_identity:
+            has_identity = any(extra_other.search(hit) for hit in rollup_hits)
         unidentified = [
             hit
             for hit in rollup_hits
@@ -238,6 +244,7 @@ def scan_log_text(
                 hit, text, concurrent_codex_markers
             )
             and not (other_tui_re is not None and other_tui_re.search(hit))
+            and not (extra_other is not None and extra_other.search(hit))
         ]
         if not has_identity or unidentified:
             suffix = f": {'; '.join(unidentified)}" if unidentified else ""

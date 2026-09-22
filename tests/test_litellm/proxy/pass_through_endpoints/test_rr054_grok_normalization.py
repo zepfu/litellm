@@ -273,3 +273,57 @@ def test_grok_model_capability_preserves_grok_46_and_flattens_composer_history()
     assert flattened["input"][1]["role"] == "assistant"
     assert "Tool label: read_file" in flattened["input"][1]["content"]
     assert flattened["input"][2]["role"] == "user"
+
+
+def test_grok_passthrough_unwraps_wrapped_encrypted_reasoning_for_grok_47() -> None:
+    """Grok 4.7 always returns encrypted reasoning; wrappers must not egress."""
+
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+        unwrap_encrypted_content_wrappers_in_place,
+        wrap_encrypted_content_with_provenance,
+    )
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _prepare_grok_request_body_for_passthrough,
+    )
+
+    native_ciphertext = "native-grok-47-encrypted-blob"
+    wrapped = wrap_encrypted_content_with_provenance(
+        native_ciphertext,
+        {
+            "producer_provider": "xai",
+            "producer_model": "xai/grok-4.7",
+            "producer_route_family": "codex_grok_native_responses_adapter",
+        },
+    )
+    assert wrapped != native_ciphertext
+    prepared = _prepare_grok_request_body_for_passthrough(
+        request=_direct_grok_passthrough_request(model="grok-4.7"),
+        request_body={
+            "model": "grok-4.7",
+            "input": [
+                {"type": "message", "role": "user", "content": "continue"},
+                {
+                    "type": "reasoning",
+                    "encrypted_content": wrapped,
+                    "aawm_encrypted_reasoning_provenance": {
+                        "producer_provider": "xai",
+                        "producer_model": "xai/grok-4.7",
+                    },
+                },
+            ],
+        },
+    )
+    assert [item.get("type") for item in prepared["input"]] == ["message"]
+    leftover = {
+        "type": "reasoning",
+        "encrypted_content": wrapped,
+        "aawm_encrypted_reasoning_provenance": {
+            "producer_provider": "xai",
+            "producer_model": "xai/grok-4.7",
+        },
+        "aawm_route_identity": {"producer_model": "xai/grok-4.7"},
+    }
+    unwrap_encrypted_content_wrappers_in_place([leftover])
+    assert leftover["encrypted_content"] == native_ciphertext
+    assert "aawm_encrypted_reasoning_provenance" not in leftover
+    assert "aawm_route_identity" not in leftover
