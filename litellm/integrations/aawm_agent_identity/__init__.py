@@ -2063,6 +2063,7 @@ _AAWM_RATE_LIMIT_METADATA_KEYS = (
     "auth_mode",
     "credential_family",
     "provider_account_hash",
+    "caller_identity_hash",
     "xai_oauth_managed",
     "xai_oauth_public_model",
     "xai_oauth_upstream_model",

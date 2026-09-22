@@ -277,6 +277,98 @@ def _extract_headers_from_kwargs(kwargs: Dict[str, Any]) -> Dict[str, str]:
     return headers
 
 
+def _opencode_provider_account_digest(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", cleaned) is None:
+        return None
+    return cleaned
+
+
+def _is_opencode_zen_rate_limit_request(
+    kwargs: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> bool:
+    """True for Zen quota attribution. OpenCode Go keeps its own namespace."""
+
+    credential_family = str(metadata.get("credential_family") or "").strip().lower()
+    provider_value = (
+        metadata.get("codex_auto_agent_selected_provider")
+        or metadata.get("provider")
+        or metadata.get("custom_llm_provider")
+        or kwargs.get("custom_llm_provider")
+    )
+    provider_value = getattr(provider_value, "value", provider_value)
+    provider_name = str(
+        _normalize_session_history_provider_name(provider_value) or ""
+    ).strip().lower()
+    route_text = " ".join(
+        str(value).strip().lower()
+        for value in (
+            metadata.get("codex_auto_agent_selected_route_family"),
+            metadata.get("passthrough_route_family"),
+            metadata.get("openai_passthrough_route_family"),
+            metadata.get("route_family"),
+            metadata.get("anthropic_auto_agent_selected_route_family"),
+        )
+        if value is not None and str(value).strip()
+    )
+    if (
+        credential_family == "opencode_go"
+        or provider_name == "opencode_go"
+        or "opencode_go" in route_text
+        or "opencode-go" in route_text
+    ):
+        return False
+    return bool(
+        metadata.get("opencode_zen") is True
+        or credential_family == "opencode_zen"
+        or provider_name == "opencode_zen"
+        or "opencode_zen" in route_text
+        or "opencode-zen" in route_text
+    )
+
+
+def _extract_proxy_caller_identity_hash(
+    kwargs: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> Optional[str]:
+    """Stable caller fingerprint kept apart from the Zen provider account."""
+
+    user_api_key_dict = kwargs.get("user_api_key_dict") or kwargs.get("user_api_key")
+    headers = _extract_headers_from_kwargs(kwargs)
+    candidates = (
+        metadata.get("user_api_key_hash"),
+        metadata.get("api_key_hash"),
+        kwargs.get("user_api_key_hash"),
+        _maybe_get(user_api_key_dict, "api_key_hash"),
+        _maybe_get(user_api_key_dict, "token"),
+        _maybe_get(user_api_key_dict, "api_key"),
+        headers.get("x-litellm-user-api-key-hash"),
+        headers.get("x-api-key-hash"),
+    )
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        candidate_text = str(candidate).strip()
+        if not candidate_text:
+            continue
+        return _short_hash(candidate_text.encode("utf-8"))
+    return None
+
+
+def _stored_provider_account_hash(
+    metadata: Dict[str, Any],
+    value: Any,
+) -> Any:
+    """Keep Zen storage on the digest. Other providers keep their existing labels."""
+
+    if not _is_opencode_zen_rate_limit_request({}, metadata):
+        return value
+    return _opencode_provider_account_digest(value)
+
+
 def _extract_rate_limit_account_hash(
     kwargs: Dict[str, Any],
     metadata: Dict[str, Any],
@@ -309,35 +401,9 @@ def _extract_rate_limit_account_hash(
             if isinstance(selected_account_hash, str) and selected_account_hash:
                 return selected_account_hash
 
-    # Zen quota keys follow the selected provider account. Caller hashes stay
-    # on the request and are not substituted for that fingerprint.
-    credential_family = str(metadata.get("credential_family") or "").strip().lower()
-    route_text = " ".join(
-        str(value).strip().lower()
-        for value in (
-            selected_route_family,
-            metadata.get("passthrough_route_family"),
-            metadata.get("route_family"),
-            metadata.get("codex_auto_agent_selected_route_family"),
-            metadata.get("anthropic_auto_agent_selected_route_family"),
-        )
-        if value is not None and str(value).strip()
-    )
-    provider_name = str(selected_provider or "").strip().lower()
-    is_opencode_go = (
-        credential_family == "opencode_go"
-        or provider_name == "opencode_go"
-        or "opencode_go" in route_text
-        or "opencode-go" in route_text
-    )
-    is_opencode_zen = not is_opencode_go and (
-        metadata.get("opencode_zen") is True
-        or credential_family == "opencode_zen"
-        or provider_name == "opencode_zen"
-        or "opencode_zen" in route_text
-        or "opencode-zen" in route_text
-    )
-    if is_opencode_zen:
+    # Zen quota keys follow the selected provider-account digest. Caller
+    # identity stays on its own fields and is not reused as this account.
+    if _is_opencode_zen_rate_limit_request(kwargs, metadata):
         hash_sources = [metadata]
         litellm_params = kwargs.get("litellm_params")
         if isinstance(litellm_params, dict):
@@ -345,16 +411,23 @@ def _extract_rate_limit_account_hash(
             if isinstance(nested_litellm_metadata, dict):
                 hash_sources.append(nested_litellm_metadata)
         for source in hash_sources:
-            selected_account_hash = source.get("provider_account_hash")
-            if isinstance(selected_account_hash, str) and selected_account_hash.strip():
-                return selected_account_hash.strip()
+            provider_account_digest = _opencode_provider_account_digest(
+                source.get("provider_account_hash")
+            )
+            if provider_account_digest is not None:
+                return provider_account_digest
 
     headers = _extract_headers_from_kwargs(kwargs)
     user_api_key_dict = kwargs.get("user_api_key_dict") or kwargs.get("user_api_key")
+    # A Zen request that reaches this loop did not carry a provider digest.
+    # Do not fold a raw credential sitting in provider_account_hash into the key.
+    provider_account_candidate = metadata.get("provider_account_hash")
+    if _is_opencode_zen_rate_limit_request(kwargs, metadata):
+        provider_account_candidate = None
     candidates = [
         metadata.get("user_api_key_hash"),
         metadata.get("api_key_hash"),
-        metadata.get("provider_account_hash"),
+        provider_account_candidate,
         metadata.get("provider_account_id"),
         metadata.get("organization_id"),
         metadata.get("org_id"),
@@ -626,6 +699,15 @@ def _build_rate_limit_context(
         if cache is not None:
             cache[identity_cache_key] = identity
 
+    if (
+        isinstance(identity, dict)
+        and _is_opencode_zen_rate_limit_request(kwargs, metadata)
+        and _opencode_provider_account_digest(identity.get("account_hash")) is not None
+    ):
+        caller_identity_hash = _extract_proxy_caller_identity_hash(kwargs, metadata)
+        if caller_identity_hash is not None:
+            metadata = {**metadata, "caller_identity_hash": caller_identity_hash}
+
     context = {
         "observed_at": _normalize_datetime(end_time) or datetime.now(timezone.utc),
         "provider": provider,
@@ -721,11 +803,17 @@ def _finalize_rate_limit_observation(
     metadata = finalized.get("metadata")
     if not isinstance(metadata, dict):
         metadata = {}
-    finalized["metadata"] = {
-        key: _json_safe_rate_limit_value(metadata.get(key))
-        for key in _AAWM_RATE_LIMIT_METADATA_KEYS
-        if metadata.get(key) is not None
-    }
+    stored_metadata: Dict[str, Any] = {}
+    for key in _AAWM_RATE_LIMIT_METADATA_KEYS:
+        value = metadata.get(key)
+        if value is None:
+            continue
+        if key == "provider_account_hash":
+            value = _stored_provider_account_hash(metadata, value)
+            if value is None:
+                continue
+        stored_metadata[key] = _json_safe_rate_limit_value(value)
+    finalized["metadata"] = stored_metadata
     finalized["exhausted"] = bool(finalized.get("exhausted"))
     if finalized.get("status") is None:
         finalized["status"] = "exhausted" if finalized["exhausted"] else "observed"
@@ -861,6 +949,10 @@ _HOST_FUNCTION_NAMES = (
     "_iter_rate_limit_dicts",
     "_merged_rate_limit_metadata",
     "_extract_headers_from_kwargs",
+    "_opencode_provider_account_digest",
+    "_is_opencode_zen_rate_limit_request",
+    "_extract_proxy_caller_identity_hash",
+    "_stored_provider_account_hash",
     "_extract_rate_limit_account_hash",
     "_resolve_rate_limit_model",
     "_infer_model_family_and_tier",

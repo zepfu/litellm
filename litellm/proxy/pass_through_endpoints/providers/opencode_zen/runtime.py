@@ -286,7 +286,8 @@ def derive_opencode_provider_account_hash(secret: str, *, namespace: str) -> str
             secret,
         )
     )
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
 
 
 def _remember_selected_zen_provider_account_hash(api_key: str) -> str:
@@ -298,11 +299,20 @@ def _remember_selected_zen_provider_account_hash(api_key: str) -> str:
     return digest
 
 
+def _is_opencode_provider_account_digest(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    prefix = "sha256:"
+    if not value.startswith(prefix) or len(value) != len(prefix) + 64:
+        return False
+    return all(character in "0123456789abcdef" for character in value[len(prefix) :])
+
+
 def _assign_selected_zen_provider_account_hash(*metadata_targets: Any) -> Optional[str]:
     """Copy the selected Zen fingerprint onto metadata without touching caller identity."""
 
     digest = _selected_zen_provider_account_hash.get()
-    if not isinstance(digest, str) or not digest:
+    if not _is_opencode_provider_account_digest(digest):
         return None
     stamped = False
     for metadata in metadata_targets:
@@ -1247,7 +1257,11 @@ async def _load_opencode_zen_api_key_for_candidate(
             _common_raise_opencode_zen_unavailable(exc)
         raise
     else:
-        if isinstance(api_key, str) and api_key:
+        if (
+            normalized_family == _constants._OPENCODE_ZEN_CREDENTIAL_FAMILY
+            and isinstance(api_key, str)
+            and api_key
+        ):
             _remember_selected_zen_provider_account_hash(api_key)
         return api_key
 
