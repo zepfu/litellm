@@ -1,8 +1,9 @@
+import codecs
 import hashlib
 import json
 import math
 import re
-from typing import Any, Dict, List, Literal, NoReturn, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, NoReturn, Optional, Set, Tuple, Union
 
 from litellm.llms.base_llm.base_utils import BaseLLMModelInfo
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
@@ -298,6 +299,92 @@ def _raise_cohere_runtime(
     )
 
 
+_COHERE_PARSER_FAILURE_REASONS = {
+    "Cohere stream ended without a native message-end event": "missing_message_end",
+    "Cohere stream ended with an incomplete event": "unconsumed_sse",
+    "Malformed Cohere stream JSON": "malformed_json",
+    "Cohere stream contained invalid UTF-8": "invalid_encoding",
+    "Expected Cohere stream event object": "non_object_event",
+    "Unsupported Cohere stream chunk type": "unsupported_type",
+    "Cohere V2 tool-call arguments were not a string": "argument_assembly",
+}
+_COHERE_FRAMING_FAILURE_REASONS = frozenset(
+    {
+        "missing_message_end",
+        "unconsumed_sse",
+        "malformed_json",
+        "invalid_encoding",
+        "unsupported_type",
+    }
+)
+
+
+def _cohere_parser_failure_reason(message: str) -> str:
+    return _COHERE_PARSER_FAILURE_REASONS.get(message, "event_schema")
+
+
+def _cohere_parser_failure_stage(reason: str) -> str:
+    if reason == "argument_assembly":
+        return "argument-assembly"
+    if reason in _COHERE_FRAMING_FAILURE_REASONS:
+        return "framing"
+    return "event-schema"
+
+
+def _raise_classified_stream_failure(exc: BaseException, *, payload: Any) -> NoReturn:
+    """Publish a landed diagnostic for one accepted parser failure."""
+    if isinstance(exc, CohereStreamDiagnostic):
+        raise exc
+    if isinstance(exc, CohereError):
+        message = str(exc)
+        if message in _COHERE_FIXED_TERMINAL_MESSAGES:
+            _raise_detached(ValueError(message))
+        _raise_cohere_diagnostic(
+            stage="event-schema",
+            payload=payload,
+            reason="provider_terminal",
+        )
+    reason = _cohere_parser_failure_reason(str(exc))
+    _raise_cohere_diagnostic(
+        stage=_cohere_parser_failure_stage(reason),
+        payload=payload,
+        reason=reason,
+    )
+
+
+def _raise_iterator_terminal(exc: CohereError) -> NoReturn:
+    message = str(exc)
+    if message in _COHERE_FIXED_TERMINAL_MESSAGES:
+        _raise_cohere_runtime(
+            ValueError(message),
+            payload=None,
+            stage="event-schema",
+            reason="provider_terminal",
+        )
+    _raise_cohere_runtime(
+        exc,
+        payload=None,
+        stage="event-schema",
+        reason="provider_terminal",
+    )
+
+
+def _raise_iterator_parse_failure(exc: ValueError) -> NoReturn:
+    reason = "event_schema"
+    stage = "event-schema"
+    if not isinstance(exc, CohereStreamDiagnostic) and (
+        str(exc) not in _COHERE_FIXED_TERMINAL_MESSAGES
+    ):
+        reason = _cohere_parser_failure_reason(str(exc))
+        stage = _cohere_parser_failure_stage(reason)
+    _raise_cohere_runtime(
+        exc,
+        payload=None,
+        stage=stage,
+        reason=reason,
+    )
+
+
 class CohereModelInfo(BaseLLMModelInfo):
     def get_provider_info(
         self,
@@ -566,616 +653,820 @@ class ModelResponseIterator:
             )
 
 
-class CohereV2ModelResponseIterator:
-    """V2-specific response iterator for Cohere streaming"""
+_COHERE_V2_DOCUMENTED_FINISH_REASONS = {
+    "COMPLETE": "stop",
+    "STOP_SEQUENCE": "stop",
+    "MAX_TOKENS": "length",
+    "TOOL_CALL": "tool_calls",
+}
+_COHERE_V2_CITATION_TYPES = {"TEXT_CONTENT", "THINKING_CONTENT", "PLAN"}
+_COHERE_V2_SOURCE_TYPES = {"document", "tool"}
 
-    _FINISH_REASON_MAP = {
-        "COMPLETE": "stop",
-        "STOP_SEQUENCE": "stop",
-        "MAX_TOKENS": "length",
-        "TOOL_CALL": "tool_calls",
-        "ERROR": "error",
-        "TIMEOUT": "error",
+
+class _CohereV2StreamSentinel:
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def __repr__(self) -> str:
+        return self._name
+
+
+_COHERE_V2_STREAM_DONE = _CohereV2StreamSentinel("cohere-v2-stream-done")
+_COHERE_V2_SOURCE_EXHAUSTED = _CohereV2StreamSentinel("cohere-v2-source-exhausted")
+
+
+def _empty_generic_chunk() -> GenericStreamingChunk:
+    return GenericStreamingChunk(
+        text="",
+        tool_use=None,
+        is_finished=False,
+        finish_reason="",
+        usage=None,
+        index=0,
+        provider_specific_fields=None,
+    )
+
+
+def _json_decode_is_incomplete(exc: json.JSONDecodeError, payload: str) -> bool:
+    if exc.msg.startswith("Unterminated"):
+        return True
+    if exc.msg.startswith("Expecting") and payload[exc.pos :].strip() == "":
+        return True
+    if exc.msg.startswith("Invalid \\u"):
+        tail = payload[exc.pos :]
+        if not tail.startswith("u"):
+            return False
+        hex_digits = 0
+        index = 1
+        while index < len(tail) and tail[index] in "0123456789abcdefABCDEF":
+            hex_digits += 1
+            index += 1
+        return hex_digits < 4 and index == len(tail)
+    return False
+
+
+def _json_payload_is_incomplete(payload: str) -> bool:
+    if payload == "":
+        return True
+    try:
+        json.loads(payload)
+    except json.JSONDecodeError as exc:
+        return _json_decode_is_incomplete(exc, payload)
+    return False
+
+
+def _load_json_object(payload: str, at_end: bool) -> dict:
+    try:
+        value = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        if at_end and _json_decode_is_incomplete(exc, payload):
+            raise ValueError("Cohere stream ended with an incomplete event") from None
+        raise ValueError("Malformed Cohere stream JSON") from None
+    if not isinstance(value, dict):
+        raise ValueError("Expected Cohere stream event object")
+    return value
+
+
+def _split_first_line(text: str) -> Optional[Tuple[str, str]]:
+    newline_at = text.find("\n")
+    carriage_at = text.find("\r")
+    if newline_at == -1 and carriage_at == -1:
+        return None
+    if carriage_at != -1 and (newline_at == -1 or carriage_at < newline_at):
+        if carriage_at + 1 == len(text):
+            return None
+        if text[carriage_at + 1] == "\n":
+            return text[:carriage_at], text[carriage_at + 2 :]
+        return text[:carriage_at], text[carriage_at + 1 :]
+    line = text[:newline_at]
+    if line.endswith("\r"):
+        line = line[:-1]
+    return line, text[newline_at + 1 :]
+
+
+def _is_complete_logical_line(text: str) -> bool:
+    stripped = text.strip()
+    if stripped == "":
+        return True
+    if stripped.startswith((":", "event:", "id:", "retry:")):
+        return True
+    if stripped.startswith("data:"):
+        payload = stripped[5:].lstrip()
+        if payload == "[DONE]":
+            return True
+        return not _json_payload_is_incomplete(payload)
+    if stripped.startswith("{"):
+        return not _json_payload_is_incomplete(stripped)
+    return True
+
+
+def _require_object(value: Any, label: str) -> dict:
+    if not isinstance(value, dict):
+        raise ValueError(f"Cohere V2 stream {label} was not an object")
+    return value
+
+
+def _delta_message(event: dict) -> dict:
+    delta = _require_object(event.get("delta"), "delta")
+    return _require_object(delta.get("message"), "delta.message")
+
+
+def _require_index(event: dict) -> int:
+    index = event.get("index")
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+        raise ValueError("Cohere V2 stream event omitted an integer index")
+    return index
+
+
+def _optional_index(event: dict) -> Optional[int]:
+    if "index" not in event or event.get("index") is None:
+        return None
+    return _require_index(event)
+
+
+def _token_count(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("Cohere V2 stream usage contained a non-numeric token count")
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError("Cohere V2 stream usage contained a non-numeric token count")
+    count = int(value)
+    if count < 0:
+        raise ValueError("Cohere V2 stream usage contained a non-numeric token count")
+    return count
+
+
+def _usage_block(usage: Any) -> Optional[ChatCompletionUsageBlock]:
+    if usage is None:
+        return None
+    source_parent = _require_object(usage, "usage")
+    source = source_parent.get("tokens")
+    if not isinstance(source, dict):
+        billed = source_parent.get("billed_units")
+        source = billed if isinstance(billed, dict) else None
+    if not isinstance(source, dict):
+        return None
+    if "input_tokens" not in source and "output_tokens" not in source:
+        return None
+    prompt_tokens = _token_count(source.get("input_tokens", 0))
+    completion_tokens = _token_count(source.get("output_tokens", 0))
+    block: ChatCompletionUsageBlock = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
     }
+    cached_tokens = source_parent.get("cached_tokens")
+    if cached_tokens is not None:
+        block["prompt_tokens_details"] = {"cached_tokens": _token_count(cached_tokens)}
+    return block
+
+
+def _non_negative_int(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"Cohere V2 stream {label} was not a non-negative integer")
+    return value
+
+
+def _copy_citation_source(source: Any) -> dict:
+    if not isinstance(source, dict):
+        raise ValueError("Cohere V2 citation source was not an object")
+    source_type = source.get("type")
+    if source_type not in _COHERE_V2_SOURCE_TYPES:
+        raise ValueError("Cohere V2 citation source type was not a documented value")
+    copied: Dict[str, Any] = {"type": source_type}
+    if "id" in source:
+        source_id = source.get("id")
+        if not isinstance(source_id, str):
+            raise ValueError("Cohere V2 citation source id was not a string")
+        copied["id"] = source_id
+    payload_key = "document" if source_type == "document" else "tool_output"
+    if payload_key in source:
+        payload = source.get(payload_key)
+        if not isinstance(payload, dict):
+            raise ValueError("Cohere V2 citation source payload was not an object")
+        copied[payload_key] = {**payload}
+    return copied
+
+
+def _copy_citation(raw: Any) -> dict:
+    citation_raw = _require_object(raw, "citations")
+    citation: Dict[str, Any] = {}
+    if "start" in citation_raw:
+        citation["start"] = _non_negative_int(
+            citation_raw.get("start"), "citation start"
+        )
+    if "end" in citation_raw:
+        citation["end"] = _non_negative_int(citation_raw.get("end"), "citation end")
+    if "text" in citation_raw:
+        text = citation_raw.get("text")
+        if not isinstance(text, str):
+            raise ValueError("Cohere V2 citation text was not a string")
+        citation["text"] = text
+    if "sources" in citation_raw:
+        sources = citation_raw.get("sources")
+        if not isinstance(sources, list):
+            raise ValueError("Cohere V2 citation sources were not a list")
+        citation["sources"] = [_copy_citation_source(source) for source in sources]
+    if "content_index" in citation_raw:
+        citation["content_index"] = _non_negative_int(
+            citation_raw.get("content_index"), "citation content index"
+        )
+    if "type" in citation_raw:
+        citation_type = citation_raw.get("type")
+        if citation_type not in _COHERE_V2_CITATION_TYPES:
+            raise ValueError("Cohere V2 citation type was not a documented value")
+        citation["type"] = citation_type
+    return citation
+
+
+class _CohereV2ToolCall:
+    def __init__(self, index: int, tool_id: str, name: str) -> None:
+        self.index = index
+        self.tool_id = tool_id
+        self.name = name
+        self.arguments = ""
+        self.ended = False
+
+
+class _CohereV2EventBuffer:
+    """Hold SSE text until a V2 event object or terminal [DONE] is complete."""
+
+    def __init__(self) -> None:
+        self._decoder = codecs.getincrementaldecoder("utf-8")("strict")
+        self._raw = ""
+        self._data_parts: List[str] = []
+        self._received_text = False
+        self._done = False
+        self.events: List[Any] = []
+
+    def feed(self, chunk: Union[str, bytes, dict, None]) -> None:
+        if chunk is None:
+            return
+        if isinstance(chunk, dict):
+            self._accept_event_object(chunk)
+            return
+        if isinstance(chunk, bytes):
+            self._append_text(self._decode_bytes(chunk))
+            self._drain()
+            return
+        if isinstance(chunk, str):
+            if chunk == "":
+                self._blank_line()
+                return
+            self._append_text(chunk)
+            self._drain()
+            return
+        raise ValueError("Unsupported Cohere stream chunk type")
+
+    def finalize(self) -> None:
+        try:
+            tail = self._decoder.decode(b"", final=True)
+        except UnicodeDecodeError:
+            raise ValueError("Cohere stream contained invalid UTF-8") from None
+        self._append_text(tail)
+        if self._raw.endswith("\r"):
+            self._raw = self._raw[:-1] + "\n"
+        self._drain()
+        if self._raw:
+            if not _is_complete_logical_line(self._raw):
+                raise ValueError("Cohere stream ended with an incomplete event")
+            line = self._raw
+            self._raw = ""
+            self._consume_line(line)
+        if self._data_parts:
+            self._flush_event(at_end=True)
+
+    def _decode_bytes(self, chunk: bytes) -> str:
+        try:
+            return self._decoder.decode(chunk, final=False)
+        except UnicodeDecodeError:
+            raise ValueError("Cohere stream contained invalid UTF-8") from None
+
+    def _append_text(self, text: str) -> None:
+        if not self._received_text and text.startswith("\ufeff"):
+            text = text[1:]
+        if text:
+            self._received_text = True
+        self._raw += text
+
+    def _drain(self) -> None:
+        while True:
+            split = _split_first_line(self._raw)
+            if split is not None:
+                line, self._raw = split
+                self._consume_line(line)
+                continue
+            if self._raw and _is_complete_logical_line(self._raw):
+                line = self._raw
+                self._raw = ""
+                self._consume_line(line)
+                continue
+            return
+
+    def _blank_line(self) -> None:
+        if self._raw:
+            if not _is_complete_logical_line(self._raw):
+                raise ValueError("Malformed Cohere stream JSON")
+            line = self._raw
+            self._raw = ""
+            self._consume_line(line)
+        self._flush_event(at_end=False)
+
+    def _accept_event_object(self, event: dict) -> None:
+        self._drain()
+        if self._raw.strip() or self._data_parts:
+            raise ValueError("Cohere stream ended with an incomplete event")
+        if self._done:
+            raise ValueError("Cohere stream continued after [DONE]")
+        self.events.append(event)
+
+    def _consume_line(self, line: str) -> None:
+        stripped = line.strip()
+        if stripped == "":
+            self._flush_event(at_end=False)
+            return
+        if stripped.startswith(":"):
+            return
+        if stripped.startswith(("event:", "id:", "retry:")):
+            if self._data_parts:
+                self._flush_event(at_end=False)
+            return
+        if stripped.startswith("data:"):
+            self._push_payload(stripped[5:].lstrip())
+            return
+        if stripped.startswith("{") and not self._data_parts:
+            self._push_payload(stripped)
+            return
+        raise ValueError("Malformed Cohere stream JSON")
+
+    def _push_payload(self, payload: str) -> None:
+        if self._done:
+            raise ValueError("Cohere stream continued after [DONE]")
+        self._data_parts.append(payload)
+        joined = "\n".join(self._data_parts).strip()
+        if joined == "[DONE]" or not _json_payload_is_incomplete(joined):
+            self._flush_event(at_end=False)
+
+    def _flush_event(self, at_end: bool) -> None:
+        if not self._data_parts:
+            return
+        payload = "\n".join(self._data_parts).strip()
+        self._data_parts = []
+        if self._done:
+            raise ValueError("Cohere stream continued after [DONE]")
+        if payload == "[DONE]":
+            self._done = True
+            self.events.append(_COHERE_V2_STREAM_DONE)
+            return
+        self.events.append(_load_json_object(payload, at_end=at_end))
+
+
+class CohereV2ModelResponseIterator:
+    """Parse Cohere V2 SSE into text, tool-call, citation, and finish chunks.
+
+    Event handling follows the top-level V2 stream schema. Tool-call argument
+    fragments stay strings until a later consumer joins them; this iterator
+    does not parse partial argument JSON.
+    """
+
+    _FINISH_REASON_MAP = _COHERE_V2_DOCUMENTED_FINISH_REASONS
 
     def __init__(
         self, streaming_response, sync_stream: bool, json_mode: Optional[bool] = False
     ):
         self.streaming_response = streaming_response
         self.response_iterator = self.streaming_response
-        self.content_blocks: List = []
-        self.tool_index = -1
+        self.sync_stream = sync_stream
         self.json_mode = json_mode
-        self._tool_calls: Dict[int, Dict[str, Any]] = {}
-        self._tool_call_indexes: Dict[str, int] = {}
-        self._next_tool_index = 0
-        self._pending_sse_payloads: List[str] = []
+        self.tool_index = -1
+        self._buffer = _CohereV2EventBuffer()
+        self._tools: Dict[int, _CohereV2ToolCall] = {}
+        self._open_citations: Set[int] = set()
+        self._message_started = False
         self._message_end_received = False
+        self._source_exhausted = False
 
     @staticmethod
     def _empty_chunk() -> GenericStreamingChunk:
+        return _empty_generic_chunk()
+
+    def _output(
+        self,
+        text: str = "",
+        tool_use: Optional[ChatCompletionToolCallChunk] = None,
+        is_finished: bool = False,
+        finish_reason: str = "",
+        usage: Optional[ChatCompletionUsageBlock] = None,
+        provider_specific_fields: Optional[dict] = None,
+    ) -> GenericStreamingChunk:
         return GenericStreamingChunk(
-            text="",
-            tool_use=None,
-            is_finished=False,
-            finish_reason="",
-            usage=None,
+            text=text,
+            tool_use=tool_use,
+            is_finished=is_finished,
+            finish_reason=finish_reason,
+            usage=usage,
             index=0,
-            provider_specific_fields=None,
+            provider_specific_fields=provider_specific_fields,
         )
 
-    @staticmethod
-    def _stringify_tool_fragment(value: Any) -> str:
-        if value is None:
-            return ""
-        if isinstance(value, str):
-            return value
-        return json.dumps(value, ensure_ascii=False)
-
-    def _extract_sse_payloads(self, chunk: Union[str, bytes, dict]) -> List[str]:
-        if isinstance(chunk, bytes):
-            try:
-                chunk = chunk.decode("utf-8")
-            except UnicodeDecodeError:
-                _raise_cohere_diagnostic(
-                    stage="framing",
-                    payload=chunk,
-                    reason="invalid_encoding",
-                )
-        if isinstance(chunk, dict):
-            try:
-                return [json.dumps(chunk, ensure_ascii=False)]
-            except (TypeError, ValueError):
-                _raise_cohere_diagnostic(
-                    stage="event-schema",
-                    payload=chunk,
-                    reason="event_schema",
-                )
-        if not isinstance(chunk, str):
-            _raise_cohere_diagnostic(
-                stage="framing",
-                payload=None,
-                reason="unsupported_type",
-            )
-
-        if not chunk.strip():
-            return []
-
-        if not any(line.strip().startswith("data:") for line in chunk.splitlines()):
-            if all(
-                not line.strip() or line.strip().startswith((":", "event:"))
-                for line in chunk.splitlines()
-            ):
-                return []
-            return [chunk.strip()]
-
-        payloads: List[str] = []
-        data_lines: List[str] = []
-
-        def flush_event() -> None:
-            if data_lines:
-                payloads.append("\n".join(data_lines))
-                data_lines.clear()
-
-        for line in chunk.splitlines():
-            stripped_line = line.strip()
-            if not stripped_line:
-                flush_event()
-                continue
-            if stripped_line.startswith(":") or stripped_line.startswith("event:"):
-                continue
-            if stripped_line.startswith("data:"):
-                data_lines.append(stripped_line[5:].lstrip())
-
-        flush_event()
-        return payloads
-
-    def _validate_stream_end(self) -> None:
-        if self._pending_sse_payloads:
-            _raise_cohere_diagnostic(
-                stage="framing",
-                payload="\n".join(self._pending_sse_payloads),
-                reason="unconsumed_sse",
-            )
-        if not self._message_end_received:
-            _raise_cohere_diagnostic(
-                stage="framing",
-                payload=b"",
-                reason="missing_message_end",
-            )
-
-    def _parse_sse_json(
-        self, chunk: Optional[Union[str, bytes, dict]] = None
-    ) -> Optional[dict]:
-        if chunk is not None:
-            self._pending_sse_payloads.extend(self._extract_sse_payloads(chunk))
-        if not self._pending_sse_payloads:
-            return None
-
-        payload = self._pending_sse_payloads.pop(0).strip()
-        if payload == "[DONE]":
-            self._validate_stream_end()
-            raise StopIteration
-
-        try:
-            parsed_chunk = json.loads(payload)
-        except json.JSONDecodeError:
-            _raise_cohere_diagnostic(
-                stage="framing",
-                payload=payload,
-                reason="malformed_json",
-            )
-
-        if not isinstance(parsed_chunk, dict):
-            _raise_cohere_diagnostic(
-                stage="event-schema",
-                payload=parsed_chunk,
-                reason="non_object_event",
-            )
-        return parsed_chunk
-
-    @staticmethod
-    def _tool_call_entries(chunk: dict) -> List[dict]:
-        delta = chunk.get("delta", {}) or {}
-        message = delta.get("message", {}) or {}
-        tool_calls = message.get("tool_calls")
-        if tool_calls is None:
-            tool_calls = delta.get("tool_calls")
-        if isinstance(tool_calls, dict):
-            return [tool_calls]
-        if isinstance(tool_calls, list):
-            return [call for call in tool_calls if isinstance(call, dict)]
-        return []
-
-    def _resolve_tool_index(
-        self, chunk: dict, tool_call: dict, position: int = 0
-    ) -> int:
-        tool_id = tool_call.get("id") or tool_call.get("call_id")
-        if isinstance(tool_id, str) and tool_id in self._tool_call_indexes:
-            return self._tool_call_indexes[tool_id]
-
-        raw_index = tool_call.get("index")
-        if raw_index is None:
-            raw_index = chunk.get("index")
-        if raw_index is None:
-            raw_index = self._next_tool_index + position
-
-        try:
-            tool_index = int(raw_index)
-        except (TypeError, ValueError):
-            tool_index = self._next_tool_index + position
-
-        self._next_tool_index = max(self._next_tool_index, tool_index + 1)
-        if isinstance(tool_id, str) and tool_id:
-            self._tool_call_indexes[tool_id] = tool_index
-        self.tool_index = max(self.tool_index, tool_index)
-        return tool_index
-
-    def _tool_call_state(self, tool_index: int) -> Dict[str, Any]:
-        return self._tool_calls.setdefault(
-            tool_index,
-            {
-                "id": None,
-                "name": None,
-                "arguments": "",
-            },
-        )
-
-    def _parse_content_delta(self, chunk: dict) -> str:
-        """Parse content-delta chunks to extract text."""
-        delta = chunk.get("delta", {})
-        message = delta.get("message", {})
-        content = message.get("content", {})
-        if isinstance(content, dict) and "text" in content:
-            return content["text"]
-        elif isinstance(content, str):
-            return content
-        return ""
-
-    def _parse_tool_call_delta(
-        self, chunk: dict
-    ) -> Optional[ChatCompletionToolCallChunk]:
-        """Parse tool-call-delta chunks to extract tool calls."""
-        tool_calls = self._tool_call_entries(chunk)
-        if not tool_calls:
-            return None
-
-        tool_call = tool_calls[0]
-        tool_index = self._resolve_tool_index(chunk, tool_call)
-        state = self._tool_call_state(tool_index)
-        function = tool_call.get("function", {}) or {}
-        tool_id = tool_call.get("id") or tool_call.get("call_id")
-        name = function.get("name") or tool_call.get("name")
-        try:
-            arguments = self._stringify_tool_fragment(
-                function.get("arguments", tool_call.get("arguments"))
-            )
-        except (TypeError, ValueError):
-            _raise_cohere_diagnostic(
-                stage="argument-assembly",
-                payload=chunk,
-                reason="argument_assembly",
-            )
-
-        if tool_id:
-            state["id"] = tool_id
-            self._tool_call_indexes[str(tool_id)] = tool_index
-        if name:
-            state["name"] = name
-        try:
-            state["arguments"] += arguments
-        except (TypeError, ValueError):
-            _raise_cohere_diagnostic(
-                stage="argument-assembly",
-                payload=chunk,
-                reason="argument_assembly",
-            )
-
-        return {
-            "id": state["id"],
+    def _tool_chunk(
+        self, tool: _CohereV2ToolCall, arguments_fragment: str
+    ) -> GenericStreamingChunk:
+        tool_use: ChatCompletionToolCallChunk = {
+            "id": tool.tool_id,
             "type": "function",
-            "function": {
-                "name": state["name"],
-                "arguments": arguments,
-            },
-            "index": tool_index,
+            "function": {"name": tool.name, "arguments": arguments_fragment},
+            "index": tool.index,
         }
+        return self._output(tool_use=tool_use)
 
-    def _parse_tool_call_start(
-        self, chunk: dict
-    ) -> Optional[ChatCompletionToolCallChunk]:
-        """Parse a tool-call-start event and register its indexed identity."""
-        tool_calls = self._tool_call_entries(chunk)
-        if not tool_calls:
+    def _reduce_message_start(self, event: dict) -> Optional[GenericStreamingChunk]:
+        if self._message_started:
+            raise ValueError("Cohere V2 stream received a second message-start event")
+        self._message_started = True
+        delta = event.get("delta")
+        if delta is None:
             return None
-
-        tool_call = tool_calls[0]
-        tool_index = self._resolve_tool_index(chunk, tool_call)
-        state = self._tool_call_state(tool_index)
-        function = tool_call.get("function", {}) or {}
-        tool_id = tool_call.get("id") or tool_call.get("call_id")
-        name = function.get("name") or tool_call.get("name")
-        try:
-            arguments = self._stringify_tool_fragment(
-                function.get("arguments", tool_call.get("arguments"))
-            )
-        except (TypeError, ValueError):
-            _raise_cohere_diagnostic(
-                stage="argument-assembly",
-                payload=chunk,
-                reason="argument_assembly",
-            )
-
-        if tool_id:
-            state["id"] = tool_id
-            self._tool_call_indexes[str(tool_id)] = tool_index
-        if name:
-            state["name"] = name
-        if arguments:
-            try:
-                state["arguments"] = arguments
-            except (TypeError, ValueError):
-                _raise_cohere_diagnostic(
-                    stage="argument-assembly",
-                    payload=chunk,
-                    reason="argument_assembly",
-                )
-
-        return {
-            "id": state["id"],
-            "type": "function",
-            "function": {
-                "name": state["name"],
-                "arguments": arguments,
-            },
-            "index": tool_index,
-        }
-
-    def _parse_tool_call_end(self, chunk: dict) -> None:
-        """Record the end of an indexed tool call without duplicating arguments."""
-        tool_calls = self._tool_call_entries(chunk)
-        if tool_calls:
-            self._resolve_tool_index(chunk, tool_calls[0])
-        elif chunk.get("index") is not None:
-            self._resolve_tool_index(chunk, {})
-
-    def _parse_tool_plan_delta(self, chunk: dict) -> Optional[dict]:
-        """Parse tool-plan-delta events to extract tool plan."""
-        delta = chunk.get("delta", {}) or {}
-        message = delta.get("message", {}) or {}
-        tool_plan = message.get("tool_plan", "")
-        if tool_plan:
-            return {"tool_plan": tool_plan}
+        message = _require_object(delta, "delta").get("message")
+        if message is None:
+            return None
+        role = _require_object(message, "delta.message").get("role")
+        if role is not None and role != "assistant":
+            raise ValueError("Cohere V2 message-start role was not assistant")
         return None
 
-    def _parse_citation_start(self, chunk: dict) -> Optional[dict]:
-        """Parse citation-start events to extract citations."""
-        delta = chunk.get("delta", {}) or {}
-        message = delta.get("message", {}) or {}
-        citations = message.get("citations")
-        if citations:
-            if isinstance(citations, dict):
-                citations = [citations]
-            return cohere_citation_provider_fields(citations)
+    def _reduce_content_start(self, event: dict) -> Optional[GenericStreamingChunk]:
+        content = _delta_message(event).get("content")
+        if content is None:
+            return None
+        content_object = _require_object(content, "content")
+        content_type = content_object.get("type")
+        if content_type is not None and content_type not in {"text", "thinking"}:
+            raise ValueError("Cohere V2 content-start type was not a documented value")
         return None
 
-    def _parse_message_end(
-        self, chunk: dict
-    ) -> Tuple[bool, str, Optional[ChatCompletionUsageBlock], Optional[str]]:
-        """Parse message-end events to extract finish info and usage."""
-        delta = chunk.get("delta", {}) or {}
-        is_finished = True
-        raw_finish_reason = delta.get("finish_reason")
-        normalized_finish_reason = (
-            str(raw_finish_reason).strip().upper()
-            if raw_finish_reason is not None
-            else ""
-        )
-        native_error = delta.get("error")
-        if isinstance(native_error, str):
-            if native_error.strip():
-                _raise_cohere_diagnostic(
-                    stage="event-schema",
-                    payload=chunk,
-                    reason="provider_terminal",
-                )
-        elif native_error:
-            terminal_identifier = None
-            if isinstance(native_error, dict):
-                for key in ("code", "type"):
-                    terminal_identifier = _cohere_fixed_terminal_identifier(
-                        native_error.get(key)
-                    )
-                    if terminal_identifier is not None:
-                        break
-            if terminal_identifier is None:
-                _raise_cohere_diagnostic(
-                    stage="event-schema",
-                    payload=chunk,
-                    reason="provider_terminal",
-                )
-            raise CohereError(
-                status_code=408 if terminal_identifier == "timeout" else 500,
-                message=_cohere_fixed_terminal_message(terminal_identifier),
-            )
+    def _reduce_content_delta(self, event: dict) -> Optional[GenericStreamingChunk]:
+        content = _delta_message(event).get("content")
+        content_object = _require_object(content, "content")
+        text = content_object.get("text", "")
+        if text is None:
+            text = ""
+        if not isinstance(text, str):
+            raise ValueError("Cohere V2 content-delta text was not a string")
+        thinking = content_object.get("thinking")
+        if thinking is not None and not isinstance(thinking, str):
+            raise ValueError("Cohere V2 content-delta thinking was not a string")
+        fields = {"thinking": thinking} if thinking else None
+        if text == "" and fields is None:
+            return None
+        return self._output(text=text, provider_specific_fields=fields)
 
-        terminal_identifier = _cohere_fixed_terminal_identifier(
-            normalized_finish_reason
+    def _reduce_content_end(self, event: dict) -> Optional[GenericStreamingChunk]:
+        if event.get("index") is not None:
+            _require_index(event)
+        return None
+
+    def _reduce_tool_plan_delta(self, event: dict) -> Optional[GenericStreamingChunk]:
+        tool_plan = _delta_message(event).get("tool_plan", "")
+        if not isinstance(tool_plan, str):
+            raise ValueError("Cohere V2 tool-plan-delta was not a string")
+        if tool_plan == "":
+            return None
+        return self._output(provider_specific_fields={"tool_plan": tool_plan})
+
+    def _tool_call_object(self, event: dict) -> dict:
+        return _require_object(_delta_message(event).get("tool_calls"), "tool_calls")
+
+    def _function_arguments(self, tool_call: dict) -> Tuple[dict, str]:
+        function = tool_call.get("function", {})
+        if function is None:
+            function = {}
+        function_object = _require_object(function, "tool call function")
+        arguments = function_object.get("arguments", "")
+        if not isinstance(arguments, str):
+            raise ValueError("Cohere V2 tool-call arguments were not a string")
+        return function_object, arguments
+
+    def _reduce_tool_call_start(self, event: dict) -> Optional[GenericStreamingChunk]:
+        index = _require_index(event)
+        if index in self._tools:
+            raise ValueError("Cohere V2 stream repeated a tool-call index")
+        tool_call = self._tool_call_object(event)
+        tool_id = tool_call.get("id")
+        if not isinstance(tool_id, str) or tool_id == "":
+            raise ValueError("Cohere V2 tool-call-start omitted a tool call id")
+        if tool_call.get("type") != "function":
+            raise ValueError("Cohere V2 tool-call-start type was not function")
+        function, arguments = self._function_arguments(tool_call)
+        name = function.get("name", "")
+        if not isinstance(name, str):
+            raise ValueError("Cohere V2 tool-call name was not a string")
+        tool = _CohereV2ToolCall(index=index, tool_id=tool_id, name=name)
+        tool.arguments = arguments
+        self._tools[index] = tool
+        self.tool_index = index
+        return self._tool_chunk(tool, arguments)
+
+    def _reduce_tool_call_delta(self, event: dict) -> Optional[GenericStreamingChunk]:
+        index = _require_index(event)
+        tool = self._tools.get(index)
+        if tool is None or tool.ended:
+            raise ValueError(
+                "Cohere V2 tool-call-delta did not match an open tool call"
+            )
+        _function, arguments = self._function_arguments(self._tool_call_object(event))
+        tool.arguments += arguments
+        if arguments == "":
+            return None
+        return self._tool_chunk(tool, arguments)
+
+    def _reduce_tool_call_end(self, event: dict) -> Optional[GenericStreamingChunk]:
+        index = _require_index(event)
+        tool = self._tools.get(index)
+        if tool is None or tool.ended:
+            raise ValueError("Cohere V2 tool-call-end did not match an open tool call")
+        tool.ended = True
+        return None
+
+    def _reduce_citation_start(self, event: dict) -> Optional[GenericStreamingChunk]:
+        index = _optional_index(event)
+        citation = _copy_citation(_delta_message(event).get("citations"))
+        if index is not None:
+            if index in self._open_citations:
+                raise ValueError("Cohere V2 stream repeated a citation index")
+            self._open_citations.add(index)
+        return self._output(
+            provider_specific_fields=cohere_citation_provider_fields([citation])
         )
+
+    def _reduce_citation_end(self, event: dict) -> Optional[GenericStreamingChunk]:
+        index = _optional_index(event)
+        if index is None:
+            return None
+        if index not in self._open_citations:
+            raise ValueError("Cohere V2 citation-end did not match an open citation")
+        self._open_citations.remove(index)
+        return None
+
+    def _reduce_message_end(self, event: dict) -> Optional[GenericStreamingChunk]:
+        if self._message_end_received:
+            raise ValueError("Cohere V2 stream received a second message-end event")
+        delta = _require_object(event.get("delta"), "delta")
+        self._raise_for_provider_terminal(event, delta)
+        normalized = self._documented_finish_reason(delta.get("finish_reason"))
+        terminal_identifier = _cohere_fixed_terminal_identifier(normalized)
         if terminal_identifier is not None:
             raise CohereError(
                 status_code=408 if terminal_identifier == "timeout" else 500,
                 message=_cohere_fixed_terminal_message(terminal_identifier),
             )
-
-        raw_finish_reason = raw_finish_reason or "COMPLETE"
-        finish_reason = self._FINISH_REASON_MAP.get(
-            str(raw_finish_reason).upper(), str(raw_finish_reason).lower()
+        finish_reason = self._FINISH_REASON_MAP[normalized]
+        self._message_end_received = True
+        return self._output(
+            is_finished=True,
+            finish_reason=finish_reason,
+            usage=_usage_block(delta.get("usage")),
+            provider_specific_fields={"native_finish_reason": normalized},
         )
 
-        usage = None
-        usage_data = delta.get("usage", {}) or {}
-        if usage_data:
-            tokens_data = usage_data.get("tokens", {}) or {}
-            prompt_tokens = int(tokens_data.get("input_tokens", 0) or 0)
-            completion_tokens = int(tokens_data.get("output_tokens", 0) or 0)
-            usage = ChatCompletionUsageBlock(
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=prompt_tokens + completion_tokens,
-            )
-
-        return is_finished, finish_reason, usage, str(raw_finish_reason)
-
-    def chunk_parser(self, chunk: dict) -> GenericStreamingChunk:
-        """
-        Parse Cohere v2 streaming chunks.
-
-        v2 format:
-        - Content: chunk.type == "content-delta" -> chunk.delta.message.content.text
-        - Tool calls: chunk.type == "tool-call-{start,delta,end}"
-        - Tool plan: chunk.type == "tool-plan-delta" -> chunk.delta.message.tool_plan
-        - Citations: chunk.type == "citation-start" -> chunk.delta.message.citations
-        - Finish: chunk.type == "message-end" -> chunk.delta.finish_reason
-        """
-        try:
-            text = ""
-            tool_use: Optional[ChatCompletionToolCallChunk] = None
-            is_finished = False
-            finish_reason = ""
-            usage: Optional[ChatCompletionUsageBlock] = None
-            provider_specific_fields = None
-
-            chunk_type = chunk.get("type", "")
-
-            # Handle different chunk types
-            if chunk_type == "content-delta":
-                text = self._parse_content_delta(chunk)
-            elif chunk_type == "tool-call-start":
-                tool_use = self._parse_tool_call_start(chunk)
-            elif chunk_type == "tool-call-delta":
-                tool_use = self._parse_tool_call_delta(chunk)
-            elif chunk_type == "tool-call-end":
-                self._parse_tool_call_end(chunk)
-            elif chunk_type == "tool-plan-delta":
-                provider_specific_fields = self._parse_tool_plan_delta(chunk)
-            elif chunk_type == "citation-start":
-                provider_specific_fields = self._parse_citation_start(chunk)
-            elif chunk_type == "message-end":
-                self._message_end_received = True
-                (
-                    is_finished,
-                    finish_reason,
-                    usage,
-                    raw_finish_reason,
-                ) = self._parse_message_end(chunk)
-                provider_specific_fields = {"native_finish_reason": raw_finish_reason}
-
-            # Handle citations in any chunk type (fallback). Map fields only;
-            # do not copy tool-output bodies into the streamed metadata.
-            if "citations" in chunk:
-                mapped_citations = cohere_citation_provider_fields(
-                    chunk.get("citations")
+    def _raise_for_provider_terminal(self, event: dict, delta: dict) -> None:
+        native_error = delta.get("error")
+        if isinstance(native_error, str):
+            if native_error.strip():
+                _raise_cohere_diagnostic(
+                    stage="event-schema",
+                    payload=event,
+                    reason="provider_terminal",
                 )
-                if mapped_citations:
-                    if provider_specific_fields is None:
-                        provider_specific_fields = {}
-                    provider_specific_fields["citations"] = mapped_citations[
-                        "citations"
-                    ]
-
-            return GenericStreamingChunk(
-                text=text,
-                tool_use=tool_use,
-                is_finished=is_finished,
-                finish_reason=finish_reason,
-                usage=usage,
-                index=0,
-                provider_specific_fields=provider_specific_fields,
-            )
-
-        except CohereStreamDiagnostic:
-            raise
-        except CohereError as exc:
-            message = str(exc)
-            if message in _COHERE_FIXED_TERMINAL_MESSAGES:
-                _raise_detached(ValueError(message))
+            return
+        if not native_error:
+            return
+        terminal_identifier = None
+        if isinstance(native_error, dict):
+            for key in ("code", "type"):
+                terminal_identifier = _cohere_fixed_terminal_identifier(
+                    native_error.get(key)
+                )
+                if terminal_identifier is not None:
+                    break
+        if terminal_identifier is None:
             _raise_cohere_diagnostic(
                 stage="event-schema",
-                payload=chunk,
+                payload=event,
                 reason="provider_terminal",
             )
-        except Exception:
-            _raise_cohere_diagnostic(
-                stage="event-schema",
-                payload=chunk,
-                reason="event_schema",
+        raise CohereError(
+            status_code=408 if terminal_identifier == "timeout" else 500,
+            message=_cohere_fixed_terminal_message(terminal_identifier),
+        )
+
+    @staticmethod
+    def _documented_finish_reason(raw_reason: Any) -> str:
+        if not isinstance(raw_reason, str):
+            raise ValueError(
+                "Cohere V2 stream message-end omitted a documented finish reason"
+            )
+        normalized = raw_reason.strip().upper()
+        if normalized in {"ERROR", "TIMEOUT"}:
+            return normalized
+        if normalized not in _COHERE_V2_DOCUMENTED_FINISH_REASONS:
+            raise ValueError(
+                "Cohere V2 stream message-end omitted a documented finish reason"
+            )
+        return normalized
+
+    def _with_top_level_citation_fields(
+        self, event: dict, parsed: Optional[GenericStreamingChunk]
+    ) -> Optional[GenericStreamingChunk]:
+        if "citations" not in event:
+            return parsed
+        mapped_citations = cohere_citation_provider_fields(event.get("citations"))
+        if not mapped_citations:
+            return parsed
+        if parsed is None:
+            parsed = self._empty_chunk()
+        provider_specific_fields = {
+            **(parsed.get("provider_specific_fields") or {}),
+            "citations": mapped_citations["citations"],
+        }
+        return {**parsed, "provider_specific_fields": provider_specific_fields}
+
+    def _reduce_event(self, event: dict) -> Optional[GenericStreamingChunk]:
+        if not isinstance(event, dict):
+            raise ValueError("Expected Cohere stream event object")
+        event_type = event.get("type")
+        if not isinstance(event_type, str):
+            raise ValueError("Cohere V2 stream event omitted a type")
+        if self._message_end_received and event_type != "debug":
+            raise ValueError("Cohere V2 stream event arrived after message-end")
+        if event_type == "debug":
+            parsed: Optional[GenericStreamingChunk] = None
+        elif event_type == "message-start":
+            parsed = self._reduce_message_start(event)
+        elif event_type == "content-start":
+            parsed = self._reduce_content_start(event)
+        elif event_type == "content-delta":
+            parsed = self._reduce_content_delta(event)
+        elif event_type == "content-end":
+            parsed = self._reduce_content_end(event)
+        elif event_type == "tool-plan-delta":
+            parsed = self._reduce_tool_plan_delta(event)
+        elif event_type == "tool-call-start":
+            parsed = self._reduce_tool_call_start(event)
+        elif event_type == "tool-call-delta":
+            parsed = self._reduce_tool_call_delta(event)
+        elif event_type == "tool-call-end":
+            parsed = self._reduce_tool_call_end(event)
+        elif event_type == "citation-start":
+            parsed = self._reduce_citation_start(event)
+        elif event_type == "citation-end":
+            parsed = self._reduce_citation_end(event)
+        elif event_type == "message-end":
+            parsed = self._reduce_message_end(event)
+        else:
+            raise ValueError("Unrecognized Cohere V2 stream event")
+        return self._with_top_level_citation_fields(event, parsed)
+
+    def chunk_parser(self, chunk: dict) -> GenericStreamingChunk:
+        try:
+            parsed = self._reduce_event(chunk)
+        except CohereStreamDiagnostic:
+            raise
+        except Exception as exc:
+            _raise_classified_stream_failure(exc, payload=chunk)
+        if parsed is None:
+            return self._empty_chunk()
+        return parsed
+
+    def _pop_ready_chunk(self) -> Optional[GenericStreamingChunk]:
+        while self._buffer.events:
+            event = self._buffer.events.pop(0)
+            if event is _COHERE_V2_STREAM_DONE:
+                if not self._message_end_received:
+                    _raise_cohere_diagnostic(
+                        stage="framing",
+                        payload=b"",
+                        reason="missing_message_end",
+                    )
+                raise StopIteration
+            try:
+                parsed = self._reduce_event(event)
+            except CohereStreamDiagnostic:
+                raise
+            except Exception as exc:
+                _raise_classified_stream_failure(exc, payload=event)
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _push_source_chunk(self, chunk: Any) -> None:
+        if chunk is _COHERE_V2_SOURCE_EXHAUSTED:
+            self._buffer.finalize()
+            self._source_exhausted = True
+            if not self._buffer.events and not self._message_end_received:
+                _raise_cohere_diagnostic(
+                    stage="framing",
+                    payload=b"",
+                    reason="missing_message_end",
+                )
+            return
+        self._buffer.feed(chunk)
+
+    def _read_sync_chunk(self) -> Any:
+        try:
+            return self.response_iterator.__next__()
+        except StopIteration:
+            return _COHERE_V2_SOURCE_EXHAUSTED
+        except Exception as exc:
+            _raise_cohere_runtime(
+                exc,
+                payload=None,
+                stage="framing",
+                reason="receive_error",
             )
 
-    # Sync iterator
+    async def _read_async_chunk(self) -> Any:
+        try:
+            return await self.async_response_iterator.__anext__()
+        except StopAsyncIteration:
+            return _COHERE_V2_SOURCE_EXHAUSTED
+        except Exception as exc:
+            _raise_cohere_runtime(
+                exc,
+                payload=None,
+                stage="framing",
+                reason="receive_error",
+            )
+
     def __iter__(self):
         return self
 
     def __next__(self):
-        while True:
-            chunk = None
-            try:
-                if self._pending_sse_payloads:
-                    parsed_chunk = self._parse_sse_json()
-                else:
-                    chunk = self.response_iterator.__next__()
-                    parsed_chunk = self._parse_sse_json(chunk=chunk)
-            except StopIteration:
-                try:
-                    self._validate_stream_end()
-                except ValueError as exc:
-                    _raise_cohere_runtime(
-                        exc,
-                        payload=None,
-                        stage="framing",
-                        reason="missing_message_end",
-                    )
-                raise StopIteration
-            except Exception as exc:
-                _raise_cohere_runtime(
-                    exc,
-                    payload=chunk,
-                    stage="framing",
-                    reason="receive_error",
-                )
-
-            try:
-                if parsed_chunk is None:
-                    continue
-                return self.chunk_parser(chunk=parsed_chunk)
-            except StopIteration:
-                raise StopIteration
-            except ValueError as exc:
-                _raise_cohere_runtime(
-                    exc,
-                    payload=chunk if chunk is not None else parsed_chunk,
-                    stage="event-schema",
-                    reason="event_schema",
-                )
+        try:
+            while True:
+                parsed = self._pop_ready_chunk()
+                if parsed is not None:
+                    return parsed
+                if self._source_exhausted:
+                    raise StopIteration
+                self._push_source_chunk(self._read_sync_chunk())
+        except StopIteration:
+            raise
+        except CohereError as exc:
+            _raise_iterator_terminal(exc)
+        except ValueError as exc:
+            _raise_iterator_parse_failure(exc)
+        except Exception as exc:
+            _raise_cohere_runtime(
+                exc,
+                payload=None,
+                stage="event-schema",
+                reason="event_schema",
+            )
 
     def convert_str_chunk_to_generic_chunk(
         self, chunk: Union[str, bytes, dict]
     ) -> GenericStreamingChunk:
-        """
-        Convert a string chunk to a GenericStreamingChunk for v2
-
-        Note: This is used for Cohere v2 pass through streaming logging
-        """
-        data_json = self._parse_sse_json(chunk=chunk)
-        if data_json is None:
+        """Convert one transport chunk, holding incomplete JSON or UTF-8."""
+        try:
+            self._buffer.feed(chunk)
+            parsed = self._pop_ready_chunk()
+        except CohereStreamDiagnostic:
+            raise
+        except ValueError as exc:
+            if str(exc) in _COHERE_FIXED_TERMINAL_MESSAGES:
+                raise
+            _raise_classified_stream_failure(exc, payload=chunk)
+        except Exception as exc:
+            _raise_classified_stream_failure(exc, payload=chunk)
+        if parsed is None:
             return self._empty_chunk()
-        return self.chunk_parser(chunk=data_json)
+        return parsed
 
-    # Async iterator
     def __aiter__(self):
         self.async_response_iterator = self.streaming_response.__aiter__()
         return self
 
     async def __anext__(self):
-        while True:
-            chunk = None
-            try:
-                if self._pending_sse_payloads:
-                    parsed_chunk = self._parse_sse_json()
-                else:
-                    chunk = await self.async_response_iterator.__anext__()
-                    parsed_chunk = self._parse_sse_json(chunk=chunk)
-            except StopIteration:
-                try:
-                    self._validate_stream_end()
-                except ValueError as exc:
-                    _raise_cohere_runtime(
-                        exc,
-                        payload=None,
-                        stage="framing",
-                        reason="missing_message_end",
-                    )
-                raise StopAsyncIteration
-            except StopAsyncIteration:
-                try:
-                    self._validate_stream_end()
-                except ValueError as exc:
-                    _raise_cohere_runtime(
-                        exc,
-                        payload=None,
-                        stage="framing",
-                        reason="missing_message_end",
-                    )
-                raise StopAsyncIteration
-            except Exception as exc:
-                _raise_cohere_runtime(
-                    exc,
-                    payload=chunk,
-                    stage="framing",
-                    reason="receive_error",
-                )
-
-            try:
-                if parsed_chunk is None:
-                    continue
-                return self.chunk_parser(chunk=parsed_chunk)
-            except StopIteration:
-                try:
-                    self._validate_stream_end()
-                except ValueError as exc:
-                    _raise_cohere_runtime(
-                        exc,
-                        payload=None,
-                        stage="framing",
-                        reason="missing_message_end",
-                    )
-                raise StopAsyncIteration
-            except StopAsyncIteration:
-                raise StopAsyncIteration
-            except ValueError as exc:
-                _raise_cohere_runtime(
-                    exc,
-                    payload=chunk if chunk is not None else parsed_chunk,
-                    stage="event-schema",
-                    reason="event_schema",
-                )
+        try:
+            while True:
+                parsed = self._pop_ready_chunk()
+                if parsed is not None:
+                    return parsed
+                if self._source_exhausted:
+                    raise StopAsyncIteration
+                self._push_source_chunk(await self._read_async_chunk())
+        except StopAsyncIteration:
+            raise
+        except StopIteration:
+            raise StopAsyncIteration from None
+        except CohereError as exc:
+            _raise_iterator_terminal(exc)
+        except ValueError as exc:
+            _raise_iterator_parse_failure(exc)
+        except Exception as exc:
+            _raise_cohere_runtime(
+                exc,
+                payload=None,
+                stage="event-schema",
+                reason="event_schema",
+            )
