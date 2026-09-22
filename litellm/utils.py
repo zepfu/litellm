@@ -4287,6 +4287,14 @@ def get_optional_params(  # noqa: PLR0915
     allowed_openai_params = allowed_openai_params or []
     supported_params.extend(allowed_openai_params)
 
+    if custom_llm_provider == "nous":
+        # Reject semantic stream/tool requests before drop_params can strip them.
+        litellm.NousChatConfig().reject_unsupported_capability_params(
+            non_default_params=non_default_params,
+            model=model,
+            reject_nonsemantic=False,
+        )
+
     _check_valid_arg(
         supported_params=supported_params or [],
     )
