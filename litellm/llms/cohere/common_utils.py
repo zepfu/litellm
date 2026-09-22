@@ -3,6 +3,9 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from litellm.llms.base_llm.base_utils import BaseLLMModelInfo
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
+from litellm.llms.cohere.chat.citation_translation import (
+    cohere_citation_provider_fields,
+)
 from litellm.types.llms.openai import AllMessageValues
 from litellm.types.utils import (
     ChatCompletionToolCallChunk,
@@ -487,7 +490,7 @@ class CohereV2ModelResponseIterator:
         if citations:
             if isinstance(citations, dict):
                 citations = [citations]
-            return {"citations": citations}
+            return cohere_citation_provider_fields(citations)
         return None
 
     def _parse_message_end(
@@ -587,11 +590,18 @@ class CohereV2ModelResponseIterator:
                     "native_finish_reason": raw_finish_reason
                 }
 
-            # Handle citations in any chunk type (fallback)
+            # Handle citations in any chunk type (fallback). Map fields only;
+            # do not copy tool-output bodies into the streamed metadata.
             if "citations" in chunk:
-                if provider_specific_fields is None:
-                    provider_specific_fields = {}
-                provider_specific_fields["citations"] = chunk["citations"]
+                mapped_citations = cohere_citation_provider_fields(
+                    chunk.get("citations")
+                )
+                if mapped_citations:
+                    if provider_specific_fields is None:
+                        provider_specific_fields = {}
+                    provider_specific_fields["citations"] = mapped_citations[
+                        "citations"
+                    ]
 
             return GenericStreamingChunk(
                 text=text,
