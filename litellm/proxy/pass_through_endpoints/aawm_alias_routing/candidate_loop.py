@@ -97,7 +97,7 @@ from .interfaces import (
 )
 from .lane_keys import (
     cohere_credential_lane_cooldown_key,
-    resolve_cohere_credential_lane_sentinel,
+    read_cohere_attempt_credential_sentinel,
 )
 from .durable import get_aawm_alias_routing_state_namespace
 from .policy import CODEX_AUTO_AGENT_OPENROUTER_PROVIDER
@@ -1078,7 +1078,18 @@ def _remember_cohere_cooldown_scope(exc: Exception, scope: str) -> None:
 
 
 def _recall_cohere_cooldown_scope(exc: Exception) -> Optional[str]:
-    scope = _cohere_cooldown_scopes.get(exc)
+    """Read a remembered scope, including exceptions that cannot be weak-referenced.
+
+    ``WeakKeyDictionary.get`` raises ``TypeError`` for ordinary ``Exception``,
+    ``ValueError``, ``TypeError``, and ``RuntimeError`` instances. The writer
+    already stores the decision as an attribute in that case.
+    """
+
+    scope: Optional[str] = None
+    try:
+        scope = _cohere_cooldown_scopes.get(exc)
+    except TypeError:
+        scope = None
     if scope not in _COHERE_COOLDOWN_SCOPE_DECISIONS:
         scope = getattr(exc, _COHERE_COOLDOWN_SCOPE_ATTR, None)
     if scope in _COHERE_COOLDOWN_SCOPE_DECISIONS:
@@ -1092,14 +1103,16 @@ def _apply_cohere_credential_cooldown_scope(
     candidate: dict[str, Any],
     scope: Optional[str],
     cooldown_seconds: float,
+    credential_sentinel: Optional[str],
 ) -> CooldownPublicationPlan:
-    """Publish key-wide Cohere failures on the credential sentinel only.
+    """Publish key-wide Cohere failures on the attempt's captured sentinel.
 
     Candidate scope keeps the model key from the existing resolver. Credential
-    scope replaces that key so one model's RPM limit cannot cool its siblings,
-    and a different credential or provider does not share the sentinel. No-scope
-    decisions publish nothing. Duration stays whatever the existing resolver
-    already computed.
+    scope replaces that key with the fingerprint captured when this attempt
+    selected its key. A later canonical key is not read here, so an in-flight
+    failure cannot cool a key that replaced it. No-scope decisions and a
+    missing fingerprint publish nothing. Duration stays whatever the existing
+    resolver already computed.
     """
 
     if scope is None or candidate.get("provider") != _CODEX_COHERE_PROVIDER:
@@ -1112,8 +1125,10 @@ def _apply_cohere_credential_cooldown_scope(
         return plan
     if scope == "none":
         return CooldownPublicationPlan(applied_scope="none", **preserved)
-    sentinel = resolve_cohere_credential_lane_sentinel()
-    cooldown_key = cohere_credential_lane_cooldown_key(candidate, sentinel)
+    cooldown_key = cohere_credential_lane_cooldown_key(
+        candidate,
+        credential_sentinel,
+    )
     duration = max(0.0, float(cooldown_seconds))
     if cooldown_key is None or duration <= 0:
         return CooldownPublicationPlan(applied_scope="none", **preserved)
@@ -6206,6 +6221,10 @@ def _resolve_failure_plan(
         candidate=candidate,
         scope=_recall_cohere_cooldown_scope(exc),
         cooldown_seconds=cooldown_seconds,
+        credential_sentinel=read_cohere_attempt_credential_sentinel(
+            exc,
+            request,
+        ),
     )
     if getattr(plan, "applied_scope", "none") != "none":
         attempt_record["cooldown_seconds"] = round(

@@ -9,18 +9,21 @@ import TabItem from '@theme/TabItem';
 Direct Cohere alias failures use one explicit cooldown scope:
 
 - **Credential** — authentication (HTTP 401/403), billing exhaustion (HTTP 402),
-  and monthly quota failures. Models that share the canonical `COHERE_API_KEY`
-  share this cooldown.
+  and monthly quota exhaustion. A 429 that only mentions a trial, including
+  "free trial", "trial limit", or "trial usage" together with a per-minute rate
+  limit, stays candidate-scoped.
 - **Candidate** — per-model limits such as RPM, plus model-unavailable and
   ordinary provider failures. One model's RPM limit does not cool its siblings.
 - **None** — request validation and cancellation. These do not publish a cooldown.
 
-The credential sentinel is `cohere:credential:` plus a 12-hex SHA-256
-fingerprint of the key. Shared cooldown is stored as
-`cohere:__credential__:<sentinel>` in the existing memory and durable cooldown
-stores. A different key, a missing key, or another provider does not join that
-cooldown. The fingerprint is one-way; raw credentials are not stored or logged.
-Cooldown duration stays with the existing store.
+The attempt fingerprints the key it selected: `cohere:credential:` plus a
+12-hex SHA-256 digest. Failure publication stores
+`cohere:__credential__:<sentinel>` for that fingerprint in the existing memory
+and durable cooldown stores. It does not substitute the canonical key later, so
+a replacement key stays eligible. A different key, a missing key, or another
+provider does not join that cooldown. The fingerprint is one-way; raw
+credentials are not stored or logged. Cooldown duration stays with the existing
+store.
 
 ## API KEYS
 

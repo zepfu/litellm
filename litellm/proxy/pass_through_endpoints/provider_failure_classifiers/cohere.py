@@ -24,15 +24,11 @@ COHERE_API_HOSTS: frozenset[str] = frozenset(
 _COHERE_CHAT_V2_PATH = "/v2/chat"
 _COHERE_CODEX_ROUTE_FAMILY = "codex_cohere_chat_completions_adapter"
 
-_MONTHLY_TRIAL_MARKERS: tuple[str, ...] = (
+_MONTHLY_QUOTA_MARKERS: tuple[str, ...] = (
     "monthly trial",
     "trial monthly",
     "monthly limit",
-    "trial limit",
-    "trial quota",
     "monthly quota",
-    "trial usage",
-    "free trial",
 )
 _COHERE_MODEL_TOKEN = r"""['"]?(?P<model>[^\s,'";]+)['"]?"""
 _COHERE_MODEL_UNAVAILABLE_MESSAGE_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -343,6 +339,17 @@ def _cohere_classification(
     )
 
 
+def _cohere_text_has_monthly_quota_exhaustion(text: str) -> bool:
+    """Credential scope requires monthly quota evidence, not a trial mention.
+
+    "free trial", "trial limit", and "trial usage" alongside a per-minute rate
+    limit stay on the candidate RPM path. A message that actually reports
+    monthly exhaustion remains credential-scoped.
+    """
+
+    return any(marker in text for marker in _MONTHLY_QUOTA_MARKERS)
+
+
 def classify_cohere_failure(
     *,
     url: Optional[httpx.URL],
@@ -358,9 +365,10 @@ def classify_cohere_failure(
     """Classify only direct Cohere failures, never OpenRouter-hosted Cohere.
 
     Scope is one explicit decision: ``credential`` for authentication, billing,
-    and monthly quota; ``candidate`` for model-scoped failures such as RPM;
-    ``none`` for validation and cancellation. ``explicit_cooldown_scope`` may
-    select one of those three decisions directly.
+    and monthly quota exhaustion; ``candidate`` for model-scoped failures such
+    as RPM; ``none`` for validation and cancellation. A trial mention is not
+    monthly evidence. ``explicit_cooldown_scope`` may select one of those three
+    decisions directly.
     """
 
     provider = str(custom_llm_provider or "").strip().lower()
@@ -391,7 +399,7 @@ def classify_cohere_failure(
             log_error_summary="Cohere billing capacity is exhausted",
             explicit_cooldown_scope=explicit_cooldown_scope,
         )
-    if status_code == 429 and any(marker in text for marker in _MONTHLY_TRIAL_MARKERS):
+    if status_code == 429 and _cohere_text_has_monthly_quota_exhaustion(text):
         return _cohere_classification(
             name="cohere_monthly_trial_exhausted",
             failure_class="quota_exhausted",

@@ -1893,9 +1893,12 @@ async def _apply_cohere_credential_lane_cooldown(
 ) -> tuple[float, Optional[str], Optional[str], Optional[str]]:
     """Suppress sibling Cohere models that share one hashed credential sentinel.
 
-    Reads the existing alias cooldown store. A missing fingerprint, a different
-    credential, or a non-Cohere candidate does not inherit the cooldown. RPM
-    remains on the model key and is not consulted here.
+    Reads the existing alias cooldown store for the key that would be used now.
+    Publication of an in-flight failure uses the fingerprint captured when that
+    attempt selected its key, so a replacement key stays eligible here. A
+    missing fingerprint, a different credential, or a non-Cohere candidate does
+    not inherit the cooldown. RPM remains on the model key and is not consulted
+    here.
     """
 
     if candidate.get("provider") != "cohere":
