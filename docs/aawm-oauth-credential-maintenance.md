@@ -70,9 +70,17 @@ LiteLLM is a **read-only consumer** of these files during request handling. It
 selects a still-valid access token (or fails the candidate with a clear
 refresh-required message). It must not refresh, seed, or rewrite these
 credentials on the request path. Direct Nous inference reads
-`providers.nous` then `credential_pool.nous` from
-`LITELLM_NOUS_OAUTH_AUTH_FILE`, else `LITELLM_HERMES_AUTH_FILE`, else
-`AAWM_HERMES_AUTH_FILE`, else `~/.hermes/auth.json`.
+`providers.nous` then `credential_pool.nous`. Request loading, refresh
+defaults, sidecar configuration, and passive health share one auth file.
+Precedence is an explicit non-default path, then
+`AAWM_NOUS_OAUTH_AUTH_FILE`, `LITELLM_NOUS_OAUTH_AUTH_FILE`,
+`LITELLM_HERMES_AUTH_FILE`, `AAWM_HERMES_AUTH_FILE`, else
+`~/.hermes/auth.json`. A blank value falls through. Request loading expands
+that selection immediately. Sidecar refresh and passive health expand the
+same file at use and keep the portable `~/.hermes/auth.json` string when the
+default file is selected. When an older request or sidecar order would open
+a different file, the process logs the winning source and the legacy source
+labels only.
 
 ### Native Grok OIDC request snapshots
 

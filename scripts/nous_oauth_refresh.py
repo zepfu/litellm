@@ -4,6 +4,7 @@
 Sidecar-only writer. LiteLLM request handling must never import this to mutate
 ``~/.hermes/auth.json``. Lock path follows Hermes-native
 ``Path.with_suffix(".lock")`` (``auth.json`` -> ``auth.lock``).
+Auth-file selection uses the shared Hermes Nous resolver.
 """
 
 from __future__ import annotations
@@ -32,6 +33,9 @@ from litellm.secret_managers.credential_file_metadata import (
     snapshot_credential_file_metadata,
 )
 from litellm.secret_managers.credential_file_write import write_and_publish_private_text
+from litellm.secret_managers.hermes_nous_auth import (
+    resolve_hermes_nous_auth_resolution,
+)
 
 # Portable ~ defaults (expanded via Path.expanduser at use sites).
 DEFAULT_NOUS_OAUTH_AUTH_FILE = "~/.hermes/auth.json"
@@ -48,6 +52,17 @@ DEFAULT_NOUS_OAUTH_AUTH_FILE_MODE = 0o600
 DEFAULT_NOUS_OAUTH_FORCE_REFRESH = False
 DEFAULT_NOUS_OAUTH_ERROR_MESSAGE_LIMIT = 500
 NOUS_REFRESH_TOKEN_HEADER = "x-nous-refresh-token"
+
+
+def resolve_nous_oauth_auth_path(
+    explicit_auth_file: str | Path | None = None,
+) -> tuple[str, str]:
+    """Return the shared Nous auth path and source label."""
+
+    resolution = resolve_hermes_nous_auth_resolution(explicit_auth_file)
+    return resolution.path, resolution.source
+
+
 _SECRET_FIELD_NAMES = DEFAULT_SECRET_FIELD_NAMES
 _TOKEN_PATH = "/api/oauth/token"
 _LIFETIME_SOURCE_FIELD = "expires_in_source"
