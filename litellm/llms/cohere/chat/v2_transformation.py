@@ -88,7 +88,9 @@ def resolve_cohere_nonstream_finish_reason(
             "finish_reason": map_finish_reason(token),
             "native_finish_reason": token,
         }
-    return {**outcome, "native_finish_reason": token}
+    resolved = deepcopy(outcome)
+    resolved["native_finish_reason"] = token
+    return resolved
 
 
 def apply_cohere_nonstream_finish_reason(
