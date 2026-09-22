@@ -182,6 +182,22 @@ def _restore_adapted_custom_tool_calls_in_response_body(
     return restored_body, restored_count, None
 
 
+def _explicit_cohere_v2_namespace_function_map(
+    request_body: dict[str, Any],
+) -> dict[str, str]:
+    metadata = request_body.get("litellm_metadata")
+    if not isinstance(metadata, dict):
+        return {}
+    raw_map = metadata.get("cohere_v2_namespace_function_map")
+    if not isinstance(raw_map, dict):
+        return {}
+    return {
+        name: namespace
+        for name, namespace in raw_map.items()
+        if isinstance(name, str) and name and isinstance(namespace, str) and namespace
+    }
+
+
 def _advertised_namespace_tool_function_adapter_map(
     request_body: Optional[dict[str, Any]],
     *,
@@ -190,19 +206,21 @@ def _advertised_namespace_tool_function_adapter_map(
     if not isinstance(request_body, dict):
         return {}
 
+    explicit_map = _explicit_cohere_v2_namespace_function_map(request_body)
     adapter_names = _get_namespace_tool_function_adapter_names_for_model(adapter_model)  # noqa: F821
     if not adapter_names:
-        return {}
+        return explicit_map
 
     _, adapted_tools, _ = _adapt_codex_namespace_tool_definitions(  # noqa: F821
         request_body.get("tools"),
         adapter_names=adapter_names,
     )
-    return {
+    allowlist_map = {
         str(item["name"]): str(item["namespace"])
         for item in adapted_tools
         if isinstance(item.get("name"), str) and isinstance(item.get("namespace"), str)
     }
+    return {**allowlist_map, **explicit_map}
 
 
 def _advertised_namespace_tool_argument_schemas(
