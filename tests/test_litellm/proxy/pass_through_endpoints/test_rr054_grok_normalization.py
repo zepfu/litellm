@@ -316,3 +316,4 @@ def test_grok_passthrough_unwraps_wrapped_encrypted_reasoning_for_grok_47() -> N
     assert reasoning["type"] == "reasoning"
     assert reasoning["encrypted_content"] == native_ciphertext
     assert not str(reasoning["encrypted_content"]).startswith("aawm_erp:")
+    assert "aawm_encrypted_reasoning_provenance" not in reasoning

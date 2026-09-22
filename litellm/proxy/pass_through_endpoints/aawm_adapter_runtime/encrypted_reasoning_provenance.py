@@ -383,7 +383,7 @@ def unwrap_encrypted_content_wrappers(encrypted_content: str) -> str:
 
 
 def unwrap_encrypted_content_wrappers_in_place(container: Any) -> None:
-    """Restore native ciphertext on nested ``encrypted_content`` fields."""
+    """Restore native ciphertext and drop provenance sidecars before xAI egress."""
 
     if isinstance(container, dict):
         encrypted = container.get("encrypted_content")
@@ -391,6 +391,8 @@ def unwrap_encrypted_content_wrappers_in_place(container: Any) -> None:
             container["encrypted_content"] = unwrap_encrypted_content_wrappers(
                 encrypted
             )
+        container.pop(PROVENANCE_ITEM_FIELD, None)
+        container.pop(ROUTE_IDENTITY_FIELD, None)
         for nested in container.values():
             unwrap_encrypted_content_wrappers_in_place(nested)
         return
