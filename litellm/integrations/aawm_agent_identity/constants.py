@@ -100,6 +100,7 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "route_family",
     "auth_mode",
     "credential_family",
+    "provider_account_hash",
     "xai_oauth_managed",
     "xai_oauth_public_model",
     "xai_oauth_upstream_model",

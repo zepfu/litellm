@@ -7,9 +7,11 @@ into the host module while retaining live monkeypatch lookups.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -68,6 +70,7 @@ _HOST_FUNCTION_NAMES = (
     "_load_opencode_zen_api_key_for_candidate",
     "_build_opencode_zen_headers",
     "_add_opencode_zen_logging_metadata",
+    "_assign_selected_zen_provider_account_hash",
     "_get_anthropic_opencode_zen_normalization_runtime",
     "_get_opencode_zen_responses_tool_name",
     "_ordered_unique_str_values",
@@ -197,6 +200,67 @@ def install(host_globals: dict[str, Any]) -> None:
     )
     for name in _HOST_FUNCTION_NAMES:
         host_globals[name] = globals()[name]
+
+
+_OPENCODE_PROVIDER_ACCOUNT_HASH_DOMAIN = "aawm-opencode-provider-account-v1"
+_OPENCODE_PROVIDER_ACCOUNT_NAMESPACES = frozenset(
+    {
+        _constants._OPENCODE_ZEN_CREDENTIAL_FAMILY,
+        _constants._OPENCODE_GO_CREDENTIAL_FAMILY,
+    }
+)
+_selected_zen_provider_account_hash: ContextVar[Optional[str]] = ContextVar(
+    "aawm_selected_zen_provider_account_hash",
+    default=None,
+)
+
+
+def derive_opencode_provider_account_hash(secret: str, *, namespace: str) -> str:
+    """Return a collision-resistant fingerprint of one selected OpenCode credential.
+
+    Zen and Go are distinct namespaces, so the same secret fingerprints
+    differently for each family. The raw credential is the preimage only.
+    """
+
+    cleaned_namespace = str(namespace or "").strip().casefold()
+    if cleaned_namespace not in _OPENCODE_PROVIDER_ACCOUNT_NAMESPACES:
+        raise ValueError("OpenCode provider-account namespace is not recognized")
+    if not isinstance(secret, str) or not secret:
+        raise ValueError(
+            "OpenCode provider-account hash requires the selected credential"
+        )
+    material = "\0".join(
+        (
+            _OPENCODE_PROVIDER_ACCOUNT_HASH_DOMAIN,
+            cleaned_namespace,
+            secret,
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _remember_selected_zen_provider_account_hash(api_key: str) -> str:
+    digest = derive_opencode_provider_account_hash(
+        api_key,
+        namespace=_constants._OPENCODE_ZEN_CREDENTIAL_FAMILY,
+    )
+    _selected_zen_provider_account_hash.set(digest)
+    return digest
+
+
+def _assign_selected_zen_provider_account_hash(*metadata_targets: Any) -> Optional[str]:
+    """Copy the selected Zen fingerprint onto metadata without touching caller identity."""
+
+    digest = _selected_zen_provider_account_hash.get()
+    if not isinstance(digest, str) or not digest:
+        return None
+    stamped = False
+    for metadata in metadata_targets:
+        if not isinstance(metadata, dict):
+            continue
+        metadata["provider_account_hash"] = digest
+        stamped = True
+    return digest if stamped else None
 
 
 def _clean_secret_string(value: Optional[str]) -> Optional[str]:
@@ -417,19 +481,26 @@ async def _load_opencode_zen_api_key_for_candidate(
 ) -> str:
     runtime = _require_runtime()
     normalized_family = str(source_family or "").strip().casefold()
+    if normalized_family != _constants._OPENCODE_GO_CREDENTIAL_FAMILY:
+        _selected_zen_provider_account_hash.set(None)
     try:
         if normalized_family == _constants._OPENCODE_GO_CREDENTIAL_FAMILY:
             return await _load_local_opencode_go_api_key()
         load_api_key = runtime.load_local_api_key
         if load_api_key is not None:
-            return await load_api_key()
-        return await _load_local_opencode_zen_api_key()
+            api_key = await load_api_key()
+        else:
+            api_key = await _load_local_opencode_zen_api_key()
     except (FileNotFoundError, ValueError) as exc:
         if use_alias_candidate_probe:
             if runtime.raise_candidate_unavailable is not None:
                 runtime.raise_candidate_unavailable(exc)
             _common_raise_opencode_zen_unavailable(exc)
         raise
+    else:
+        if isinstance(api_key, str) and api_key:
+            _remember_selected_zen_provider_account_hash(api_key)
+        return api_key
 
 
 async def _build_opencode_zen_headers(

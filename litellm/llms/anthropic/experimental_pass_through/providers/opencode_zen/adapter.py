@@ -42,6 +42,21 @@ class Runtime:
     completion_provider: str
 
 
+def _bind_selected_zen_provider_account_hash(metadata: Any) -> None:
+    """Stamp the fingerprint selected by the Zen credential loader.
+
+    Imported lazily because the Zen package initializer loads this module
+    while the proxy runtime module is still importing.
+    """
+
+    from litellm.proxy.pass_through_endpoints.providers.opencode_zen.runtime import (
+        _assign_selected_zen_provider_account_hash,
+    )
+
+    if isinstance(metadata, dict):
+        _assign_selected_zen_provider_account_hash(metadata)
+
+
 def _raise_translated_opencode_zen_failure(
     exc: Exception,
     *,
@@ -121,6 +136,9 @@ async def prepare_responses_route(
         request,
         use_alias_candidate_probe=use_alias_candidate_probe,
     )
+    _bind_selected_zen_provider_account_hash(
+        translated_request_body.get("litellm_metadata")
+    )
 
     def handle_exception(exc: Exception) -> None:
         _raise_translated_opencode_zen_failure(
@@ -185,6 +203,9 @@ async def prepare_completion_route(
     )
     api_key = await runtime.load_api_key(
         use_alias_candidate_probe=use_alias_candidate_probe
+    )
+    _bind_selected_zen_provider_account_hash(
+        prepared_request_body.get("litellm_metadata")
     )
     custom_headers = runtime.assemble_headers(api_key=api_key, request=request)
     runtime.validate_egress(

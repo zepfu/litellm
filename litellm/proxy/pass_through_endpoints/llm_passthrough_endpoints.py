@@ -4247,10 +4247,16 @@ async def opencode_zen_proxy_route(
                 passthrough_logging_metadata = dict(custom_metadata)
 
     _annotate_request_scope_for_adapted_access_log(request, httpx.URL(target_url))
+    custom_headers = await _build_opencode_zen_headers(request)
+    _assign_selected_zen_provider_account_hash(passthrough_logging_metadata)
+    if isinstance(custom_body, dict):
+        body_metadata = custom_body.get("litellm_metadata")
+        if isinstance(body_metadata, dict):
+            _assign_selected_zen_provider_account_hash(body_metadata)
     return await pass_through_request(
         request=request,
         target=target_url,
-        custom_headers=await _build_opencode_zen_headers(request),
+        custom_headers=custom_headers,
         user_api_key_dict=user_api_key_dict,
         custom_body=custom_body,
         forward_headers=False,
