@@ -2,6 +2,7 @@
 Handles transforming from Responses API -> LiteLLM completion  (Chat Completion API)
 """
 
+import re
 import time
 from collections.abc import Sequence
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union, cast
@@ -65,6 +66,14 @@ from litellm.types.utils import (
 
 ########### Initialize Classes used for Responses API  ###########
 TOOL_CALLS_CACHE = InMemoryCache()
+
+# Safe provider finish tokens only. Free-form provider text must not reach errors.
+_SAFE_PROVIDER_FINISH_REASON = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_PROVIDER_FAILURE_FINISH_REASONS = frozenset({"ERROR", "TIMEOUT"})
+_CHAT_FAILURE_FINISH_REASONS = frozenset({"error", "timeout"})
+_COMPLETED_PROVIDER_FINISH_REASONS = frozenset(
+    {"COMPLETE", "STOP_SEQUENCE", "TOOL_CALL"}
+)
 
 
 class ChatCompletionSession(TypedDict, total=False):
@@ -1512,6 +1521,37 @@ class LiteLLMCompletionResponsesConfig:
         return responses_tools
 
     @staticmethod
+    def _safe_provider_finish_reason(raw_finish_reason: Any) -> Optional[str]:
+        """Return an uppercase provider finish token, or None when it is unsafe."""
+        if not isinstance(raw_finish_reason, str):
+            return None
+        token = raw_finish_reason.strip().upper()
+        if not _SAFE_PROVIDER_FINISH_REASON.fullmatch(token):
+            return None
+        return token
+
+    @staticmethod
+    def _native_finish_reason_from_choices(
+        choices: List[Choices],
+    ) -> Optional[str]:
+        if not choices:
+            return None
+        fields = getattr(choices[0], "provider_specific_fields", None)
+        if not isinstance(fields, dict):
+            return None
+        return LiteLLMCompletionResponsesConfig._safe_provider_finish_reason(
+            fields.get("native_finish_reason")
+        )
+
+    @staticmethod
+    def _provider_failure_error(reason: str) -> Dict[str, str]:
+        """Error details that name only an allowlisted finish token."""
+        return {
+            "code": "server_error",
+            "message": f"Provider generation ended with {reason}",
+        }
+
+    @staticmethod
     def _map_chat_completion_finish_reason_to_responses_status(
         finish_reason: Optional[str],
     ) -> ResponsesAPIStatus:
@@ -1519,6 +1559,7 @@ class LiteLLMCompletionResponsesConfig:
         Map chat completion finish_reason to responses API status.
 
         Chat completion finish_reason values include: "stop", "length", "tool_calls", "content_filter", "function_call"
+        Provider failures use "error" and "timeout" and must not become a normal stop.
         Responses API status values are: "completed", "failed", "in_progress", "cancelled", "queued", "incomplete"
 
         Args:
@@ -1535,9 +1576,84 @@ class LiteLLMCompletionResponsesConfig:
             return "completed"
         elif finish_reason in ["length", "content_filter"]:
             return "incomplete"
+        elif finish_reason in _CHAT_FAILURE_FINISH_REASONS:
+            return "failed"
         else:
             # Default to completed for unknown finish reasons
             return "completed"
+
+    @staticmethod
+    def _map_finish_reason_to_output_item_status(
+        finish_reason: Optional[str],
+    ) -> Literal["in_progress", "completed", "incomplete"]:
+        """Reasoning items only accept completed, incomplete, or in_progress."""
+        status = LiteLLMCompletionResponsesConfig._map_chat_completion_finish_reason_to_responses_status(
+            finish_reason
+        )
+        if status == "completed" or status == "in_progress":
+            return status
+        return "incomplete"
+
+    @staticmethod
+    def _resolve_responses_terminal_state(
+        finish_reason: Optional[str],
+        native_finish_reason: Optional[str],
+        incomplete_details: Any,
+        error: Any,
+    ) -> Tuple[ResponsesAPIStatus, Any, Any]:
+        """Resolve Responses status plus incomplete/error details.
+
+        Provider ERROR/TIMEOUT stay failed even when an earlier chat mapping
+        rewrote the OpenAI finish_reason to stop.
+        """
+        if (
+            native_finish_reason in _PROVIDER_FAILURE_FINISH_REASONS
+            or finish_reason in _CHAT_FAILURE_FINISH_REASONS
+        ):
+            if native_finish_reason in _PROVIDER_FAILURE_FINISH_REASONS:
+                reason = native_finish_reason
+            elif finish_reason == "timeout":
+                reason = "TIMEOUT"
+            else:
+                reason = "ERROR"
+            return (
+                "failed",
+                None,
+                LiteLLMCompletionResponsesConfig._provider_failure_error(reason),
+            )
+
+        if native_finish_reason == "MAX_TOKENS" or finish_reason == "length":
+            details = incomplete_details or {"reason": "max_output_tokens"}
+            return "incomplete", details, None
+
+        if finish_reason == "content_filter":
+            details = incomplete_details or {"reason": "content_filter"}
+            return "incomplete", details, None
+
+        if (
+            finish_reason
+            in {
+                "stop",
+                "tool_calls",
+                "function_call",
+                None,
+            }
+            or native_finish_reason in _COMPLETED_PROVIDER_FINISH_REASONS
+        ):
+            return "completed", incomplete_details, error
+
+        mapped = LiteLLMCompletionResponsesConfig._map_chat_completion_finish_reason_to_responses_status(
+            finish_reason
+        )
+        if mapped == "failed":
+            return (
+                "failed",
+                None,
+                LiteLLMCompletionResponsesConfig._provider_failure_error("ERROR"),
+            )
+        if mapped == "incomplete":
+            return mapped, incomplete_details, None
+        return "completed", incomplete_details, error
 
     @staticmethod
     def convert_response_function_tool_call_to_chat_completion_tool_call(
@@ -1704,6 +1820,21 @@ class LiteLLMCompletionResponsesConfig:
         choices: List[Choices] = getattr(chat_completion_response, "choices", [])
         if choices and len(choices) > 0:
             finish_reason = choices[0].finish_reason
+        native_finish_reason = (
+            LiteLLMCompletionResponsesConfig._native_finish_reason_from_choices(choices)
+        )
+        (
+            responses_status,
+            incomplete_details,
+            response_error,
+        ) = LiteLLMCompletionResponsesConfig._resolve_responses_terminal_state(
+            finish_reason=finish_reason,
+            native_finish_reason=native_finish_reason,
+            incomplete_details=getattr(
+                chat_completion_response, "incomplete_details", None
+            ),
+            error=getattr(chat_completion_response, "error", None),
+        )
 
         responses_api_response: ResponsesAPIResponse = ResponsesAPIResponse(
             id=getattr(chat_completion_response, "id", None)
@@ -1716,10 +1847,8 @@ class LiteLLMCompletionResponsesConfig:
                 if getattr(chat_completion_response, "object", None) == "response"
                 else "response"
             ),
-            error=getattr(chat_completion_response, "error", None),
-            incomplete_details=getattr(
-                chat_completion_response, "incomplete_details", None
-            ),
+            error=response_error,
+            incomplete_details=incomplete_details,
             instructions=getattr(chat_completion_response, "instructions", None),
             metadata=getattr(chat_completion_response, "metadata", {}),
             output=LiteLLMCompletionResponsesConfig._transform_chat_completion_choices_to_responses_output(
@@ -1740,9 +1869,7 @@ class LiteLLMCompletionResponsesConfig:
                 chat_completion_response, "previous_response_id", None
             ),
             reasoning=None,
-            status=LiteLLMCompletionResponsesConfig._map_chat_completion_finish_reason_to_responses_status(
-                finish_reason
-            ),
+            status=responses_status,
             text={},
             truncation=getattr(chat_completion_response, "truncation", None),
             usage=LiteLLMCompletionResponsesConfig._transform_chat_completion_usage_to_responses_usage(
@@ -1750,9 +1877,22 @@ class LiteLLMCompletionResponsesConfig:
             ),
             user=getattr(chat_completion_response, "user", None),
         )
-        responses_api_response._hidden_params = getattr(
-            chat_completion_response, "_hidden_params", {}
-        )
+        hidden_params = getattr(chat_completion_response, "_hidden_params", None)
+        if isinstance(hidden_params, dict):
+            hidden_params = dict(hidden_params)
+        else:
+            hidden_params = {}
+        if native_finish_reason:
+            existing_provider_fields = hidden_params.get("provider_specific_fields")
+            if isinstance(existing_provider_fields, dict):
+                provider_fields = {
+                    **existing_provider_fields,
+                    "native_finish_reason": native_finish_reason,
+                }
+            else:
+                provider_fields = {"native_finish_reason": native_finish_reason}
+            hidden_params["provider_specific_fields"] = provider_fields
+        responses_api_response._hidden_params = hidden_params
 
         # Surface provider-specific fields (generic passthrough from any provider)
         provider_fields = responses_api_response._hidden_params.get(
@@ -2022,11 +2162,8 @@ class LiteLLMCompletionResponsesConfig:
                         ResponseReasoningItem(
                             type="reasoning",
                             id=f"rs_{hash(str(message.reasoning_content))}",
-                            status=cast(
-                                Literal["in_progress", "completed", "incomplete"],
-                                LiteLLMCompletionResponsesConfig._map_chat_completion_finish_reason_to_responses_status(
-                                    choice.finish_reason
-                                ),
+                            status=LiteLLMCompletionResponsesConfig._map_finish_reason_to_output_item_status(
+                                choice.finish_reason
                             ),
                             summary=[
                                 {
