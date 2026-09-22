@@ -8114,6 +8114,7 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
     terminal_response: Optional[dict[str, Any]] = None
     terminal_event_type: Optional[str] = None
     terminal_seen = False
+    frozen_precommit_action: Optional[str] = None
     held_chunks: list[Any] = []
     held_bytes = 0
     empty_success_body = {
@@ -8187,6 +8188,8 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
         )
 
     def _apply_terminal_policy(*, raise_errors: bool) -> None:
+        if state.get("complete"):
+            return
         body = terminal_response
         if body is None:
             _mark_invalid("missing_terminal_response")
@@ -8266,76 +8269,80 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
         nonlocal saw_substantive, saw_content, saw_failed, first_error_payload
         nonlocal terminal_response, terminal_event_type, terminal_seen
         nonlocal complete_frame_count
+        if frozen_precommit_action in {"fail", "fail_empty"}:
+            return
         complete_frame_count += 1
-        frame_bytes = (event_block + "\n\n").encode("utf-8")
-        (
-            decision,
-            error_payload,
-            inspected_event_type,
-        ) = PassThroughStreamingHandler._inspect_responses_pre_commit_chunks(
-            [frame_bytes]
-        )
-        if decision == "substantive":
-            saw_substantive = True
-            if inspected_event_type not in {"response.completed", "response.done"}:
-                saw_content = True
-        elif decision == "failed":
-            saw_failed = True
-            if first_error_payload is None and isinstance(error_payload, dict):
-                first_error_payload = error_payload
-        event_name: Optional[str] = None
-        data_lines: list[str] = []
-        for line in event_block.splitlines():
-            if line.startswith("event:"):
-                event_name = line.partition(":")[2].strip() or None
-            elif line.startswith("data:"):
-                data_lines.append(line.partition(":")[2].lstrip())
-        if not data_lines:
-            return
-        data_text = "\n".join(data_lines).strip()
-        if not data_text or data_text == "[DONE]":
-            return
         try:
-            payload = json.loads(data_text)
-        except Exception:  # noqa: BLE001
-            return
-        if not isinstance(payload, dict):
-            return
-        payload_type = payload.get("type")
-        event_type = payload_type if isinstance(payload_type, str) else event_name
-        if not isinstance(event_type, str) or not event_type.strip():
-            return
-        if len(event_summaries) < 50:
-            event_summaries.append({"type": event_type})
-        if event_type not in {
-            "response.completed",
-            "response.done",
-            "response.failed",
-            "response.incomplete",
-        }:
-            return
-        if terminal_seen:
-            if committed:
+            frame_bytes = (event_block + "\n\n").encode("utf-8")
+            (
+                decision,
+                error_payload,
+                inspected_event_type,
+            ) = PassThroughStreamingHandler._inspect_responses_pre_commit_chunks(
+                [frame_bytes]
+            )
+            if decision == "substantive":
+                saw_substantive = True
+                if inspected_event_type not in {"response.completed", "response.done"}:
+                    saw_content = True
+            elif decision == "failed":
+                saw_failed = True
+                if first_error_payload is None and isinstance(error_payload, dict):
+                    first_error_payload = error_payload
+            event_name: Optional[str] = None
+            data_lines: list[str] = []
+            for line in event_block.splitlines():
+                if line.startswith("event:"):
+                    event_name = line.partition(":")[2].strip() or None
+                elif line.startswith("data:"):
+                    data_lines.append(line.partition(":")[2].lstrip())
+            if not data_lines:
+                return
+            data_text = "\n".join(data_lines).strip()
+            if not data_text or data_text == "[DONE]":
+                return
+            try:
+                payload = json.loads(data_text)
+            except Exception:  # noqa: BLE001
+                return
+            if not isinstance(payload, dict):
+                return
+            payload_type = payload.get("type")
+            event_type = payload_type if isinstance(payload_type, str) else event_name
+            if not isinstance(event_type, str) or not event_type.strip():
+                return
+            if len(event_summaries) < 50:
+                event_summaries.append({"type": event_type})
+            if event_type not in {
+                "response.completed",
+                "response.done",
+                "response.failed",
+                "response.incomplete",
+            }:
+                return
+            if terminal_seen:
                 _mark_invalid("event_after_terminal")
-            return
-        terminal_event_type = event_type
-        terminal_seen = True
-        response_payload = payload.get("response")
-        terminal_response = (
-            response_payload if isinstance(response_payload, dict) else None
-        )
-        _set_state(
-            terminal_seen=True,
-            terminal_status=(
-                terminal_response.get("status")
-                if isinstance(terminal_response, dict)
-                else None
-            ),
-        )
+                return
+            terminal_event_type = event_type
+            terminal_seen = True
+            response_payload = payload.get("response")
+            terminal_response = (
+                response_payload if isinstance(response_payload, dict) else None
+            )
+            _set_state(
+                terminal_seen=True,
+                terminal_status=(
+                    terminal_response.get("status")
+                    if isinstance(terminal_response, dict)
+                    else None
+                ),
+            )
+        finally:
+            _note_precommit_frame_boundary()
 
     def _consume_sse_text(text: str, *, final: bool = False) -> None:
         nonlocal parser_buffer, trailing_cr
-        if decoder_failed:
+        if decoder_failed or frozen_precommit_action in {"fail", "fail_empty"}:
             return
         if trailing_cr:
             text = f"\r{text}"
@@ -8354,7 +8361,14 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
             event_block = pending[:delimiter_index]
             pending = pending[delimiter_index + 2 :]
             _capture_complete_frame(event_block)
+            if frozen_precommit_action in {"fail", "fail_empty"}:
+                parser_buffer = ""
+                pending = ""
+                break
         if not final:
+            return
+        if frozen_precommit_action in {"fail", "fail_empty"}:
+            parser_buffer = ""
             return
         if trailing_cr:
             parser_buffer += "\n"
@@ -8382,7 +8396,7 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
     def _feed_chunk(raw_chunk: Any) -> None:
         _consume_sse_text(_decode_chunk_text(raw_chunk))
 
-    def _precommit_action() -> str:
+    def _compute_precommit_action() -> str:
         if decoder_failed:
             return "fail_empty"
         if saw_failed and not saw_content:
@@ -8395,6 +8409,19 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
             return "commit"
         return "hold"
 
+    def _note_precommit_frame_boundary() -> None:
+        nonlocal frozen_precommit_action
+        if committed or frozen_precommit_action is not None:
+            return
+        action = _compute_precommit_action()
+        if action != "hold":
+            frozen_precommit_action = action
+
+    def _precommit_action() -> str:
+        if frozen_precommit_action is not None:
+            return frozen_precommit_action
+        return _compute_precommit_action()
+
     def _run_precommit_action(action: str) -> str:
         if action == "hold":
             return "hold"
@@ -8404,10 +8431,11 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
         if action == "fail":
             _raise_precommit_failure()
             raise AssertionError("unreachable")
-        if terminal_seen and not saw_content:
-            _apply_terminal_policy(raise_errors=True)
-        elif terminal_seen:
-            _apply_terminal_policy(raise_errors=False)
+        if not state.get("complete"):
+            if terminal_seen and not saw_content:
+                _apply_terminal_policy(raise_errors=True)
+            elif terminal_seen:
+                _apply_terminal_policy(raise_errors=False)
         return "commit"
 
     _set_state()
@@ -8447,7 +8475,7 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
                 for held in held_chunks:
                     yield _stamp(held)
                 held_chunks.clear()
-            elif terminal_seen and not state.get("complete"):
+            if terminal_seen and not state.get("complete"):
                 _apply_terminal_policy(raise_errors=False)
             elif not state.get("complete"):
                 _mark_invalid("stream_closed_before_validation")
