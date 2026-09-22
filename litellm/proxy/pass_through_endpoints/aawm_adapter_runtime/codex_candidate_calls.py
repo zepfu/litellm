@@ -6618,6 +6618,10 @@ async def _prepare_codex_cohere_chat_completions_adapter_route(
     from litellm.proxy.pass_through_endpoints.providers.cohere import (
         runtime as _cohere_runtime,
     )
+    from litellm.llms.cohere.chat.v2_transformation import (
+        COHERE_V2_NAMESPACE_FUNCTION_MAP_KEY,
+        translate_cohere_v2_responses_request,
+    )
     from litellm.responses.litellm_completion_transformation.transformation import (
         LiteLLMCompletionResponsesConfig,
     )
@@ -6627,6 +6631,16 @@ async def _prepare_codex_cohere_chat_completions_adapter_route(
             prepared_request_body
         )
     )
+    adapted_request_body, namespace_by_name = translate_cohere_v2_responses_request(
+        adapted_request_body
+    )
+    if namespace_by_name:
+        # Validation restores namespace identity from the original attempt body.
+        original_metadata = dict(prepared_request_body.get("litellm_metadata") or {})
+        original_metadata[COHERE_V2_NAMESPACE_FUNCTION_MAP_KEY] = dict(
+            namespace_by_name
+        )
+        prepared_request_body["litellm_metadata"] = original_metadata
     adapted_request_body, _adapted_namespace_tools = (
         _adapt_codex_namespace_tools_to_functions_from_request_body(
             adapted_request_body
