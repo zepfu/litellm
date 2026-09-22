@@ -9267,6 +9267,7 @@ def _prepare_opencode_zen_known_free_logging(
     *,
     completion_call_kwargs: dict[str, Any],
     is_known_free_direct: bool,
+    stamp_response_cost: bool = True,
 ) -> dict[str, Any]:
     if not is_known_free_direct:
         return completion_call_kwargs
@@ -9284,7 +9285,8 @@ def _prepare_opencode_zen_known_free_logging(
         start_time=datetime.datetime.now(),
         **completion_call_kwargs,
     )
-    logging_obj.model_call_details["response_cost"] = 0.0
+    if stamp_response_cost:
+        logging_obj.model_call_details["response_cost"] = 0.0
     completion_call_kwargs["litellm_logging_obj"] = logging_obj
     return completion_call_kwargs
 
