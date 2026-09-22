@@ -307,7 +307,7 @@ class ZAICodingPlanChatConfig(OpenAIGPTConfig):
         api_key: Optional[str] = None,
         api_base: Optional[str] = None,
     ) -> dict:
-        _ = headers, messages, optional_params, api_key
+        _ = headers, messages, api_key
         self._model_id(model)
         self._validate_api_base(api_base)
         managed_key = self._get_canonical_api_key()
@@ -317,6 +317,7 @@ class ZAICodingPlanChatConfig(OpenAIGPTConfig):
                 contract,
                 api_key=managed_key,
                 litellm_params=litellm_params,
+                optional_params=optional_params,
             )
             return attach_zcode_signature_headers(
                 identity,

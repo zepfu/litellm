@@ -11,6 +11,7 @@ import hashlib
 import secrets
 import threading
 import time
+import uuid
 from typing import Callable, Mapping, Optional
 from urllib.parse import urlsplit
 
@@ -29,7 +30,6 @@ _APP_ID = "zcode"
 _POW_LEADING_ZERO_BITS = 8
 _POW_SEARCH_LIMIT = 1_000_000
 _SEPARATOR_MESSAGE = "Client signing credential must contain one separator."
-_SESSION_MESSAGE = "Client request signing requires X-Session-Id."
 _SIGNING_FAILED_MESSAGE = "Client request signing failed."
 _POW_FAILED_MESSAGE = "Client request proof-of-work failed."
 _REFRESHABLE_REASONS = frozenset(
@@ -273,7 +273,7 @@ def _split_client_credential(api_key: str) -> tuple[str, str]:
 def _required_session_id(headers: Mapping[str, str]) -> str:
     session_id = _session_id_from_headers(headers)
     if session_id is None:
-        raise ZCodeSigningError(_SESSION_MESSAGE, fail_open=False)
+        return str(uuid.uuid4())
     return session_id
 
 

@@ -61,8 +61,10 @@ Authorization, OpenCode, Kimi, Cursor, device, and session-secret headers
 are not forwarded.
 
 Signing headers are added only when the descriptor's feature gate is
-enabled. Gate or handshake failure sends the request unsigned. Other
-signing failures fail closed.
+enabled. The session id is the request session when one is present,
+otherwise `prompt_cache_key`, otherwise a request-scoped id. Gate or
+handshake failure sends the request unsigned. Other signing failures
+fail closed.
 
 The older service-owned `litellm-zai-coding-plan/<fork>` User-Agent is
 not sent on this route.

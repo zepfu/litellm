@@ -32,6 +32,7 @@ _SESSION_ID_FIELDS = (
     "codex_session_id",
     "claude_session_id",
     "anthropic_session_id",
+    "prompt_cache_key",
 )
 _SESSION_PREFIXES = ("sess_", "subagent_agent_")
 _QUERY_PREFIX = "query_"
@@ -112,6 +113,7 @@ def build_zcode_model_headers(
     profile_name: Optional[str] = None,
     runtime_globals: Optional[Mapping[str, Any]] = None,
     request_id_factory: Optional[Callable[[], str]] = None,
+    optional_params: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, str]:
     """Build unsigned ZCode model-request headers from a loaded contract."""
 
@@ -120,7 +122,7 @@ def build_zcode_model_headers(
     if not isinstance(api_key, str) or api_key.strip() == "":
         raise ZCodeHeaderContractError("api_key must be a non-blank string")
 
-    sources = _metadata_dicts(litellm_params)
+    sources = _session_sources(litellm_params, optional_params)
     headers = zcode_profile_headers(
         contract, litellm_params=litellm_params, profile_name=profile_name
     )
@@ -432,6 +434,18 @@ def _require_number(value: Any, field_name: str) -> float:
             f"ZCode header contract field {field_name} must be a number"
         )
     return float(value)
+
+
+def _session_sources(
+    litellm_params: Optional[Mapping[str, Any]],
+    optional_params: Optional[Mapping[str, Any]] = None,
+) -> tuple[Mapping[str, Any], ...]:
+    sources = list(_metadata_dicts(litellm_params))
+    if isinstance(optional_params, Mapping):
+        sources.append(optional_params)
+    if isinstance(litellm_params, Mapping):
+        sources.append(litellm_params)
+    return tuple(sources)
 
 
 def _metadata_dicts(
