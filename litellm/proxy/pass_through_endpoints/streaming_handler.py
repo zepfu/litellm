@@ -76,6 +76,14 @@ _RESPONSES_NON_SUBSTANTIVE_LIFECYCLE_EVENTS = frozenset(
     }
 )
 _RESPONSES_PRE_COMMIT_FAILURE_EVENTS = frozenset({"response.failed", "error"})
+_RECOGNIZED_PROVIDER_TERMINAL_EVENTS = frozenset(
+    {
+        "response.completed",
+        "response.failed",
+        "response.incomplete",
+        "error",
+    }
+)
 _RESPONSES_SUBSTANTIVE_EVENT_PREFIXES = (
     "response.output_text",
     "response.output_item",
@@ -139,6 +147,8 @@ class ResponsesStreamPreCommitFailure(Exception):
         status_code: Optional[int] = None,
         pre_commit_retry_exhausted: bool = False,
         error_payload: Optional[Dict[str, Any]] = None,
+        provider_returned: bool = True,
+        failure_origin: Optional[str] = None,
     ) -> None:
         self.error_class = error_class
         self.classification = classification
@@ -150,7 +160,8 @@ class ResponsesStreamPreCommitFailure(Exception):
         self.pre_commit_retry_exhausted = pre_commit_retry_exhausted
         self.error_payload = error_payload if isinstance(error_payload, dict) else None
         self.message = message or classification
-        self.provider_returned = True
+        self.provider_returned = provider_returned
+        self.failure_origin = failure_origin
         self.detail = {
             "error": {
                 "message": self.message,
@@ -1045,6 +1056,8 @@ class PassThroughStreamingHandler:
         pre_commit_retry_exhausted: bool = False,
         retry_after_seconds: float = RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS,
         openai_alpha_capacity_retry_enabled: bool = False,
+        provider_returned: bool = True,
+        failure_origin: Optional[str] = None,
     ) -> ResponsesStreamPreCommitFailure:
         error_class, classification, retryable = (
             PassThroughStreamingHandler._classify_responses_pre_commit_error(
@@ -1119,6 +1132,8 @@ class PassThroughStreamingHandler:
             message=sanitized_message,
             pre_commit_retry_exhausted=pre_commit_retry_exhausted,
             error_payload=error_payload,
+            provider_returned=provider_returned,
+            failure_origin=failure_origin,
         )
 
     @staticmethod
@@ -1192,6 +1207,27 @@ class PassThroughStreamingHandler:
                 except StopAsyncIteration:
                     iterator = None
                     break
+                except httpx.ReadError as exc:
+                    # Only this upstream read is a transport failure. Parser,
+                    # prefix storage, and later remainder iteration stay raw.
+                    read_failure = ResponsesStreamPreCommitFailure(
+                        error_class="stream_interrupted",
+                        classification="transient_stream_interruption",
+                        retryable=True,
+                        error_code="stream_read_error",
+                        error_type="transport",
+                        message=(
+                            "OpenAI Responses precommit stream read failed "
+                            "before a substantive event."
+                        ),
+                        provider_returned=False,
+                        failure_origin="local_transport",
+                    )
+                    read_failure.__cause__ = exc
+                    return (
+                        _PrefixedHttpxByteStream(response, prefix, iterator),
+                        read_failure,
+                    )
                 if not chunk:
                     continue
                 chunk = bytes(chunk)
@@ -1242,6 +1278,8 @@ class PassThroughStreamingHandler:
                         openai_alpha_capacity_retry_enabled=(
                             openai_alpha_capacity_retry_enabled
                         ),
+                        provider_returned=False,
+                        failure_origin="local_missing_terminal",
                     ),
                 )
             return _PrefixedHttpxByteStream(response, prefix, iterator), None
@@ -3741,8 +3779,13 @@ class PassThroughStreamingHandler:
             all_chunks=all_chunks,
             terminal_payload=terminal_payload,
         )
-        if terminal_event_type:
-            metadata["aawm_provider_terminal_event_type"] = terminal_event_type
+        recognized_terminal = (
+            terminal_event_type in _RECOGNIZED_PROVIDER_TERMINAL_EVENTS
+        )
+        reconciled_provider_error = isinstance(error_payload, dict)
+        metadata["aawm_provider_terminal_event_type"] = (
+            terminal_event_type if recognized_terminal else None
+        )
         if isinstance(terminal_payload, dict):
             metadata["aawm_provider_terminal_payload"] = dict(terminal_payload)
         error_class, classification, retryable = (
@@ -3782,12 +3825,12 @@ class PassThroughStreamingHandler:
         if selected_model not in (None, ""):
             metadata.setdefault("model", selected_model)
         metadata.setdefault("route_family", selected_route)
-        metadata.setdefault("provider_returned", True)
         metadata.setdefault("attempted_provider_call", True)
         if isinstance(error_payload, dict):
             payload_status = error_payload.get("status_code")
             if isinstance(payload_status, int):
                 metadata.setdefault("upstream_status_code", payload_status)
+        local_failure_origin: Optional[str] = None
         if policy_failure_kind or policy_failure_code or policy_failure_class:
             if isinstance(error_payload, dict):
                 metadata["aawm_provider_terminal_error_payload"] = dict(
@@ -3818,6 +3861,7 @@ class PassThroughStreamingHandler:
                 or "output_policy_failure"
             )
             retryable = False
+            local_failure_origin = "local_policy"
         elif (
             delivered_disposition
             and delivered_disposition != "completed"
@@ -3833,10 +3877,31 @@ class PassThroughStreamingHandler:
                 error_class = f"delivered_{delivered_disposition}"
                 classification = error_class
                 retryable = False
-        elif delivered_disposition == "cancelled" and terminal_event_type is None:
+        elif (
+            delivered_disposition == "cancelled"
+            and terminal_event_type is None
+            and not reconciled_provider_error
+        ):
             error_class = "stream_interrupted"
             classification = "transient_stream_interruption"
             retryable = True
+            local_failure_origin = "local_missing_terminal"
+        if (
+            local_failure_origin is None
+            and not recognized_terminal
+            and not reconciled_provider_error
+        ):
+            local_failure_origin = "local_missing_terminal"
+        provider_authored = bool(
+            recognized_terminal
+            or (reconciled_provider_error and local_failure_origin is None)
+        )
+        metadata["provider_returned"] = provider_authored
+        metadata["aawm_failure_origin"] = (
+            local_failure_origin
+            if local_failure_origin is not None
+            else ("provider" if provider_authored else "local_missing_terminal")
+        )
         sanitized_message = None
         if isinstance(error_payload, dict):
             sanitized_message = (
@@ -3865,12 +3930,24 @@ class PassThroughStreamingHandler:
             metadata["aawm_policy_failure_code"] = policy_failure_code
         if policy_failure_class:
             metadata["aawm_policy_failure_class"] = policy_failure_class
+        extracted_code = None
+        extracted_type = None
+        if isinstance(error_payload, dict):
+            extracted_code, extracted_type, _extracted_message = (
+                PassThroughStreamingHandler._extract_responses_stream_error_fields(
+                    error_payload
+                )
+            )
         failure_exc = ResponsesStreamPreCommitFailure(
             error_class=error_class,
             classification=classification,
             retryable=retryable,
+            error_code=extracted_code,
+            error_type=extracted_type,
             error_payload=error_payload if isinstance(error_payload, dict) else None,
             message=sanitized_message,
+            provider_returned=provider_authored,
+            failure_origin=metadata["aawm_failure_origin"],
         )
         if policy_failure_kind:
             setattr(failure_exc, "policy_failure_kind", policy_failure_kind)
@@ -3897,7 +3974,10 @@ class PassThroughStreamingHandler:
             "policy_failure_kind": policy_failure_kind or None,
             "policy_failure_code": policy_failure_code or None,
             "policy_failure_class": policy_failure_class or None,
-            "provider_terminal_event_type": terminal_event_type,
+            "provider_terminal_event_type": (
+                terminal_event_type if recognized_terminal else None
+            ),
+            "failure_origin": metadata.get("aawm_failure_origin"),
             "model": request_body.get("model") if isinstance(request_body, dict) else None,
         }
         metadata.update(failure_context)
@@ -3913,9 +3993,15 @@ class PassThroughStreamingHandler:
                 "event_type": (
                     policy_failure_kind
                     or policy_failure_code
-                    or terminal_event_type
-                    or "response.failed"
+                    or (terminal_event_type if recognized_terminal else None)
+                    or metadata.get("aawm_failure_origin")
+                    or "local_missing_terminal"
                 ),
+                "provider_terminal_event_type": (
+                    terminal_event_type if recognized_terminal else None
+                ),
+                "failure_origin": metadata.get("aawm_failure_origin"),
+                "provider_returned": provider_authored,
                 "endpoint": (
                     metadata.get("endpoint")
                     or route_context.get("incoming_endpoint")

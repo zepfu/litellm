@@ -1820,3 +1820,76 @@ class TestSignaturePinning:
             _resolve_auto_agent_alias_route_rollup_group_header_label,
         ):
             assert not inspect.iscoroutinefunction(fn)
+
+
+def _retry_metadata(*, success: bool) -> dict[str, Any]:
+    return {
+        "litellm_call_id": "retry-call-1",
+        "aawm_route_rollup_context": {
+            "group_header_label": "repo",
+            "incoming_endpoint": "/v1/responses",
+            "outgoing_target": "chatgpt.com/backend-api/codex/responses",
+            "model_label": "gpt-6-astra",
+            "reasoning_effort": "xhigh",
+        },
+        "aawm_openai_retry_logical_count": 3 if success else 5,
+        "aawm_openai_retry_elapsed_wait_seconds": 12.0 if success else 120.0,
+        "aawm_openai_retry_failed_attempt_seconds": 4.5,
+        "aawm_openai_retry_scheduled_wait_seconds": 90.0,
+        "aawm_openai_retry_reasons": ["Capacity", "Stream interruption"],
+    }
+
+
+def test_recovered_retry_rollup_shows_measured_wait_not_failed_attempt_time():
+    metadata = _retry_metadata(success=True)
+    kwargs = {"litellm_params": {"metadata": metadata}}
+    accumulator = aawm_route_logging.AawmRouteRollupAccumulator(interval_seconds=60)
+    with patch.object(
+        aawm_route_logging,
+        "_get_or_replace_aawm_route_rollup_accumulator_locked",
+        return_value=accumulator,
+    ), patch.object(aawm_route_logging, "aawm_route_rollups_enabled", return_value=True):
+        aawm_route_logging.record_aawm_route_rollup_turn(kwargs)
+        aawm_route_logging.record_aawm_route_rollup_turn(kwargs)
+    stored = next(iter(next(iter(accumulator._groups.values())).sublines.values()))
+    assert stored.retry_logical_count == 3
+    assert stored.retry_failed_attempt_seconds == 4.5
+    lines = accumulator.flush(force=True)
+    rendered = next(line for line in lines if "gpt-6-astra" in line)
+    assert (
+        "Turns: 1 [Retry (Capacity, Stream interruption): 3 | Elapsed Wait: 12 seconds]"
+        in rendered
+    )
+    assert "4.5" not in rendered
+    assert "90" not in rendered
+    with patch.object(aawm_route_logging, "json_logs", False):
+        colored = aawm_route_logging._colorize_aawm_route_rollup_line(rendered)
+    assert f"{aawm_route_logging._AAWM_ROUTE_ROLLUP_GREEN}Retry" in colored
+    assert colored.startswith(" - gpt-6-astra")
+
+
+def test_failed_retry_rollup_colors_only_the_retry_word_red():
+    metadata = _retry_metadata(success=False)
+    kwargs = {"litellm_params": {"metadata": metadata}}
+    accumulator = aawm_route_logging.AawmRouteRollupAccumulator(interval_seconds=60)
+    with patch.object(
+        aawm_route_logging,
+        "_get_or_replace_aawm_route_rollup_accumulator_locked",
+        return_value=accumulator,
+    ), patch.object(aawm_route_logging, "aawm_route_rollups_enabled", return_value=True):
+        aawm_route_logging.record_aawm_route_rollup_failure(
+            kwargs,
+            message=None,
+            status="Failed",
+        )
+    lines = accumulator.flush(force=True)
+    rendered = next(line for line in lines if "gpt-6-astra" in line)
+    assert (
+        "Turns: 0 [Retry (Capacity, Stream interruption): 5 | Elapsed Wait: 2 minutes]"
+        in rendered
+    )
+    with patch.object(aawm_route_logging, "json_logs", False):
+        colored = aawm_route_logging._colorize_aawm_route_rollup_line(rendered)
+    assert colored.startswith(" - gpt-6-astra")
+    assert f"{aawm_route_logging._AAWM_ROUTE_ROLLUP_RED}Retry" in colored
+    assert not colored.startswith(aawm_route_logging._AAWM_ROUTE_ROLLUP_RED)

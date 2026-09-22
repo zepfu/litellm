@@ -53,6 +53,7 @@ _AAWM_PARSED_CODEX_REVIEW_DECISIONS_KWARGS_KEY = (
 _AAWM_ROUTE_LOG_REASONING_EFFORT_METADATA_KEY = "reasoning_effort_native_value"
 _AAWM_ROUTE_ROLLUP_REASONING_EFFORT_MAX_CHARS = 32
 _AAWM_ROUTE_ROLLUP_RED = "\033[91m"
+_AAWM_ROUTE_ROLLUP_GREEN = "\033[92m"
 _AAWM_ROUTE_ROLLUP_BLUE = "\033[94m"
 _AAWM_ROUTE_ROLLUP_YELLOW = "\033[93m"
 _AAWM_ROUTE_ROLLUP_RESET = "\033[0m"
@@ -1751,6 +1752,39 @@ def _format_aawm_route_rollup_subline_destination_suffix(
     return f" -> {outgoing_target}"
 
 
+def _format_aawm_route_rollup_elapsed_wait(seconds: float) -> str:
+    elapsed = max(0.0, float(seconds))
+    if elapsed >= 60.0:
+        minutes = elapsed / 60.0
+        if abs(minutes - round(minutes)) < 0.05:
+            amount = int(round(minutes))
+            unit = "minute" if amount == 1 else "minutes"
+            return f"{amount} {unit}"
+        rendered = f"{minutes:.1f}".rstrip("0").rstrip(".")
+        return f"{rendered} minutes"
+    if abs(elapsed - round(elapsed)) < 0.05:
+        amount = int(round(elapsed))
+        unit = "second" if amount == 1 else "seconds"
+        return f"{amount} {unit}"
+    rendered = f"{elapsed:.1f}".rstrip("0").rstrip(".")
+    return f"{rendered} seconds"
+
+
+def _format_aawm_route_rollup_retry_suffix(
+    *,
+    retry_count: int,
+    elapsed_wait_seconds: float,
+    reasons: tuple[str, ...],
+) -> str:
+    if retry_count <= 0:
+        return ""
+    reason_text = ", ".join(reason for reason in reasons if reason) or "Unspecified"
+    return (
+        f" [Retry ({reason_text}): {retry_count} | Elapsed Wait: "
+        f"{_format_aawm_route_rollup_elapsed_wait(elapsed_wait_seconds)}]"
+    )
+
+
 def _format_aawm_route_rollup_lines(
     *,
     group_header_label: str,
@@ -1768,6 +1802,9 @@ def _format_aawm_route_rollup_lines(
             int,
             tuple[str, ...],
             Optional[str],
+            int,
+            float,
+            tuple[str, ...],
         ]
     ],
     request_outcome: Optional[str] = None,
@@ -1801,11 +1838,15 @@ def _format_aawm_route_rollup_lines(
         denied_reviews,
         denied_rationales,
         account_display,
+        retry_count,
+        retry_wait_seconds,
+        retry_reasons,
     ) in sublines:
         message_suffix = f" [{message}]" if message else ""
         account_suffix = f" ({account_display})" if account_display else ""
         lines.append(
             f" - {model_label}{account_suffix}:{effort} - Turns: {turns}"
+            f"{_format_aawm_route_rollup_retry_suffix(retry_count=retry_count, elapsed_wait_seconds=retry_wait_seconds, reasons=retry_reasons)}"
             f"{message_suffix}"
             f"{_format_aawm_route_rollup_status_tag(status)}"
             f"{_format_aawm_route_rollup_subline_destination_suffix(outgoing_target=outgoing_target, common_destination=common_destination)}"
@@ -1864,6 +1905,43 @@ class _AawmRouteRollupSubline:
     approved_rationales: list[str] = field(default_factory=list)
     denied_reviews: int = 0
     denied_rationales: list[str] = field(default_factory=list)
+    retry_logical_count: int = 0
+    retry_elapsed_wait_seconds: float = 0.0
+    retry_failed_attempt_seconds: float = 0.0
+    retry_reasons: list[str] = field(default_factory=list)
+
+    def add_retry_facts(self, facts: Optional[dict[str, Any]]) -> None:
+        """Add one request-final retry snapshot once.
+
+        The metadata flag stops the same cumulative snapshot from landing on
+        another account row or a second finalization of this request.
+        """
+
+        if not isinstance(facts, dict):
+            return
+        source = facts.get("source")
+        if isinstance(source, dict) and source.get("aawm_openai_retry_rollup_applied") is True:
+            return
+        count = facts.get("logical_retries")
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            return
+        wait = facts.get("elapsed_wait_seconds")
+        if not isinstance(wait, (int, float)) or isinstance(wait, bool):
+            wait = 0.0
+        failed = facts.get("failed_attempt_seconds")
+        if not isinstance(failed, (int, float)) or isinstance(failed, bool):
+            failed = 0.0
+        reasons = facts.get("reasons")
+        if not isinstance(reasons, tuple):
+            reasons = ()
+        self.retry_logical_count += count
+        self.retry_elapsed_wait_seconds += max(0.0, float(wait))
+        self.retry_failed_attempt_seconds += max(0.0, float(failed))
+        for reason in reasons:
+            if isinstance(reason, str) and reason and reason not in self.retry_reasons:
+                self.retry_reasons.append(reason)
+        if isinstance(source, dict):
+            source["aawm_openai_retry_rollup_applied"] = True
 
     def has_flushable_activity(self) -> bool:
         """True when the subline is a completed turn or a tagged/status row.
@@ -1878,6 +1956,7 @@ class _AawmRouteRollupSubline:
             or bool(self.message)
             or self.approved_reviews > 0
             or self.denied_reviews > 0
+            or self.retry_logical_count > 0
         )
 
     def register_origin_identity(
@@ -2051,6 +2130,9 @@ class _AawmRouteRollupGroup:
             int,
             tuple[str, ...],
             Optional[str],
+            int,
+            float,
+            tuple[str, ...],
         ]
     ]:
         return [
@@ -2068,6 +2150,9 @@ class _AawmRouteRollupGroup:
                 self.account_display_by_identity.get(subline_key[3])
                 if subline_key[3] is not None
                 else None,
+                self.sublines[subline_key].retry_logical_count,
+                self.sublines[subline_key].retry_elapsed_wait_seconds,
+                tuple(self.sublines[subline_key].retry_reasons),
             )
             for subline_key in self.subline_order
             if subline_key in self.sublines
@@ -2119,6 +2204,7 @@ class AawmRouteRollupAccumulator:
         origin_identity: Optional[_AawmRouteRollupOriginIdentity] = None,
         review_decision: Optional[AawmReviewDecision] = None,
         review_correlation: Optional[_AawmRouteRollupReviewCorrelation] = None,
+        retry_facts: Optional[dict[str, Any]] = None,
         now: Optional[datetime] = None,
     ) -> list[str]:
         if not self.enabled():
@@ -2318,6 +2404,7 @@ class AawmRouteRollupAccumulator:
             message=cleaned_message,
             origin_identity=origin_identity,
         )
+        subline.add_retry_facts(retry_facts)
 
         if normalized_request_status in _AAWM_ROUTE_ROLLUP_REQUEST_TERMINAL_STATUS_VALUES:
             group.event_sequence += 1
@@ -2625,9 +2712,44 @@ def flush_aawm_route_rollups(
     return lines
 
 
+def _rollup_line_turn_count(line: str) -> int:
+    marker = "Turns: "
+    index = line.find(marker)
+    if index < 0:
+        return 0
+    start = index + len(marker)
+    end = start
+    while end < len(line) and line[end].isdigit():
+        end += 1
+    if end == start:
+        return 0
+    return int(line[start:end])
+
+
+def _colorize_retry_word(line: str) -> str:
+    marker = "[Retry ("
+    index = line.find(marker)
+    if index < 0:
+        return line
+    color = (
+        _AAWM_ROUTE_ROLLUP_RED
+        if _rollup_line_turn_count(line) <= 0
+        or " [Failed]" in line
+        or " [Exhausted]" in line
+        else _AAWM_ROUTE_ROLLUP_GREEN
+    )
+    word_at = index + 1
+    return (
+        f"{line[:word_at]}{color}Retry{_AAWM_ROUTE_ROLLUP_RESET}"
+        f"{line[word_at + len('Retry'):]}"
+    )
+
+
 def _colorize_aawm_route_rollup_line(line: str) -> str:
     if json_logs or not line.startswith(" - "):
         return line
+    if "[Retry (" in line:
+        return _colorize_retry_word(line)
     if " [Cooling Down]" in line:
         return f"{_AAWM_ROUTE_ROLLUP_BLUE}{line}{_AAWM_ROUTE_ROLLUP_RESET}"
     if " [Failed]" in line or " [Exhausted]" in line or " [Ineligible]" in line:
@@ -3107,6 +3229,7 @@ def record_aawm_route_rollup(
     origin_identity: Optional[_AawmRouteRollupOriginIdentity] = None,
     review_decision: Optional[AawmReviewDecision] = None,
     review_correlation: Optional[_AawmRouteRollupReviewCorrelation] = None,
+    retry_facts: Optional[dict[str, Any]] = None,
     now: Optional[datetime] = None,
 ) -> None:
     with _aawm_route_rollup_lock:
@@ -3127,6 +3250,7 @@ def record_aawm_route_rollup(
             origin_identity=origin_identity,
             review_decision=review_decision,
             review_correlation=review_correlation,
+            retry_facts=retry_facts,
             now=now,
         )
     _ensure_aawm_route_rollup_flush_worker()
@@ -3241,6 +3365,36 @@ def _build_aawm_route_rollup_origin_identity(
     return candidate_identity
 
 
+def _openai_retry_facts_from_metadata(
+    metadata: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    if not isinstance(metadata, dict):
+        return None
+    if metadata.get("aawm_openai_retry_rollup_applied") is True:
+        return None
+    count = metadata.get("aawm_openai_retry_logical_count")
+    if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+        return None
+    wait = metadata.get("aawm_openai_retry_elapsed_wait_seconds")
+    if not isinstance(wait, (int, float)) or isinstance(wait, bool):
+        wait = 0.0
+    failed = metadata.get("aawm_openai_retry_failed_attempt_seconds")
+    if not isinstance(failed, (int, float)) or isinstance(failed, bool):
+        failed = 0.0
+    reasons = metadata.get("aawm_openai_retry_reasons")
+    if not isinstance(reasons, list):
+        reasons = []
+    return {
+        "logical_retries": count,
+        "elapsed_wait_seconds": float(wait),
+        "failed_attempt_seconds": float(failed),
+        "reasons": tuple(
+            reason for reason in reasons if isinstance(reason, str) and reason.strip()
+        ),
+        "source": metadata,
+    }
+
+
 def record_aawm_route_rollup_turn(
     kwargs: Optional[dict],
     *,
@@ -3308,6 +3462,7 @@ def record_aawm_route_rollup_turn(
         ),
         review_decision=review_decision,
         review_correlation=review_correlation,
+        retry_facts=_openai_retry_facts_from_metadata(metadata),
         now=now,
     )
 
@@ -3340,6 +3495,7 @@ def record_aawm_route_rollup_failure(
             context,
             metadata=metadata,
         ),
+        retry_facts=_openai_retry_facts_from_metadata(metadata),
         now=now,
     )
     return True

@@ -282,6 +282,8 @@ def _build_terminal_error_log_fields(
         ("terminal_outcome", ("terminal_outcome", "outcome")),
         ("fallback_result", ("fallback_result", "fallback")),
         ("event_type", ("event_type",)),
+        ("provider_terminal_event_type", ("provider_terminal_event_type",)),
+        ("failure_origin", ("failure_origin", "aawm_failure_origin")),
     )
     fields: dict[str, Any] = {}
     for output_key, source_keys in label_fields:

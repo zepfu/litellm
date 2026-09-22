@@ -3956,3 +3956,298 @@ async def test_stream_capacity_failure_retry_after_reaches_proxy_wire_headers(
     assert response.status_code == 503
     assert response.headers.get("retry-after") == expected_retry_after
     assert json.loads(response.body)["error"]["message"] == str(expected_detail)
+
+
+class _ReadFailingUpstream:
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+        self.status_code = 200
+        self.aclose_calls = 0
+
+    def aiter_bytes(self):
+        exc = self._exc
+
+        class _Iterator:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise exc
+
+            async def aclose(self):
+                return None
+
+        return _Iterator()
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+
+
+@pytest.mark.asyncio
+async def test_precommit_read_error_is_transport_not_capacity():
+    upstream = _ReadFailingUpstream(httpx.ReadError("connection reset Bearer secret"))
+    _peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+        upstream
+    )
+
+    assert failure is not None
+    assert failure.error_class == "stream_interrupted"
+    assert failure.classification == "transient_stream_interruption"
+    assert failure.provider_returned is False
+    assert failure.failure_origin == "local_transport"
+    assert isinstance(failure.__cause__, httpx.ReadError)
+    assert "Bearer" not in failure.message
+    http_exc = failure.as_http_exception()
+    assert http_exc.status_code == 503
+    assert http_exc.detail["error"]["code"] == "stream_read_error"
+    assert "connection reset" not in str(http_exc.detail)
+
+
+@pytest.mark.asyncio
+async def test_precommit_parser_error_is_not_normalized_as_transport():
+    upstream = _FakeUpstreamStream([b"data: {}\n\n"])
+    with patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler._ResponsesPreCommitSSEParser.feed",
+        side_effect=ValueError("parser failed"),
+    ):
+        with pytest.raises(ValueError, match="parser failed"):
+            await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+                upstream
+            )
+
+
+def test_typed_http200_overload_diagnostic_keeps_status_fields_distinct():
+    from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+        _record_openai_raw_retry_event,
+    )
+
+    failure = ResponsesStreamPreCommitFailure(
+        error_class="server_overloaded",
+        classification="transient_capacity",
+        retryable=True,
+        error_code="server_overloaded",
+        error_type="server_error",
+        message="overloaded sk-abcdefghijklmnopqrstuvwxyz012345",
+    )
+    request = MagicMock()
+    request.state = SimpleNamespace()
+    recorded: list[dict[str, Any]] = []
+
+    def _capture(**kwargs: Any) -> None:
+        recorded.append(kwargs)
+        _record_openai_raw_retry_event(**kwargs)
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints._record_openai_raw_retry_event",
+        side_effect=_capture,
+    ):
+        result = _classify_passthrough_raw_http_error(
+            failure,
+            status_code=503,
+            request=request,
+            diagnostic_enabled=True,
+            event_stage="retry_loop",
+        )
+
+    assert result is None
+    assert recorded[0]["classification_reason"] == "typed_precommit_failure"
+    assert recorded[0]["error_class"] == "server_overloaded"
+    assert recorded[0]["classification"] == "transient_capacity"
+    assert recorded[0]["classification_status_code"] == 503
+    event = request.state.aawm_openai_raw_retry_events[-1]
+    assert event["observed_http_status_code"] is None
+    assert event["classification_status_code"] == 503
+    assert event["error_class"] == "server_overloaded"
+    assert event["classification"] == "transient_capacity"
+    assert event["classification_reason"] == "typed_precommit_failure"
+    assert event["provider_error_code"] == "server_overloaded"
+    assert "sk-abcdefghijklmnopqrstuvwxyz012345" not in str(
+        event["provider_error_message"]
+    )
+    assert "unsupported_exception" not in str(event)
+
+
+def test_unsupported_raw_exception_still_returns_none():
+    request = MagicMock()
+    request.state = SimpleNamespace()
+    result = _classify_passthrough_raw_http_error(
+        ValueError("local"),
+        status_code=None,
+        request=request,
+        diagnostic_enabled=True,
+    )
+    assert result is None
+    event = request.state.aawm_openai_raw_retry_events[-1]
+    assert event["classification_reason"] == "unsupported_exception"
+    assert event["error_class"] is None
+    assert event["classification"] is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_without_terminal_keeps_reconciled_capacity_error():
+    metadata: dict[str, Any] = {}
+    kwargs = {"litellm_params": {"metadata": metadata}}
+    logging_obj = MagicMock()
+    logging_obj.async_failure_handler = AsyncMock()
+    emitted: list[dict[str, Any]] = []
+
+    def _capture_emit(context: dict[str, Any], **_kwargs: Any) -> bool:
+        emitted.append(dict(context))
+        return True
+
+    chunks = _sse(
+        "error",
+        {
+            "type": "error",
+            "error": {
+                "code": "server_overloaded",
+                "type": "server_error",
+                "message": "The server is currently overloaded.",
+            },
+        },
+    ).decode().splitlines()
+    with patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler._emit_aawm_terminal_error",
+        side_effect=_capture_emit,
+    ), patch(
+        "litellm.proxy.aawm_route_logging.record_aawm_route_rollup_failure"
+    ):
+        await PassThroughStreamingHandler._finalize_failed_responses_stream(
+            litellm_logging_obj=logging_obj,
+            kwargs=kwargs,
+            metadata=metadata,
+            all_chunks=chunks,
+            request_body={"model": "gpt-5.4"},
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+            terminal_event_type=None,
+            terminal_payload=None,
+            handler_branch_state=["initial"],
+            delivered_wire_disposition={"delivered_disposition": "cancelled"},
+        )
+
+    assert metadata["aawm_responses_stream_failure_class"] == "server_overloaded"
+    assert metadata["aawm_responses_stream_failure_classification"] == "transient_capacity"
+    assert metadata["aawm_responses_stream_failure_retryable"] is True
+    assert metadata["aawm_delivered_disposition"] == "cancelled"
+    assert metadata["provider_returned"] is True
+    assert metadata["aawm_provider_terminal_event_type"] is None
+    assert emitted[0]["event_type"] != "response.failed"
+    assert emitted[0]["failure_origin"] == "provider"
+
+
+@pytest.mark.asyncio
+async def test_missing_terminal_is_local_and_not_observed_response_failed():
+    metadata: dict[str, Any] = {}
+    kwargs = {"litellm_params": {"metadata": metadata}}
+    logging_obj = MagicMock()
+    logging_obj.async_failure_handler = AsyncMock()
+    emitted: list[dict[str, Any]] = []
+
+    def _capture_emit(context: dict[str, Any], **_kwargs: Any) -> bool:
+        emitted.append(dict(context))
+        return True
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler._emit_aawm_terminal_error",
+        side_effect=_capture_emit,
+    ), patch(
+        "litellm.proxy.aawm_route_logging.record_aawm_route_rollup_failure"
+    ):
+        await PassThroughStreamingHandler._finalize_failed_responses_stream(
+            litellm_logging_obj=logging_obj,
+            kwargs=kwargs,
+            metadata=metadata,
+            all_chunks=[],
+            request_body={"model": "gpt-5.4"},
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+            terminal_event_type=None,
+            terminal_payload=None,
+            handler_branch_state=["initial"],
+            delivered_wire_disposition={"delivered_disposition": "cancelled"},
+        )
+
+    assert metadata["aawm_responses_stream_failure_class"] == "stream_interrupted"
+    assert metadata["provider_returned"] is False
+    assert metadata["aawm_provider_terminal_event_type"] is None
+    assert metadata["aawm_failure_origin"] == "local_missing_terminal"
+    assert emitted[0]["event_type"] == "local_missing_terminal"
+    assert emitted[0]["provider_terminal_event_type"] is None
+
+
+@pytest.mark.asyncio
+async def test_stream_read_retry_admits_ordinary_replacement_sends(monkeypatch):
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        get_or_create_openai_provider_call_ledger,
+    )
+
+    request = MagicMock()
+    request.state = SimpleNamespace()
+
+    async def _still_connected() -> bool:
+        return False
+
+    request.is_disconnected = _still_connected
+    ledger = get_or_create_openai_provider_call_ledger(
+        request,
+        custom_llm_provider="openai",
+        target="https://chatgpt.com/backend-api/codex/responses",
+    )
+    assert ledger is not None
+    assert ledger.max_logical_provider_calls == 3
+    reservations: list[int] = []
+
+    async def operation():
+        reservation = ledger.reserve(
+            target="https://chatgpt.com/backend-api/codex/responses",
+            candidate_context={
+                "provider": "openai",
+                "model": "gpt-5.4",
+                "account_hash": "account-hash",
+                "lane_key": "lane",
+            },
+            prior_response_closed=True,
+            allow_capacity_retry=True,
+        )
+        reservations.append(reservation.ordinal)
+        raise ResponsesStreamPreCommitFailure(
+            error_class="stream_interrupted",
+            classification="transient_stream_interruption",
+            retryable=True,
+            retry_after_seconds=0.0,
+            provider_returned=False,
+            failure_origin="local_transport",
+        )
+
+    coordinator = MagicMock()
+    coordinator.deadline_seconds = 7200.0
+    coordinator.remaining_seconds = 7200.0
+    coordinator.sleep_with_wakeup = AsyncMock(
+        side_effect=AssertionError("stream retry must not use the capacity sleeper")
+    )
+    coordinator.next_wait_seconds = MagicMock(
+        side_effect=AssertionError("stream retry must not use the capacity schedule")
+    )
+    coordinator.record_retry = MagicMock()
+    coordinator.record_terminal = MagicMock()
+    monkeypatch.setattr(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+        AsyncMock(),
+    )
+
+    with pytest.raises(ResponsesStreamPreCommitFailure):
+        await _execute_passthrough_pre_first_byte_with_hidden_retries(
+            kwargs={},
+            operation_name="stream_pre_first_byte",
+            operation=operation,
+            caller_managed_hidden_retry=False,
+            request=request,
+            openai_capacity_coordinator=coordinator,
+        )
+
+    assert reservations == [1, 2, 3]
+    assert ledger.snapshot()["capacity_retry_authorized"] is False
+    assert ledger.snapshot()["logical_provider_calls"] == 3
+    coordinator.sleep_with_wakeup.assert_not_called()
+    coordinator.record_retry.assert_not_called()

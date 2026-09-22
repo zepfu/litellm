@@ -52,6 +52,7 @@ from websockets.exceptions import (
 
 import litellm
 from litellm._logging import (
+    _redact_string,
     emit_aawm_error_intake_only,
     trigger_egress_guard_alert,
     verbose_aawm_route_logger,
@@ -1506,7 +1507,9 @@ def _build_openai_raw_retry_failure_origin(
         ):
             origin["observed_http_status_code"] = observed_status_code
         if response is not None:
-            origin["provider_returned"] = True
+            # A received HTTP response is observation, not authorship of a
+            # locally synthesized EOF, policy, or transport failure.
+            origin["response_observed"] = True
             origin["provider_provenance_source"] = "response_observation"
     except Exception:
         # The origin is diagnostic-only and must remain best effort.
@@ -1741,6 +1744,10 @@ def _record_openai_raw_retry_event(
     authorization_result: Optional[str] = None,
     authorization_denial_reason: Optional[str] = None,
     diagnostic_enabled: bool = False,
+    provider_error_code: Optional[str] = None,
+    provider_error_type: Optional[str] = None,
+    provider_error_message: Optional[str] = None,
+    failure_origin_label: Optional[str] = None,
 ) -> None:
     if diagnostic_enabled is not True:
         return
@@ -1862,6 +1869,18 @@ def _record_openai_raw_retry_event(
                 authorization_denial_reason
             ),
             "ledger": ledger,
+            "provider_error_code": _clean_passthrough_error_context_value(
+                provider_error_code
+            ),
+            "provider_error_type": _clean_passthrough_error_context_value(
+                provider_error_type
+            ),
+            "provider_error_message": _bounded_redacted_retry_message(
+                provider_error_message
+            ),
+            "failure_origin_label": _clean_passthrough_error_context_value(
+                failure_origin_label
+            ),
         }
         origin_field_map = {
             "failure_source_request_fingerprint": "request_fingerprint",
@@ -2458,6 +2477,29 @@ def _classify_passthrough_hidden_retry_failure(
     return None, exc.__class__.__name__, None
 
 
+def _bounded_redacted_retry_message(value: Any) -> Optional[str]:
+    """Keep a short redacted provider message without request echoes."""
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    redacted = _redact_string(value.strip())
+    return _clean_passthrough_error_context_value(redacted)
+
+
+def _typed_precommit_diagnostic_status(
+    failure: ResponsesStreamPreCommitFailure,
+    status_code: Optional[int],
+) -> Optional[int]:
+    if isinstance(status_code, int) and not isinstance(status_code, bool):
+        return status_code
+    if failure.retryable:
+        return 503
+    typed_status = failure.status_code
+    if isinstance(typed_status, int) and not isinstance(typed_status, bool):
+        return typed_status
+    return None
+
+
 def _classify_passthrough_raw_http_error(
     exc: Exception,
     *,
@@ -2493,6 +2535,34 @@ def _classify_passthrough_raw_http_error(
             diagnostic_enabled=diagnostic_enabled,
         )
         return result
+
+    if isinstance(exc, ResponsesStreamPreCommitFailure):
+        # Typed failures already own control-flow classification. Record that
+        # classification instead of an unsupported/null raw result, and return
+        # None so this diagnostic cannot overwrite the retry decision.
+        _record_openai_raw_retry_event(
+            event_type="openai_typed_precommit_classification",
+            event_stage=event_stage,
+            request=request,
+            kwargs=kwargs,
+            custom_llm_provider=custom_llm_provider,
+            litellm_call_id=litellm_call_id,
+            failure=exc,
+            classification_status_code=_typed_precommit_diagnostic_status(
+                exc,
+                status_code,
+            ),
+            error_class=exc.error_class,
+            classification=exc.classification,
+            retryable=bool(exc.retryable),
+            classification_reason="typed_precommit_failure",
+            provider_error_code=exc.error_code,
+            provider_error_type=exc.error_type,
+            provider_error_message=exc.message,
+            failure_origin_label=getattr(exc, "failure_origin", None),
+            diagnostic_enabled=diagnostic_enabled,
+        )
+        return None
 
     if not isinstance(exc, (HTTPException, httpx.HTTPStatusError)):
         return _finish(None, reason="unsupported_exception")
@@ -2790,6 +2860,75 @@ def _get_passthrough_terminal_failure_kind(
     return "expected_upstream_capacity_or_internal"
 
 
+def _openai_retry_reason_label(
+    failure_class: str,
+    failure_classification: Optional[str],
+) -> Optional[str]:
+    """Map a retry class to the operator rollup reason without relabeling transport."""
+
+    normalized_class = str(failure_class or "").strip()
+    normalized_classification = str(failure_classification or "").strip()
+    if not normalized_class or normalized_class == "success":
+        return None
+    if (
+        normalized_class in _RESPONSES_TRANSIENT_STREAM_CLASSES
+        or normalized_class == "stream_interrupted"
+        or normalized_classification == "transient_stream_interruption"
+    ):
+        return "Stream interruption"
+    if normalized_class in {
+        "upstream_connectivity_failure",
+        "transport_dns_failure",
+    }:
+        return "Transport"
+    if normalized_class in {
+        "server_overloaded",
+        "upstream_overloaded",
+        "capacity_exhausted",
+    } or normalized_classification == "transient_capacity":
+        return "Capacity"
+    if (
+        normalized_class == "upstream_transient_internal"
+        or normalized_classification == "transient_upstream"
+    ):
+        return "Upstream"
+    return None
+
+
+def _copy_openai_retry_progress(metadata: Dict[str, Any], retry_count: int) -> None:
+    """Replace rollup totals with the latest measured snapshot."""
+
+    metadata["aawm_openai_retry_logical_count"] = retry_count
+    progress = metadata.get("_aawm_openai_retry_progress")
+    if not isinstance(progress, dict):
+        return
+    measured_wait = progress.get("measured_wait_seconds")
+    if isinstance(measured_wait, (int, float)) and not isinstance(measured_wait, bool):
+        metadata["aawm_openai_retry_elapsed_wait_seconds"] = round(
+            max(0.0, float(measured_wait)),
+            3,
+        )
+    failed_attempt = progress.get("failed_attempt_seconds")
+    if isinstance(failed_attempt, (int, float)) and not isinstance(failed_attempt, bool):
+        metadata["aawm_openai_retry_failed_attempt_seconds"] = round(
+            max(0.0, float(failed_attempt)),
+            3,
+        )
+    scheduled_wait = progress.get("scheduled_wait_seconds")
+    if isinstance(scheduled_wait, (int, float)) and not isinstance(scheduled_wait, bool):
+        metadata["aawm_openai_retry_scheduled_wait_seconds"] = round(
+            max(0.0, float(scheduled_wait)),
+            3,
+        )
+    reasons = progress.get("reasons")
+    if isinstance(reasons, list):
+        metadata["aawm_openai_retry_reasons"] = [
+            reason
+            for reason in reasons
+            if isinstance(reason, str) and reason.strip()
+        ]
+
+
 def _record_passthrough_hidden_retry_metadata(
     kwargs: Optional[dict],
     *,
@@ -2873,6 +3012,7 @@ def _record_passthrough_hidden_retry_metadata(
         )
     metadata["aawm_passthrough_hidden_retry_count"] = retry_count
     metadata["aawm_passthrough_hidden_logical_retry_count"] = retry_count
+    _copy_openai_retry_progress(metadata, retry_count)
     if final_outcome is not None:
         if logical_provider_send_count is not None:
             if final_outcome.startswith("success"):
@@ -2945,6 +3085,33 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
     attempt_number = 0
     last_capacity_exception: Optional[Exception] = None
     logical_provider_call_start: Optional[int] = None
+    retry_progress: Dict[str, Any] = {
+        "measured_wait_seconds": 0.0,
+        "failed_attempt_seconds": 0.0,
+        "scheduled_wait_seconds": 0.0,
+        "reasons": [],
+    }
+    if isinstance(kwargs, dict):
+        _ensure_passthrough_metadata(kwargs)[
+            "_aawm_openai_retry_progress"
+        ] = retry_progress
+
+    def _note_retry_reason(class_name: str, classification_name: Optional[str]) -> None:
+        label = _openai_retry_reason_label(class_name, classification_name)
+        reasons = retry_progress.get("reasons")
+        if label and isinstance(reasons, list) and label not in reasons:
+            reasons.append(label)
+
+    async def _accumulate_measured_wait(delay: float, sleep: Any) -> Any:
+        started = time.monotonic()
+        try:
+            return await sleep
+        finally:
+            retry_progress["measured_wait_seconds"] = float(
+                retry_progress.get("measured_wait_seconds") or 0.0
+            ) + max(0.0, time.monotonic() - started)
+            scheduled = float(retry_progress.get("scheduled_wait_seconds") or 0.0)
+            retry_progress["scheduled_wait_seconds"] = scheduled + max(0.0, delay)
     if request is not None:
         request_ledger = get_request_provider_call_ledger(request)
         if request_ledger is not None:
@@ -2964,6 +3131,7 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     ),
                 )
         try:
+            operation_started = time.monotonic()
             timeout_seconds: Optional[float] = None
             if budget_seconds > 0:
                 timeout_seconds = (
@@ -2994,20 +3162,48 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         operation_name=operation_name,
                     )
             except ClientDisconnectedCancellation:
+                retry_progress["failed_attempt_seconds"] = float(
+                    retry_progress.get("failed_attempt_seconds") or 0.0
+                ) + max(0.0, time.monotonic() - operation_started)
                 if openai_capacity_coordinator is not None:
                     openai_capacity_coordinator.record_terminal(
                         "client_disconnected",
                         error_class="client_disconnected",
                         status_code=None,
                     )
+                _record_passthrough_hidden_retry_metadata(
+                    kwargs,
+                    attempt_number=attempt_number,
+                    max_attempts=max_attempts,
+                    status_code=None,
+                    failure_class="client_disconnected",
+                    wait_seconds=0.0,
+                    final_outcome="cancelled",
+                    request=request,
+                    logical_provider_call_start=logical_provider_call_start,
+                )
                 raise
             except asyncio.CancelledError:
+                retry_progress["failed_attempt_seconds"] = float(
+                    retry_progress.get("failed_attempt_seconds") or 0.0
+                ) + max(0.0, time.monotonic() - operation_started)
                 if openai_capacity_coordinator is not None:
                     openai_capacity_coordinator.record_terminal(
                         "cancelled",
                         error_class="cancelled",
                         status_code=None,
                     )
+                _record_passthrough_hidden_retry_metadata(
+                    kwargs,
+                    attempt_number=attempt_number,
+                    max_attempts=max_attempts,
+                    status_code=None,
+                    failure_class="cancelled",
+                    wait_seconds=0.0,
+                    final_outcome="cancelled",
+                    request=request,
+                    logical_provider_call_start=logical_provider_call_start,
+                )
                 raise
             if openai_capacity_coordinator is not None:
                 await openai_capacity_coordinator.signal_success()
@@ -3040,6 +3236,9 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                 )
             return result
         except Exception as exc:
+            retry_progress["failed_attempt_seconds"] = float(
+                retry_progress.get("failed_attempt_seconds") or 0.0
+            ) + max(0.0, time.monotonic() - operation_started)
             (
                 status_code,
                 failure_class,
@@ -3140,8 +3339,14 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                 else None
             )
             if raw_http_classification is not None:
-                _, raw_failure_classification, _ = raw_http_classification
+                raw_error_class, raw_failure_classification, _ = raw_http_classification
                 failure_classification = raw_failure_classification
+                _note_retry_reason(
+                    raw_error_class or failure_class,
+                    failure_classification,
+                )
+            else:
+                _note_retry_reason(failure_class, failure_classification)
             raw_http_capacity_overload = bool(
                 raw_http_classification is not None
                 and raw_http_classification[0]
@@ -3151,14 +3356,18 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
             capacity_failure = bool(
                 (
                     isinstance(exc, ResponsesStreamPreCommitFailure)
-                    and exc.error_class
-                    in (
-                        _RESPONSES_TRANSIENT_CAPACITY_CLASSES
-                        | _RESPONSES_TRANSIENT_STREAM_CLASSES
-                    )
+                    and exc.error_class in _RESPONSES_TRANSIENT_CAPACITY_CLASSES
                     and exc.retryable
                 )
                 or raw_http_capacity_overload
+            )
+            ordinary_stream_retry = bool(
+                isinstance(exc, ResponsesStreamPreCommitFailure)
+                and exc.error_class in _RESPONSES_TRANSIENT_STREAM_CLASSES
+                and exc.retryable
+                and not exc.pre_commit_retry_exhausted
+                and not getattr(exc, "aawm_call_ledger_exhausted", False)
+                and not getattr(exc, "aawm_openai_wire_replay_blocked", False)
             )
             if (
                 openai_capacity_coordinator is not None
@@ -3214,6 +3423,33 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     remaining_seconds,
                 )
                 should_retry = True
+            elif (
+                openai_capacity_coordinator is not None
+                and ordinary_stream_retry
+            ):
+                # Stream replacement sends use remaining ordinary ledger
+                # admission. They do not receive a capacity grant or the
+                # capacity delay schedule.
+                stream_ledger = (
+                    get_request_provider_call_ledger(request)
+                    if request is not None
+                    else None
+                )
+                remaining_ordinary_sends = None
+                if stream_ledger is not None:
+                    remaining_ordinary_sends = stream_ledger.snapshot().get(
+                        "remaining_logical_provider_calls"
+                    )
+                if (
+                    isinstance(remaining_ordinary_sends, int)
+                    and not isinstance(remaining_ordinary_sends, bool)
+                    and remaining_ordinary_sends > 0
+                ):
+                    should_retry = True
+                    wait_seconds = float(exc.retry_after_seconds or 10.0)
+                else:
+                    should_retry = False
+                    wait_seconds = 0.0
             elif openai_capacity_coordinator is not None:
                 # The coordinator owns only OpenAI/Codex capacity retries. Do
                 # not let generic retryable errors enter a zero-second loop.
@@ -3346,16 +3582,19 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                 failure_class,
                 wait_seconds,
             )
-            if openai_capacity_coordinator is not None:
+            if openai_capacity_coordinator is not None and capacity_failure:
                 if request is not None:
                     try:
-                        wakeup_reason = await await_with_client_disconnect(
-                            lambda: openai_capacity_coordinator.sleep_with_wakeup(
-                                wait_seconds,
-                                error_class=failure_class,
-                                status_code=status_code,
+                        wakeup_reason = await _accumulate_measured_wait(
+                            wait_seconds,
+                            await_with_client_disconnect(
+                                lambda: openai_capacity_coordinator.sleep_with_wakeup(
+                                    wait_seconds,
+                                    error_class=failure_class,
+                                    status_code=status_code,
+                                ),
+                                request=request,
                             ),
-                            request=request,
                         )
                     except ClientDisconnectedCancellation:
                         openai_capacity_coordinator.record_terminal(
@@ -3363,28 +3602,65 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                             error_class=failure_class,
                             status_code=status_code,
                         )
+                        _record_passthrough_hidden_retry_metadata(
+                            kwargs,
+                            attempt_number=attempt_number,
+                            max_attempts=max_attempts,
+                            status_code=status_code,
+                            failure_class=failure_class,
+                            wait_seconds=0.0,
+                            final_outcome="cancelled",
+                            failure_classification=failure_classification,
+                            request=request,
+                            logical_provider_call_start=logical_provider_call_start,
+                        )
                         raise
                     except asyncio.CancelledError:
                         openai_capacity_coordinator.record_terminal(
                             "cancelled",
                             error_class=failure_class,
                             status_code=status_code,
+                        )
+                        _record_passthrough_hidden_retry_metadata(
+                            kwargs,
+                            attempt_number=attempt_number,
+                            max_attempts=max_attempts,
+                            status_code=status_code,
+                            failure_class=failure_class,
+                            wait_seconds=0.0,
+                            final_outcome="cancelled",
+                            failure_classification=failure_classification,
+                            request=request,
+                            logical_provider_call_start=logical_provider_call_start,
                         )
                         raise
                 else:
                     try:
-                        wakeup_reason = (
-                            await openai_capacity_coordinator.sleep_with_wakeup(
+                        wakeup_reason = await _accumulate_measured_wait(
+                            wait_seconds,
+                            openai_capacity_coordinator.sleep_with_wakeup(
                                 wait_seconds,
                                 error_class=failure_class,
                                 status_code=status_code,
-                            )
+                            ),
                         )
                     except asyncio.CancelledError:
                         openai_capacity_coordinator.record_terminal(
                             "cancelled",
                             error_class=failure_class,
                             status_code=status_code,
+                        )
+                        _record_passthrough_hidden_retry_metadata(
+                            kwargs,
+                            attempt_number=attempt_number,
+                            max_attempts=max_attempts,
+                            status_code=status_code,
+                            failure_class=failure_class,
+                            wait_seconds=0.0,
+                            final_outcome="cancelled",
+                            failure_classification=failure_classification,
+                            request=request,
+                            logical_provider_call_start=logical_provider_call_start,
                         )
                         raise
                 openai_capacity_coordinator.record_retry(
@@ -3393,7 +3669,25 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     status_code=status_code,
                 )
             else:
-                await _passthrough_hidden_retry_sleep(wait_seconds)
+                try:
+                    await _accumulate_measured_wait(
+                        wait_seconds,
+                        _passthrough_hidden_retry_sleep(wait_seconds),
+                    )
+                except asyncio.CancelledError:
+                    _record_passthrough_hidden_retry_metadata(
+                        kwargs,
+                        attempt_number=attempt_number,
+                        max_attempts=max_attempts,
+                        status_code=status_code,
+                        failure_class=failure_class,
+                        wait_seconds=0.0,
+                        final_outcome="cancelled",
+                        failure_classification=failure_classification,
+                        request=request,
+                        logical_provider_call_start=logical_provider_call_start,
+                    )
+                    raise
 
 
 def _clean_passthrough_error_context_value(value: Any) -> Optional[str]:
