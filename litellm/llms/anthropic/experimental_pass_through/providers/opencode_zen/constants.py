@@ -9,14 +9,14 @@ _OPENCODE_ZEN_DEFAULT_BASE_URL = "https://opencode.ai/zen/v1"
 
 _OPENCODE_ZEN_PROVIDER = "opencode_zen"
 
-# OC-010: Zen-distinct egress families. Zen credential selection and egress
-# bind the Zen credential family to the Zen target family so an OpenCode Go
-# credential (or its target identity) can never be selected or sent on a Zen
-# route. Go callers keep the historical host family until a later item.
+# OC-010: Zen credential selection and egress bind the Zen credential family
+# to the Zen target family. OC-019 binds Go callers to the distinct Go
+# credential family, target family, and cache namespace.
 _OPENCODE_ZEN_CREDENTIAL_FAMILY = "opencode_zen"
 _OPENCODE_ZEN_TARGET_FAMILY = "opencode_zen"
 _OPENCODE_GO_CREDENTIAL_FAMILY = "opencode_go"
 _OPENCODE_GO_TARGET_FAMILY = "opencode_go"
+_OPENCODE_GO_CREDENTIAL_CACHE_NAMESPACE = "opencode_go"
 
 _OPENCODE_ZEN_AUTH_FILE_ENV_VARS = (
     "LITELLM_OPENCODE_AUTH_FILE",
@@ -26,6 +26,17 @@ _OPENCODE_ZEN_AUTH_FILE_ENV_VARS = (
 _OPENCODE_ZEN_API_KEY_ENV_VARS = (
     "LITELLM_OPENCODE_API_KEY",
     "OPENCODE_API_KEY",
+)
+
+# OC-019: explicit Go keys only. These never include the Zen/general names.
+_OPENCODE_GO_API_KEY_ENV_VARS = (
+    "LITELLM_OPENCODE_GO_API_KEY",
+    "OPENCODE_GO_API_KEY",
+)
+
+_OPENCODE_GO_AUTH_FILE_ENV_VARS = (
+    "LITELLM_OPENCODE_GO_AUTH_FILE",
+    "OPENCODE_GO_AUTH_FILE",
 )
 
 _OPENCODE_ZEN_DEFAULT_AUTH_PATHS = (
