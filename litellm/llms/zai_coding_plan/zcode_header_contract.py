@@ -121,11 +121,9 @@ def build_zcode_model_headers(
         raise ZCodeHeaderContractError("api_key must be a non-blank string")
 
     sources = _metadata_dicts(litellm_params)
-    selected_profile = _select_profile_name(profile_name, sources)
-    profile_headers = contract.profiles.get(selected_profile)
-    if not isinstance(profile_headers, Mapping):
-        raise ZCodeHeaderContractError("selected ZCode header profile is missing")
-    headers = _copy_string_mapping(profile_headers)
+    headers = zcode_profile_headers(
+        contract, litellm_params=litellm_params, profile_name=profile_name
+    )
     profile_user_agent = headers.get("User-Agent")
     if not isinstance(profile_user_agent, str) or profile_user_agent.strip() == "":
         raise ZCodeHeaderContractError("selected ZCode profile is missing User-Agent")
@@ -141,6 +139,24 @@ def build_zcode_model_headers(
     }
     _reject_forbidden_headers(assembled, contract.forbidden_inbound_headers)
     return assembled
+
+
+def zcode_profile_headers(
+    contract: ZCodeHeaderContract,
+    *,
+    litellm_params: Optional[Mapping[str, Any]] = None,
+    profile_name: Optional[str] = None,
+) -> dict[str, str]:
+    """Return a copy of the selected ZCode profile headers."""
+
+    if not isinstance(contract, ZCodeHeaderContract):
+        raise ZCodeHeaderContractError("contract must be a ZCodeHeaderContract")
+    sources = _metadata_dicts(litellm_params)
+    selected_profile = _select_profile_name(profile_name, sources)
+    profile_headers = contract.profiles.get(selected_profile)
+    if not isinstance(profile_headers, Mapping):
+        raise ZCodeHeaderContractError("selected ZCode header profile is missing")
+    return _copy_string_mapping(profile_headers)
 
 
 def reset_zcode_header_contract_cache() -> None:
@@ -601,4 +617,5 @@ __all__ = [
     "build_zcode_model_headers",
     "load_zcode_header_contract",
     "reset_zcode_header_contract_cache",
+    "zcode_profile_headers",
 ]

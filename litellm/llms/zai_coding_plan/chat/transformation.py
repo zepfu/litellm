@@ -10,11 +10,16 @@ from litellm.types.llms.openai import AllMessageValues, ChatCompletionToolParam
 
 from ...openai.chat.gpt_transformation import OpenAIGPTConfig
 from ...openai.common_utils import OpenAIError
+from ..zcode_header_contract import (
+    ZCodeHeaderContractError,
+    build_zcode_model_headers,
+    load_zcode_header_contract,
+    zcode_profile_headers,
+)
+from ..zcode_signing import ZCodeSigningError, attach_zcode_signature_headers
 
 ZAI_CODING_PLAN_API_BASE = "https://api.z.ai/api/coding/paas/v4"
-ZAI_CODING_PLAN_CHAT_COMPLETIONS_URL = (
-    f"{ZAI_CODING_PLAN_API_BASE}/chat/completions"
-)
+ZAI_CODING_PLAN_CHAT_COMPLETIONS_URL = f"{ZAI_CODING_PLAN_API_BASE}/chat/completions"
 ZAI_CODING_PLAN_PROVIDER_NAME = "zai_coding_plan"
 ZAI_CODING_PLAN_USER_AGENT_PREFIX = "litellm-zai-coding-plan"
 ZAI_CODING_PLAN_MODEL_IDS = frozenset(
@@ -131,32 +136,11 @@ class ZAICodingPlanChatConfig(OpenAIGPTConfig):
         raise ZAICodingPlanAuthenticationError()
 
     @staticmethod
-    def _user_agent() -> str:
-        env_fork = get_secret_str("AAWM_LITELLM_FORK_VERSION") or get_secret_str(
-            "LITELLM_FORK_VERSION"
-        )
-        if isinstance(env_fork, str) and env_fork.strip():
-            version = env_fork.strip()
-        else:
-            try:
-                from litellm._version import version as litellm_version
-            except Exception:
-                litellm_version = "unknown"
-            if (
-                isinstance(litellm_version, str)
-                and "+" in litellm_version
-                and litellm_version.split("+", 1)[1].strip()
-            ):
-                version = litellm_version.split("+", 1)[1].strip()
-            elif isinstance(litellm_version, str) and litellm_version.strip() and litellm_version != "unknown":
-                version = litellm_version.strip()
-            else:
-                version = "dev"
-        return f"{ZAI_CODING_PLAN_USER_AGENT_PREFIX}/{version}"
-
-    @staticmethod
     def _map_reasoning_effort(value: object) -> str:
-        if not isinstance(value, str) or value not in ZAI_CODING_PLAN_REASONING_EFFORT_MAP:
+        if (
+            not isinstance(value, str)
+            or value not in ZAI_CODING_PLAN_REASONING_EFFORT_MAP
+        ):
             supported = ", ".join(ZAI_CODING_PLAN_REASONING_EFFORTS)
             raise ValueError(
                 "Z.AI Coding Plan does not support reasoning_effort="
@@ -323,12 +307,31 @@ class ZAICodingPlanChatConfig(OpenAIGPTConfig):
         api_key: Optional[str] = None,
         api_base: Optional[str] = None,
     ) -> dict:
-        _ = headers, messages, optional_params, litellm_params, api_key
+        _ = headers, messages, optional_params, api_key
         self._model_id(model)
         self._validate_api_base(api_base)
-        return {
-            "Authorization": f"Bearer {self._get_canonical_api_key()}",
-            "Content-Type": "application/json",
-            "Accept-Language": "en-US,en",
-            "User-Agent": self._user_agent(),
-        }
+        managed_key = self._get_canonical_api_key()
+        try:
+            contract = load_zcode_header_contract()
+            identity = build_zcode_model_headers(
+                contract,
+                api_key=managed_key,
+                litellm_params=litellm_params,
+            )
+            return attach_zcode_signature_headers(
+                identity,
+                api_key=managed_key,
+                runtime_header_version=contract.signing.runtime_header_version,
+                feature_gate_url=contract.signing.feature_gate_url,
+                handshake_url=contract.signing.handshake_url,
+                feature_gate_headers=zcode_profile_headers(
+                    contract, litellm_params=litellm_params
+                ),
+                feature_gate_timeout_seconds=contract.signing.feature_gate_timeout_seconds,
+                feature_gate_cache_ttl_seconds=contract.signing.feature_gate_cache_ttl_seconds,
+                handshake_timeout_seconds=contract.signing.handshake_timeout_seconds,
+            )
+        except ZCodeHeaderContractError as exc:
+            raise OpenAIError(status_code=500, message=str(exc), headers={}) from exc
+        except ZCodeSigningError as exc:
+            raise OpenAIError(status_code=400, message=str(exc), headers={}) from exc

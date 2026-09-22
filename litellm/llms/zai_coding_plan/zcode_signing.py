@@ -356,7 +356,7 @@ def _handshake_for_private_key(
                 "apiKey": api_key,
                 "nonce": nonce,
                 "sig": signature,
-                "ts": timestamp_ms,
+                "ts": str(timestamp_ms),
             },
             handshake_timeout_seconds,
         )
