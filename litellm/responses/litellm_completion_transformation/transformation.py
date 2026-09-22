@@ -2294,7 +2294,7 @@ class LiteLLMCompletionResponsesConfig:
                     GenericResponseOutputItem(
                         type="message",
                         id=chat_completion_response.id,
-                        status=LiteLLMCompletionResponsesConfig._map_chat_completion_finish_reason_to_responses_status(
+                        status=LiteLLMCompletionResponsesConfig._map_finish_reason_to_output_item_status(
                             choice.finish_reason
                         ),
                         role=choice.message.role,
