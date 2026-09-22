@@ -20,6 +20,11 @@ from litellm.integrations.aawm_passthrough_shape_capture import (
     passthrough_full_payload_capture_enabled,
 )
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
+from litellm.llms.cohere.cancellation import (
+    aclose_upstream_response_once,
+    is_cohere_api_host,
+    is_cohere_provider_name,
+)
 from litellm.litellm_core_utils.thread_pool_executor import executor
 from litellm.proxy._types import PassThroughEndpointLoggingResultValues
 from litellm.proxy.aawm_route_logging import (
@@ -2480,6 +2485,13 @@ class PassThroughStreamingHandler:
             local_identity = (
                 transfer_identity if "transfer_identity" in locals() else {}
             )
+            if is_cohere_provider_name(custom_llm_provider) or is_cohere_api_host(
+                getattr(response, "url", None)
+            ):
+                try:
+                    await aclose_upstream_response_once(response)
+                except Exception:
+                    pass
             await _finalize_transfer_if_needed(
                 local_identity,
                 "cancelled",
@@ -2519,6 +2531,13 @@ class PassThroughStreamingHandler:
             local_identity = (
                 transfer_identity if "transfer_identity" in locals() else {}
             )
+            if is_cohere_provider_name(custom_llm_provider) or is_cohere_api_host(
+                getattr(response, "url", None)
+            ):
+                try:
+                    await aclose_upstream_response_once(response)
+                except Exception:
+                    pass
             await _finalize_transfer_if_needed(
                 local_identity,
                 "disconnected",

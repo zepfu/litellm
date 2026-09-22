@@ -1,3 +1,4 @@
+import asyncio
 import json
 import ssl
 from typing import (
@@ -58,6 +59,11 @@ from litellm.llms.base_llm.vector_store_files.transformation import (
     BaseVectorStoreFilesConfig,
 )
 from litellm.llms.base_llm.videos.transformation import BaseVideoConfig
+from litellm.llms.cohere.cancellation import (
+    aclose_upstream_response_once,
+    attach_cohere_upstream_response,
+    is_cohere_provider_name,
+)
 from litellm.llms.custom_httpx.http_handler import (
     AsyncHTTPHandler,
     HTTPHandler,
@@ -814,6 +820,7 @@ class BaseLLMHTTPHandler:
                 litellm_params=litellm_params,
                 json_mode=json_mode,
                 optional_params=optional_params,
+                custom_llm_provider=custom_llm_provider,
             )
             return CustomStreamWrapper(
                 completion_stream=completion_stream,
@@ -871,6 +878,7 @@ class BaseLLMHTTPHandler:
         fake_stream: bool = False,
         client: Optional[HTTPHandler] = None,
         json_mode: bool = False,
+        custom_llm_provider: Optional[str] = None,
     ) -> Tuple[Any, dict]:
         if client is None or not isinstance(client, HTTPHandler):
             sync_httpx_client = _get_httpx_client(
@@ -920,6 +928,11 @@ class BaseLLMHTTPHandler:
                 sync_stream=True,
                 json_mode=json_mode,
             )
+        attach_cohere_upstream_response(
+            custom_llm_provider,
+            completion_stream,
+            response,
+        )
 
         # LOGGING
         logging_obj.post_call(
@@ -1022,49 +1035,60 @@ class BaseLLMHTTPHandler:
         if fake_stream is True:
             stream = False
 
-        response = await self._make_common_async_call(
-            async_httpx_client=async_httpx_client,
-            provider_config=provider_config,
-            api_base=api_base,
-            headers=headers,
-            data=data,
-            signed_json_body=signed_json_body,
-            timeout=timeout,
-            litellm_params=litellm_params,
-            stream=stream,
-            logging_obj=logging_obj,
-        )
-
-        if fake_stream is True:
-            model_response: ModelResponse = provider_config.transform_response(
-                model=model,
-                raw_response=response,
-                model_response=litellm.ModelResponse(),
-                logging_obj=logging_obj,
-                request_data=data,
-                messages=messages,
-                optional_params=optional_params,
+        response = None
+        try:
+            response = await self._make_common_async_call(
+                async_httpx_client=async_httpx_client,
+                provider_config=provider_config,
+                api_base=api_base,
+                headers=headers,
+                data=data,
+                signed_json_body=signed_json_body,
+                timeout=timeout,
                 litellm_params=litellm_params,
-                encoding=None,
-                json_mode=json_mode,
+                stream=stream,
+                logging_obj=logging_obj,
             )
 
-            completion_stream: Any = MockResponseIterator(
-                model_response=model_response, json_mode=json_mode
-            )
-        else:
-            completion_stream = provider_config.get_model_response_iterator(
-                streaming_response=response.aiter_lines(), sync_stream=False
-            )
-        # LOGGING
-        logging_obj.post_call(
-            input=messages,
-            api_key="",
-            original_response="first stream response received",
-            additional_args={"complete_input_dict": data},
-        )
+            if fake_stream is True:
+                model_response: ModelResponse = provider_config.transform_response(
+                    model=model,
+                    raw_response=response,
+                    model_response=litellm.ModelResponse(),
+                    logging_obj=logging_obj,
+                    request_data=data,
+                    messages=messages,
+                    optional_params=optional_params,
+                    litellm_params=litellm_params,
+                    encoding=None,
+                    json_mode=json_mode,
+                )
 
-        return completion_stream, response.headers
+                completion_stream: Any = MockResponseIterator(
+                    model_response=model_response, json_mode=json_mode
+                )
+            else:
+                completion_stream = provider_config.get_model_response_iterator(
+                    streaming_response=response.aiter_lines(), sync_stream=False
+                )
+            attach_cohere_upstream_response(
+                custom_llm_provider,
+                completion_stream,
+                response,
+            )
+            # LOGGING
+            logging_obj.post_call(
+                input=messages,
+                api_key="",
+                original_response="first stream response received",
+                additional_args={"complete_input_dict": data},
+            )
+
+            return completion_stream, response.headers
+        except asyncio.CancelledError:
+            if is_cohere_provider_name(custom_llm_provider):
+                await aclose_upstream_response_once(response)
+            raise
 
     def _add_stream_param_to_request_body(
         self,

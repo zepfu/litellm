@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 import traceback
@@ -7,6 +8,7 @@ import httpx
 
 import litellm
 from litellm._logging import verbose_logger
+from litellm.llms.cohere.cancellation import mark_cohere_cancellation
 from litellm.types.utils import LlmProviders
 
 from ..exceptions import (
@@ -1525,6 +1527,40 @@ def exception_type(  # type: ignore  # noqa: PLR0915
             elif (
                 custom_llm_provider == "cohere" or custom_llm_provider == "cohere_chat"
             ):  # Cohere
+                if isinstance(
+                    original_exception, (asyncio.CancelledError, GeneratorExit)
+                ):
+                    raise original_exception
+                cohere_status_code = getattr(original_exception, "status_code", None)
+                provider_response = getattr(original_exception, "response", None)
+                if cohere_status_code is None and provider_response is not None:
+                    cohere_status_code = getattr(provider_response, "status_code", None)
+                if cohere_status_code == 499:
+                    exception_mapping_worked = True
+                    cohere_message = getattr(original_exception, "message", error_str)
+                    raised_exception = APIError(
+                        status_code=499,
+                        message=f"CohereException - {cohere_message}",
+                        llm_provider="cohere",
+                        model=model,
+                        request=getattr(original_exception, "request", None),
+                    )
+                    if provider_response is not None:
+                        setattr(raised_exception, "response", provider_response)
+                    mark_cohere_cancellation(
+                        raised_exception,
+                        provider_returned=(
+                            provider_response is not None
+                            or getattr(
+                                original_exception,
+                                "_aawm_provider_returned",
+                                False,
+                            )
+                            is True
+                            or type(original_exception).__name__ == "CohereError"
+                        ),
+                    )
+                    raise raised_exception
                 if (
                     "invalid api token" in error_str
                     or "No API key provided." in error_str

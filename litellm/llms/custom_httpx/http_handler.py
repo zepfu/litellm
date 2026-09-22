@@ -33,6 +33,10 @@ from litellm.constants import (
     DEFAULT_SSL_CIPHERS,
 )
 from litellm.litellm_core_utils.logging_utils import track_llm_api_timing
+from litellm.llms.cohere.cancellation import (
+    aclose_cohere_cancelled_response,
+    close_cohere_cancelled_response,
+)
 from litellm.types.llms.custom_http import *
 
 if TYPE_CHECKING:
@@ -548,6 +552,8 @@ class AsyncHTTPHandler:
                 setattr(e, "text", mask_sensitive_info(e.response.text))
 
             setattr(e, "status_code", e.response.status_code)
+            if e.response.status_code == 499:
+                await aclose_cohere_cancelled_response(e.response)
 
             raise e
         except Exception as e:
@@ -1116,6 +1122,8 @@ class HTTPHandler:
                 setattr(e, "text", error_text)
 
             setattr(e, "status_code", e.response.status_code)
+            if e.response.status_code == 499:
+                close_cohere_cancelled_response(e.response)
             raise e
         except Exception as e:
             raise e

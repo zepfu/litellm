@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, List, Optional, Union
 
 import litellm
 from litellm._logging import verbose_router_logger
+from litellm.llms.cohere.cancellation import is_cohere_request_cancellation
 from litellm.constants import (
     DEFAULT_COOLDOWN_TIME_SECONDS,
     DEFAULT_FAILURE_THRESHOLD_MINIMUM_REQUESTS,
@@ -187,6 +188,8 @@ def _should_cooldown_deployment(
 
     - v1 logic (Legacy): if allowed fails or allowed fail policy set, coolsdown if num fails in this minute > allowed fails
     """
+    if is_cohere_request_cancellation(original_exception):
+        return False
     ## BASE CASE - single deployment
     model_group = litellm_router_instance.get_model_group(id=deployment)
     is_single_deployment_model_group = False

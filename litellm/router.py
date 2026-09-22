@@ -66,6 +66,7 @@ from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.dd_tracing import tracer
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLogging
 from litellm.litellm_core_utils.sensitive_data_masker import SensitiveDataMasker
+from litellm.llms.cohere.cancellation import is_cohere_request_cancellation
 from litellm.llms.openai_like.json_loader import JSONProviderRegistry
 from litellm.router_strategy.budget_limiter import RouterBudgetLimiting
 from litellm.router_strategy.least_busy import LeastBusyLoggingHandler
@@ -5410,6 +5411,8 @@ class Router:
             )
             return response
         except Exception as e:
+            if is_cohere_request_cancellation(e):
+                raise
             return await self.async_function_with_fallbacks_common_utils(
                 e,
                 disable_fallbacks,
@@ -5513,6 +5516,8 @@ class Router:
             )
             return response
         except Exception as e:
+            if is_cohere_request_cancellation(e):
+                raise
             current_attempt = None
             original_exception = e
             deployment_num_retries = getattr(e, "num_retries", None)
@@ -6071,6 +6076,8 @@ class Router:
         verbose_router_logger.debug("Router: Entering 'deployment_callback_on_failure'")
         try:
             exception = kwargs.get("exception", None)
+            if is_cohere_request_cancellation(exception):
+                return False
             exception_status = getattr(exception, "status_code", "")
 
             # Cache litellm_params to avoid repeated dict lookups

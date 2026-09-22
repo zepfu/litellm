@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from litellm.llms.cohere.cancellation import COHERE_CANCELLATION_FAILURE_CLASS
 from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.common import (
     _coerce_upstream_error_payload,
     _extract_passthrough_exception_detail,
@@ -387,12 +388,21 @@ def classify_cohere_failure(
     if not is_cohere_api_url(url):
         return None
 
-    if _is_cohere_cancellation(exc, status_code):
-        return _cohere_classification(
+    if (
+        _is_cohere_cancellation(exc, status_code)
+        or isinstance(exc, GeneratorExit)
+        or getattr(exc, "_aawm_cohere_cancellation", False) is True
+    ):
+        return CohereFailureClassification(
             name="cohere_cancellation",
-            failure_class="transient",
-            log_error_summary="Cohere request was cancelled",
-            explicit_cooldown_scope=explicit_cooldown_scope,
+            failure_kind="cohere_cancellation",
+            failure_class=COHERE_CANCELLATION_FAILURE_CLASS,
+            cooldown_scope=cohere_cooldown_scope_decision(
+                "cohere_cancellation",
+                explicit_scope=explicit_cooldown_scope,
+            ),
+            advance_fresh_candidate=False,
+            log_error_summary="Cohere request cancelled",
         )
     text = _normalized_error_text(exc)
     if status_code in (401, 403):

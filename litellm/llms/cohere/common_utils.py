@@ -1,3 +1,4 @@
+import asyncio
 import codecs
 import hashlib
 import json
@@ -7,6 +8,10 @@ from typing import Any, Dict, List, Literal, NoReturn, Optional, Set, Tuple, Uni
 
 from litellm.llms.base_llm.base_utils import BaseLLMModelInfo
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
+from litellm.llms.cohere.cancellation import (
+    aclose_upstream_response_once,
+    close_upstream_response_once,
+)
 from litellm.llms.cohere.chat.citation_translation import (
     cohere_citation_provider_fields,
 )
@@ -1168,6 +1173,28 @@ class CohereV2ModelResponseIterator:
         self._message_started = False
         self._message_end_received = False
         self._source_exhausted = False
+        self._aawm_stream_closed = False
+
+    def _cohere_upstream_target(self) -> Any:
+        raw_response = getattr(self, "_aawm_raw_response", None)
+        if raw_response is not None:
+            return raw_response
+        return self.streaming_response
+
+    def close(self) -> None:
+        if self._aawm_stream_closed:
+            return
+        target = self._cohere_upstream_target()
+        if not callable(getattr(target, "close", None)):
+            return
+        self._aawm_stream_closed = True
+        close_upstream_response_once(target)
+
+    async def aclose(self) -> None:
+        if self._aawm_stream_closed:
+            return
+        self._aawm_stream_closed = True
+        await aclose_upstream_response_once(self._cohere_upstream_target())
 
     @staticmethod
     def _empty_chunk() -> GenericStreamingChunk:
@@ -1541,6 +1568,9 @@ class CohereV2ModelResponseIterator:
                 self._push_source_chunk(self._read_sync_chunk())
         except StopIteration:
             raise
+        except GeneratorExit:
+            self.close()
+            raise
         except CohereError as exc:
             _raise_iterator_terminal(exc)
         except ValueError as exc:
@@ -1590,6 +1620,9 @@ class CohereV2ModelResponseIterator:
             raise
         except StopIteration:
             raise StopAsyncIteration from None
+        except asyncio.CancelledError:
+            await self.aclose()
+            raise
         except CohereError as exc:
             _raise_iterator_terminal(exc)
         except ValueError as exc:
