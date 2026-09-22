@@ -680,6 +680,12 @@ class BaseLLMHTTPHandler:
         if extra_body is not None:
             data = {**data, **extra_body}
 
+        if custom_llm_provider == "nous":
+            litellm.NousChatConfig().reject_unsupported_outbound_request(
+                outbound_params=data,
+                model=model,
+            )
+
         headers, signed_json_body = provider_config.sign_request(
             headers=headers,
             optional_params=optional_params,

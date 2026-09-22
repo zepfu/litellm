@@ -4289,11 +4289,22 @@ def get_optional_params(  # noqa: PLR0915
 
     if custom_llm_provider == "nous":
         # Reject semantic stream/tool requests before drop_params can strip them.
-        litellm.NousChatConfig().reject_unsupported_capability_params(
+        # Empty tools and tool_choice=auto stay eligible without drop_params.
+        nous_config = litellm.NousChatConfig()
+        nous_config.reject_unsupported_capability_params(
             non_default_params=non_default_params,
             model=model,
-            reject_nonsemantic=False,
         )
+        supported_capability_params = nous_config.get_supported_openai_params(
+            model=model
+        )
+        for param in ("stream", "tools", "tool_choice"):
+            if (
+                param in supported_capability_params
+                or param not in non_default_params
+            ):
+                continue
+            non_default_params.pop(param, None)
 
     _check_valid_arg(
         supported_params=supported_params or [],
@@ -4985,6 +4996,12 @@ def get_optional_params(  # noqa: PLR0915
         nested_paths = [p for p in additional_drop_params if is_nested_path(p)]
         for path in nested_paths:
             optional_params = delete_nested_value(optional_params, path)
+
+    if custom_llm_provider == "nous":
+        litellm.NousChatConfig().reject_unsupported_outbound_request(
+            outbound_params=optional_params,
+            model=model,
+        )
 
     return optional_params
 
