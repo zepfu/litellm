@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass
 from typing import Any, Optional, Union
@@ -71,6 +72,20 @@ _COHERE_UNSUPPORTED_OPERATION_MARKERS: tuple[str, ...] = (
     "not_implemented",
     "operation not supported",
     "operation is not supported",
+)
+_COHERE_COOLDOWN_SCOPE_DECISIONS = frozenset({"credential", "candidate", "none"})
+_COHERE_CREDENTIAL_SCOPE_FAILURES = frozenset(
+    {
+        "cohere_authentication",
+        "cohere_billing_exhausted",
+        "cohere_monthly_trial_exhausted",
+    }
+)
+_COHERE_UNSCOPED_FAILURES = frozenset(
+    {
+        "cohere_validation",
+        "cohere_cancellation",
+    }
 )
 
 
@@ -275,6 +290,59 @@ def _classify_cohere_retryable_status(
     return None
 
 
+def cohere_cooldown_scope_decision(
+    failure_name: str,
+    *,
+    explicit_scope: Optional[str] = None,
+) -> str:
+    """Resolve one explicit Cohere cooldown scope.
+
+    ``explicit_scope`` may be ``credential``, ``candidate``, or ``none``.
+    Any other explicit value is ignored and the failure name decides:
+    authentication, billing, and monthly quota are credential-wide; validation
+    and cancellation have no cooldown scope; remaining Cohere failures stay
+    on the single candidate.
+    """
+
+    if (
+        isinstance(explicit_scope, str)
+        and explicit_scope in _COHERE_COOLDOWN_SCOPE_DECISIONS
+    ):
+        return explicit_scope
+    if failure_name in _COHERE_CREDENTIAL_SCOPE_FAILURES:
+        return "credential"
+    if failure_name in _COHERE_UNSCOPED_FAILURES:
+        return "none"
+    return "candidate"
+
+
+def _is_cohere_cancellation(exc: Exception, status_code: Optional[int]) -> bool:
+    if isinstance(exc, asyncio.CancelledError):
+        return True
+    if type(exc).__name__ == "CancelledError":
+        return True
+    return status_code == 499
+
+
+def _cohere_classification(
+    *,
+    name: str,
+    failure_class: str,
+    log_error_summary: str,
+    explicit_cooldown_scope: Optional[str] = None,
+) -> CohereFailureClassification:
+    return CohereFailureClassification(
+        name=name,
+        failure_kind=name,
+        failure_class=failure_class,
+        cooldown_scope=cohere_cooldown_scope_decision(
+            name,
+            explicit_scope=explicit_cooldown_scope,
+        ),
+        log_error_summary=log_error_summary,
+    )
+
+
 def classify_cohere_failure(
     *,
     url: Optional[httpx.URL],
@@ -285,8 +353,15 @@ def classify_cohere_failure(
     provider_returned: bool = False,
     route_family: Optional[str] = None,
     selected_upstream_model: Optional[str] = None,
+    explicit_cooldown_scope: Optional[str] = None,
 ) -> Optional[CohereFailureClassification]:
-    """Classify only direct Cohere failures, never OpenRouter-hosted Cohere."""
+    """Classify only direct Cohere failures, never OpenRouter-hosted Cohere.
+
+    Scope is one explicit decision: ``credential`` for authentication, billing,
+    and monthly quota; ``candidate`` for model-scoped failures such as RPM;
+    ``none`` for validation and cancellation. ``explicit_cooldown_scope`` may
+    select one of those three decisions directly.
+    """
 
     provider = str(custom_llm_provider or "").strip().lower()
     if provider and provider != "cohere":
@@ -294,34 +369,48 @@ def classify_cohere_failure(
     if not is_cohere_api_url(url):
         return None
 
+    if _is_cohere_cancellation(exc, status_code):
+        return _cohere_classification(
+            name="cohere_cancellation",
+            failure_class="transient",
+            log_error_summary="Cohere request was cancelled",
+            explicit_cooldown_scope=explicit_cooldown_scope,
+        )
     text = _normalized_error_text(exc)
     if status_code in (401, 403):
-        return CohereFailureClassification(
+        return _cohere_classification(
             name="cohere_authentication",
-            failure_kind="cohere_authentication",
             failure_class="auth",
             log_error_summary="Cohere authentication failed",
+            explicit_cooldown_scope=explicit_cooldown_scope,
+        )
+    if status_code == 402:
+        return _cohere_classification(
+            name="cohere_billing_exhausted",
+            failure_class="quota_exhausted",
+            log_error_summary="Cohere billing capacity is exhausted",
+            explicit_cooldown_scope=explicit_cooldown_scope,
         )
     if status_code == 429 and any(marker in text for marker in _MONTHLY_TRIAL_MARKERS):
-        return CohereFailureClassification(
+        return _cohere_classification(
             name="cohere_monthly_trial_exhausted",
-            failure_kind="cohere_monthly_trial_exhausted",
             failure_class="quota_exhausted",
             log_error_summary="Cohere monthly trial capacity is exhausted",
+            explicit_cooldown_scope=explicit_cooldown_scope,
         )
     if status_code == 429:
-        return CohereFailureClassification(
+        return _cohere_classification(
             name="cohere_rpm_rate_limit",
-            failure_kind="cohere_rpm_rate_limit",
             failure_class="rate_limit",
             log_error_summary="Cohere request rate limit reached",
+            explicit_cooldown_scope=explicit_cooldown_scope,
         )
     if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)):
-        return CohereFailureClassification(
+        return _cohere_classification(
             name="cohere_timeout_connectivity",
-            failure_kind="cohere_timeout_connectivity",
             failure_class="transient",
             log_error_summary="Cohere timeout or connectivity failure",
+            explicit_cooldown_scope=explicit_cooldown_scope,
         )
     if _has_structured_model_unavailable_evidence(
         url=url,
@@ -333,25 +422,25 @@ def classify_cohere_failure(
         provider_returned=provider_returned,
         exc=exc,
     ):
-        return CohereFailureClassification(
+        return _cohere_classification(
             name="cohere_model_unavailable",
-            failure_kind="cohere_model_unavailable",
             failure_class="model_unavailable",
             log_error_summary="Cohere model is unsupported or unavailable",
+            explicit_cooldown_scope=explicit_cooldown_scope,
         )
     if status_code in (400, 422):
-        return CohereFailureClassification(
+        return _cohere_classification(
             name="cohere_validation",
-            failure_kind="cohere_validation",
             failure_class="provider_4xx_other",
             log_error_summary="Cohere request validation failed",
+            explicit_cooldown_scope=explicit_cooldown_scope,
         )
     if status_code == 404:
-        return CohereFailureClassification(
+        return _cohere_classification(
             name="cohere_provider_failure",
-            failure_kind="cohere_provider_failure",
             failure_class="provider_4xx_other",
             log_error_summary="Cohere provider request failed",
+            explicit_cooldown_scope=explicit_cooldown_scope,
         )
     retryable_status = _classify_cohere_retryable_status(
         status_code=status_code,
@@ -365,11 +454,11 @@ def classify_cohere_failure(
         failure_class = "rate_limit"
     else:
         failure_class = "transient"
-    return CohereFailureClassification(
+    return _cohere_classification(
         name="cohere_provider_failure",
-        failure_kind="cohere_provider_failure",
         failure_class=failure_class,
         log_error_summary="Cohere provider request failed",
+        explicit_cooldown_scope=explicit_cooldown_scope,
     )
 
 
@@ -377,5 +466,6 @@ __all__ = [
     "COHERE_API_HOSTS",
     "CohereFailureClassification",
     "classify_cohere_failure",
+    "cohere_cooldown_scope_decision",
     "is_cohere_api_url",
 ]
