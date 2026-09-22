@@ -24,11 +24,12 @@ COHERE_API_HOSTS: frozenset[str] = frozenset(
 _COHERE_CHAT_V2_PATH = "/v2/chat"
 _COHERE_CODEX_ROUTE_FAMILY = "codex_cohere_chat_completions_adapter"
 
-_MONTHLY_QUOTA_MARKERS: tuple[str, ...] = (
-    "monthly trial",
-    "trial monthly",
-    "monthly limit",
+_MONTHLY_QUOTA_EXHAUSTION_MARKERS: tuple[str, ...] = (
     "monthly quota",
+    "monthly limit",
+    "monthly capacity",
+    "quota exhausted",
+    "capacity exhausted",
 )
 _COHERE_MODEL_TOKEN = r"""['"]?(?P<model>[^\s,'";]+)['"]?"""
 _COHERE_MODEL_UNAVAILABLE_MESSAGE_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -340,14 +341,19 @@ def _cohere_classification(
 
 
 def _cohere_text_has_monthly_quota_exhaustion(text: str) -> bool:
-    """Credential scope requires monthly quota evidence, not a trial mention.
+    """Credential scope requires monthly quota or capacity exhaustion.
 
-    "free trial", "trial limit", and "trial usage" alongside a per-minute rate
-    limit stay on the candidate RPM path. A message that actually reports
-    monthly exhaustion remains credential-scoped.
+    Naming the monthly trial plan is not exhaustion. An explicit per-minute
+    rate limit that only mentions that plan stays candidate-scoped, as do
+    "free trial", "trial limit", and "trial usage" rate limits. A message that
+    reports monthly quota or capacity exhaustion stays credential-scoped.
     """
 
-    return any(marker in text for marker in _MONTHLY_QUOTA_MARKERS)
+    if "monthly" not in text:
+        return False
+    if any(marker in text for marker in _MONTHLY_QUOTA_EXHAUSTION_MARKERS):
+        return True
+    return "exhausted" in text or "exhaustion" in text
 
 
 def classify_cohere_failure(

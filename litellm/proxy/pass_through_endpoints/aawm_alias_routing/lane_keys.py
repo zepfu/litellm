@@ -333,6 +333,22 @@ def resolve_cohere_credential_lane_sentinel(
 _COHERE_ATTEMPT_CREDENTIAL_SENTINEL_ATTR = "_aawm_cohere_attempt_credential_sentinel"
 
 
+def clear_cohere_attempt_credential_sentinel(request: Any = None) -> None:
+    """Drop a previous attempt's fingerprint before this attempt loads a key.
+
+    A missing-key failure must not publish cooldown for the prior attempt.
+    The current exception's stamped fingerprint is independent of this value.
+    """
+
+    state = getattr(request, "state", None)
+    if state is None:
+        return
+    try:
+        setattr(state, _COHERE_ATTEMPT_CREDENTIAL_SENTINEL_ATTR, None)
+    except (AttributeError, TypeError):
+        return
+
+
 def capture_cohere_attempt_credential_sentinel(
     credential: str,
     *,

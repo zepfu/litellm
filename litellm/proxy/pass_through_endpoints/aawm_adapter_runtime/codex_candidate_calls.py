@@ -69,6 +69,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.opencode_go_rejecti
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.lane_keys import (
     capture_cohere_attempt_credential_sentinel,
+    clear_cohere_attempt_credential_sentinel,
     stamp_cohere_attempt_credential_sentinel,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
@@ -2247,6 +2248,23 @@ def install(
     )
 
     _mod["_load_opencode_go_api_key"] = _load_opencode_go_api_key
+    # Rebound Cohere preparation and its failure callback resolve these names
+    # from the host namespace, not from this module.
+    for _name, _value in (
+        (
+            "capture_cohere_attempt_credential_sentinel",
+            capture_cohere_attempt_credential_sentinel,
+        ),
+        (
+            "clear_cohere_attempt_credential_sentinel",
+            clear_cohere_attempt_credential_sentinel,
+        ),
+        (
+            "stamp_cohere_attempt_credential_sentinel",
+            stamp_cohere_attempt_credential_sentinel,
+        ),
+    ):
+        host_globals.setdefault(_name, _value)
     for _name, _value in (
         (
             "prepare_cohere_v2_strict_completion_kwargs",
@@ -6653,6 +6671,7 @@ async def _prepare_codex_cohere_chat_completions_adapter_route(
     use_alias_candidate_probe: bool = False,
 ) -> "_aawm_adapter_driver.CompletionAdapterRoutePlan":
     _ = use_alias_candidate_probe
+    clear_cohere_attempt_credential_sentinel(request)
     normalized_model = adapter_model.strip() if isinstance(adapter_model, str) else ""
     provider, separator, upstream_model = normalized_model.partition("/")
     if (
