@@ -440,23 +440,142 @@ def _strip_openai_function_strict(tools: List[Any]) -> List[Any]:
 
 
 def apply_cohere_v2_strict_tools(request_data: dict) -> dict:
-    """Translate requested function strictness onto Cohere ``strict_tools``."""
+    """Record uniform function strictness without stripping flags.
+
+    OpenAI ``strict`` flags stay on the tools until post-override finalization.
+    Mixed or invalid strictness is left in place so a later tool override can
+    still be judged before egress.
+    """
     tools = request_data.get("tools")
     if not isinstance(tools, list) or not tools:
         return request_data
     if not any(_tool_declares_strict_key(tool) for tool in tools):
         return request_data
+    try:
+        tools_request_strict = resolve_cohere_v2_strict_tools(tools)
+    except CohereV2StrictToolsError:
+        return request_data
+    if tools_request_strict:
+        return {**request_data, "strict_tools": True}
+    if "strict_tools" not in request_data:
+        return request_data
+    updated = dict(request_data)
+    updated.pop("strict_tools", None)
+    return updated
 
-    strict_tools = resolve_cohere_v2_strict_tools(tools)
-    updated = {
+
+def finalize_cohere_v2_strict_tools(request_data: dict) -> dict:
+    """Apply strictness from the effective tools and request flag.
+
+    Call this after overrides such as ``extra_body`` are merged. Conflicting
+    combinations raise before the caller can send the body.
+    """
+    if not isinstance(request_data, dict):
+        return request_data
+    tools = request_data.get("tools")
+    flag_present = "strict_tools" in request_data
+    flag = request_data.get("strict_tools") if flag_present else None
+    if flag_present and not isinstance(flag, bool):
+        raise CohereV2StrictToolsError(
+            "Cohere strict_tools cannot represent a non-boolean request flag."
+        )
+    if not isinstance(tools, list) or not tools:
+        if flag is True:
+            raise CohereV2StrictToolsError(
+                "Cohere strict_tools cannot enable strictness without strict function tools."
+            )
+        return request_data
+
+    tools_request_strict = resolve_cohere_v2_strict_tools(tools)
+    if flag is True and not tools_request_strict:
+        raise CohereV2StrictToolsError(
+            "Cohere strict_tools cannot enable strictness for tools whose caller did not request it."
+        )
+    if flag is False and tools_request_strict:
+        raise CohereV2StrictToolsError(
+            "Cohere strict_tools cannot disable strictness for tools that requested it."
+        )
+
+    finalized = {
         **request_data,
         "tools": _strip_openai_function_strict(tools),
     }
-    if strict_tools:
-        updated["strict_tools"] = True
+    if tools_request_strict:
+        finalized["strict_tools"] = True
+    elif flag is False:
+        finalized["strict_tools"] = False
     else:
-        updated.pop("strict_tools", None)
-    return updated
+        finalized.pop("strict_tools", None)
+    return finalized
+
+
+def shield_cohere_responses_function_parameters(
+    responses_api_request: dict,
+) -> tuple:
+    """Copy non-dict function parameters out of a Responses request.
+
+    The shared Responses converter replaces falsy parameters and raises on
+    values that ``dict(...)`` cannot accept. Cohere keeps those original
+    values. The returned request is a shallow copy with only the shielded
+    function tools replaced.
+    """
+    if not isinstance(responses_api_request, dict):
+        return responses_api_request, []
+    tools = responses_api_request.get("tools")
+    if not isinstance(tools, list):
+        return responses_api_request, []
+
+    preserved: List[tuple] = []
+    shielded_tools: List[Any] = []
+    function_index = 0
+    changed = False
+    for tool in tools:
+        if isinstance(tool, dict) and tool.get("type") == "function":
+            if "parameters" in tool and not isinstance(tool.get("parameters"), dict):
+                preserved.append((function_index, tool.get("parameters")))
+                shielded_tools.append({**tool, "parameters": {"type": "object"}})
+                changed = True
+            else:
+                shielded_tools.append(tool)
+            function_index += 1
+        else:
+            shielded_tools.append(tool)
+    if not changed:
+        return responses_api_request, []
+    return {**responses_api_request, "tools": shielded_tools}, preserved
+
+
+def restore_cohere_responses_function_parameters(
+    completion_kwargs: dict,
+    preserved: List[tuple],
+) -> dict:
+    """Put shielded Responses parameter values back onto converted tools."""
+    if not preserved or not isinstance(completion_kwargs, dict):
+        return completion_kwargs
+    tools = completion_kwargs.get("tools")
+    if not isinstance(tools, list):
+        return completion_kwargs
+    preserved_by_index = {index: parameters for index, parameters in preserved}
+    restored_tools: List[Any] = []
+    function_index = 0
+    for tool in tools:
+        if isinstance(tool, dict) and tool.get("type") == "function":
+            if function_index in preserved_by_index:
+                function = tool.get("function")
+                original_parameters = preserved_by_index[function_index]
+                if isinstance(function, dict):
+                    tool = {
+                        **tool,
+                        "function": {
+                            **function,
+                            "parameters": original_parameters,
+                        },
+                    }
+                else:
+                    tool = {**tool, "parameters": original_parameters}
+            function_index += 1
+        restored_tools.append(tool)
+    return {**completion_kwargs, "tools": restored_tools}
 
 
 def prepare_cohere_v2_strict_completion_kwargs(
@@ -468,6 +587,11 @@ def prepare_cohere_v2_strict_completion_kwargs(
     ``strict_tools``. All-nonstrict flags are removed here so Cohere does not
     receive the OpenAI field. Caller-owned tool objects are not mutated.
     """
+    extra_body = completion_kwargs.get("extra_body")
+    if isinstance(extra_body, dict) and (
+        "tools" in extra_body or "strict_tools" in extra_body
+    ):
+        return completion_kwargs
     tools = completion_kwargs.get("tools")
     if not isinstance(tools, list) or not tools:
         return completion_kwargs
@@ -685,6 +809,10 @@ class CohereV2ChatConfig(OpenAIGPTConfig):
         )
 
         return apply_cohere_v2_strict_tools(data)
+
+    def finalize_strict_tools_request(self, request_data: dict) -> dict:
+        """Decide strictness from the body after ``extra_body`` overrides."""
+        return finalize_cohere_v2_strict_tools(request_data)
 
     async def async_transform_request(
         self,

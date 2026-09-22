@@ -680,6 +680,12 @@ class BaseLLMHTTPHandler:
         if extra_body is not None:
             data = {**data, **extra_body}
 
+        finalize_strict_tools_request = getattr(
+            provider_config, "finalize_strict_tools_request", None
+        )
+        if callable(finalize_strict_tools_request):
+            data = finalize_strict_tools_request(data)
+
         headers, signed_json_body = provider_config.sign_request(
             headers=headers,
             optional_params=optional_params,
