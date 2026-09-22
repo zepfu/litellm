@@ -101,8 +101,9 @@ class _ZenAuthCacheEntry:
 
 @dataclass(frozen=True)
 class _ZenAuthFlight:
-    generation: _ZenAuthGeneration
-    task: "asyncio.Task[str]"
+    """One in-flight read for a path, independent of the caller's preliminary stat."""
+
+    task: "asyncio.Task[_ZenAuthCacheEntry]"
 
 
 _zen_auth_cache: "OrderedDict[str, _ZenAuthCacheEntry]" = OrderedDict()
@@ -511,10 +512,13 @@ def _zen_auth_read_fingerprint(
 
 
 def _open_zen_auth_descriptor(path: Path) -> int:
+    """Open the final path without following a symlink or blocking on a FIFO."""
+
     nofollow = getattr(os, "O_NOFOLLOW", None)
-    if nofollow is None:
+    nonblock = getattr(os, "O_NONBLOCK", None)
+    if nofollow is None or nonblock is None:
         raise OSError(errno.EINVAL, "secure open is unavailable")
-    flags = os.O_RDONLY | nofollow
+    flags = os.O_RDONLY | nofollow | nonblock
     cloexec = getattr(os, "O_CLOEXEC", None)
     if cloexec is not None:
         flags |= cloexec
@@ -522,12 +526,35 @@ def _open_zen_auth_descriptor(path: Path) -> int:
 
 
 def _map_zen_auth_open_error(exc: OSError, source_label: str) -> ValueError:
-    if exc.errno in (errno.ELOOP, errno.EMLINK):
+    if exc.errno in (errno.ELOOP, errno.EMLINK, errno.ENXIO, errno.EAGAIN):
         return _zen_auth_file_error(
             source_label,
             "is missing or not a regular file.",
         )
     return _zen_auth_file_error(source_label, "is not readable.")
+
+
+def _zen_auth_descriptor_metadata(
+    descriptor: int,
+    source_label: str,
+) -> os.stat_result:
+    """Reject anything that is not a bounded regular file before reading it."""
+
+    try:
+        metadata = os.fstat(descriptor)
+    except OSError:
+        raise _zen_auth_file_error(source_label, "is not readable.") from None
+    if not stat.S_ISREG(metadata.st_mode):
+        raise _zen_auth_file_error(
+            source_label,
+            "is missing or not a regular file.",
+        )
+    if metadata.st_size > _ZEN_AUTH_MAX_BYTES:
+        raise _zen_auth_file_error(
+            source_label,
+            "exceeds the maximum auth-file size.",
+        )
+    return metadata
 
 
 def _read_descriptor_bounded(descriptor: int) -> bytes:
@@ -546,14 +573,6 @@ def _read_descriptor_bounded(descriptor: int) -> bytes:
     if total > limit:
         raise ValueError("auth file exceeds the maximum size")
     return b"".join(chunks)
-
-
-def _zen_auth_text_differs(path_text: str, descriptor_text: str) -> bool:
-    if path_text == descriptor_text:
-        return False
-    normalized_path = path_text.replace("\r\n", "\n").replace("\r", "\n")
-    normalized_descriptor = descriptor_text.replace("\r\n", "\n").replace("\r", "\n")
-    return normalized_path != normalized_descriptor
 
 
 def _api_key_from_opencode_auth_text(
@@ -607,28 +626,12 @@ def _stat_zen_auth_generation_sync(
     except OSError as exc:
         raise _map_zen_auth_open_error(exc, source_label) from None
     try:
-        try:
-            metadata = os.fstat(descriptor)
-        except OSError:
-            raise _zen_auth_file_error(
-                source_label,
-                "is not readable.",
-            ) from None
+        metadata = _zen_auth_descriptor_metadata(descriptor, source_label)
     finally:
         try:
             os.close(descriptor)
         except OSError:
             pass
-    if not stat.S_ISREG(metadata.st_mode):
-        raise _zen_auth_file_error(
-            source_label,
-            "is missing or not a regular file.",
-        )
-    if metadata.st_size > _ZEN_AUTH_MAX_BYTES:
-        raise _zen_auth_file_error(
-            source_label,
-            "exceeds the maximum auth-file size.",
-        )
     return _zen_auth_generation(metadata)
 
 
@@ -636,42 +639,21 @@ def _read_one_zen_auth_attempt_sync(
     path: Path,
     source_label: str,
 ) -> Optional[tuple[str, _ZenAuthGeneration]]:
-    """Read one generation. Return None when the file changes mid-read."""
+    """Read one generation through the validated descriptor.
+
+    Return None when that inode changes mid-read. Invalid UTF-8 is a content
+    failure for the generation that was read.
+    """
 
     try:
         descriptor = _open_zen_auth_descriptor(path)
     except OSError as exc:
         raise _map_zen_auth_open_error(exc, source_label) from None
     try:
+        before = _zen_auth_descriptor_metadata(descriptor, source_label)
         try:
-            before = os.fstat(descriptor)
+            raw_bytes = _read_descriptor_bounded(descriptor)
         except OSError:
-            raise _zen_auth_file_error(
-                source_label,
-                "is not readable.",
-            ) from None
-        if not stat.S_ISREG(before.st_mode):
-            raise _zen_auth_file_error(
-                source_label,
-                "is missing or not a regular file.",
-            )
-        if before.st_size > _ZEN_AUTH_MAX_BYTES:
-            raise _zen_auth_file_error(
-                source_label,
-                "exceeds the maximum auth-file size.",
-            )
-        try:
-            # Path.read_text stays on this path so an unreadable replacement
-            # fails closed with the existing sanitized error.
-            path_text = path.read_text(encoding="utf-8")
-        except Exception:
-            raise _zen_auth_file_error(
-                source_label,
-                "is not readable.",
-            ) from None
-        try:
-            descriptor_text = _read_descriptor_bounded(descriptor).decode("utf-8")
-        except (OSError, UnicodeDecodeError):
             raise _zen_auth_file_error(
                 source_label,
                 "is not readable.",
@@ -688,14 +670,25 @@ def _read_one_zen_auth_attempt_sync(
                 source_label,
                 "is not readable.",
             ) from None
-        if _zen_auth_read_fingerprint(before) != _zen_auth_read_fingerprint(
-            after
-        ) or _zen_auth_text_differs(path_text, descriptor_text):
+        if not stat.S_ISREG(after.st_mode):
+            raise _zen_auth_file_error(
+                source_label,
+                "is missing or not a regular file.",
+            )
+        if _zen_auth_read_fingerprint(before) != _zen_auth_read_fingerprint(after):
             return None
         generation = _zen_auth_generation(after)
         try:
+            auth_text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            raise _ZenAuthContentError(
+                f"OpenCode Zen auth file configured via {source_label} "
+                "does not contain valid UTF-8 text.",
+                generation,
+            ) from None
+        try:
             api_key = _api_key_from_opencode_auth_text(
-                descriptor_text,
+                auth_text,
                 source_label=source_label,
                 source_family=_constants._OPENCODE_ZEN_CREDENTIAL_FAMILY,
             )
@@ -766,7 +759,10 @@ def _remember_zen_auth_unlocked(
         _zen_auth_cache.popitem(last=False)
 
 
-def _finish_zen_auth_flight(path_key: str, task: "asyncio.Task[str]") -> None:
+def _finish_zen_auth_flight(
+    path_key: str,
+    task: "asyncio.Task[_ZenAuthCacheEntry]",
+) -> None:
     flight = _zen_auth_flights.get(path_key)
     if flight is not None and flight.task is task:
         _zen_auth_flights.pop(path_key, None)
@@ -783,6 +779,40 @@ async def _drop_zen_auth_cache_if_owner(path_key: str) -> None:
             _zen_auth_cache.pop(path_key, None)
 
 
+async def _current_zen_auth_generation(
+    path: Path,
+    source_label: str,
+    path_key: str,
+) -> _ZenAuthGeneration:
+    """Probe outside the shared lock, then drop a key the probe can no longer see."""
+
+    try:
+        return await asyncio.to_thread(
+            _stat_zen_auth_generation_sync,
+            path,
+            source_label,
+        )
+    except Exception:
+        async with _get_zen_auth_lock():
+            _zen_auth_cache.pop(path_key, None)
+        raise
+
+
+def _publish_matches_owner(
+    path_key: str,
+    generation: _ZenAuthGeneration,
+    current: Optional[_ZenAuthGeneration],
+) -> bool:
+    task = asyncio.current_task()
+    flight = _zen_auth_flights.get(path_key)
+    if flight is None or flight.task is not task:
+        return False
+    if current != generation:
+        _zen_auth_cache.pop(path_key, None)
+        return False
+    return True
+
+
 async def _publish_zen_auth_if_current(
     path: Path,
     source_label: str,
@@ -790,22 +820,16 @@ async def _publish_zen_auth_if_current(
     generation: _ZenAuthGeneration,
     api_key: str,
 ) -> None:
-    task = asyncio.current_task()
+    try:
+        current: Optional[_ZenAuthGeneration] = await asyncio.to_thread(
+            _stat_zen_auth_generation_sync,
+            path,
+            source_label,
+        )
+    except Exception:
+        current = None
     async with _get_zen_auth_lock():
-        flight = _zen_auth_flights.get(path_key)
-        if flight is None or flight.task is not task:
-            return
-        try:
-            current = await asyncio.to_thread(
-                _stat_zen_auth_generation_sync,
-                path,
-                source_label,
-            )
-        except Exception:
-            _zen_auth_cache.pop(path_key, None)
-            return
-        if current != generation:
-            _zen_auth_cache.pop(path_key, None)
+        if not _publish_matches_owner(path_key, generation, current):
             return
         _remember_zen_auth_unlocked(path_key, generation, api_key)
 
@@ -819,22 +843,16 @@ async def _publish_zen_auth_failure(
 ) -> None:
     """Record a sanitized content failure and do not keep the previous key."""
 
-    task = asyncio.current_task()
+    try:
+        current: Optional[_ZenAuthGeneration] = await asyncio.to_thread(
+            _stat_zen_auth_generation_sync,
+            path,
+            source_label,
+        )
+    except Exception:
+        current = None
     async with _get_zen_auth_lock():
-        flight = _zen_auth_flights.get(path_key)
-        if flight is None or flight.task is not task:
-            return
-        try:
-            current = await asyncio.to_thread(
-                _stat_zen_auth_generation_sync,
-                path,
-                source_label,
-            )
-        except Exception:
-            _zen_auth_cache.pop(path_key, None)
-            return
-        if current != generation:
-            _zen_auth_cache.pop(path_key, None)
+        if not _publish_matches_owner(path_key, generation, current):
             return
         _zen_auth_cache[path_key] = _ZenAuthCacheEntry(
             generation=generation,
@@ -849,7 +867,7 @@ async def _run_zen_auth_flight(
     path: Path,
     source_label: str,
     path_key: str,
-) -> str:
+) -> _ZenAuthCacheEntry:
     try:
         api_key, generation = await asyncio.to_thread(
             _read_stable_zen_auth_api_key_sync,
@@ -864,7 +882,10 @@ async def _run_zen_auth_flight(
             exc.generation,
             str(exc),
         )
-        raise ValueError(str(exc)) from None
+        return _ZenAuthCacheEntry(
+            generation=exc.generation,
+            error_message=str(exc),
+        )
     except BaseException:
         await _drop_zen_auth_cache_if_owner(path_key)
         raise
@@ -875,41 +896,84 @@ async def _run_zen_auth_flight(
         generation,
         api_key,
     )
-    return api_key
+    return _ZenAuthCacheEntry(generation=generation, api_key=api_key)
+
+
+def _fresh_zen_auth_unlocked(
+    path_key: str,
+    generation: _ZenAuthGeneration,
+    now: float,
+) -> Optional[_ZenAuthCacheEntry]:
+    cached = _zen_auth_cache.get(path_key)
+    if not _zen_auth_entry_is_fresh(cached, generation, now):
+        return None
+    _zen_auth_cache.move_to_end(path_key)
+    return cached
+
+
+def _join_zen_auth_flight_unlocked(
+    path_key: str,
+) -> "Optional[asyncio.Task[_ZenAuthCacheEntry]]":
+    flight = _zen_auth_flights.get(path_key)
+    if flight is not None and not flight.task.done():
+        return flight.task
+    return None
+
+
+def _claim_zen_auth_flight_unlocked(
+    path: Path,
+    source_label: str,
+    path_key: str,
+) -> "asyncio.Task[_ZenAuthCacheEntry]":
+    inflight = _join_zen_auth_flight_unlocked(path_key)
+    if inflight is not None:
+        return inflight
+    _zen_auth_cache.pop(path_key, None)
+    task = asyncio.create_task(_run_zen_auth_flight(path, source_label, path_key))
+    _zen_auth_flights[path_key] = _ZenAuthFlight(task=task)
+    task.add_done_callback(
+        lambda done, key=path_key: _finish_zen_auth_flight(key, done)
+    )
+    return task
 
 
 async def _load_cached_zen_file_api_key() -> str:
     path, source_label = await asyncio.to_thread(_resolve_zen_auth_load_inputs_sync)
     path_key = _zen_auth_cache_key(path)
-    async with _get_zen_auth_lock():
-        try:
-            generation = await asyncio.to_thread(
-                _stat_zen_auth_generation_sync,
+    for _attempt in range(_ZEN_AUTH_READ_ATTEMPTS):
+        generation = await _current_zen_auth_generation(path, source_label, path_key)
+        async with _get_zen_auth_lock():
+            cached = _fresh_zen_auth_unlocked(path_key, generation, time.monotonic())
+            if cached is not None:
+                return cached.reveal()
+            task = _join_zen_auth_flight_unlocked(path_key)
+        if task is None:
+            # The file may have been replaced, and another caller may already
+            # have read that replacement, after the preliminary stat above.
+            generation = await _current_zen_auth_generation(
                 path,
                 source_label,
+                path_key,
             )
-        except Exception:
-            _zen_auth_cache.pop(path_key, None)
-            raise
-        now = time.monotonic()
-        cached = _zen_auth_cache.get(path_key)
-        if _zen_auth_entry_is_fresh(cached, generation, now):
-            _zen_auth_cache.move_to_end(path_key)
-            assert cached is not None
-            return cached.reveal()
-        _zen_auth_cache.pop(path_key, None)
-        flight = _zen_auth_flights.get(path_key)
-        if flight is None or flight.generation != generation or flight.task.done():
-            task = asyncio.create_task(
-                _run_zen_auth_flight(path, source_label, path_key)
-            )
-            flight = _ZenAuthFlight(generation=generation, task=task)
-            _zen_auth_flights[path_key] = flight
-            task.add_done_callback(
-                lambda done, key=path_key: _finish_zen_auth_flight(key, done)
-            )
-        task = flight.task
-    return await asyncio.shield(task)
+            async with _get_zen_auth_lock():
+                cached = _fresh_zen_auth_unlocked(
+                    path_key,
+                    generation,
+                    time.monotonic(),
+                )
+                if cached is not None:
+                    return cached.reveal()
+                task = _claim_zen_auth_flight_unlocked(path, source_label, path_key)
+        result = await asyncio.shield(task)
+        if result.generation == generation:
+            return result.reveal()
+        current = await _current_zen_auth_generation(path, source_label, path_key)
+        if current == result.generation:
+            return result.reveal()
+    raise _zen_auth_file_error(
+        source_label,
+        "changed while it was read.",
+    )
 
 
 async def _load_local_opencode_auth_api_key(*, source_family: str) -> str:
