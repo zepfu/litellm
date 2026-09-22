@@ -333,10 +333,18 @@ async def write_aawm_alias_routing_durable_payload(  # noqa: PLR0915
         return False
 
     now = time.time()
-    new_expires = now + max(0.0, float(ttl_seconds))
+    raw_deadline = payload.get("absolute_expires_at_epoch") if isinstance(payload, dict) else None
+    if isinstance(raw_deadline, (int, float)) and not isinstance(raw_deadline, bool):
+        # Keep the caller's absolute deadline. Do not replace it with now+ttl.
+        new_expires = float(raw_deadline)
+        ttl = new_expires - now
+        if ttl <= 0:
+            return False
+    else:
+        new_expires = now + max(0.0, float(ttl_seconds))
+        ttl = max(1.0, float(ttl_seconds))
     durable_payload = dict(payload)
     durable_payload["expires_at_epoch"] = new_expires
-    ttl = max(1.0, float(ttl_seconds))
     if state_kind.strip().lower() == "affinity" and not _reserve_durable_affinity_key(
         cache_key,
         expires_at_epoch=new_expires,
@@ -1002,6 +1010,21 @@ local txn_id = ARGV[5]
 local receipt_json = ARGV[6]
 local cd_value_json = ARGV[7]
 local allow_ttl_shrink = tonumber(ARGV[8]) == 1
+local seed_payload = cjson.decode(cd_value_json)
+local absolute_deadline = tonumber(seed_payload['absolute_expires_at_epoch'])
+-- A monthly deadline is absolute. Recompute from Redis TIME at this write.
+-- A deadline that has already passed deletes the cooldown keys and does not
+-- store server time plus the caller's relative TTL.
+if absolute_deadline ~= nil and absolute_deadline > 0 then
+  local now_pre = tonumber(redis.call('TIME')[1])
+  if absolute_deadline <= now_pre then
+    for i = 1, num_cd do
+      redis.call('DEL', KEYS[1 + i])
+    end
+    return 1
+  end
+  req_ttl = math.ceil(absolute_deadline - now_pre)
+end
 
 -- Phase 1: Aggregate unique-member capacity preflight.
 -- All identity keys in one transaction map to the same identity set.
@@ -1092,18 +1115,30 @@ for i = 1, num_cd do
         end
     end
     local payload = cjson.decode(cd_value_json)
-    if effective_ttl == -1 then
-        -- Persistent: explicit JSON-safe marker (no arbitrary date)
-        payload['persistent'] = true
-        payload['expires_at_epoch'] = cjson.null
+    if absolute_deadline ~= nil and absolute_deadline > 0 then
+        local remain = absolute_deadline - now_ts
+        if remain <= 0 then
+            redis.call('DEL', cd_key)
+        else
+            payload['expires_at_epoch'] = absolute_deadline
+            payload['absolute_expires_at_epoch'] = absolute_deadline
+            redis.call('SET', cd_key, cjson.encode(payload))
+            redis.call('EXPIRE', cd_key, math.ceil(remain))
+        end
     else
-        payload['expires_at_epoch'] = now_ts + effective_ttl
-    end
-    redis.call('SET', cd_key, cjson.encode(payload))
-    if effective_ttl == -1 then
-        redis.call('PERSIST', cd_key)
-    elseif effective_ttl > 0 then
-        redis.call('EXPIRE', cd_key, effective_ttl)
+        if effective_ttl == -1 then
+            -- Persistent: explicit JSON-safe marker (no arbitrary date)
+            payload['persistent'] = true
+            payload['expires_at_epoch'] = cjson.null
+        else
+            payload['expires_at_epoch'] = now_ts + effective_ttl
+        end
+        redis.call('SET', cd_key, cjson.encode(payload))
+        if effective_ttl == -1 then
+            redis.call('PERSIST', cd_key)
+        elseif effective_ttl > 0 then
+            redis.call('EXPIRE', cd_key, effective_ttl)
+        end
     end
 end
 
@@ -1219,6 +1254,7 @@ async def publish_cooldown_transaction(  # noqa: PLR0915
     max_lanes_per_identity: int = 64,
     cooldown_payload: Optional[dict] = None,
     allow_ttl_shrink: bool = False,
+    expires_at_epoch: Optional[float] = None,
 ) -> CooldownTransactionResult:
     """Execute the atomic cooldown publication transaction.
 
@@ -1302,7 +1338,15 @@ async def publish_cooldown_transaction(  # noqa: PLR0915
     # reader (read_aawm_alias_routing_durable_payload / parse_aawm_alias_routing_durable_expiry)
     # can validate the payload after restart or local-memory loss.
     cd_payload = cooldown_payload or {"cooldown_keys": cooldown_keys}
-    if "expires_at_epoch" not in cd_payload:
+    if expires_at_epoch is not None:
+        # The Lua script expires the key at this absolute epoch. It must not
+        # replace that deadline with Redis TIME plus the caller's relative TTL.
+        cd_payload = {
+            **cd_payload,
+            "expires_at_epoch": float(expires_at_epoch),
+            "absolute_expires_at_epoch": float(expires_at_epoch),
+        }
+    elif "expires_at_epoch" not in cd_payload:
         cd_payload["expires_at_epoch"] = time.time() + float(ttl_seconds)
     cd_value_json = _json.dumps(cd_payload, separators=(",", ":"))
 
