@@ -1,10 +1,21 @@
+import re
 import time
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any, AsyncIterator, Iterator, List, Optional, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncIterator,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Union,
+)
 
 import httpx
 
 import litellm
+from litellm.litellm_core_utils.core_helpers import map_finish_reason
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.types.llms.cohere import CohereV2ChatResponse
 from litellm.types.llms.openai import (
@@ -26,6 +37,83 @@ if TYPE_CHECKING:
     LiteLLMLoggingObj = _LiteLLMLoggingObj
 else:
     LiteLLMLoggingObj = Any
+
+# Provider finish reasons are uppercase tokens. Reject anything else so a
+# payload cannot carry raw response text into native_finish_reason or errors.
+_SAFE_COHERE_FINISH_REASON = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+
+# Chat finish_reason values for ERROR/TIMEOUT are not OpenAI "stop". Choices()
+# construction runs map_finish_reason, which currently collapses ERROR to stop.
+_COHERE_NONSTREAM_FINISH_REASON_OUTCOMES: Dict[str, Dict[str, Any]] = {
+    "COMPLETE": {"finish_reason": "stop"},
+    "STOP_SEQUENCE": {"finish_reason": "stop"},
+    "MAX_TOKENS": {
+        "finish_reason": "length",
+        "incomplete_details": {"reason": "max_output_tokens"},
+    },
+    "TOOL_CALL": {"finish_reason": "tool_calls"},
+    "ERROR": {
+        "finish_reason": "error",
+        "error": {
+            "code": "server_error",
+            "message": "Provider generation ended with ERROR",
+        },
+    },
+    "TIMEOUT": {
+        "finish_reason": "timeout",
+        "error": {
+            "code": "server_error",
+            "message": "Provider generation ended with TIMEOUT",
+        },
+    },
+}
+
+
+def resolve_cohere_nonstream_finish_reason(
+    raw_finish_reason: Any,
+) -> Optional[Dict[str, Any]]:
+    """Map one Cohere nonstream finish_reason onto chat completion fields.
+
+    Returns None when the provider value is missing or not a safe token.
+    Known failures stay on error/timeout instead of stop.
+    """
+    if not isinstance(raw_finish_reason, str):
+        return None
+    token = raw_finish_reason.strip().upper()
+    if not _SAFE_COHERE_FINISH_REASON.fullmatch(token):
+        return None
+    outcome = _COHERE_NONSTREAM_FINISH_REASON_OUTCOMES.get(token)
+    if outcome is None:
+        return {
+            "finish_reason": map_finish_reason(token),
+            "native_finish_reason": token,
+        }
+    return {**outcome, "native_finish_reason": token}
+
+
+def apply_cohere_nonstream_finish_reason(
+    model_response: ModelResponse,
+    raw_finish_reason: Any,
+) -> None:
+    """Write the nonstream finish reason onto an existing chat completion."""
+    resolved = resolve_cohere_nonstream_finish_reason(raw_finish_reason)
+    if resolved is None or not model_response.choices:
+        return
+    choice = model_response.choices[0]
+    # Assign after construction. Choices.__init__ would remap ERROR to stop.
+    choice.finish_reason = resolved["finish_reason"]
+    existing_fields = getattr(choice, "provider_specific_fields", None)
+    provider_fields = dict(existing_fields) if isinstance(existing_fields, dict) else {}
+    choice.provider_specific_fields = {
+        **provider_fields,
+        "native_finish_reason": resolved["native_finish_reason"],
+    }
+    incomplete_details = resolved.get("incomplete_details")
+    if incomplete_details is not None:
+        model_response.incomplete_details = incomplete_details
+    error = resolved.get("error")
+    if error is not None:
+        model_response.error = error
 
 
 class CohereV2ChatConfig(OpenAIGPTConfig):
@@ -297,6 +385,10 @@ class CohereV2ChatConfig(OpenAIGPTConfig):
             total_tokens=prompt_tokens + completion_tokens,
         )
         setattr(model_response, "usage", usage)
+        apply_cohere_nonstream_finish_reason(
+            model_response=model_response,
+            raw_finish_reason=cohere_v2_chat_response.get("finish_reason"),
+        )
         return model_response
 
     def get_model_response_iterator(
