@@ -20,16 +20,16 @@ from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.types.llms.cohere import CohereV2ChatResponse
 from litellm.types.llms.openai import (
     AllMessageValues,
-    ChatCompletionToolCallChunk,
     ChatCompletionAnnotation,
-    ChatCompletionAnnotationURLCitation,
+    ChatCompletionToolCallChunk,
 )
 from litellm.llms.openai.chat.gpt_transformation import OpenAIGPTConfig
-from litellm.types.utils import ModelResponse, Usage
+from litellm.types.utils import ModelResponse, Usage, add_provider_specific_fields
 
 from ..common_utils import CohereError
 from ..common_utils import CohereV2ModelResponseIterator
 from ..common_utils import validate_environment as cohere_validate_environment
+from .citation_translation import translate_cohere_v2_citations
 
 if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import Logging as _LiteLLMLoggingObj
@@ -340,8 +340,9 @@ class CohereV2ChatConfig(OpenAIGPTConfig):
                 ]
             )
 
-        ## ADD CITATIONS AS ANNOTATIONS
+        ## ADD CITATIONS AS ANNOTATIONS OR PROVIDER METADATA
         annotations: Optional[List[ChatCompletionAnnotation]] = None
+        citation_fields: Optional[dict] = None
         citations = None
 
         if (
@@ -351,7 +352,11 @@ class CohereV2ChatConfig(OpenAIGPTConfig):
             citations = cohere_v2_chat_response["message"]["citations"]
 
         if citations:
-            annotations = self._translate_citations_to_openai_annotations(citations)
+            annotations, citation_fields = translate_cohere_v2_citations(citations)
+            if not annotations:
+                annotations = None
+            if not citation_fields:
+                citation_fields = None
 
         ## Tool calling response
         cohere_tools_response = cohere_v2_chat_response["message"].get("tool_calls", [])
@@ -373,6 +378,17 @@ class CohereV2ChatConfig(OpenAIGPTConfig):
             ).tool_calls
         if annotations:
             current_message.annotations = annotations
+        if citation_fields:
+            existing_fields = getattr(current_message, "provider_specific_fields", None)
+            merged_fields = (
+                {**existing_fields, **citation_fields}
+                if isinstance(existing_fields, dict)
+                else citation_fields
+            )
+            add_provider_specific_fields(current_message, merged_fields)
+
+        if citation_fields:
+            self._merge_citation_provider_fields(model_response, citation_fields)
 
         ## CALCULATING USAGE - use cohere `billed_units` for returning usage
         token_usage = cohere_v2_chat_response["usage"].get("tokens", {})
@@ -427,67 +443,35 @@ class CohereV2ChatConfig(OpenAIGPTConfig):
     ) -> BaseLLMException:
         return CohereError(status_code=status_code, message=error_message)
 
+    @staticmethod
+    def _merge_citation_provider_fields(
+        model_response: ModelResponse,
+        citation_fields: dict,
+    ) -> None:
+        """Publish filtered citation metadata where Responses conversion reads it."""
+        hidden_params = getattr(model_response, "_hidden_params", None)
+        if isinstance(hidden_params, dict):
+            hidden_params = {**hidden_params}
+        else:
+            hidden_params = {}
+        existing_fields = hidden_params.get("provider_specific_fields")
+        if isinstance(existing_fields, dict):
+            provider_fields = {**existing_fields, **citation_fields}
+        else:
+            provider_fields = {**citation_fields}
+        hidden_params["provider_specific_fields"] = provider_fields
+        model_response._hidden_params = hidden_params
+
     def _translate_citations_to_openai_annotations(
         self, citations: List[dict]
     ) -> List[ChatCompletionAnnotation]:
         """
-        Transform Cohere citations to OpenAI annotations format.
+        Transform Cohere citations to OpenAI url_citation annotations.
 
-        Creates separate annotations for each source in a citation, allowing multiple
-        annotations with the same start/end index if they reference different sources.
-
-        Args:
-            citations: List of Cohere citation objects with format:
-                {
-                    "start": int,
-                    "end": int,
-                    "text": str,
-                    "sources": [
-                        {
-                            "type": "document",
-                            "document": {
-                                "title": str,
-                                "snippet": str,
-                                ...
-                            },
-                            "id": str
-                        }
-                    ]
-                }
-
-        Returns:
-            List of OpenAI ChatCompletionAnnotation objects (one per source)
+        Document sources become annotations only when they already have a real
+        HTTP(S) URL, a title, and offsets. Tool sources are not forced into
+        that shape; ``translate_cohere_v2_citations`` keeps their ids and
+        offsets in provider metadata without tool-output bodies or fabricated URLs.
         """
-        annotations: List[ChatCompletionAnnotation] = []
-
-        for citation in citations:
-            start_index = citation.get("start", 0)
-            end_index = citation.get("end", 0)
-
-            # Extract source information - loop through all sources
-            sources = citation.get("sources", [])
-            if not sources:
-                continue
-
-            # Create an annotation for each source
-            for source in sources:
-                if source.get("type") == "document" and "document" in source:
-                    document = source["document"]
-                    title = document.get("title", "")
-                    url = source.get("url") or f"source:{source.get('id', 'unknown')}"
-
-                    url_citation: ChatCompletionAnnotationURLCitation = {
-                        "start_index": start_index,
-                        "end_index": end_index,
-                        "title": title,
-                        "url": url,
-                    }
-
-                    annotation: ChatCompletionAnnotation = {
-                        "type": "url_citation",
-                        "url_citation": url_citation,
-                    }
-
-                    annotations.append(annotation)
-
+        annotations, _citation_fields = translate_cohere_v2_citations(citations)
         return annotations
