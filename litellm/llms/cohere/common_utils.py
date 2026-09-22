@@ -1482,6 +1482,11 @@ class CohereV2ModelResponseIterator:
                 return parsed
         return None
 
+    def _require_message_end_at_exhaustion(self) -> None:
+        """Reject a drained EOF queue that never carried native message-end."""
+        if not self._message_end_received:
+            raise ValueError("Cohere stream ended without a native message-end event")
+
     def _push_source_chunk(self, chunk: Any) -> None:
         if chunk is _COHERE_V2_SOURCE_EXHAUSTED:
             self._buffer.finalize()
@@ -1531,6 +1536,7 @@ class CohereV2ModelResponseIterator:
                 if parsed is not None:
                     return parsed
                 if self._source_exhausted:
+                    self._require_message_end_at_exhaustion()
                     raise StopIteration
                 self._push_source_chunk(self._read_sync_chunk())
         except StopIteration:
@@ -1577,6 +1583,7 @@ class CohereV2ModelResponseIterator:
                 if parsed is not None:
                     return parsed
                 if self._source_exhausted:
+                    self._require_message_end_at_exhaustion()
                     raise StopAsyncIteration
                 self._push_source_chunk(await self._read_async_chunk())
         except StopAsyncIteration:
