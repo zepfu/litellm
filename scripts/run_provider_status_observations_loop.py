@@ -228,10 +228,6 @@ DEFAULT_NOUS_OAUTH_REFRESH_INTERVAL_SECONDS = 300.0
 DEFAULT_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS = (
     nous_oauth_refresh.DEFAULT_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS
 )
-NOUS_OAUTH_SIDECAR_AUTH_FILE_ENV_VARS = (
-    "LITELLM_NOUS_OAUTH_AUTH_FILE",
-    "AAWM_HERMES_AUTH_FILE",
-)
 DEFAULT_CURSOR_AGENT_AUTH_REFRESH_INTERVAL_SECONDS = (
     cursor_agent_auth_refresh.DEFAULT_CURSOR_AGENT_AUTH_REFRESH_INTERVAL_SECONDS
 )
@@ -2108,26 +2104,15 @@ def _resolve_kimi_oauth_sidecar_auth_file(
 def _resolve_nous_oauth_sidecar_auth_file(
     explicit_auth_file: Optional[str],
 ) -> tuple[str, str]:
-    explicit_value = (
-        explicit_auth_file.strip()
-        if isinstance(explicit_auth_file, str) and explicit_auth_file.strip()
-        else None
-    )
+    """Resolve sidecar refresh and passive-health auth from one precedence."""
 
-    aawm_auth_file = os.getenv("AAWM_NOUS_OAUTH_AUTH_FILE", "").strip()
-    if aawm_auth_file:
-        return str(Path(aawm_auth_file).expanduser()), "AAWM_NOUS_OAUTH_AUTH_FILE"
-
-    if explicit_value and explicit_value != DEFAULT_NOUS_OAUTH_AUTH_FILE:
-        return str(Path(explicit_value).expanduser()), "explicit"
-
-    for env_name in NOUS_OAUTH_SIDECAR_AUTH_FILE_ENV_VARS:
-        env_value = os.getenv(env_name, "").strip()
-        if env_value:
-            return str(Path(env_value).expanduser()), env_name
-
-    _maybe_reject_default_auth_source("default")
-    return DEFAULT_NOUS_OAUTH_AUTH_FILE, "default"
+    path, source = nous_oauth_refresh.resolve_nous_oauth_auth_path(explicit_auth_file)
+    _maybe_reject_default_auth_source(source)
+    # Keep the portable default string in sidecar config. Refresh and passive
+    # health expand it at use, which is the same file the request loader opens.
+    if source == "default":
+        return DEFAULT_NOUS_OAUTH_AUTH_FILE, source
+    return path, source
 
 
 def _resolve_cursor_agent_auth_file(
@@ -5083,10 +5068,12 @@ def _build_parser(  # noqa: PLR0915
     parser.add_argument(
         "--nous-oauth-auth-file",
         dest="nous_oauth_auth_file",
-        default=os.getenv("AAWM_NOUS_OAUTH_AUTH_FILE", DEFAULT_NOUS_OAUTH_AUTH_FILE),
+        default=DEFAULT_NOUS_OAUTH_AUTH_FILE,
         help=(
             "Hermes Nous Portal OAuth auth JSON file maintained by this sidecar. "
-            "Defaults to AAWM_NOUS_OAUTH_AUTH_FILE or ~/.hermes/auth.json."
+            "Explicit path, then AAWM_NOUS_OAUTH_AUTH_FILE, "
+            "LITELLM_NOUS_OAUTH_AUTH_FILE, LITELLM_HERMES_AUTH_FILE, "
+            "AAWM_HERMES_AUTH_FILE, or ~/.hermes/auth.json."
         ),
     )
     parser.add_argument(
