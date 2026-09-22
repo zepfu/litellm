@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import re
 from typing import Any, Dict, List, Literal, NoReturn, Optional, Tuple, Union
 
@@ -113,9 +114,11 @@ def _cohere_v1_chunk_index(raw_index: Any) -> Optional[int]:
     if isinstance(raw_index, int):
         return raw_index
     if isinstance(raw_index, float):
+        if not math.isfinite(raw_index):
+            return None
         try:
             return int(raw_index)
-        except (TypeError, ValueError):
+        except (OverflowError, TypeError, ValueError):
             return None
     if isinstance(raw_index, str) and _COHERE_EVENT_INDEX_RE.fullmatch(
         raw_index.strip()
