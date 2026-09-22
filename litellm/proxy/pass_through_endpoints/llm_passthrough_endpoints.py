@@ -3271,6 +3271,39 @@ def _preserve_or_rewrite_grok_cli_input_history_in_place(
     _rewrite_grok_native_unsupported_input_items_in_place(prepared_body)
 
 
+def _unwrap_grok_passthrough_encrypted_reasoning_in_place(
+    prepared_body: dict[str, Any],
+) -> None:
+    """Restore native ciphertext before grok CLI chat-proxy egress.
+
+    Grok 4.7 always returns Responses ``reasoning.encrypted_content``. LiteLLM
+    stamps ``aawm_erp`` / ``litellm_enc`` wrappers for downstream identity;
+    xAI cannot decrypt those wrappers on the next turn.
+    """
+
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+        unwrap_encrypted_content_wrappers,
+    )
+
+    def _unwrap_node(value: Any) -> None:
+        if isinstance(value, dict):
+            encrypted = value.get("encrypted_content")
+            if isinstance(encrypted, str) and encrypted:
+                value["encrypted_content"] = unwrap_encrypted_content_wrappers(
+                    encrypted
+                )
+            for nested in value.values():
+                _unwrap_node(nested)
+            return
+        if isinstance(value, list):
+            for nested in value:
+                _unwrap_node(nested)
+
+    input_items = prepared_body.get("input")
+    if isinstance(input_items, list):
+        _unwrap_node(input_items)
+
+
 def _prepare_grok_request_body_for_passthrough(
     *,
     request: Request,
@@ -3289,6 +3322,7 @@ def _prepare_grok_request_body_for_passthrough(
         _grok_unsupported_input_items,
     ) = _drop_unsupported_codex_input_items_from_request_body(prepared_body)
     _preserve_or_rewrite_grok_cli_input_history_in_place(prepared_body)
+    _unwrap_grok_passthrough_encrypted_reasoning_in_place(prepared_body)
     (
         prepared_body,
         _removed_tool_choice,

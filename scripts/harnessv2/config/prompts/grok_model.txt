@@ -1,1 +1,3 @@
-Reply with exactly the word PONG.
+Execute a harmless local shell command (`pwd`) in this workspace and return only that command's stdout. Do not guess the result. Do not skip the command.
+
+Then print that exact stdout on its own line, then reply with the exact token hv2-grok-child on its own line. Do not print the token until the stdout is visible.
