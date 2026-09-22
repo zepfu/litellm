@@ -227,6 +227,22 @@ _COHERE_V2_DOCUMENTED_FINISH_REASONS = {
 }
 _COHERE_V2_CITATION_TYPES = {"TEXT_CONTENT", "THINKING_CONTENT", "PLAN"}
 _COHERE_V2_SOURCE_TYPES = {"document", "tool"}
+_COHERE_V2_SSE_EVENT_NAMES = (
+    "citation-end",
+    "citation-start",
+    "content-delta",
+    "content-end",
+    "content-start",
+    "debug",
+    "message-end",
+    "message-start",
+    "tool-call-delta",
+    "tool-call-end",
+    "tool-call-start",
+    "tool-plan-delta",
+)
+_COHERE_V2_SSE_FIELD_INTROS = ("data:", "event:", "id:", "retry:", ":")
+_COHERE_V2_JSON_LITERALS = ("true", "false", "null")
 
 
 class _CohereV2StreamSentinel:
@@ -253,21 +269,93 @@ def _empty_generic_chunk() -> GenericStreamingChunk:
     )
 
 
+def _hex_run(text: str) -> int:
+    count = 0
+    for char in text:
+        if char not in "0123456789abcdefABCDEF":
+            break
+        count += 1
+    return count
+
+
+def _unicode_escape_is_open(payload: str, pos: int) -> bool:
+    """True when a \\u escape has no character after its hex digits yet."""
+    start = payload.rfind("\\u", 0, min(len(payload), pos + 2))
+    if start < 0 or start > pos:
+        return False
+    digits = payload[start + 2 :]
+    hex_digits = _hex_run(digits)
+    return hex_digits == len(digits) and hex_digits <= 4
+
+
+def _number_form(text: str) -> Optional[str]:
+    """Classify text as a complete JSON number, an open prefix, or neither."""
+    if text == "":
+        return None
+    index = 0
+    if text[0] == "-":
+        index = 1
+        if index == len(text) or text[index] == ".":
+            return "incomplete" if text in {"-", "-."} else None
+    if index >= len(text) or not text[index].isdigit():
+        return None
+    while index < len(text) and text[index].isdigit():
+        index += 1
+    if index == len(text):
+        return "complete"
+    if text[index] == ".":
+        index += 1
+        fraction_start = index
+        while index < len(text) and text[index].isdigit():
+            index += 1
+        if index == len(text):
+            return "incomplete" if fraction_start == index else "complete"
+    if index < len(text) and text[index] in "eE":
+        index += 1
+        if index == len(text):
+            return "incomplete"
+        if text[index] in "+-":
+            index += 1
+            if index == len(text):
+                return "incomplete"
+        if index >= len(text) or not text[index].isdigit():
+            return None
+        while index < len(text) and text[index].isdigit():
+            index += 1
+        if index == len(text):
+            return "complete"
+    return None
+
+
+def _is_literal_prefix(tail: str) -> bool:
+    return any(
+        literal.startswith(tail) and literal != tail
+        for literal in _COHERE_V2_JSON_LITERALS
+    )
+
+
+def _tail_is_open_json_value(payload: str, pos: int) -> bool:
+    tail = payload[pos:]
+    if tail == "":
+        return False
+    if _number_form(tail) == "incomplete":
+        return True
+    if pos > 0 and payload[pos - 1].isdigit():
+        return _number_form("0" + tail) == "incomplete"
+    return False
+
+
 def _json_decode_is_incomplete(exc: json.JSONDecodeError, payload: str) -> bool:
     if exc.msg.startswith("Unterminated"):
         return True
+    if exc.msg.startswith("Invalid \\u") and _unicode_escape_is_open(payload, exc.pos):
+        return True
+    if exc.msg.startswith("Expecting value") and _is_literal_prefix(payload[exc.pos :]):
+        return True
+    if _tail_is_open_json_value(payload, exc.pos):
+        return True
     if exc.msg.startswith("Expecting") and payload[exc.pos :].strip() == "":
         return True
-    if exc.msg.startswith("Invalid \\u"):
-        tail = payload[exc.pos :]
-        if not tail.startswith("u"):
-            return False
-        hex_digits = 0
-        index = 1
-        while index < len(tail) and tail[index] in "0123456789abcdefABCDEF":
-            hex_digits += 1
-            index += 1
-        return hex_digits < 4 and index == len(tail)
     return False
 
 
@@ -310,17 +398,43 @@ def _split_first_line(text: str) -> Optional[Tuple[str, str]]:
     return line, text[newline_at + 1 :]
 
 
+def _is_pending_sse_line(stripped: str) -> bool:
+    """True when more bytes can still finish this SSE line."""
+    if any(
+        intro.startswith(stripped) and intro != stripped
+        for intro in _COHERE_V2_SSE_FIELD_INTROS
+    ):
+        return True
+    if not stripped.startswith("event:"):
+        return False
+    rest = stripped[6:]
+    name = rest[1:] if rest.startswith(" ") else rest
+    if name == "":
+        return True
+    return any(
+        known.startswith(name) and known != name for known in _COHERE_V2_SSE_EVENT_NAMES
+    )
+
+
+def _is_done_prefix(payload: str) -> bool:
+    return "[DONE]".startswith(payload) and payload != "[DONE]"
+
+
 def _is_complete_logical_line(text: str) -> bool:
     stripped = text.strip()
     if stripped == "":
         return True
+    if _is_pending_sse_line(stripped):
+        return False
     if stripped.startswith((":", "event:", "id:", "retry:")):
         return True
     if stripped.startswith("data:"):
         payload = stripped[5:].lstrip()
         if payload == "[DONE]":
             return True
-        return not _json_payload_is_incomplete(payload)
+        if _is_done_prefix(payload) or _json_payload_is_incomplete(payload):
+            return False
+        return True
     if stripped.startswith("{"):
         return not _json_payload_is_incomplete(stripped)
     return True
@@ -462,6 +576,7 @@ class _CohereV2EventBuffer:
         self._data_parts: List[str] = []
         self._received_text = False
         self._done = False
+        self._hold_for_newline = False
         self.events: List[Any] = []
 
     def feed(self, chunk: Union[str, bytes, dict, None]) -> None:
@@ -471,15 +586,23 @@ class _CohereV2EventBuffer:
             self._accept_event_object(chunk)
             return
         if isinstance(chunk, bytes):
+            # Raw transport fragments end only at a line boundary.
+            self._hold_for_newline = True
             self._append_text(self._decode_bytes(chunk))
-            self._drain()
+            self._drain(allow_logical=False)
+            if not self._raw:
+                self._hold_for_newline = False
             return
         if isinstance(chunk, str):
             if chunk == "":
                 self._blank_line()
                 return
+            # Strings without a held raw fragment are complete logical lines
+            # when the SSE field is already finished. Prefixes stay buffered.
             self._append_text(chunk)
-            self._drain()
+            self._drain(allow_logical=not self._hold_for_newline)
+            if not self._raw:
+                self._hold_for_newline = False
             return
         raise ValueError("Unsupported Cohere stream chunk type")
 
@@ -514,14 +637,14 @@ class _CohereV2EventBuffer:
             self._received_text = True
         self._raw += text
 
-    def _drain(self) -> None:
+    def _drain(self, allow_logical: bool = True) -> None:
         while True:
             split = _split_first_line(self._raw)
             if split is not None:
                 line, self._raw = split
                 self._consume_line(line)
                 continue
-            if self._raw and _is_complete_logical_line(self._raw):
+            if allow_logical and self._raw and _is_complete_logical_line(self._raw):
                 line = self._raw
                 self._raw = ""
                 self._consume_line(line)
@@ -535,6 +658,7 @@ class _CohereV2EventBuffer:
             line = self._raw
             self._raw = ""
             self._consume_line(line)
+        self._hold_for_newline = False
         self._flush_event(at_end=False)
 
     def _accept_event_object(self, event: dict) -> None:
