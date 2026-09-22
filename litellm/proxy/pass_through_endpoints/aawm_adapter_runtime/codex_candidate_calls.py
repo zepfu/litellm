@@ -9666,23 +9666,45 @@ def _build_opencode_go_egress_plan(
     use_alias_candidate_probe: bool,
     opencode_session_identity: Optional[str],
     alias_probe_timeout_seconds: float,
+    target_base: str,
+    target_url: str,
+    headers: dict[str, str],
 ) -> OpenCodeGoEgressPlan:
-    """Materialize one Go plan and bind egress validation to it."""
+    """Materialize one Go plan from carried preflight context.
+
+    Remaining local target, header, or egress-validation failures stay
+    inside the typed no-call boundary.
+    """
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
         adapter_config as go_adapter_config,
     )
 
+    _ = request, endpoint
     config = go_adapter_config.CODEX_OPENCODE_GO
-    target_base = _get_opencode_go_target_base()
-    target_url = _join_opencode_zen_passthrough_url(
-        base_target_url=target_base,
-        endpoint=endpoint,
-    )
-    headers = _build_opencode_go_egress_headers(
-        api_key=api_key,
-        request=request,
-        session_identity=opencode_session_identity,
-    )
+    try:
+        resolved_target_base = str(target_base)
+        resolved_target_url = str(target_url)
+        if not resolved_target_base or not resolved_target_url:
+            raise ValueError("OpenCode Go egress target is incomplete")
+        api_base = f"{resolved_target_base.rstrip('/')}/v1"
+    except Exception as exc:
+        raise_opencode_go_preflight(
+            exc,
+            reason="invalid_target",
+            use_alias_candidate_probe=use_alias_candidate_probe,
+        )
+    try:
+        resolved_headers = {
+            str(key): str(value) for key, value in dict(headers).items()
+        }
+        if not resolved_headers:
+            raise ValueError("OpenCode Go egress headers are empty")
+    except Exception as exc:
+        raise_opencode_go_preflight(
+            exc,
+            reason="invalid_headers",
+            use_alias_candidate_probe=use_alias_candidate_probe,
+        )
     retryable_source = globals().get(
         "_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES",
         (),
@@ -9691,47 +9713,54 @@ def _build_opencode_go_egress_plan(
         retryable = tuple(dict.fromkeys((429, *tuple(retryable_source))))
     except TypeError:
         retryable = (429,)
-    plan = OpenCodeGoEgressPlan(
-        config=config,
-        canonical_model=canonical_model,
-        canonical_request_body=dict(canonical_request_body),
-        provider_bound_body=dict(provider_bound_body),
-        target_base=target_base,
-        target_url=target_url,
-        api_base=f"{target_base.rstrip('/')}/v1",
-        api_key=api_key,
-        headers=headers,
-        credential_family=config.credential_family,
-        expected_target_family=config.expected_target_family,
-        client_requested_stream=client_requested_stream,
-        transport_mode=transport_mode,
-        retry_timeout=OpenCodeGoRetryTimeoutPolicy(
-            alias_probe_timeout_seconds=alias_probe_timeout_seconds,
-            caller_managed_hidden_retry=True,
-            retryable_upstream_status_codes=retryable,
-        ),
-        proxy_server_request={
-            "headers": {},
-            "body": dict(canonical_request_body),
-        },
-        shared_session=_get_proxy_shared_aiohttp_session(),
-        litellm_metadata=dict(litellm_metadata),
-        completion_kwargs=(
-            dict(completion_kwargs) if isinstance(completion_kwargs, dict) else None
-        ),
-        request_input=request_input,
-        responses_api_request=responses_api_request,
-        advertised_tools=advertised_tools,
-        is_known_free_direct=is_known_free_direct,
-        use_alias_candidate_probe=use_alias_candidate_probe,
-        opencode_session_identity=opencode_session_identity,
-    )
-    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
-        url=plan.target_url,
-        headers=plan.headers,
-        credential_family=plan.credential_family,
-        expected_target_family=plan.expected_target_family,
-    )
+    try:
+        plan = OpenCodeGoEgressPlan(
+            config=config,
+            canonical_model=canonical_model,
+            canonical_request_body=dict(canonical_request_body),
+            provider_bound_body=dict(provider_bound_body),
+            target_base=resolved_target_base,
+            target_url=resolved_target_url,
+            api_base=api_base,
+            api_key=api_key,
+            headers=resolved_headers,
+            credential_family=config.credential_family,
+            expected_target_family=config.expected_target_family,
+            client_requested_stream=client_requested_stream,
+            transport_mode=transport_mode,
+            retry_timeout=OpenCodeGoRetryTimeoutPolicy(
+                alias_probe_timeout_seconds=alias_probe_timeout_seconds,
+                caller_managed_hidden_retry=True,
+                retryable_upstream_status_codes=retryable,
+            ),
+            proxy_server_request={
+                "headers": {},
+                "body": dict(canonical_request_body),
+            },
+            shared_session=_get_proxy_shared_aiohttp_session(),
+            litellm_metadata=dict(litellm_metadata),
+            completion_kwargs=(
+                dict(completion_kwargs) if isinstance(completion_kwargs, dict) else None
+            ),
+            request_input=request_input,
+            responses_api_request=responses_api_request,
+            advertised_tools=advertised_tools,
+            is_known_free_direct=is_known_free_direct,
+            use_alias_candidate_probe=use_alias_candidate_probe,
+            opencode_session_identity=opencode_session_identity,
+        )
+        HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+            url=plan.target_url,
+            headers=plan.headers,
+            credential_family=plan.credential_family,
+            expected_target_family=plan.expected_target_family,
+        )
+    except Exception as exc:
+        raise_opencode_go_preflight(
+            exc,
+            reason="egress_validation",
+            use_alias_candidate_probe=use_alias_candidate_probe,
+        )
     return plan
 
 
@@ -10464,6 +10493,9 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
             use_alias_candidate_probe=use_alias_candidate_probe,
             opencode_session_identity=opencode_session_identity,
             alias_probe_timeout_seconds=_go_probe_timeout_seconds,
+            target_base=target_base_url,
+            target_url=target_url,
+            headers=custom_headers,
         )
         target_url = plan.target_url
         rollup_kwargs = _build_adapted_route_rollup_kwargs(plan.litellm_metadata)
@@ -10806,6 +10838,9 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
         use_alias_candidate_probe=use_alias_candidate_probe,
         opencode_session_identity=opencode_session_identity,
         alias_probe_timeout_seconds=_go_probe_timeout_seconds,
+        target_base=target_base_url,
+        target_url=target_url,
+        headers=custom_headers,
     )
     target_url = plan.target_url
     rollup_kwargs = _build_adapted_route_rollup_kwargs(plan.litellm_metadata)
