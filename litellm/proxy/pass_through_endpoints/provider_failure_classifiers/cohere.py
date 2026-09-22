@@ -24,12 +24,16 @@ COHERE_API_HOSTS: frozenset[str] = frozenset(
 _COHERE_CHAT_V2_PATH = "/v2/chat"
 _COHERE_CODEX_ROUTE_FAMILY = "codex_cohere_chat_completions_adapter"
 
-_MONTHLY_QUOTA_EXHAUSTION_MARKERS: tuple[str, ...] = (
-    "monthly quota",
-    "monthly limit",
-    "monthly capacity",
-    "quota exhausted",
-    "capacity exhausted",
+# The exhausted noun must be the monthly allowance. A per-minute quota that is
+# exhausted "on the monthly trial plan" does not match.
+_MONTHLY_ALLOWANCE_EXHAUSTION_RE = re.compile(
+    r"monthly(?:\s+trial)?\s+(?:quota|capacity|limit)"
+    r"(?:\s+(?:is|was|has|been|the|your)){0,4}"
+    r"\s+(?:exhausted|exhaustion|exceeded|reached|depleted)"
+    r"|"
+    r"(?:exhausted|exhaustion|exceeded|reached|depleted)"
+    r"(?:\s+\w+){0,5}"
+    r"\s+monthly(?:\s+trial)?\s+(?:quota|capacity|limit)"
 )
 _COHERE_MODEL_TOKEN = r"""['"]?(?P<model>[^\s,'";]+)['"]?"""
 _COHERE_MODEL_UNAVAILABLE_MESSAGE_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -341,19 +345,18 @@ def _cohere_classification(
 
 
 def _cohere_text_has_monthly_quota_exhaustion(text: str) -> bool:
-    """Credential scope requires monthly quota or capacity exhaustion.
+    """Credential scope requires exhaustion of the monthly quota or capacity.
 
-    Naming the monthly trial plan is not exhaustion. An explicit per-minute
-    rate limit that only mentions that plan stays candidate-scoped, as do
-    "free trial", "trial limit", and "trial usage" rate limits. A message that
-    reports monthly quota or capacity exhaustion stays credential-scoped.
+    A monthly-trial plan name is not that evidence. Exhausting an explicitly
+    per-minute quota, including "rpm quota exhausted" or "requests per minute
+    quota is exhausted" on the monthly trial plan, stays candidate-scoped.
+    "monthly trial quota exhausted" and other monthly-quota or monthly-capacity
+    exhaustion stay credential-scoped.
     """
 
     if "monthly" not in text:
         return False
-    if any(marker in text for marker in _MONTHLY_QUOTA_EXHAUSTION_MARKERS):
-        return True
-    return "exhausted" in text or "exhaustion" in text
+    return _MONTHLY_ALLOWANCE_EXHAUSTION_RE.search(text) is not None
 
 
 def classify_cohere_failure(
