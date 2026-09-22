@@ -486,6 +486,35 @@ def _raise_nous_alias_probe_contract_incompatible(
     raise exc from incompatibility
 
 
+def _raise_nous_direct_dispatch_unsupported(
+    *,
+    unsupported_capabilities: list[str],
+) -> None:
+    """Reject a direct Nous request before credential load or provider egress.
+
+    Alias probes keep candidate-ineligibility metadata. Direct dispatch uses
+    the ordinary invalid-request error and does not attach that state.
+    """
+    from litellm.proxy._types import ProxyException
+
+    param_by_capability = {
+        "streaming": "stream",
+        "function_calling": "tools",
+        "tool_choice": "tool_choice",
+    }
+    param = "stream"
+    for capability in ("streaming", "function_calling", "tool_choice"):
+        if capability in unsupported_capabilities:
+            param = param_by_capability[capability]
+            break
+    raise ProxyException(
+        message=f"{param} is not supported for this Nous Portal model.",
+        type="invalid_request_error",
+        param=param,
+        code=400,
+    )
+
+
 class _CursorPostEgressOutputError(ValueError):
     """A returned Cursor payload could not be normalized after provider Run."""
 
@@ -2088,6 +2117,7 @@ _HOST_FUNCTION_NAMES = (
     "_nous_catalog_capability_info",
     "_nous_alias_probe_unsupported_capabilities",
     "_raise_nous_alias_probe_contract_incompatible",
+    "_raise_nous_direct_dispatch_unsupported",
     "_handle_codex_nous_chat_completions_adapter_route",
     "_consume_opencode_zen_tools_mode_header",
     "_build_opencode_zen_completion_call_kwargs",
@@ -11449,7 +11479,6 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
 
         return getattr(_lpe, name)
 
-    client_requested_stream = bool(request_body.get("stream"))
     raw_tool_choice = request_body.get("tool_choice")
     nous_auto_tool_choice = (
         isinstance(raw_tool_choice, str) and raw_tool_choice == "auto"
@@ -11525,32 +11554,30 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
     adapted_request_body.pop("parallel_tool_calls", None)
     request_body = adapted_request_body
 
-    if use_alias_candidate_probe:
-        client_requested_stream = bool(request_body.get("stream"))
-        requested_tools = bool(request_body.get("tools"))
-        adapted_tool_choice = request_body.get("tool_choice")
-        requested_tool_choice = (
-            adapted_tool_choice is not None
-            and not (
-                isinstance(adapted_tool_choice, str)
-                and adapted_tool_choice == "auto"
-            )
+    client_requested_stream = bool(request_body.get("stream"))
+    requested_tools = bool(request_body.get("tools"))
+    adapted_tool_choice = request_body.get("tool_choice")
+    requested_tool_choice = adapted_tool_choice is not None and not (
+        isinstance(adapted_tool_choice, str) and adapted_tool_choice == "auto"
+    )
+    if client_requested_stream or requested_tools or requested_tool_choice:
+        unsupported_capabilities = _nous_alias_probe_unsupported_capabilities(
+            client_requested_stream=client_requested_stream,
+            requested_tools=requested_tools,
+            requested_tool_choice=requested_tool_choice,
+            model_info=_nous_catalog_capability_info(
+                adapter_model=adapter_model,
+            ),
         )
-        if client_requested_stream or requested_tools or requested_tool_choice:
-            unsupported_capabilities = (
-                _nous_alias_probe_unsupported_capabilities(
-                    client_requested_stream=client_requested_stream,
-                    requested_tools=requested_tools,
-                    requested_tool_choice=requested_tool_choice,
-                    model_info=_nous_catalog_capability_info(
-                        adapter_model=adapter_model,
-                    ),
-                )
-            )
-            if unsupported_capabilities:
+        if unsupported_capabilities:
+            if use_alias_candidate_probe:
                 _raise_nous_alias_probe_contract_incompatible(
                     unsupported_capabilities=unsupported_capabilities,
                     request_body=request_body,
+                )
+            else:
+                _raise_nous_direct_dispatch_unsupported(
+                    unsupported_capabilities=unsupported_capabilities,
                 )
 
     request_input = request_body.get("input", "")
