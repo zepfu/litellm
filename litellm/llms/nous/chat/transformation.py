@@ -1,8 +1,9 @@
 """Translate OpenAI chat completions to Nous Portal `/v1/chat/completions`."""
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from litellm.exceptions import UnsupportedParamsError
+from litellm.types.llms.openai import AllMessageValues
 from litellm.utils import (
     _get_model_info_helper,
     supports_function_calling,
@@ -86,35 +87,55 @@ class NousChatConfig(OpenAILikeChatConfig):
             return value is not None and not (isinstance(value, str) and value == "auto")
         return False
 
+    @staticmethod
+    def effective_capability_params(outbound_params: dict) -> dict:
+        """Return capability fields after the final ``extra_body`` overlay."""
+        effective: dict = {}
+        for param in _CAPABILITY_GATED_PARAMS:
+            if param in outbound_params:
+                effective[param] = outbound_params[param]
+        extra_body = outbound_params.get("extra_body")
+        if isinstance(extra_body, dict):
+            for param in _CAPABILITY_GATED_PARAMS:
+                if param in extra_body:
+                    effective[param] = extra_body[param]
+        return effective
+
     def reject_unsupported_capability_params(
         self,
         *,
         non_default_params: dict,
         model: str,
-        reject_nonsemantic: bool,
     ) -> None:
-        """Reject unsupported stream, tools, and tool_choice before egress.
+        """Reject unsupported streaming, nonempty tools, and substantive tool_choice.
 
-        Semantic requests are rejected even when ``drop_params`` is set.
-        ``stream=False`` stays eligible. Semantically empty tool payloads are
-        rejected only when ``reject_nonsemantic`` is set, which preserves the
-        direct mapper contract for an explicit empty declaration.
+        ``stream=False``, an empty tool list, and ``tool_choice='auto'`` stay
+        eligible when the model does not advertise those capabilities. This
+        holds whether or not ``drop_params`` is set.
         """
         supported_openai_params = self.get_supported_openai_params(model=model)
         for param in _CAPABILITY_GATED_PARAMS:
             if param not in non_default_params or param in supported_openai_params:
                 continue
-            semantic = self._capability_value_requests_feature(param, non_default_params[param])
-            if param == "stream":
-                if not semantic:
-                    continue
-            elif not semantic and not reject_nonsemantic:
+            if not self._capability_value_requests_feature(param, non_default_params[param]):
                 continue
             raise UnsupportedParamsError(
                 message=f"{param} is not supported for this Nous Portal model.",
                 llm_provider="nous",
                 model=model,
             )
+
+    def reject_unsupported_outbound_request(
+        self,
+        *,
+        outbound_params: dict,
+        model: str,
+    ) -> None:
+        """Reject capability fields on the merged outbound request."""
+        self.reject_unsupported_capability_params(
+            non_default_params=self.effective_capability_params(outbound_params),
+            model=model,
+        )
 
     def map_openai_params(
         self,
@@ -124,9 +145,28 @@ class NousChatConfig(OpenAILikeChatConfig):
         drop_params: bool,
         **kwargs,
     ) -> dict:
-        self.reject_unsupported_capability_params(
-            non_default_params=non_default_params,
+        self.reject_unsupported_outbound_request(
+            outbound_params={**non_default_params, **optional_params},
             model=model,
-            reject_nonsemantic=not drop_params,
         )
         return super().map_openai_params(non_default_params, optional_params, model, drop_params)
+
+    def transform_request(
+        self,
+        model: str,
+        messages: List[AllMessageValues],
+        optional_params: dict,
+        litellm_params: dict,
+        headers: dict,
+    ) -> dict:
+        self.reject_unsupported_outbound_request(
+            outbound_params=optional_params,
+            model=model,
+        )
+        return super().transform_request(
+            model=model,
+            messages=messages,
+            optional_params=optional_params,
+            litellm_params=litellm_params,
+            headers=headers,
+        )

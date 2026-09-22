@@ -11540,6 +11540,9 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
         adapted_request_body,
         _unsupported_request_params,
     ) = drop_request_params(adapted_request_body)
+    # Judge the caller's choice before drop_tool_choice removes a substantive
+    # tool_choice that arrived without tool definitions.
+    caller_tool_choice = adapted_request_body.get("tool_choice")
     (
         adapted_request_body,
         _removed_tool_choice,
@@ -11554,9 +11557,17 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
     adapted_request_body.pop("parallel_tool_calls", None)
     request_body = adapted_request_body
 
-    client_requested_stream = bool(request_body.get("stream"))
-    requested_tools = bool(request_body.get("tools"))
-    adapted_tool_choice = request_body.get("tool_choice")
+    effective_capability_params = litellm.NousChatConfig.effective_capability_params(
+        request_body
+    )
+    if (
+        "tool_choice" not in effective_capability_params
+        and caller_tool_choice is not None
+    ):
+        effective_capability_params["tool_choice"] = caller_tool_choice
+    client_requested_stream = bool(effective_capability_params.get("stream"))
+    requested_tools = bool(effective_capability_params.get("tools"))
+    adapted_tool_choice = effective_capability_params.get("tool_choice")
     requested_tool_choice = adapted_tool_choice is not None and not (
         isinstance(adapted_tool_choice, str) and adapted_tool_choice == "auto"
     )
@@ -11571,9 +11582,16 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
         )
         if unsupported_capabilities:
             if use_alias_candidate_probe:
+                diagnostic_request_body = request_body
+                judged_tool_choice = effective_capability_params.get("tool_choice")
+                if "tool_choice" not in request_body and judged_tool_choice is not None:
+                    diagnostic_request_body = {
+                        **request_body,
+                        "tool_choice": judged_tool_choice,
+                    }
                 _raise_nous_alias_probe_contract_incompatible(
                     unsupported_capabilities=unsupported_capabilities,
-                    request_body=request_body,
+                    request_body=diagnostic_request_body,
                 )
             else:
                 _raise_nous_direct_dispatch_unsupported(

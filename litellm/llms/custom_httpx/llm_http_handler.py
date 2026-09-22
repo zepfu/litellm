@@ -685,6 +685,11 @@ class BaseLLMHTTPHandler:
         )
         if callable(finalize_strict_tools_request):
             data = finalize_strict_tools_request(data)
+        if custom_llm_provider == "nous":
+            litellm.NousChatConfig().reject_unsupported_outbound_request(
+                outbound_params=data,
+                model=model,
+            )
 
         headers, signed_json_body = provider_config.sign_request(
             headers=headers,
