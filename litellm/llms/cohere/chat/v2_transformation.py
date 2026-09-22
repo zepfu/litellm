@@ -163,18 +163,33 @@ def _has_cohere_tools(params: dict) -> bool:
     return isinstance(tools, list) and len(tools) > 0
 
 
+def _normalize_cohere_request_model(model: str) -> str:
+    """Return the model name Cohere is sent, for catalog lookup.
+
+    Provider resolution drops one leading ``cohere`` or ``cohere_chat``
+    prefix. The v2 completion path then removes every ``v2/`` route
+    prefix before transport. Forced-tool support is stored on that
+    catalog name, not on the route-prefixed alias.
+    """
+    normalized = model
+    provider, separator, remainder = normalized.partition("/")
+    if separator and provider in _COHERE_CHAT_PROVIDERS:
+        normalized = remainder
+    if "v2/" in normalized:
+        normalized = normalized.replace("v2/", "")
+    return normalized
+
+
 def _cohere_model_info(model: str) -> Optional[dict]:
     """Return Cohere catalog metadata for ``model``, or None when unmapped."""
     from litellm.utils import get_model_info
 
-    normalized = model.split("/", 1)[1] if model.startswith("cohere/") else model
+    normalized = _normalize_cohere_request_model(model)
     lookups = (
-        (model, "cohere_chat"),
-        (model, "cohere"),
         (normalized, "cohere_chat"),
         (normalized, "cohere"),
         (f"cohere/{normalized}", "cohere"),
-        (model, None),
+        (f"cohere/{normalized}", "cohere_chat"),
         (normalized, None),
     )
     seen = set()
@@ -279,11 +294,18 @@ def _map_cohere_v2_tool_choice(
 
     ``auto`` is Cohere's documented default and is preserved by omitting
     ``tool_choice``. ``required`` and ``none`` stay REQUIRED and NONE.
-    Unsupported forms, including a named function, are rejected instead of
-    being weakened to automatic selection.
+    Unsupported forms, including null and a named function, are rejected
+    instead of being weakened to automatic selection.
     """
     if tool_choice is None:
-        return None
+        raise CohereUnsupportedToolChoiceError(
+            message=(
+                "Cohere V2 does not support tool_choice null. Supported forms "
+                "are auto, required, and none. The request was rejected before "
+                "provider transport."
+            ),
+            model=model,
+        )
     form = _classify_cohere_tool_choice(tool_choice, model)
     if form == _COHERE_TOOL_CHOICE_AUTO:
         return None
@@ -319,6 +341,23 @@ def _project_cohere_v2_tool_choice(model: str, optional_params: dict) -> dict:
             key: value for key, value in optional_params.items() if key != "tool_choice"
         }
     return {**optional_params, "tool_choice": mapped_tool_choice}
+
+
+def _apply_cohere_v2_tool_choice_to_request_body(
+    model: str, request_data: dict
+) -> None:
+    """Map ``tool_choice`` on the body that will be sent to Cohere."""
+    if "tool_choice" not in request_data:
+        return
+    mapped_tool_choice = _map_cohere_v2_tool_choice(
+        request_data.get("tool_choice"),
+        model=model,
+        tools_present=_has_cohere_tools(request_data),
+    )
+    if mapped_tool_choice is None:
+        request_data.pop("tool_choice", None)
+        return
+    request_data["tool_choice"] = mapped_tool_choice
 
 
 class CohereV2ChatConfig(OpenAIGPTConfig):
@@ -474,6 +513,38 @@ class CohereV2ChatConfig(OpenAIGPTConfig):
             if param == "seed":
                 optional_params["seed"] = value
         return optional_params
+
+    def sign_request(
+        self,
+        headers: dict,
+        optional_params: dict,
+        request_data: dict,
+        api_base: str,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        stream: Optional[bool] = None,
+        fake_stream: Optional[bool] = None,
+    ):
+        """Validate tool_choice after extra_body has been merged.
+
+        The shared handler merges ``extra_body`` onto the transformed body
+        and then calls this method, before any provider request. Mapping
+        here covers the JSON that is actually sent.
+        """
+        body_model = request_data.get("model")
+        if not isinstance(body_model, str) or not body_model.strip():
+            body_model = model or ""
+        _apply_cohere_v2_tool_choice_to_request_body(body_model, request_data)
+        return super().sign_request(
+            headers=headers,
+            optional_params=optional_params,
+            request_data=request_data,
+            api_base=api_base,
+            api_key=api_key,
+            model=model,
+            stream=stream,
+            fake_stream=fake_stream,
+        )
 
     def transform_request(
         self,
