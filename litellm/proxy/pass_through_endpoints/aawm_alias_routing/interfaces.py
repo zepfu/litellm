@@ -149,6 +149,9 @@ class CooldownPublicationPlan:
     grok_account_quota_exhausted: bool = False
     kimi_failure_metadata: Optional[dict[str, Any]] = None
     allow_ttl_shrink: bool = False
+    # Absolute Cohere monthly deadline. Publication recomputes remaining TTL
+    # from this epoch; None keeps the publisher's relative duration.
+    expires_at_epoch: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
