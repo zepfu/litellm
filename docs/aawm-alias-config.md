@@ -162,7 +162,7 @@ substitute OpenRouter free Nemotron (`nvidia/nemotron-*:free` stays on
 
 OpenCode Zen keeps both adapter forms (`anthropic_opencode_zen_responses_adapter`
 and `anthropic_opencode_zen_completion_adapter`). xAI keeps managed
-`oa_xai/grok-4.6` and native `xai/grok-4.6` lanes distinct. Cursor Grok
+`oa_xai/grok-4.7` and native `xai/grok-4.7` lanes distinct. Cursor Grok
 stays on `provider-cursor_agent`. Anthropic coverage remains
 Anthropic-native (`anthropic_messages`); Codex ingress still drops that
 family.
@@ -218,19 +218,18 @@ Both windows recur every day, include the start, and exclude the end;
 there is no weekday distinction. The `work-other` Alibaba gate is on its
 `sota-deepseek` reference, so direct `sota-deepseek` use is unchanged.
 
-`sota-xai` follows the CFG-038 provider-neutral order: Cursor Grok
-(`cursor_agent/cursor-grok-4.6-high`, priority 110), native xAI/OIDC
-(`xai/grok-4.6`, priority 100), then managed xAI/OAuth
-(`oa_xai/grok-4.6`, priority 90). `work-other` inherits this order through
-`alias_reference: sota-xai`, and the three lanes remain distinct. The managed
-OAuth candidate has no
-candidate-level reasoning override: caller `reasoning.effort=xhigh` is sent
-unchanged to `oa_xai/grok-4.6`, with requested/native effort metadata and the
+`sota-xai` follows native xAI/OIDC (`xai/grok-4.7`, priority 100), then
+managed xAI/OAuth (`oa_xai/grok-4.7`, priority 90). Cursor Grok stays on
+`sota-cursor` (`cursor_agent/cursor-grok-4.6-high`). `work-other` inherits
+the `sota-xai` order through `alias_reference: sota-xai`, and the two xAI
+lanes remain distinct. The managed OAuth candidate has no candidate-level
+reasoning override: caller `reasoning.effort=xhigh` is sent unchanged to
+`oa_xai/grok-4.7`, with requested/native effort metadata and the
 provider-native field/provider recorded. Its route rollup is
-`grok-4.6(sota-xai):xhigh`. Cursor Agent uses `cursor_agent`, not Cloud Agents
+`grok-4.7(sota-xai):xhigh`. Cursor Agent uses `cursor_agent`, not Cloud Agents
 `cursor`.
 
-For this managed `oa_xai`/`sota-xai` flow, Grok 4.6 adapts both the
+For this managed `oa_xai`/`sota-xai` flow, Grok 4.7 adapts both the
 `collaboration` and `multi_agent_v1` namespaces. Those children are flattened
 into provider-bound function tools and sanitized before egress. Provider
 function calls and results are restored to stock Codex collaboration and
@@ -348,9 +347,9 @@ for the daily half-open window `22:00-08:00 UTC+8`), Z.AI Coding Plan
 `route_family: muse_code`, priority 85, no reasoning-effort override),
 and `alias_reference: sota-xai` (priority 80). The Z.AI candidate is skipped
 during its daily `14:00-18:00 UTC+8` peak window.
-`sota-xai` currently expands in this order: Cursor
-`cursor_agent/cursor-grok-4.6-high`, native xAI/OIDC `xai/grok-4.6`, then
-managed xAI/OAuth `oa_xai/grok-4.6`. Luna remains the final OpenAI fallback
+`sota-xai` currently expands in this order: native xAI/OIDC `xai/grok-4.7`,
+then managed xAI/OAuth `oa_xai/grok-4.7`. Cursor Grok remains on
+`sota-cursor`. Luna remains the final OpenAI fallback
 on `work`, not `work-other`. Closing the
 window prevents new affinity and does not evict an existing session owner.
 
@@ -359,10 +358,9 @@ window prevents new affinity and does not evict an existing session owner.
 The `expert` alias first references `expert-other` (priority 110), then falls
 back to OpenAI/Codex `gpt-6-astra` (`codex_responses`, priority 0,
 `reasoning_effort: low`). `expert-other` orders scheduled Alibaba Token Plan
-`alibaba_token_plan/qwen3.8-max` (priority 100, `22:00-08:00 UTC+8`), Cursor
-Agent `cursor_agent/cursor-grok-4.6-high` (priority 90), and native xAI/OIDC
-`xai/grok-4.6` (priority 0). It does not include managed xAI/OAuth or
-Anthropic candidates.
+`alibaba_token_plan/qwen3.8-max` (priority 100, `22:00-08:00 UTC+8`) and
+native xAI/OIDC `xai/grok-4.7` (priority 0). It does not include managed
+xAI/OAuth, Cursor Grok, or Anthropic candidates.
 
 ## Maintained `auto-review` aliases
 
@@ -385,9 +383,8 @@ The `sota-openai` alias is compiled from `sota-openai.yaml` and currently has
 one candidate: OpenAI/Codex `gpt-5.6-sol` (`codex_responses`, priority 100,
 `reasoning_effort: medium`). The generic `sota` dispatch selects
 `sota-openai` for Codex and default origins. Its `grok` branch selects
-`sota-xai`, whose order is Cursor Agent
-`cursor_agent/cursor-grok-4.6-high`, native xAI/OIDC `xai/grok-4.6`, then
-managed xAI/OAuth `oa_xai/grok-4.6`.
+`sota-xai`, whose order is native xAI/OIDC `xai/grok-4.7`, then managed
+xAI/OAuth `oa_xai/grok-4.7`. Cursor Grok remains on `sota-cursor`.
 
 ## Candidate schedule windows
 

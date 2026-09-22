@@ -111,36 +111,32 @@ class TestCursorAgentCompile:
         assert "composer-2.5-fast" not in models
         assert all(candidate.provider != "cursor" for candidate in candidates)
 
-    def test_sota_xai_orders_cursor_native_then_managed_xai(self):
+    def test_sota_xai_orders_native_then_managed_xai(self):
         snapshot = compile_yaml(_SOTA_XAI_YAML_PATH.read_text(encoding="utf-8"))
         candidates = snapshot.aliases["sota-xai"].candidates
-        xai = _candidate_by_model(candidates, "oa_xai/grok-4.6")
-        native_xai = _candidate_by_model(candidates, "xai/grok-4.6")
-        cursor_grok = _candidate_by_model(candidates, _CURSOR_GROK_MODEL)
+        xai = _candidate_by_model(candidates, "oa_xai/grok-4.7")
+        native_xai = _candidate_by_model(candidates, "xai/grok-4.7")
 
         assert [candidate.model for candidate in candidates] == [
-            _CURSOR_GROK_MODEL,
-            "xai/grok-4.6",
-            "oa_xai/grok-4.6",
+            "xai/grok-4.7",
+            "oa_xai/grok-4.7",
         ]
         assert xai.provider == "xai"
         assert xai.priority == 90
         assert native_xai.provider == "xai"
         assert native_xai.priority == 100
-        assert cursor_grok.provider == "cursor_agent"
-        assert cursor_grok.priority == 110
-        assert cursor_grok.route_family == _CODEX_CURSOR_ROUTE_FAMILY
-        assert cursor_grok.anthropic_route_family == _ANTHROPIC_CURSOR_ROUTE_FAMILY
-        assert cursor_grok.priority > native_xai.priority > xai.priority
+        assert native_xai.priority > xai.priority
+        assert all(candidate.model != _CURSOR_GROK_MODEL for candidate in candidates)
 
-    def test_directory_compile_inherits_cursor_grok_on_work_other(self):
+    def test_directory_compile_keeps_cursor_grok_on_sota_cursor(self):
         snapshot = compile_directory(DEFAULT_CONFIG_DIR)
         sota_xai = snapshot.aliases["sota-xai"].candidates
         assert [candidate.model for candidate in sota_xai] == [
-            _CURSOR_GROK_MODEL,
-            "xai/grok-4.6",
-            "oa_xai/grok-4.6",
+            "xai/grok-4.7",
+            "oa_xai/grok-4.7",
         ]
+        sota_cursor = snapshot.aliases["sota-cursor"].candidates
+        assert [candidate.model for candidate in sota_cursor] == [_CURSOR_GROK_MODEL]
         assert "work-other" in snapshot.aliases
         assert any(
             getattr(entry, "alias_name", None) == "sota-xai"

@@ -3257,7 +3257,7 @@ def _grok_cli_passthrough_history_model(prepared_body: dict[str, Any]) -> Any:
 def _preserve_or_rewrite_grok_cli_input_history_in_place(
     prepared_body: dict[str, Any],
 ) -> None:
-    """Keep grok-4.6 typed tool history; flatten only models that still rewrite."""
+    """Keep grok-4.6/4.7 typed tool history; flatten only models that still rewrite."""
 
     model = _grok_cli_passthrough_history_model(prepared_body)
     if has_grok_native_route_capability(

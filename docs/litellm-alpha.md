@@ -162,9 +162,9 @@ The current canonical alias YAML exposes these alpha test paths:
 - `auto-review` references `auto-review-other`, then Luna and OpenRouter
   DeepSeek. `codex-auto-review` references that same public graph.
 - `sota-openai` uses OpenAI `gpt-5.6-sol`.
-- `sota-xai` orders Cursor Agent
-  `cursor_agent/cursor-grok-4.6-high`, native xAI/OIDC
-  `xai/grok-4.6`, then managed xAI/OAuth `oa_xai/grok-4.6`.
+- `sota-xai` orders native xAI/OIDC `xai/grok-4.7`, then managed
+  xAI/OAuth `oa_xai/grok-4.7`. Cursor Agent
+  `cursor_agent/cursor-grok-4.6-high` stays on `sota-cursor`.
   `UserMessageAction.requestContext` is official schema field 2. For a fresh
   clean alias dispatch, LiteLLM intentionally sends it as an empty message
   (`requestContext: {}`). The official CLI normally computes and populates

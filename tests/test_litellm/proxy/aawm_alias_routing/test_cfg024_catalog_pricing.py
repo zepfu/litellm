@@ -17,6 +17,8 @@ SERVED_CONCRETE_MODELS = (
     "cursor_agent/composer-2.5",
     "cursor_agent/cursor-grok-4.6-high",
     "oa_xai/grok-4.6",
+    "xai/grok-4.7",
+    "oa_xai/grok-4.7",
     "kimi_code/k3",
     "cohere/north-mini-code-1-0",
     "openrouter/qwen/qwen3.6-flash",

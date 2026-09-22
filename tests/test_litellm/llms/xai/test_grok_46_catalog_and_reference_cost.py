@@ -196,12 +196,16 @@ def test_should_register_native_and_managed_grok_46_descriptors() -> None:
     assert native.credential_family == "xai_grok_oidc"
 
 
-def test_should_activate_grok_46_for_sota_xai() -> None:
+def test_should_keep_grok_46_catalog_rows_after_sota_xai_cutover() -> None:
     yaml_path = REPO_ROOT / "litellm/proxy/aawm_alias_config/sota-xai.yaml"
     yaml_text = yaml_path.read_text()
 
-    assert "model: oa_xai/grok-4.6" in yaml_text
-    assert "model: oa_xai/grok-4.5" not in yaml_text
+    assert "model: oa_xai/grok-4.6" not in yaml_text
+    assert "model: xai/grok-4.6" not in yaml_text
+    for catalog_path in CATALOG_PATHS:
+        catalog = json.loads(catalog_path.read_text())
+        assert "xai/grok-4.6" in catalog
+        assert "oa_xai/grok-4.6" in catalog
 
 
 def test_should_not_override_caller_reasoning_effort_for_sota_xai() -> None:

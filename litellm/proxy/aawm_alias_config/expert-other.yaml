@@ -14,6 +14,6 @@ aliases:
           utc_offset: "+08:00"
 
       - provider: xai
-        model: xai/grok-4.6
+        model: xai/grok-4.7
         route_family: codex_grok_native_responses_adapter
         priority: 0

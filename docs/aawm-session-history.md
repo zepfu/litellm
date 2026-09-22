@@ -1746,21 +1746,21 @@ The config-driven `sota-openai` route uses this order:
 
 The config-driven `sota-xai` route uses this order:
 
-1. `cursor_agent/cursor-grok-4.6-high` via Cursor Agent
-2. `xai/grok-4.6` via native xAI OIDC
-3. `oa_xai/grok-4.6` via managed xAI OAuth Responses adapter
+1. `xai/grok-4.7` via native xAI OIDC
+2. `oa_xai/grok-4.7` via managed xAI OAuth Responses adapter
 
-The three candidate lanes remain distinct. `work` and its nested `work-other`
-alias reference inherit this provider-neutral `sota-xai` order. The managed
+Cursor Agent `cursor_agent/cursor-grok-4.6-high` stays on `sota-cursor`.
+The two xAI candidate lanes remain distinct. `work` and its nested `work-other`
+alias reference inherit this `sota-xai` order. The managed
 `sota-xai` candidate has no candidate-level reasoning override. For caller
-`reasoning.effort=xhigh`, the outbound `oa_xai/grok-4.6` request keeps `xhigh`
+`reasoning.effort=xhigh`, the outbound `oa_xai/grok-4.7` request keeps `xhigh`
 unchanged. Session/request metadata records the requested/native effort as
 `xhigh`, together with the provider-native field/provider; the route rollup is
-`grok-4.6(sota-xai):xhigh`.
+`grok-4.7(sota-xai):xhigh`.
 
 
-`sota-xai` serves Grok 4.6 through the three lanes above; its managed OAuth
-lane is last after Cursor and native OIDC. Historical native Grok 4.5 behavior
+`sota-xai` serves Grok 4.7 through the two lanes above; its managed OAuth
+lane is last after native OIDC. Historical native Grok 4.5 behavior
 remains distinct: generic `aawm_codex_auto_agent_candidate_unavailable` probe
 failures do not apply a durable Grok 4.5 cooldown, native Grok 4.5 uses
 cooldown scope `none`, and other xAI alias candidates use request-local
@@ -2607,16 +2607,17 @@ structured edits, stale `old_string` retries, bounded reads, and reading before
 overwriting existing files even when the provider adapter removes unsupported
 top-level fields.
 
-## Managed xAI Grok 4.6 reference-cost metadata
+## Managed xAI Grok 4.7 reference-cost metadata
 
-The active `sota-xai` alias order is Cursor Agent
-(`cursor_agent/cursor-grok-4.6-high`) -> native xAI OIDC (`xai/grok-4.6`) ->
-managed xAI OAuth (`oa_xai/grok-4.6`). The managed candidate's session-history
-record keeps the managed rate as reference metadata rather than an invoice
-cost: `actual_invoice_cost_known` is `false` and `response_cost_usd` remains
-`NULL`. The reference provenance is the xAI Grok 4.6 source, created timestamp
-`1785974400` (`2026-08-06T00:00:00Z`), owner `xai`, empty aliases, and verified
-date `2026-08-12`.
+The active `sota-xai` alias order is native xAI OIDC (`xai/grok-4.7`) ->
+managed xAI OAuth (`oa_xai/grok-4.7`). Cursor Agent
+(`cursor_agent/cursor-grok-4.6-high`) stays on `sota-cursor`. The managed
+candidate's session-history record keeps the managed rate as reference
+metadata rather than an invoice cost: `actual_invoice_cost_known` is `false`
+and `response_cost_usd` remains `NULL`. The reference provenance is the xAI
+Grok 4.7 source, created timestamp `1790035200` (`2026-09-22T00:00:00Z`),
+owner `xai`, empty aliases, and verified date `2026-09-22`. Historical Grok
+4.6 catalog rows remain for direct-model traffic.
 
 The reference rates are input/cache/output `$2/$0.50/$6` per million tokens,
 image input `$2` per million image tokens, and `$4/$1/$12` above `200000`

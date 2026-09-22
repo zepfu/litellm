@@ -529,8 +529,8 @@ def test_canonical_work_compiles_current_graph() -> None:
         {
             "zai_coding_plan/glm-5.3-flash",
             "cursor_agent/cursor-grok-4.6-high",
-            "xai/grok-4.6",
-            "oa_xai/grok-4.6",
+            "xai/grok-4.7",
+            "oa_xai/grok-4.7",
         }
     )
 

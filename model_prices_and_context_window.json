@@ -41831,6 +41831,75 @@
             "reasoning"
         ]
     },
+    "xai/grok-4.7": {
+        "aliases": [],
+        "created": 1790035200,
+        "input_cost_per_image_token": 2e-06,
+        "input_cost_per_token": 2e-06,
+        "input_cost_per_token_above_200k_tokens": 4e-06,
+        "cache_read_input_token_cost": 5e-07,
+        "cache_read_input_token_cost_above_200k_tokens": 1e-06,
+        "litellm_provider": "xai",
+        "max_input_tokens": 500000,
+        "max_output_tokens": 500000,
+        "max_tokens": 500000,
+        "mode": "responses",
+        "output_cost_per_token": 6e-06,
+        "output_cost_per_token_above_200k_tokens": 1.2e-05,
+        "owned_by": "xai",
+        "provider_specific_entry": {
+            "xai": {
+                "capabilities": [
+                    "native_grok_continuation_retry",
+                    "native_responses_tool_history"
+                ]
+            }
+        },
+        "source": "https://docs.x.ai/developers/models/grok-4.7",
+        "supports_function_calling": true,
+        "supports_reasoning": true,
+        "supports_tool_choice": true,
+        "supports_xhigh_reasoning_effort": true,
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ],
+            "multi_agent_v1": [
+                "close_agent",
+                "resume_agent",
+                "send_input",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
+        "unsupported_hosted_tools": [
+            "custom",
+            "image_generation",
+            "namespace",
+            "tool_search"
+        ],
+        "unsupported_request_params": [
+            "external_web_access",
+            "reasoning_effort",
+            "reasoningEffort"
+        ],
+        "rewrite_input_item_types": [
+            "function_call",
+            "function_call_output"
+        ],
+        "supports_vision": true,
+        "supports_web_search": true,
+        "verified": "2026-09-22",
+        "unsupported_input_item_types": []
+    },
     "xai/grok-4.5": {
         "litellm_provider": "xai",
         "max_input_tokens": 500000,
@@ -41938,6 +42007,67 @@
         "unsupported_input_item_types": [
             "reasoning"
         ]
+    },
+    "oa_xai/grok-4.7": {
+        "aliases": [],
+        "created": 1790035200,
+        "input_cost_per_image_token": 2e-06,
+        "input_cost_per_token": 2e-06,
+        "input_cost_per_token_above_200k_tokens": 4e-06,
+        "cache_read_input_token_cost": 5e-07,
+        "cache_read_input_token_cost_above_200k_tokens": 1e-06,
+        "litellm_provider": "xai",
+        "max_input_tokens": 500000,
+        "max_output_tokens": 500000,
+        "max_tokens": 500000,
+        "mode": "responses",
+        "output_cost_per_token": 6e-06,
+        "output_cost_per_token_above_200k_tokens": 1.2e-05,
+        "owned_by": "xai",
+        "source": "https://docs.x.ai/developers/models/grok-4.7",
+        "supports_function_calling": true,
+        "supports_reasoning": true,
+        "supports_tool_choice": true,
+        "supports_xhigh_reasoning_effort": true,
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ],
+            "multi_agent_v1": [
+                "close_agent",
+                "resume_agent",
+                "send_input",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
+        "unsupported_hosted_tools": [
+            "custom",
+            "image_generation",
+            "namespace",
+            "tool_search"
+        ],
+        "unsupported_request_params": [
+            "external_web_access",
+            "reasoning_effort",
+            "reasoningEffort"
+        ],
+        "rewrite_input_item_types": [
+            "function_call",
+            "function_call_output"
+        ],
+        "supports_vision": true,
+        "supports_web_search": true,
+        "verified": "2026-09-22",
+        "unsupported_input_item_types": []
     },
     "oa_xai/grok-4.5": {
         "litellm_provider": "xai",

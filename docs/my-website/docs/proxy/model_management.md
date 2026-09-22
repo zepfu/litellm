@@ -44,17 +44,18 @@ combines maximum reasoning with proactive subagent delegation, not an API
 Config-driven alias routing uses:
 
 - `sota-openai`: `gpt-6-astra` (priority 100) with `reasoning_effort: high`
-- `sota-xai`: `cursor_agent/cursor-grok-4.6-high` via Cursor Agent
-  (priority 110), then `xai/grok-4.6` via native xAI OIDC (priority 100), then
-  `oa_xai/grok-4.6` via managed xAI OAuth (priority 90)
+- `sota-xai`: `xai/grok-4.7` via native xAI OIDC (priority 100), then
+  `oa_xai/grok-4.7` via managed xAI OAuth (priority 90). Cursor Agent
+  `cursor_agent/cursor-grok-4.6-high` stays on `sota-cursor`.
 - Managed `sota-xai` has no candidate-level reasoning override: caller
-  `reasoning.effort=xhigh` is sent unchanged to `oa_xai/grok-4.6`. Request
+  `reasoning.effort=xhigh` is sent unchanged to `oa_xai/grok-4.7`. Request
   metadata records the requested/native effort as `xhigh` and the
   provider-native field/provider; the route rollup is
-  `grok-4.6(sota-xai):xhigh`. The managed candidate is last after the
-  Cursor Agent and native xAI OIDC lanes; all three routes remain distinct.
+  `grok-4.7(sota-xai):xhigh`. The managed candidate is last after native
+  xAI OIDC; the two xAI routes remain distinct.
 - `sota`: selects the producer-family `sota-*` alias from TUI origin, defaulting to `sota-openai`.
 - Grok 4.6 (`xai/grok-4.6`, `oa_xai/grok-4.6`): 500k context; created 1785974400 (2026-08-06T00:00:00Z), owned by xAI, no aliases, source `https://docs.x.ai/developers/models/grok-4.6`, verified 2026-08-12; input $2/M, output $6/M, cached input $0.50/M, image input $2/M image tokens; above 200k whole-request input tokens, input/cache/output are $4/$1/$12 per million; managed-route session history records this as a reference rate with invoice cost unknown
+- Grok 4.7 (`xai/grok-4.7`, `oa_xai/grok-4.7`): 500k context; created 1790035200 (2026-09-22T00:00:00Z), owned by xAI, no aliases, source `https://docs.x.ai/developers/models/grok-4.7`, verified 2026-09-22; input $2/M, output $6/M, cached input $0.50/M, image input $2/M image tokens; above 200k whole-request input tokens, input/cache/output are $4/$1/$12 per million; managed-route session history records this as a reference rate with invoice cost unknown. Grok 4.7 always returns Responses `reasoning.encrypted_content` even when not requested.
 - Cursor Agent Composer 2.5 standard (`cursor_agent/composer-2.5`): CLI slug `composer-2.5`, not Fast and not xAI `grok-composer-2.5-fast`; public list $0.50/$0.20/$2.50 per million input/cache-read/output, reference-only with invoice cost unknown
 - Cursor Grok 4.6 (`cursor_agent/cursor-grok-4.6-high`): CLI slug `cursor-grok-4.6-high`, distinct from `oa_xai/grok-4.6` and `xai/grok-4.6`; public list $2/$0.50/$6 per million input/cache-read/output, reference-only with invoice cost unknown; temporary launch discount is not baked in
 - `sota-alibaba`: `alibaba_token_plan/qwen3.8-max` → `alibaba_token_plan/qwen3.7-max`
@@ -67,10 +68,10 @@ Config-driven alias routing uses:
 - `basic-other`: during `22:00-08:00 UTC+8`, Alibaba `alibaba_token_plan/deepseek-v4.1-flash` (100) is admitted before Z.AI `zai_coding_plan/glm-5.3-flash` (90) and Cursor Composer `cursor_agent/composer-2.5` (80); the priority-zero tail is Luna at low effort for non-Claude/missing/unknown origins or native Haiku for Claude origins
 - `work`: nested `work-other` alias reference (priority 110) → Claude-only native
   Sonnet tail → `gpt-5.6-luna` (priority 0) with `reasoning_effort: high`
-- `work-other`: ordinary configured alias and valid exact-name / `alias_reference` target. During `22:00-08:00 UTC+8` the order is `sota-deepseek` (`alibaba_token_plan/deepseek-v4-pro`), Z.AI `zai_coding_plan/glm-5.3-flash`, `sota-moonshot`, then `sota-xai` in its declared order: Cursor Agent `cursor_agent/cursor-grok-4.6-high`, native xAI OIDC `xai/grok-4.6`, then managed xAI OAuth `oa_xai/grok-4.6`. Outside that window DeepSeek is omitted from new selection.
+- `work-other`: ordinary configured alias and valid exact-name / `alias_reference` target. During `22:00-08:00 UTC+8` the order is `sota-deepseek` (`alibaba_token_plan/deepseek-v4-pro`), Z.AI `zai_coding_plan/glm-5.3-flash`, `sota-moonshot`, then `sota-xai` in its declared order: native xAI OIDC `xai/grok-4.7`, then managed xAI OAuth `oa_xai/grok-4.7`. Outside that window DeepSeek is omitted from new selection.
 - `expert`: `expert-other` (priority 100) → OpenAI/Codex `gpt-6-astra`
   (`codex_responses`, priority 0) with authoritative `reasoning_effort: low`
-- `expert-other`: during `22:00-08:00 UTC+8`, Alibaba `alibaba_token_plan/qwen3.8-max` (100) is admitted before Cursor Grok `cursor_agent/cursor-grok-4.6-high` (90) and native xAI `xai/grok-4.6` (0)
+- `expert-other`: during `22:00-08:00 UTC+8`, Alibaba `alibaba_token_plan/qwen3.8-max` (100) is admitted before native xAI `xai/grok-4.7` (0)
 - `auto-review`: `auto-review-other` (100) → Luna at low effort (90) → priority-zero OpenRouter DeepSeek at low effort; `codex-auto-review` is a public alias reference to this graph
 - `auto-review-other`: during `22:00-08:00 UTC+8`, Alibaba DeepSeek Flash (100) is admitted before Z.AI Flash (90) and Cursor Composer (80), with low effort throughout
 

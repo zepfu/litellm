@@ -309,10 +309,10 @@ tuis:
     cwd: /tmp/hv2-grok-workspace
     session_dir: /tmp/hv2-grok-sessions
     default_models:
-      - grok-4.6
-    default_orchestration_parent: grok-4.6
+      - grok-4.7
+    default_orchestration_parent: grok-4.7
     default_orchestration_children:
-      - grok-4.6
+      - grok-4.7
     model_prompt: grok_model
     orchestration_prompt: grok_orchestration
     tmux:
@@ -374,7 +374,7 @@ tuis:
       selected_needles:
         - "{selector}"
         - "{model}"
-        - "Grok 4.6"
+        - "Grok 4.7"
         - always-approve
       reply_needles:
         - hv2-grok-child

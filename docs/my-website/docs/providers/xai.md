@@ -339,7 +339,7 @@ message. Internal metadata and credentials remain outside prompt input.
 
 ## Native Grok Route Capabilities
 
-Native `xai/grok-4.5` and `xai/grok-4.6` declare the
+Native `xai/grok-4.5`, `xai/grok-4.6`, and `xai/grok-4.7` declare the
 `native_grok_continuation_retry` capability in the canonical xAI model
 metadata. Native recovery and cooldown handling require both this explicit
 capability and a native Grok route family. Managed `oa_xai/*`, Cursor, Composer,
@@ -347,7 +347,8 @@ Grok Build, and unprofiled future models do not inherit the native policy.
 Malformed native output remains request-local and does not create a durable
 candidate cooldown.
 
-Native `xai/grok-4.6` also declares `native_responses_tool_history`. Its native
+Native `xai/grok-4.6` and `xai/grok-4.7` also declare
+`native_responses_tool_history`. Their native
 OIDC request projection preserves typed `function_call` and
 `function_call_output` pairs, their order, names, and `call_id` correlation.
 Arguments remain JSON strings; object arguments and outputs are serialized

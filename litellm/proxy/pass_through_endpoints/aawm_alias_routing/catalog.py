@@ -23,6 +23,8 @@ SERVED_CONCRETE_MODELS: Tuple[Tuple[str, str, str], ...] = (
         "cursor_agent",
     ),
     ("oa_xai/grok-4.6", "oa_xai/grok-4.6", "oa_xai"),
+    ("xai/grok-4.7", "xai/grok-4.7", "xai"),
+    ("oa_xai/grok-4.7", "oa_xai/grok-4.7", "oa_xai"),
     ("kimi_code/k3", "kimi_code/k3", "kimi_code"),
     ("cohere/north-mini-code-1-0", "cohere/north-mini-code-1-0", "cohere"),
     ("alibaba_token_plan/glm-5.2", "alibaba_token_plan/glm-5.2", "alibaba_token_plan"),

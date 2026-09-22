@@ -115,14 +115,8 @@ _OPERATIONAL_ALIAS_ORDER = {
             100,
         ),
         (
-            "cursor_agent",
-            "cursor_agent/cursor-grok-4.6-high",
-            "codex_cursor_agent_aiserver_adapter",
-            90,
-        ),
-        (
             "xai",
-            "xai/grok-4.6",
+            "xai/grok-4.7",
             "codex_grok_native_responses_adapter",
             0,
         ),
@@ -366,12 +360,12 @@ def test_provider_xai_keeps_managed_and_native_lanes_distinct() -> None:
         for entry in alias.candidates
     ]
     assert (
-        "oa_xai/grok-4.6",
+        "oa_xai/grok-4.7",
         "codex_xai_oauth_responses_adapter",
         "anthropic_xai_oauth_responses_adapter",
     ) in pairs
     assert (
-        "xai/grok-4.6",
+        "xai/grok-4.7",
         "codex_grok_native_responses_adapter",
         "anthropic_grok_native_responses_adapter",
     ) in pairs

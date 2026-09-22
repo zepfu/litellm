@@ -259,6 +259,7 @@ OA_XAI_ROUTE_DESCRIPTORS: Mapping[str, XAIRouteDescriptor] = MappingProxyType(
             ("oa_xai/grok-4.3", "xai/grok-4.3"),
             ("oa_xai/grok-4.5", "xai/grok-4.5"),
             ("oa_xai/grok-4.6", "xai/grok-4.6"),
+            ("oa_xai/grok-4.7", "xai/grok-4.7"),
             (
                 "oa_xai/grok-4.20-0309-reasoning",
                 "xai/grok-4.20-0309-reasoning",
@@ -284,6 +285,7 @@ GROK_NATIVE_ROUTE_DESCRIPTORS: Mapping[str, XAIRouteDescriptor] = MappingProxyTy
             "grok-composer-2.5-fast",
             "grok-4.5",
             "grok-4.6",
+            "grok-4.7",
         )
     }
 )

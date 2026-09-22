@@ -7,9 +7,6 @@ from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
-from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
-    is_openrouter_free_model,
-)
 
 OPENROUTER_COST_STATUS_UNMAPPED = "unmapped"
 OPENROUTER_COST_STATUS_FREE = "free"
@@ -61,6 +58,10 @@ def authoritative_openrouter_usage_cost(cost: Any, model: Any) -> Optional[float
         return None
     if not math.isfinite(value) or value < 0:
         return None
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+        is_openrouter_free_model,
+    )
+
     if value == 0 and not is_openrouter_free_model(model):
         return None
     return value
@@ -68,6 +69,10 @@ def authoritative_openrouter_usage_cost(cost: Any, model: Any) -> Optional[float
 
 def openrouter_cost_status(*, model: Any, response_cost: Optional[float]) -> str:
     """Stable OpenRouter cost status for session-history and passthrough logs."""
+
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+        is_openrouter_free_model,
+    )
 
     if is_openrouter_free_model(model):
         return OPENROUTER_COST_STATUS_FREE

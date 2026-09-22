@@ -673,22 +673,23 @@ def test_canonical_work_other_inherits_sota_xai_order_after_daily_deepseek() -> 
             "alibaba_token_plan/deepseek-v4-pro",
             "zai_coding_plan/glm-5.3-flash",
             "kimi_code/k3",
-            "cursor_agent/cursor-grok-4.6-high",
-            "xai/grok-4.6",
-            "oa_xai/grok-4.6",
+            "xai/grok-4.7",
+            "oa_xai/grok-4.7",
         ]
         assert [candidate["model"] for candidate in outside] == [
             "zai_coding_plan/glm-5.3-flash",
             "kimi_code/k3",
-            "cursor_agent/cursor-grok-4.6-high",
-            "xai/grok-4.6",
-            "oa_xai/grok-4.6",
+            "xai/grok-4.7",
+            "oa_xai/grok-4.7",
         ]
-        inherited_grok = outside[1:] if outside and outside[0]["model"] == "zai_coding_plan/glm-5.3-flash" else outside[-3:]
+        inherited_grok = [
+            candidate
+            for candidate in outside
+            if candidate["model"] in ("xai/grok-4.7", "oa_xai/grok-4.7")
+        ]
         grok_models = (
-            "cursor_agent/cursor-grok-4.6-high",
-            "xai/grok-4.6",
-            "oa_xai/grok-4.6",
+            "xai/grok-4.7",
+            "oa_xai/grok-4.7",
         )
         assert [
             candidate["model"] for candidate in inherited_grok
@@ -707,7 +708,7 @@ def test_canonical_work_other_inherits_sota_xai_order_after_daily_deepseek() -> 
                 for candidate in inherited_grok
                 if candidate["model"] in grok_models
             }
-        ) == 3
+        ) == 2
         assert all(
             "qwen" not in str(candidate["model"])
             for candidate in (*inside, *outside)
@@ -727,15 +728,13 @@ def test_canonical_work_other_inherits_sota_xai_order_after_daily_deepseek() -> 
         assert [candidate["model"] for candidate in inside_anthropic] == [
             "alibaba_token_plan/deepseek-v4-pro",
             "kimi_code/k3",
-            "cursor_agent/cursor-grok-4.6-high",
-            "xai/grok-4.6",
-            "oa_xai/grok-4.6",
+            "xai/grok-4.7",
+            "oa_xai/grok-4.7",
         ]
         assert [candidate["model"] for candidate in outside_anthropic] == [
             "kimi_code/k3",
-            "cursor_agent/cursor-grok-4.6-high",
-            "xai/grok-4.6",
-            "oa_xai/grok-4.6",
+            "xai/grok-4.7",
+            "oa_xai/grok-4.7",
         ]
         assert (
             inside_anthropic[0]["route_family"]
@@ -751,9 +750,8 @@ def test_canonical_work_other_inherits_sota_xai_order_after_daily_deepseek() -> 
             "alibaba_token_plan/deepseek-v4-pro",
             "zai_coding_plan/glm-5.3-flash",
             "kimi_code/k3",
-            "cursor_agent/cursor-grok-4.6-high",
-            "xai/grok-4.6",
-            "oa_xai/grok-4.6",
+            "xai/grok-4.7",
+            "oa_xai/grok-4.7",
         ]
     finally:
         snapshot_select.set_active_routing_snapshot(previous)
@@ -828,12 +826,10 @@ def test_canonical_expert_other_selects_alibaba_cursor_then_native_xai() -> None
 
         assert [candidate["model"] for candidate in inside] == [
             "alibaba_token_plan/qwen3.8-max",
-            "cursor_agent/cursor-grok-4.6-high",
-            "xai/grok-4.6",
+            "xai/grok-4.7",
         ]
         assert [candidate["model"] for candidate in outside] == [
-            "cursor_agent/cursor-grok-4.6-high",
-            "xai/grok-4.6",
+            "xai/grok-4.7",
         ]
     finally:
         snapshot_select.set_active_routing_snapshot(previous)
@@ -940,9 +936,8 @@ def test_canonical_work_selects_effective_codex_order() -> None:
         entry.model for entry in declared if isinstance(entry, RoutingCandidate)
     }
     grok_models = (
-        "cursor_agent/cursor-grok-4.6-high",
-        "xai/grok-4.6",
-        "oa_xai/grok-4.6",
+        "xai/grok-4.7",
+        "oa_xai/grok-4.7",
     )
     assert direct_models.isdisjoint(grok_models)
     assert [
@@ -987,20 +982,14 @@ def test_canonical_work_selects_effective_codex_order() -> None:
                 110,
             ),
             (
-                "cursor_agent",
-                "cursor_agent/cursor-grok-4.6-high",
-                "codex_cursor_agent_aiserver_adapter",
-                110,
-            ),
-            (
                 "xai",
-                "xai/grok-4.6",
+                "xai/grok-4.7",
                 "codex_grok_native_responses_adapter",
                 110,
             ),
             (
                 "xai",
-                "oa_xai/grok-4.6",
+                "oa_xai/grok-4.7",
                 "codex_xai_oauth_responses_adapter",
                 110,
             ),
@@ -1012,7 +1001,6 @@ def test_canonical_work_selects_effective_codex_order() -> None:
             ),
         ]
         assert [candidate.get("alias_reference") for candidate in selected] == [
-            "work-other",
             "work-other",
             "work-other",
             "work-other",
@@ -1036,7 +1024,7 @@ def test_canonical_work_selects_effective_codex_order() -> None:
                 candidate["cooldown_identity_tag"]
                 for candidate in inherited_grok
             }
-        ) == 3
+        ) == 2
         assert all(
             sum(candidate["model"] == model for candidate in selected) == 1
             for model in grok_models

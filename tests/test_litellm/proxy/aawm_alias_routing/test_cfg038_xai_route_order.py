@@ -1,4 +1,4 @@
-"""CFG-038: Cursor, then native OIDC, then managed OAuth for Grok 4.6."""
+"""CFG-038: native OIDC then managed OAuth for Grok 4.7; Cursor stays on sota-cursor."""
 
 from __future__ import annotations
 
@@ -52,8 +52,8 @@ _PROVIDER_XAI_YAML = (
 )
 
 _CURSOR_MODEL = "cursor_agent/cursor-grok-4.6-high"
-_OIDC_MODEL = "xai/grok-4.6"
-_OAUTH_MODEL = "oa_xai/grok-4.6"
+_OIDC_MODEL = "xai/grok-4.7"
+_OAUTH_MODEL = "oa_xai/grok-4.7"
 _CURSOR_ROUTE = "codex_cursor_agent_aiserver_adapter"
 _OIDC_ROUTE = "codex_grok_native_responses_adapter"
 _OAUTH_ROUTE = "codex_xai_oauth_responses_adapter"
@@ -62,7 +62,6 @@ _OIDC_ANTHROPIC_ROUTE = "anthropic_grok_native_responses_adapter"
 _OAUTH_ANTHROPIC_ROUTE = "anthropic_xai_oauth_responses_adapter"
 
 _SOTA_XAI_ORDER = (
-    ("cursor_agent", _CURSOR_MODEL, _CURSOR_ROUTE, 110),
     ("xai", _OIDC_MODEL, _OIDC_ROUTE, 100),
     ("xai", _OAUTH_MODEL, _OAUTH_ROUTE, 90),
 )
@@ -162,27 +161,24 @@ def _assert_xai_candidate_classification(
     assert not _is_codex_auto_agent_cursor_agent_candidate(oauth_public)
 
 
-def test_sota_xai_yaml_compiles_cursor_then_oidc_then_oauth() -> None:
+def test_sota_xai_yaml_compiles_oidc_then_oauth() -> None:
     snapshot = compile_yaml(_SOTA_XAI_YAML.read_text(encoding="utf-8"))
     alias = snapshot.aliases["sota-xai"]
     assert alias.dispatch is None
-    assert len(alias.candidates) == 3
+    assert len(alias.candidates) == 2
     assert all(isinstance(entry, RoutingCandidate) for entry in alias.candidates)
     assert [_identity(entry) for entry in alias.candidates] == list(_SOTA_XAI_ORDER)
 
-    cursor, oidc, oauth = alias.candidates
-    assert cursor.anthropic_route_family == _CURSOR_ANTHROPIC_ROUTE
+    oidc, oauth = alias.candidates
     assert oidc.anthropic_route_family == _OIDC_ANTHROPIC_ROUTE
     assert oauth.anthropic_route_family == _OAUTH_ANTHROPIC_ROUTE
-    assert resolve_anthropic_route_family(cursor.route_family, None) == (
-        _CURSOR_ANTHROPIC_ROUTE
-    )
     assert resolve_anthropic_route_family(oidc.route_family, None) == (
         _OIDC_ANTHROPIC_ROUTE
     )
     assert resolve_anthropic_route_family(oauth.route_family, None) == (
         _OAUTH_ANTHROPIC_ROUTE
     )
+    assert all(entry.model != _CURSOR_MODEL for entry in alias.candidates)
 
 
 def test_directory_sota_xai_matches_file_compile_order() -> None:
@@ -218,11 +214,8 @@ def test_sota_xai_compiled_candidates_keep_distinct_route_lane_credential_failur
     try:
         compiled = snapshot.aliases["sota-xai"].candidates
         assert [_identity(entry) for entry in compiled] == list(_SOTA_XAI_ORDER)
-        cursor, oidc, oauth = compiled
+        oidc, oauth = compiled
 
-        cursor_attr = _attribution(
-            cursor, owning_alias="sota-xai", route_family=_CURSOR_ROUTE
-        )
         oidc_attr = _attribution(
             oidc, owning_alias="sota-xai", route_family=_OIDC_ROUTE
         )
@@ -230,31 +223,18 @@ def test_sota_xai_compiled_candidates_keep_distinct_route_lane_credential_failur
             oauth, owning_alias="sota-xai", route_family=_OAUTH_ROUTE
         )
 
-        assert cursor_attr["lane_key"] == CODEX_AUTO_AGENT_CURSOR_AGENT_LANE_KEY
         assert oidc_attr["lane_key"] == CODEX_AUTO_AGENT_XAI_LANE_KEY
         assert oauth_attr["lane_key"] == CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY
-        assert len({cursor_attr["lane_key"], oidc_attr["lane_key"], oauth_attr["lane_key"]}) == 3
+        assert oidc_attr["lane_key"] != oauth_attr["lane_key"]
 
-        assert cursor_attr["credential_family"] == "cursor_agent"
         assert oidc_attr["credential_family"] == GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY
         assert oauth_attr["credential_family"] == XAI_OAUTH_CREDENTIAL_FAMILY
         assert oidc_attr["credential_family"] == "xai_grok_oidc"
         assert oauth_attr["credential_family"] == "xai_oauth"
-        assert len(
-            {
-                cursor_attr["credential_family"],
-                oidc_attr["credential_family"],
-                oauth_attr["credential_family"],
-            }
-        ) == 3
 
-        assert cursor_attr["route_family"] != oidc_attr["route_family"]
         assert oidc_attr["route_family"] != oauth_attr["route_family"]
-        assert cursor_attr["cooldown_identity_tag"] != oidc_attr["cooldown_identity_tag"]
         assert oidc_attr["cooldown_identity_tag"] != oauth_attr["cooldown_identity_tag"]
-        assert cursor_attr["cooldown_key"] != oidc_attr["cooldown_key"]
         assert oidc_attr["cooldown_key"] != oauth_attr["cooldown_key"]
-        assert cursor_attr["quota_cooldown_key"] is None
         assert oidc_attr["quota_cooldown_key"] == (
             f"xai:__account_quota__:{CODEX_AUTO_AGENT_XAI_LANE_KEY}"
         )
@@ -262,8 +242,6 @@ def test_sota_xai_compiled_candidates_keep_distinct_route_lane_credential_failur
             f"xai:__account_quota__:{CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY}"
         )
         assert oidc_attr["quota_cooldown_key"] != oauth_attr["quota_cooldown_key"]
-
-        _assert_xai_candidate_classification(cursor, oidc, oauth)
 
         selected = snapshot_select._select_snapshot_candidates(
             "sota-xai",
@@ -274,10 +252,10 @@ def test_sota_xai_compiled_candidates_keep_distinct_route_lane_credential_failur
             for row in selected
         ] == list(_SOTA_XAI_ORDER)
         assert [row["cooldown_identity_tag"] for row in selected] == [
-            cursor_attr["cooldown_identity_tag"],
             oidc_attr["cooldown_identity_tag"],
             oauth_attr["cooldown_identity_tag"],
         ]
+        assert all(row["model"] != _CURSOR_MODEL for row in selected)
 
         anthropic = snapshot_select._select_snapshot_candidates(
             "sota-xai",
@@ -287,14 +265,16 @@ def test_sota_xai_compiled_candidates_keep_distinct_route_lane_credential_failur
             (row["provider"], row["model"], row["route_family"], row["selection_priority"])
             for row in anthropic
         ] == [
-            ("cursor_agent", _CURSOR_MODEL, _CURSOR_ANTHROPIC_ROUTE, 110),
             ("xai", _OIDC_MODEL, _OIDC_ANTHROPIC_ROUTE, 100),
             ("xai", _OAUTH_MODEL, _OAUTH_ANTHROPIC_ROUTE, 90),
         ]
-        assert len({row["cooldown_identity_tag"] for row in anthropic}) == 3
+        assert len({row["cooldown_identity_tag"] for row in anthropic}) == 2
         assert [row["cooldown_identity_tag"] for row in anthropic] != [
             row["cooldown_identity_tag"] for row in selected
         ]
+        cursor_alias = snapshot.aliases["sota-cursor"].candidates
+        assert [entry.model for entry in cursor_alias] == [_CURSOR_MODEL]
+        _assert_xai_candidate_classification(cursor_alias[0], oidc, oauth)
     finally:
         snapshot_select.set_active_routing_snapshot(previous)
 

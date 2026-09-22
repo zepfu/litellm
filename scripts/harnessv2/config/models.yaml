@@ -44,6 +44,8 @@ models:
     - cursor_agent/cursor-grok-4.6-high
     - xai/grok-4.6
     - oa_xai/grok-4.6
+    - xai/grok-4.7
+    - oa_xai/grok-4.7
     - kimi_code/k3
     - cohere/north-mini-code-1-0
     - alibaba_token_plan/glm-5.2

@@ -196,9 +196,9 @@ class GrokDriver:
         return self._active_session or self._default_session_name()
 
     def _tmux_target(self, name: str | None = None) -> str:
-        """Exact tmux session target. Dots in `grok-4.6` are pane paths.
+        """Exact tmux session target. Dots in `grok-4.7` are pane paths.
 
-        ``=name`` is not enough: tmux still splits ``grok-4.6`` as
+        ``=name`` is not enough: tmux still splits ``grok-4.7`` as
         ``session:window.pane``. A trailing colon pins the session.
         """
         session = name or self._session_name()

@@ -949,7 +949,7 @@ def test_should_plan_grok_tui_against_alpha_not_as_stub(hv, config) -> None:
     )
     assert plan.tui == "grok"
     assert plan.container == "litellm-alpha"
-    assert plan.orchestration_parents == ("grok-4.6",)
+    assert plan.orchestration_parents == ("grok-4.7",)
     artifact = hv.run_plan(plan)
     assert artifact["ok"] is True
     assert artifact["dry_run"] is True
@@ -1010,7 +1010,7 @@ def test_should_bind_grok_driver_child_env_to_alpha_grok_v1(hv, config) -> None:
     assert driver.bind_resolved(resolved) == "http://127.0.0.1:4011/grok/v1"
     env = driver.child_env()
     assert env["GROK_CLI_CHAT_PROXY_BASE_URL"] == "http://127.0.0.1:4011/grok/v1"
-    argv = driver.launch_argv("grok-4.6")
+    argv = driver.launch_argv("grok-4.7")
     joined = " ".join(argv)
     assert "groklt" not in joined
     assert ":4000" not in joined

@@ -52,6 +52,8 @@ def test_alias_catalog_publishes_configured_multi_agent_version_only() -> None:
     baseline_rows = build_passthrough_model_list(without_metadata)["data"]
     baseline_by_id = {row["id"]: row for row in baseline_rows}
     assert rows_by_id["oa_xai/grok-4.6"] == baseline_by_id["oa_xai/grok-4.6"]
+    assert rows_by_id["xai/grok-4.7"] == baseline_by_id["xai/grok-4.7"]
+    assert rows_by_id["oa_xai/grok-4.7"] == baseline_by_id["oa_xai/grok-4.7"]
 
 
 COMPILED_ALIAS_NAMES = [
