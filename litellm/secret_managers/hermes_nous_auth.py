@@ -85,10 +85,34 @@ def _expand_path(value: str) -> str:
     return str(Path(value).expanduser())
 
 
-def _same_auth_file(left: str, right: str) -> bool:
-    return str(Path(left).expanduser().resolve(strict=False)) == str(
-        Path(right).expanduser().resolve(strict=False)
-    )
+def _resolved_comparison_target(value: str) -> str:
+    return str(Path(value).resolve(strict=False))
+
+
+def _legacy_raw_selection(
+    precedence: Sequence[str],
+    configured: Mapping[str, str],
+) -> tuple[str, str]:
+    for source in precedence:
+        raw_path = configured.get(source)
+        if raw_path:
+            return raw_path, source
+    return _DEFAULT_HERMES_AUTH_PATH, _DEFAULT_SOURCE
+
+
+def _request_legacy_path(raw_path: str, source: str) -> str:
+    """Old request loading opened the stripped env string and did not expand ~."""
+
+    if source == _DEFAULT_SOURCE:
+        return _expand_path(raw_path)
+    return raw_path
+
+
+def _sidecar_legacy_path(raw_path: str, source: str) -> str:
+    """Old sidecar resolution expanded ~ before opening the auth file."""
+
+    del source
+    return _expand_path(raw_path)
 
 
 def _explicit_path(explicit_auth_file: Any) -> Optional[str]:
@@ -128,6 +152,33 @@ def _select_auth_file(
     return _expand_path(_DEFAULT_HERMES_AUTH_PATH), _DEFAULT_SOURCE
 
 
+def _legacy_mismatch_label(
+    consumer: str,
+    precedence: Sequence[str],
+    configured: Mapping[str, str],
+    shared_path: str,
+    interpret_path: Callable[[str, str], str],
+) -> Optional[str]:
+    """Return a source label when this old order would open another file.
+
+    Expansion and resolution failures stay inside this comparison. The label
+    is a fixed source name and never includes a path or exception text.
+    """
+
+    raw_path, source = _legacy_raw_selection(precedence, configured)
+    label = f"legacy {consumer} source {source}"
+    try:
+        legacy_path = interpret_path(raw_path, source)
+        same_file = _resolved_comparison_target(legacy_path) == (
+            _resolved_comparison_target(shared_path)
+        )
+    except Exception:
+        return label
+    if same_file:
+        return None
+    return label
+
+
 def _warn_legacy_precedence_mismatch(
     shared_path: str,
     shared_source: str,
@@ -136,19 +187,43 @@ def _warn_legacy_precedence_mismatch(
     """Warn when an old consumer order would open a different file.
 
     The message names sources only. It must not include the path or any
-    credential material.
+    credential material. A failed comparison does not replace the winning
+    selection.
     """
 
-    mismatches: list[str] = []
-    for consumer, precedence in (
-        ("request", LEGACY_REQUEST_NOUS_AUTH_FILE_PRECEDENCE),
-        ("sidecar", LEGACY_SIDECAR_NOUS_AUTH_FILE_PRECEDENCE),
-    ):
-        legacy_path, legacy_source = _select_auth_file(precedence, configured)
-        if not _same_auth_file(shared_path, legacy_path):
-            mismatches.append(f"legacy {consumer} source {legacy_source}")
+    try:
+        mismatches = [
+            label
+            for label in (
+                _legacy_mismatch_label(
+                    "request",
+                    LEGACY_REQUEST_NOUS_AUTH_FILE_PRECEDENCE,
+                    configured,
+                    shared_path,
+                    _request_legacy_path,
+                ),
+                _legacy_mismatch_label(
+                    "sidecar",
+                    LEGACY_SIDECAR_NOUS_AUTH_FILE_PRECEDENCE,
+                    configured,
+                    shared_path,
+                    _sidecar_legacy_path,
+                ),
+            )
+            if label is not None
+        ]
+    except Exception:
+        _log_legacy_warning(
+            shared_source,
+            ("legacy request source", "legacy sidecar source"),
+        )
+        return
     if not mismatches:
         return
+    _log_legacy_warning(shared_source, tuple(mismatches))
+
+
+def _log_legacy_warning(shared_source: str, mismatches: tuple[str, ...]) -> None:
     warning_key = (shared_source, *mismatches)
     if warning_key in _warned_migration_keys:
         return
