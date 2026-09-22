@@ -136,9 +136,11 @@ async def prepare_responses_route(
         request,
         use_alias_candidate_probe=use_alias_candidate_probe,
     )
-    _bind_selected_zen_provider_account_hash(
-        translated_request_body.get("litellm_metadata")
-    )
+    translated_metadata = translated_request_body.get("litellm_metadata")
+    if not isinstance(translated_metadata, dict):
+        translated_metadata = {}
+        translated_request_body["litellm_metadata"] = translated_metadata
+    _bind_selected_zen_provider_account_hash(translated_metadata)
 
     def handle_exception(exc: Exception) -> None:
         _raise_translated_opencode_zen_failure(
@@ -204,9 +206,11 @@ async def prepare_completion_route(
     api_key = await runtime.load_api_key(
         use_alias_candidate_probe=use_alias_candidate_probe
     )
-    _bind_selected_zen_provider_account_hash(
-        prepared_request_body.get("litellm_metadata")
-    )
+    completion_metadata = prepared_request_body.get("litellm_metadata")
+    if not isinstance(completion_metadata, dict):
+        completion_metadata = {}
+        prepared_request_body["litellm_metadata"] = completion_metadata
+    _bind_selected_zen_provider_account_hash(completion_metadata)
     custom_headers = runtime.assemble_headers(api_key=api_key, request=request)
     runtime.validate_egress(
         url=target_url,

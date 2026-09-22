@@ -1027,8 +1027,13 @@ def _build_session_history_metadata(
 
     for key in _AAWM_SESSION_HISTORY_METADATA_KEYS:
         value = metadata.get(key)
-        if value is not None:
-            history_metadata[key] = _json_safe_rate_limit_value(value)
+        if value is None:
+            continue
+        if key == "provider_account_hash":
+            value = _stored_provider_account_hash(metadata, value)
+            if value is None:
+                continue
+        history_metadata[key] = _json_safe_rate_limit_value(value)
     for key in ("canonical_thread_id", "parent_thread_id"):
         value = metadata.get(key)
         if value is not None and key not in history_metadata:

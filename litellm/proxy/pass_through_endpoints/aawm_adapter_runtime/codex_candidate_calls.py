@@ -9815,12 +9815,23 @@ async def _handle_codex_opencode_zen_adapter_route(
         use_alias_candidate_probe=use_alias_candidate_probe,
         load_api_key=_load_opencode_zen_api_key_for_candidate,
     )
+    completion_metadata = (
+        completion_kwargs.get("metadata")
+        if isinstance(completion_kwargs, dict)
+        else None
+    )
+    request_metadata = (
+        request_body.get("litellm_metadata")
+        if isinstance(request_body, dict)
+        else None
+    )
     (
         globals().get("_assign_selected_zen_provider_account_hash")
         or (lambda *_targets: None)
     )(
         litellm_metadata,
-        request_body.get("litellm_metadata") if isinstance(request_body, dict) else None,
+        request_metadata,
+        completion_metadata,
     )
     custom_headers = BaseOpenAIPassThroughHandler._assemble_headers(
         api_key=api_key,
