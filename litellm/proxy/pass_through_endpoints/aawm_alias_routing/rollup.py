@@ -648,6 +648,26 @@ def install(host_globals: dict) -> None:
         host_globals[_name] = _rebound
     # Rebound functions resolve imported helpers through host_globals.
     host_globals.setdefault(
+        "canonicalize_openrouter_native_responses_route_family",
+        canonicalize_openrouter_native_responses_route_family,
+    )
+    host_globals.setdefault(
+        "CODEX_AUTO_AGENT_OPENROUTER_RESPONSES_ROUTE_FAMILY",
+        CODEX_AUTO_AGENT_OPENROUTER_RESPONSES_ROUTE_FAMILY,
+    )
+    host_globals.setdefault(
+        "_CODEX_AUTO_AGENT_NATIVE_PROVIDER",
+        _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+    )
+    host_globals.setdefault(
+        "_clean_codex_auth_value",
+        _clean_codex_auth_value,
+    )
+    host_globals.setdefault(
+        "_codex_oauth_responses_target_url",
+        _codex_oauth_responses_target_url,
+    )
+    host_globals.setdefault(
         "_normalize_aawm_route_log_reasoning_effort",
         _normalize_aawm_route_log_reasoning_effort,
     )
