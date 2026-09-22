@@ -109,12 +109,14 @@ def _strip_openai_function_strict(tools: List[Any]) -> List[Any]:
 
 
 def apply_cohere_v2_strict_tools(request_data: dict) -> dict:
-    """Record uniform function strictness without stripping flags.
+    """Leave a caller-supplied ``strict_tools`` value unchanged.
 
-    OpenAI ``strict`` flags stay on the tools until post-override finalization.
-    Mixed or invalid strictness is left in place so a later tool override can
-    still be judged before egress.
+    OpenAI ``strict`` flags and an explicit request flag stay on the body until
+    post-merge finalization. Deleting or replacing that flag here would hide a
+    conflict with a later tool override.
     """
+    if not isinstance(request_data, dict) or "strict_tools" in request_data:
+        return request_data
     tools = request_data.get("tools")
     if not isinstance(tools, list) or not tools:
         return request_data
@@ -126,11 +128,7 @@ def apply_cohere_v2_strict_tools(request_data: dict) -> dict:
         return request_data
     if tools_request_strict:
         return {**request_data, "strict_tools": True}
-    if "strict_tools" not in request_data:
-        return request_data
-    updated = dict(request_data)
-    updated.pop("strict_tools", None)
-    return updated
+    return request_data
 
 
 def finalize_cohere_v2_strict_tools(request_data: dict) -> dict:
