@@ -3282,26 +3282,12 @@ def _unwrap_grok_passthrough_encrypted_reasoning_in_place(
     """
 
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
-        unwrap_encrypted_content_wrappers,
+        unwrap_encrypted_content_wrappers_in_place,
     )
-
-    def _unwrap_node(value: Any) -> None:
-        if isinstance(value, dict):
-            encrypted = value.get("encrypted_content")
-            if isinstance(encrypted, str) and encrypted:
-                value["encrypted_content"] = unwrap_encrypted_content_wrappers(
-                    encrypted
-                )
-            for nested in value.values():
-                _unwrap_node(nested)
-            return
-        if isinstance(value, list):
-            for nested in value:
-                _unwrap_node(nested)
 
     input_items = prepared_body.get("input")
     if isinstance(input_items, list):
-        _unwrap_node(input_items)
+        unwrap_encrypted_content_wrappers_in_place(input_items)
 
 
 def _prepare_grok_request_body_for_passthrough(

@@ -1481,6 +1481,63 @@ async def test_grok_prepare_should_return_original_body_for_non_native_model() -
 
 
 @pytest.mark.asyncio
+async def test_grok_prepare_should_unwrap_wrapped_encrypted_reasoning_for_grok_47(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+        wrap_encrypted_content_with_provenance,
+    )
+
+    native_ciphertext = "native-grok-47-encrypted-blob"
+    wrapped = wrap_encrypted_content_with_provenance(
+        native_ciphertext,
+        {
+            "producer_provider": "xai",
+            "producer_model": "xai/grok-4.7",
+            "producer_route_family": "codex_grok_native_responses_adapter",
+        },
+    )
+    monkeypatch.setattr(
+        request_prep,
+        "has_grok_native_route_capability",
+        lambda model, capability: True,
+    )
+    monkeypatch.setattr(
+        request_prep._anthropic_grok_normalization,
+        "preserve_typed_function_history_in_place",
+        lambda body: None,
+    )
+    monkeypatch.setattr(
+        request_prep,
+        "_build_grok_native_oauth_headers_async",
+        AsyncMock(return_value={"authorization": "Bearer oauth-token"}),
+    )
+    _configure(
+        normalize_grok_native_oauth_model=lambda model: (
+            "grok-4.7" if model in {"xai/grok-4.7", "grok-4.7"} else None
+        ),
+        get_grok_native_oauth_access_token=AsyncMock(return_value="oauth-token"),
+    )
+    result = await request_prep._prepare_grok_native_oauth_passthrough_request(
+        {
+            "model": "xai/grok-4.7",
+            "input": [
+                {"type": "message", "role": "user", "content": "continue"},
+                {
+                    "type": "reasoning",
+                    "encrypted_content": wrapped,
+                },
+            ],
+        },
+        request=_request(),
+    )
+    prepared_body = result[3]
+    reasoning = prepared_body["input"][1]
+    assert reasoning["encrypted_content"] == native_ciphertext
+    assert not str(reasoning["encrypted_content"]).startswith("aawm_erp:")
+
+
+@pytest.mark.asyncio
 async def test_grok_prepare_should_preserve_exact_body_and_callback_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

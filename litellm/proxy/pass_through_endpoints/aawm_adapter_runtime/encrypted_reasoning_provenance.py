@@ -382,6 +382,23 @@ def unwrap_encrypted_content_wrappers(encrypted_content: str) -> str:
     return current
 
 
+def unwrap_encrypted_content_wrappers_in_place(container: Any) -> None:
+    """Restore native ciphertext on nested ``encrypted_content`` fields."""
+
+    if isinstance(container, dict):
+        encrypted = container.get("encrypted_content")
+        if isinstance(encrypted, str) and encrypted:
+            container["encrypted_content"] = unwrap_encrypted_content_wrappers(
+                encrypted
+            )
+        for nested in container.values():
+            unwrap_encrypted_content_wrappers_in_place(nested)
+        return
+    if isinstance(container, list):
+        for nested in container:
+            unwrap_encrypted_content_wrappers_in_place(nested)
+
+
 def _encrypted_function_output_blob_present(value: Any) -> bool:
     """True when *value* is ChatGPT-bound function-output ciphertext."""
     if isinstance(value, str):
@@ -1937,6 +1954,8 @@ __all__ = [
     "sanitize_encrypted_reasoning_provenance",
     "wrap_encrypted_content_with_provenance",
     "unwrap_encrypted_content_with_provenance",
+    "unwrap_encrypted_content_wrappers",
+    "unwrap_encrypted_content_wrappers_in_place",
     "extract_item_encrypted_reasoning_provenance",
     "stamp_encrypted_reasoning_provenance_on_item",
     "stamp_encrypted_reasoning_provenance_in_response",
