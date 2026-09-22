@@ -1095,6 +1095,8 @@ def _classify_codex_cohere_candidate_failure(
         return None
     if classification.name == "cohere_timeout_connectivity":
         return "upstream_timeout"
+    if classification.name in {"cohere_timeout_status", "cohere_transient_upstream"}:
+        return "upstream_transient_internal"
     return {
         "auth": "provider_terminal_error",
         "quota_exhausted": "usage_limit_reached",
