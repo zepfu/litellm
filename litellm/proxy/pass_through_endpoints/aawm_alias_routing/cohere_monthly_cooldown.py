@@ -16,6 +16,7 @@ hold. Ordinary per-model RPM failures never carry this marker.
 from __future__ import annotations
 
 import math
+import re
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -63,14 +64,34 @@ _RPM_PERIODS = frozenset(
         "requests",
     }
 )
-_MONTHLY_EXHAUSTION_TEXT_MARKERS = (
-    "monthly trial",
-    "trial monthly",
-    "monthly quota",
-    "monthly limit",
-    "monthly usage",
-    "calendar month",
-    "calendar-month",
+_NON_EXHAUSTED_MONTHLY_STATUSES = frozenset(
+    {"available", "ok", "active", "remaining", "healthy"}
+)
+# Exhaustion must attach to the monthly quota. Naming a monthly plan, or
+# reporting monthly usage that is still available, is not exhaustion.
+_MONTHLY_QUOTA_EXHAUSTED_RE = re.compile(
+    r"(?:"
+    r"monthly\s+(?:trial|quota|limit|usage|allowance|capacity)"
+    r"(?:\s+\w+){0,5}\s+"
+    r"(?:exhausted|exceeded|reached|depleted)"
+    r"|"
+    r"(?:exhausted|exceeded|reached|depleted)"
+    r"(?:\s+\w+){0,6}\s+"
+    r"monthly\s+(?:trial|quota|limit|usage|allowance|capacity)"
+    r")",
+    re.IGNORECASE,
+)
+_RPM_EXHAUSTION_RE = re.compile(
+    r"(?:"
+    r"(?:\brpm\b(?:\s+quota)?|rate[\s-]*limit|requests?\s+per\s+minute)"
+    r"\s+(?:is\s+)?"
+    r"(?:exhausted|exceeded|reached|depleted)"
+    r"|"
+    r"(?:exhausted|exceeded|reached|depleted)"
+    r"\s+"
+    r"(?:\brpm\b(?:\s+quota)?|rate[\s-]*limit|requests?\s+per\s+minute)"
+    r")",
+    re.IGNORECASE,
 )
 _RESET_FIELD_ORDER = (
     "expected_reset_at",
@@ -139,13 +160,17 @@ def cohere_monthly_exhaustion_marker(value: Any) -> Optional[Mapping[str, Any]]:
 
 
 def cohere_failure_has_monthly_exhaustion_evidence(exc: Exception) -> bool:
-    """Return whether ``exc`` shows Cohere monthly exhaustion, not trial RPM wording."""
+    """Return whether the monthly quota itself is exhausted.
+
+    A monthly plan name, a monthly usage percentage, or a structured monthly
+    period whose status is still available does not qualify.
+    """
 
     try:
         text = _exception_text(exc)
     except _RESET_CONVERSION_ERRORS:
         text = ""
-    if any(marker in text for marker in _MONTHLY_EXHAUSTION_TEXT_MARKERS):
+    if _text_says_monthly_quota_exhausted(text):
         return True
     try:
         payloads = _exception_payloads(exc)
@@ -153,8 +178,7 @@ def cohere_failure_has_monthly_exhaustion_evidence(exc: Exception) -> bool:
         return False
     for payload in payloads:
         for error_object in _walk_error_dicts(payload):
-            period = _period_token(error_object)
-            if _is_monthly_period(period) and not _is_rpm_period(period):
+            if _structured_monthly_quota_exhausted(error_object):
                 return True
     return False
 
@@ -292,6 +316,23 @@ def apply_cohere_monthly_cooldown_horizon(
     )
 
 
+def cohere_monthly_publication_deadline(plan: Any) -> Optional[float]:
+    """Return the plan's absolute monthly deadline, or None for other holds."""
+
+    if not isinstance(plan, CooldownPublicationPlan):
+        return None
+    deadline = plan.expires_at_epoch
+    if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
+        return None
+    try:
+        epoch = float(deadline)
+    except _RESET_CONVERSION_ERRORS:
+        return None
+    if not math.isfinite(epoch):
+        return None
+    return epoch
+
+
 def align_cohere_monthly_publication_plan(
     plan: Any,
     *,
@@ -380,6 +421,32 @@ def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _text_says_monthly_quota_exhausted(text: str) -> bool:
+    """Return whether text says the monthly quota itself is exhausted."""
+
+    if not text:
+        return False
+    for clause in re.split(r"[;:.!?]|\n+", text):
+        without_rpm = _RPM_EXHAUSTION_RE.sub(" ", clause)
+        if _MONTHLY_QUOTA_EXHAUSTED_RE.search(without_rpm):
+            return True
+    return False
+
+
+def _structured_monthly_quota_exhausted(error_object: Mapping[str, Any]) -> bool:
+    """Return whether this object says the monthly quota is exhausted."""
+
+    if not _is_monthly_period(_period_token(error_object)):
+        return False
+    status = str(error_object.get("status") or error_object.get("quota_status") or "").strip().lower()
+    if status in _NON_EXHAUSTED_MONTHLY_STATUSES:
+        return False
+    if status in _EXHAUSTED_STATUSES:
+        return True
+    failure_kind = str(error_object.get("failure_kind") or "").strip().lower()
+    return failure_kind == COHERE_MONTHLY_FAILURE_KIND
 
 
 def _dict_has_monthly_scope(error_object: Mapping[str, Any]) -> bool:

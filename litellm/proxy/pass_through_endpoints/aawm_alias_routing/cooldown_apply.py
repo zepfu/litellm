@@ -19,12 +19,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import time
 from typing import Any, Awaitable, Callable, Optional, Sequence
 
 from fastapi import Request
 
 from .cohere_monthly_cooldown import (
     align_cohere_monthly_publication_plan,
+    cohere_monthly_publication_deadline,
     expire_cohere_monthly_cooldown_hold,
 )
 from .interfaces import CooldownPublicationPlan
@@ -364,15 +366,40 @@ def _resolve_auto_agent_cooldown_publication_plan(
 # ---------------------------------------------------------------------------
 
 
+def _durable_ttl_for_deadline(
+    seconds: float,
+    expires_at_epoch: Optional[float],
+) -> tuple[float, dict[str, float]]:
+    """Return the TTL to write now, and absolute deadline fields when present.
+
+    A passed deadline yields TTL zero so the caller does not create a hold.
+    """
+
+    if expires_at_epoch is None:
+        return max(0.0, float(seconds)), {}
+    try:
+        deadline = float(expires_at_epoch)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0, {}
+    remaining = deadline - time.time()
+    if remaining != remaining or remaining <= 0:
+        return 0.0, {}
+    return remaining, {
+        "expires_at_epoch": deadline,
+        "absolute_expires_at_epoch": deadline,
+    }
+
+
 async def _persist_codex_cooldown_durable(
     *,
     keys: Sequence[str],
     seconds: float,
     allow_ttl_shrink: bool = False,
+    expires_at_epoch: Optional[float] = None,
 ) -> None:
     """Persist codex cooldown keys to durable Redis (post-release, R3-1)."""
     assert _write_durable_payload is not None
-    ttl_seconds = max(0.0, float(seconds))
+    ttl_seconds, deadline_fields = _durable_ttl_for_deadline(seconds, expires_at_epoch)
     if ttl_seconds <= 0:
         return
     for key in keys:
@@ -380,7 +407,7 @@ async def _persist_codex_cooldown_durable(
             "alias_family": "codex",
             "state_kind": "cooldown",
             "state_key": key,
-            "payload": {"cooldown_key": key},
+            "payload": {"cooldown_key": key, **deadline_fields},
             "ttl_seconds": ttl_seconds,
         }
         if allow_ttl_shrink:
@@ -395,10 +422,12 @@ async def _persist_anthropic_cooldown_durable(
     keys: Sequence[str],
     seconds: float,
     allow_ttl_shrink: bool = False,
+    expires_at_epoch: Optional[float] = None,
 ) -> None:
     """Persist anthropic cooldown keys to durable Redis (post-release, R3-1)."""
+    del allow_ttl_shrink
     assert _write_durable_payload is not None
-    ttl_seconds = max(0.0, float(seconds))
+    ttl_seconds, deadline_fields = _durable_ttl_for_deadline(seconds, expires_at_epoch)
     if ttl_seconds <= 0:
         return
     for key in keys:
@@ -406,7 +435,7 @@ async def _persist_anthropic_cooldown_durable(
             alias_family="anthropic",
             state_kind="cooldown",
             state_key=key,
-            payload={"cooldown_key": key},
+            payload={"cooldown_key": key, **deadline_fields},
             ttl_seconds=ttl_seconds,
         )
 
@@ -835,6 +864,17 @@ async def execute_cooldown_publication_transaction(  # noqa: PLR0915
                     )
 
                 # Execute atomic durable transaction BEFORE local mutation.
+                # Re-check the absolute deadline at this write. The Lua script
+                # expires at that epoch instead of Redis TIME plus the TTL
+                # captured when the lock was acquired.
+                monthly_deadline = cohere_monthly_publication_deadline(plan)
+                if monthly_deadline is not None and monthly_deadline <= time.time():
+                    await expire_cohere_monthly_cooldown_hold(
+                        alias_family=index_family,
+                        plan=plan,
+                        family_state=family_state,
+                    )
+                    return None
                 transaction_kwargs = {
                     "alias_family": index_family,
                     "identity_hash": identity_hash,
@@ -844,6 +884,8 @@ async def execute_cooldown_publication_transaction(  # noqa: PLR0915
                 }
                 if plan.allow_ttl_shrink:
                     transaction_kwargs["allow_ttl_shrink"] = True
+                if monthly_deadline is not None:
+                    transaction_kwargs["expires_at_epoch"] = monthly_deadline
                 txn_result = await publish_cooldown_transaction(
                     **transaction_kwargs,
                 )
@@ -853,14 +895,25 @@ async def execute_cooldown_publication_transaction(  # noqa: PLR0915
                 # durable pre-images and local snapshots.
                 from .state import RegisterBatchOutcome as _RBOutcome
                 try:
-                    # Memory publish (after durable commit succeeds).
-                    if plan.memory_keys:
+                    # Memory publish uses the same absolute deadline. If Redis
+                    # returned after the reset, clear the keys instead of
+                    # applying the pre-call remaining TTL.
+                    if monthly_deadline is not None and monthly_deadline <= time.time():
+                        await expire_cohere_monthly_cooldown_hold(
+                            alias_family=index_family,
+                            plan=plan,
+                            family_state=family_state,
+                        )
+                        return txn_result
+                    elif plan.memory_keys:
                         memory_kwargs = {
                             "keys": plan.memory_keys,
                             "seconds": plan.duration_seconds,
                         }
                         if plan.allow_ttl_shrink:
                             memory_kwargs["allow_ttl_shrink"] = True
+                        if monthly_deadline is not None:
+                            memory_kwargs["expires_at_epoch"] = monthly_deadline
                         publish_cooldown_memory_fn(**memory_kwargs)
 
                     # Local commit: update index under the same mutation lease.
@@ -910,24 +963,40 @@ async def execute_cooldown_publication_transaction(  # noqa: PLR0915
 
             else:
                 # 3e. Memory publish (Redis unconfigured or no durable keys).
-                if plan.memory_keys:
+                monthly_deadline = cohere_monthly_publication_deadline(plan)
+                if monthly_deadline is not None and monthly_deadline <= time.time():
+                    await expire_cohere_monthly_cooldown_hold(
+                        alias_family=index_family,
+                        plan=plan,
+                        family_state=family_state,
+                    )
+                elif plan.memory_keys:
                     memory_kwargs = {
                         "keys": plan.memory_keys,
                         "seconds": plan.duration_seconds,
                     }
                     if plan.allow_ttl_shrink:
                         memory_kwargs["allow_ttl_shrink"] = True
+                    if monthly_deadline is not None:
+                        memory_kwargs["expires_at_epoch"] = monthly_deadline
                     publish_cooldown_memory_fn(**memory_kwargs)
 
                 # Legacy persist (only when Redis is unconfigured, NOT when
                 # configured-but-unhealthy -- that case already failed closed).
-                if not _has_strict_redis and not _redis_configured and plan.durable_keys:
+                if (
+                    monthly_deadline is not None
+                    and monthly_deadline <= time.time()
+                ):
+                    pass
+                elif not _has_strict_redis and not _redis_configured and plan.durable_keys:
                     persist_kwargs = {
                         "keys": plan.durable_keys,
                         "seconds": plan.duration_seconds,
                     }
                     if plan.allow_ttl_shrink:
                         persist_kwargs["allow_ttl_shrink"] = True
+                    if monthly_deadline is not None:
+                        persist_kwargs["expires_at_epoch"] = monthly_deadline
                     await persist_cooldown_fn(**persist_kwargs)
 
         finally:

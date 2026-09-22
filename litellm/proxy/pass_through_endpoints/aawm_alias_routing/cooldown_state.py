@@ -921,11 +921,45 @@ async def _get_anthropic_auto_agent_merged_codex_openai_cooldown_state(
 # ---------------------------------------------------------------------------
 
 
+def _publish_family_cooldown_memory(
+    family: Any,
+    *,
+    keys: Sequence[str],
+    seconds: float,
+    allow_ttl_shrink: bool = False,
+    expires_at_epoch: Optional[float] = None,
+) -> None:
+    """Publish one family's memory hold from a relative TTL or absolute deadline.
+
+    ``expires_at_epoch`` is applied at this write. A deadline that has already
+    passed clears those keys and does not start a new hold from ``seconds``.
+    """
+
+    if expires_at_epoch is not None:
+        try:
+            remaining = float(expires_at_epoch) - time.time()
+        except (TypeError, ValueError, OverflowError):
+            remaining = 0.0
+        if remaining != remaining or remaining <= 0:
+            for key in keys:
+                family.cooldown_until_monotonic_by_key.pop(key, None)
+            return
+        for key in keys:
+            family.set_cooldown_memory(key, remaining, allow_ttl_shrink=True)
+        return
+    for key in keys:
+        if allow_ttl_shrink:
+            family.set_cooldown_memory(key, seconds, allow_ttl_shrink=True)
+        else:
+            family.set_cooldown_memory(key, seconds)
+
+
 def _publish_codex_cooldown_memory(
     *,
     keys: Sequence[str],
     seconds: float,
     allow_ttl_shrink: bool = False,
+    expires_at_epoch: Optional[float] = None,
 ) -> None:
     """Synchronously publish cooldowns into codex family memory (R3-1).
 
@@ -933,16 +967,13 @@ def _publish_codex_cooldown_memory(
     call this inside the probe lock without violating the
     ``probe_lock -> (nothing awaitable)`` ordering.
     """
-    mgr = _require_manager()
-    for key in keys:
-        if allow_ttl_shrink:
-            mgr.codex.set_cooldown_memory(
-                key,
-                seconds,
-                allow_ttl_shrink=True,
-            )
-        else:
-            mgr.codex.set_cooldown_memory(key, seconds)
+    _publish_family_cooldown_memory(
+        _require_manager().codex,
+        keys=keys,
+        seconds=seconds,
+        allow_ttl_shrink=allow_ttl_shrink,
+        expires_at_epoch=expires_at_epoch,
+    )
 
 
 def _publish_anthropic_cooldown_memory(
@@ -950,8 +981,18 @@ def _publish_anthropic_cooldown_memory(
     keys: Sequence[str],
     seconds: float,
     allow_ttl_shrink: bool = False,
+    expires_at_epoch: Optional[float] = None,
 ) -> None:
     """Synchronously publish cooldowns into anthropic family memory (R3-1)."""
+    del allow_ttl_shrink
+    if expires_at_epoch is not None:
+        _publish_family_cooldown_memory(
+            _require_manager().anthropic,
+            keys=keys,
+            seconds=seconds,
+            expires_at_epoch=expires_at_epoch,
+        )
+        return
     mgr = _require_manager()
     for key in keys:
         mgr.anthropic.set_cooldown_memory(key, seconds)
