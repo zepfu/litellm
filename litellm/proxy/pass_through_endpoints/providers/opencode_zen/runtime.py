@@ -26,6 +26,7 @@ import httpx
 from starlette.requests import Request
 from starlette.responses import StreamingResponse
 
+from litellm.integrations.aawm_agent_identity.enrich import _short_hash
 from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen import (
     constants as _constants,
 )
@@ -123,6 +124,7 @@ _HOST_FUNCTION_NAMES = (
     "_build_opencode_zen_headers",
     "_add_opencode_zen_logging_metadata",
     "_assign_selected_zen_provider_account_hash",
+    "_bind_direct_zen_caller_identity",
     "_get_anthropic_opencode_zen_normalization_runtime",
     "_get_opencode_zen_responses_tool_name",
     "_ordered_unique_str_values",
@@ -319,8 +321,77 @@ def _assign_selected_zen_provider_account_hash(*metadata_targets: Any) -> Option
         if not isinstance(metadata, dict):
             continue
         metadata["provider_account_hash"] = digest
+        metadata["credential_family"] = _constants._OPENCODE_ZEN_CREDENTIAL_FAMILY
+        metadata["opencode_zen"] = True
         stamped = True
     return digest if stamped else None
+
+
+def _caller_secret_from_authenticated_user(user_api_key_dict: Any) -> Optional[str]:
+    """Return the proxy caller secret already resolved into the authenticated key."""
+
+    if user_api_key_dict is None:
+        return None
+    for name in ("api_key_hash", "token", "api_key"):
+        if isinstance(user_api_key_dict, dict):
+            value = user_api_key_dict.get(name)
+        else:
+            value = getattr(user_api_key_dict, name, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _caller_secret_from_proxy_headers(request: Any) -> Optional[str]:
+    """Use the inbound proxy key only when it is not the selected Zen credential."""
+
+    headers = getattr(request, "headers", None)
+    header_get = getattr(headers, "get", None)
+    if not callable(header_get):
+        return None
+    selected_digest = _selected_zen_provider_account_hash.get()
+    for name in ("x-litellm-api-key", "authorization"):
+        raw_value = header_get(name)
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            continue
+        cleaned = raw_value.strip()
+        if name == "authorization" and cleaned.lower().startswith("bearer "):
+            cleaned = cleaned[7:].strip()
+        if not cleaned:
+            continue
+        if (
+            isinstance(selected_digest, str)
+            and derive_opencode_provider_account_hash(
+                cleaned,
+                namespace=_constants._OPENCODE_ZEN_CREDENTIAL_FAMILY,
+            )
+            == selected_digest
+        ):
+            continue
+        return cleaned
+    return None
+
+
+def _bind_direct_zen_caller_identity(
+    user_api_key_dict: Any,
+    request: Any,
+    *metadata_targets: Any,
+) -> Optional[str]:
+    """Record the authenticated proxy caller without changing the Zen account digest."""
+
+    caller_secret = _caller_secret_from_authenticated_user(user_api_key_dict)
+    if caller_secret is None:
+        caller_secret = _caller_secret_from_proxy_headers(request)
+    if caller_secret is None:
+        return None
+    fingerprint = _short_hash(caller_secret.encode("utf-8"))
+    stamped = False
+    for metadata in metadata_targets:
+        if not isinstance(metadata, dict):
+            continue
+        metadata["caller_identity_hash"] = fingerprint
+        stamped = True
+    return fingerprint if stamped else None
 
 
 def _clean_secret_string(value: Optional[str]) -> Optional[str]:

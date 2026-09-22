@@ -1,3 +1,4 @@
+import re
 from typing import Any, Optional
 
 # Pre-define optional kwargs keys as frozenset for O(1) lookups
@@ -95,6 +96,64 @@ def _is_authoritative_xai_oauth_metadata(metadata: dict) -> bool:
     )
 
 
+def _zen_provider_account_digest(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", cleaned) is None:
+        return None
+    return cleaned
+
+
+def _selected_zen_account_metadata(metadata: Any) -> Optional[dict]:
+    """Internal metadata that carries the digest from Zen credential selection."""
+
+    if not isinstance(metadata, dict):
+        return None
+    if _zen_provider_account_digest(metadata.get("provider_account_hash")) is None:
+        return None
+    credential_family = str(metadata.get("credential_family") or "").strip().casefold()
+    route_text = " ".join(
+        str(value).strip().casefold()
+        for value in (
+            metadata.get("codex_auto_agent_selected_route_family"),
+            metadata.get("passthrough_route_family"),
+            metadata.get("openai_passthrough_route_family"),
+            metadata.get("route_family"),
+            metadata.get("anthropic_auto_agent_selected_route_family"),
+        )
+        if value is not None and str(value).strip()
+    )
+    if (
+        metadata.get("opencode_zen") is True
+        or credential_family == "opencode_zen"
+        or "opencode_zen" in route_text
+        or "opencode-zen" in route_text
+    ):
+        return metadata
+    return None
+
+
+def _restore_selected_zen_account_metadata(
+    merged_metadata: dict,
+    internal_metadata: dict,
+) -> None:
+    """Keep the selected Zen digest and namespace ahead of request metadata."""
+
+    selected = _selected_zen_account_metadata(internal_metadata)
+    if selected is None:
+        return
+    digest = _zen_provider_account_digest(selected.get("provider_account_hash"))
+    if digest is None:
+        return
+    merged_metadata["provider_account_hash"] = digest
+    merged_metadata["credential_family"] = "opencode_zen"
+    merged_metadata["opencode_zen"] = True
+    caller_identity_hash = selected.get("caller_identity_hash")
+    if isinstance(caller_identity_hash, str) and caller_identity_hash.strip():
+        merged_metadata["caller_identity_hash"] = caller_identity_hash.strip()
+
+
 def merge_metadata_for_logging(
     metadata: Optional[dict],
     litellm_metadata: Optional[dict],
@@ -122,6 +181,7 @@ def merge_metadata_for_logging(
                 internal_metadata.get("tags"),
             )
 
+    _restore_selected_zen_account_metadata(merged_metadata, internal_metadata)
     return merged_metadata
 
 

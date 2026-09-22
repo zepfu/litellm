@@ -247,17 +247,27 @@ def _iter_rate_limit_dicts(*roots: Any) -> List[Dict[str, Any]]:
 
 def _merged_rate_limit_metadata(kwargs: Dict[str, Any]) -> Dict[str, Any]:
     metadata: Dict[str, Any] = {}
+    standard_metadata: Optional[Dict[str, Any]] = None
     standard_logging_object = kwargs.get("standard_logging_object")
     if isinstance(standard_logging_object, dict):
-        standard_metadata = standard_logging_object.get("metadata")
-        if isinstance(standard_metadata, dict):
-            metadata.update(dict(standard_metadata))
+        raw_standard_metadata = standard_logging_object.get("metadata")
+        if isinstance(raw_standard_metadata, dict):
+            standard_metadata = dict(raw_standard_metadata)
+            metadata.update(standard_metadata)
+    selected_metadata: Optional[Dict[str, Any]] = None
     litellm_params = kwargs.get("litellm_params")
     if isinstance(litellm_params, dict):
-        litellm_metadata = litellm_params.get("metadata")
-        if isinstance(litellm_metadata, dict):
-            metadata.update(dict(litellm_metadata))
-    return metadata
+        raw_selected_metadata = litellm_params.get("litellm_metadata")
+        if isinstance(raw_selected_metadata, dict):
+            selected_metadata = raw_selected_metadata
+        request_metadata = litellm_params.get("metadata")
+        if isinstance(request_metadata, dict):
+            metadata.update(dict(request_metadata))
+    return _restore_selected_zen_account_metadata(
+        metadata,
+        selected_metadata,
+        standard_metadata,
+    )
 
 
 def _extract_headers_from_kwargs(kwargs: Dict[str, Any]) -> Dict[str, str]:
@@ -286,6 +296,60 @@ def _opencode_provider_account_digest(value: Any) -> Optional[str]:
     return cleaned
 
 
+def _opencode_route_text(metadata: Dict[str, Any]) -> str:
+    return " ".join(
+        str(value).strip().lower()
+        for value in (
+            metadata.get("codex_auto_agent_selected_route_family"),
+            metadata.get("passthrough_route_family"),
+            metadata.get("openai_passthrough_route_family"),
+            metadata.get("route_family"),
+            metadata.get("anthropic_auto_agent_selected_route_family"),
+        )
+        if value is not None and str(value).strip()
+    )
+
+
+def _metadata_has_selected_zen_account(metadata: Dict[str, Any]) -> bool:
+    """Zen markers identify the selected account even if credential_family conflicts."""
+
+    if _opencode_provider_account_digest(metadata.get("provider_account_hash")) is None:
+        return False
+    credential_family = str(metadata.get("credential_family") or "").strip().lower()
+    route_text = _opencode_route_text(metadata)
+    return bool(
+        metadata.get("opencode_zen") is True
+        or credential_family == "opencode_zen"
+        or "opencode_zen" in route_text
+        or "opencode-zen" in route_text
+    )
+
+
+def _restore_selected_zen_account_metadata(
+    metadata: Dict[str, Any],
+    *sources: Any,
+) -> Dict[str, Any]:
+    """Put the selected Zen digest and namespace back after a caller overlay."""
+
+    selected: Optional[Dict[str, Any]] = None
+    for source in sources:
+        if isinstance(source, dict) and _metadata_has_selected_zen_account(source):
+            selected = source
+            break
+    if selected is None:
+        return metadata
+    digest = _opencode_provider_account_digest(selected.get("provider_account_hash"))
+    if digest is None:
+        return metadata
+    metadata["provider_account_hash"] = digest
+    metadata["credential_family"] = "opencode_zen"
+    metadata["opencode_zen"] = True
+    caller_identity_hash = selected.get("caller_identity_hash")
+    if isinstance(caller_identity_hash, str) and caller_identity_hash.strip():
+        metadata["caller_identity_hash"] = caller_identity_hash.strip()
+    return metadata
+
+
 def _is_opencode_zen_rate_limit_request(
     kwargs: Dict[str, Any],
     metadata: Dict[str, Any],
@@ -303,30 +367,14 @@ def _is_opencode_zen_rate_limit_request(
     provider_name = str(
         _normalize_session_history_provider_name(provider_value) or ""
     ).strip().lower()
-    route_text = " ".join(
-        str(value).strip().lower()
-        for value in (
-            metadata.get("codex_auto_agent_selected_route_family"),
-            metadata.get("passthrough_route_family"),
-            metadata.get("openai_passthrough_route_family"),
-            metadata.get("route_family"),
-            metadata.get("anthropic_auto_agent_selected_route_family"),
-        )
-        if value is not None and str(value).strip()
-    )
-    if (
-        credential_family == "opencode_go"
-        or provider_name == "opencode_go"
-        or "opencode_go" in route_text
-        or "opencode-go" in route_text
-    ):
-        return False
+    route_text = _opencode_route_text(metadata)
     return bool(
         metadata.get("opencode_zen") is True
         or credential_family == "opencode_zen"
         or provider_name == "opencode_zen"
         or "opencode_zen" in route_text
         or "opencode-zen" in route_text
+        or _metadata_has_selected_zen_account(metadata)
     )
 
 
@@ -404,12 +452,13 @@ def _extract_rate_limit_account_hash(
     # Zen quota keys follow the selected provider-account digest. Caller
     # identity stays on its own fields and is not reused as this account.
     if _is_opencode_zen_rate_limit_request(kwargs, metadata):
-        hash_sources = [metadata]
+        hash_sources = []
         litellm_params = kwargs.get("litellm_params")
         if isinstance(litellm_params, dict):
             nested_litellm_metadata = litellm_params.get("litellm_metadata")
             if isinstance(nested_litellm_metadata, dict):
                 hash_sources.append(nested_litellm_metadata)
+        hash_sources.append(metadata)
         for source in hash_sources:
             provider_account_digest = _opencode_provider_account_digest(
                 source.get("provider_account_hash")
@@ -948,8 +997,11 @@ _HOST_FUNCTION_NAMES = (
     "_coerce_rate_limit_payload",
     "_iter_rate_limit_dicts",
     "_merged_rate_limit_metadata",
+    "_restore_selected_zen_account_metadata",
     "_extract_headers_from_kwargs",
     "_opencode_provider_account_digest",
+    "_opencode_route_text",
+    "_metadata_has_selected_zen_account",
     "_is_opencode_zen_rate_limit_request",
     "_extract_proxy_caller_identity_hash",
     "_stored_provider_account_hash",
