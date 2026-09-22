@@ -60,10 +60,15 @@ _COHERE_EVENT_TYPES = frozenset(
     }
 )
 _COHERE_EVENT_INDEX_RE = re.compile(r"\A-?\d{1,12}\Z")
-_COHERE_PROVIDER_ERROR_TOKEN_RE = re.compile(r"\A[A-Za-z0-9_.:-]{1,64}\Z")
-_COHERE_PROVIDER_ERROR_PREFIXES = (
-    "Cohere streaming error: ",
-    "Cohere streaming terminated with ",
+_COHERE_TERMINAL_IDENTIFIERS = {
+    "ERROR": "error",
+    "TIMEOUT": "timeout",
+}
+_COHERE_FIXED_TERMINAL_MESSAGES = frozenset(
+    {
+        "Cohere streaming terminated with error",
+        "Cohere streaming terminated with timeout",
+    }
 )
 
 
@@ -99,6 +104,24 @@ def _bounded_event_type(value: Any) -> str:
     if isinstance(value, str) and value in _COHERE_EVENT_TYPES:
         return value
     return "unknown"
+
+
+def _cohere_v1_chunk_index(raw_index: Any) -> Optional[int]:
+    """Parse a V1 chunk index without interpolating a rejected value."""
+    if isinstance(raw_index, bool):
+        return int(raw_index)
+    if isinstance(raw_index, int):
+        return raw_index
+    if isinstance(raw_index, float):
+        try:
+            return int(raw_index)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(raw_index, str) and _COHERE_EVENT_INDEX_RE.fullmatch(
+        raw_index.strip()
+    ):
+        return int(raw_index.strip())
+    return None
 
 
 def _bounded_event_index(value: Any) -> str:
@@ -212,24 +235,17 @@ def _raise_cohere_diagnostic(
     )
 
 
-def _cohere_provider_error_token(native_error: Any) -> Optional[str]:
-    if not isinstance(native_error, dict):
+def _cohere_fixed_terminal_identifier(value: Any) -> Optional[str]:
+    """Return a terminal word from the fixed set, never the raw payload text."""
+    if isinstance(value, bool) or not isinstance(value, str):
         return None
-    for key in ("code", "type"):
-        token = native_error.get(key)
-        if isinstance(token, str) and _COHERE_PROVIDER_ERROR_TOKEN_RE.fullmatch(token):
-            return token
-    return None
+    return _COHERE_TERMINAL_IDENTIFIERS.get(value.strip().upper())
 
 
-def _safe_provider_failure_message(message: str) -> bool:
-    if not message.startswith(_COHERE_PROVIDER_ERROR_PREFIXES):
-        return False
-    if len(message) > 280 or "\n" in message or "\r" in message:
-        return False
-    if "{" in message or "}" in message:
-        return False
-    return True
+def _cohere_fixed_terminal_message(identifier: str) -> str:
+    if identifier not in _COHERE_TERMINAL_IDENTIFIERS.values():
+        identifier = "error"
+    return f"Cohere streaming terminated with {identifier}"
 
 
 def _cohere_public_failure_message(
@@ -248,7 +264,7 @@ def _cohere_public_failure_message(
             reason="invalid_encoding",
         )
     message = str(exc)
-    if _safe_provider_failure_message(message):
+    if message in _COHERE_FIXED_TERMINAL_MESSAGES:
         return message
     return _cohere_stream_diagnostic(
         stage=stage,
@@ -395,7 +411,13 @@ class ModelResponseIterator:
             usage: Optional[ChatCompletionUsageBlock] = None
             provider_specific_fields = None
 
-            index = int(chunk.get("index", 0))
+            index = _cohere_v1_chunk_index(chunk.get("index", 0))
+            if index is None:
+                _raise_cohere_diagnostic(
+                    stage="event-schema",
+                    payload=chunk,
+                    reason="event_schema",
+                )
 
             if "text" in chunk:
                 text = chunk["text"]
@@ -424,6 +446,14 @@ class ModelResponseIterator:
                 payload=chunk,
                 reason="malformed_json",
             )
+        except CohereStreamDiagnostic:
+            raise
+        except (TypeError, ValueError):
+            _raise_cohere_diagnostic(
+                stage="event-schema",
+                payload=chunk,
+                reason="event_schema",
+            )
 
     # Sync iterator
     def __iter__(self):
@@ -434,7 +464,7 @@ class ModelResponseIterator:
             chunk = self.response_iterator.__next__()
         except StopIteration:
             raise StopIteration
-        except ValueError as exc:
+        except Exception as exc:
             _raise_cohere_runtime(
                 exc,
                 payload=None,
@@ -482,7 +512,22 @@ class ModelResponseIterator:
                 payload=str_line,
                 reason="malformed_json",
             )
-        return self.chunk_parser(chunk=data_json)
+        try:
+            return self.chunk_parser(chunk=data_json)
+        except CohereStreamDiagnostic:
+            raise
+        except json.JSONDecodeError:
+            _raise_cohere_diagnostic(
+                stage="framing",
+                payload=str_line,
+                reason="malformed_json",
+            )
+        except (TypeError, ValueError):
+            _raise_cohere_diagnostic(
+                stage="event-schema",
+                payload=data_json,
+                reason="event_schema",
+            )
 
     # Async iterator
     def __aiter__(self):
@@ -494,7 +539,7 @@ class ModelResponseIterator:
             chunk = await self.async_response_iterator.__anext__()
         except StopAsyncIteration:
             raise StopAsyncIteration
-        except ValueError as exc:
+        except Exception as exc:
             _raise_cohere_runtime(
                 exc,
                 payload=None,
@@ -862,44 +907,39 @@ class CohereV2ModelResponseIterator:
         )
         native_error = delta.get("error")
         if isinstance(native_error, str):
-            error_message = " ".join(native_error.split())
-            if error_message:
-                if (
-                    len(error_message) <= 240
-                    and "{" not in error_message
-                    and "}" not in error_message
-                ):
-                    raise CohereError(
-                        status_code=(
-                            408 if normalized_finish_reason == "TIMEOUT" else 500
-                        ),
-                        message=f"Cohere streaming error: {error_message}",
-                    )
+            if native_error.strip():
                 _raise_cohere_diagnostic(
                     stage="event-schema",
                     payload=chunk,
                     reason="provider_terminal",
                 )
         elif native_error:
-            provider_token = _cohere_provider_error_token(native_error)
-            if provider_token is not None:
-                raise CohereError(
-                    status_code=(408 if normalized_finish_reason == "TIMEOUT" else 500),
-                    message=f"Cohere streaming error: {provider_token}",
+            terminal_identifier = None
+            if isinstance(native_error, dict):
+                for key in ("code", "type"):
+                    terminal_identifier = _cohere_fixed_terminal_identifier(
+                        native_error.get(key)
+                    )
+                    if terminal_identifier is not None:
+                        break
+            if terminal_identifier is None:
+                _raise_cohere_diagnostic(
+                    stage="event-schema",
+                    payload=chunk,
+                    reason="provider_terminal",
                 )
-            _raise_cohere_diagnostic(
-                stage="event-schema",
-                payload=chunk,
-                reason="provider_terminal",
+            raise CohereError(
+                status_code=408 if terminal_identifier == "timeout" else 500,
+                message=_cohere_fixed_terminal_message(terminal_identifier),
             )
 
-        if normalized_finish_reason in {"ERROR", "TIMEOUT"}:
+        terminal_identifier = _cohere_fixed_terminal_identifier(
+            normalized_finish_reason
+        )
+        if terminal_identifier is not None:
             raise CohereError(
-                status_code=408 if normalized_finish_reason == "TIMEOUT" else 500,
-                message=(
-                    f"Cohere streaming terminated with "
-                    f"{normalized_finish_reason.lower()}"
-                ),
+                status_code=408 if terminal_identifier == "timeout" else 500,
+                message=_cohere_fixed_terminal_message(terminal_identifier),
             )
 
         raw_finish_reason = raw_finish_reason or "COMPLETE"
@@ -985,9 +1025,7 @@ class CohereV2ModelResponseIterator:
             raise
         except CohereError as exc:
             message = str(exc)
-            if message.startswith(_COHERE_DIAGNOSTIC_PREFIX):
-                _raise_detached(CohereStreamDiagnostic(message))
-            if _safe_provider_failure_message(message):
+            if message in _COHERE_FIXED_TERMINAL_MESSAGES:
                 _raise_detached(ValueError(message))
             _raise_cohere_diagnostic(
                 stage="event-schema",
@@ -1025,7 +1063,7 @@ class CohereV2ModelResponseIterator:
                         reason="missing_message_end",
                     )
                 raise StopIteration
-            except ValueError as exc:
+            except Exception as exc:
                 _raise_cohere_runtime(
                     exc,
                     payload=chunk,
@@ -1096,7 +1134,7 @@ class CohereV2ModelResponseIterator:
                         reason="missing_message_end",
                     )
                 raise StopAsyncIteration
-            except ValueError as exc:
+            except Exception as exc:
                 _raise_cohere_runtime(
                     exc,
                     payload=chunk,
