@@ -7298,6 +7298,71 @@ _XAI_DEFERRED_STREAM_FAILURE_PHASES = frozenset(
         "cleanup_outcome",
     }
 )
+_XAI_DEFERRED_STREAM_POST_TERMINAL_CANCEL_PHASES = frozenset(
+    {
+        "iterator_cancelled",
+        "stream_response_cancelled",
+        "finalization_wait_cancelled",
+        "finalize_enter",
+        "finalization_task_reused",
+        "finalization_task_returned",
+        "finalizer_enter",
+        "finalizer_result",
+        "finalization_task_created",
+    }
+)
+_XAI_DEFERRED_STREAM_TRUE_FAILURE_PHASES = frozenset(
+    {
+        "iterator_exception",
+        "close_before_eof",
+        "renewal_failed",
+        "stream_response_exception",
+        "finalization_task_raised",
+        "release_result",
+        "cleanup_outcome",
+    }
+)
+
+
+def _xai_deferred_stream_completed_valid_terminal(payload: Mapping[str, Any]) -> bool:
+    """True when the Responses validator already accepted a completed terminal."""
+    return (
+        payload.get("complete") is True
+        and payload.get("valid") is True
+        and payload.get("terminal_seen") is True
+        and payload.get("terminal_status") == "completed"
+    )
+
+
+def _xai_deferred_stream_is_post_terminal_cancel(payload: Mapping[str, Any]) -> bool:
+    """ASGI CancelledError after a completed valid Responses terminal.
+
+    Hypercorn/client cancel after the validator already accepted a completed
+    terminal is healthy log noise. Mid-stream cancel still fails closed.
+    """
+    if not _xai_deferred_stream_completed_valid_terminal(payload):
+        return False
+    if payload.get("validation_ok") is False:
+        return False
+    if payload.get("result_error_present") is True:
+        return False
+    if payload.get("mutation_outcome") in {"error", "conflict"}:
+        return False
+    phase = payload.get("phase")
+    if phase in _XAI_DEFERRED_STREAM_TRUE_FAILURE_PHASES:
+        return False
+    exception_category = payload.get("exception_category")
+    if exception_category not in {None, "cancelled"}:
+        return False
+    if phase not in _XAI_DEFERRED_STREAM_POST_TERMINAL_CANCEL_PHASES:
+        return False
+    if phase in {
+        "iterator_cancelled",
+        "stream_response_cancelled",
+        "finalization_wait_cancelled",
+    }:
+        return True
+    return payload.get("requested_success") is False
 
 
 def _xai_deferred_stream_should_emit(payload: Mapping[str, Any]) -> bool:
@@ -7305,10 +7370,13 @@ def _xai_deferred_stream_should_emit(payload: Mapping[str, Any]) -> bool:
 
     ``AAWM_ALIAS_ROUTE_LOG_HEALTHY=1`` (same flag as healthy
     ``AAWM_OPENAI_FINAL_SEND_BINDING`` / alias-route JSON) emits every phase.
-    Default-off keeps validator-pass / iterator-progress snapshots quiet.
+    Default-off keeps validator-pass / iterator-progress snapshots quiet,
+    including completed-valid post-terminal ASGI cancel.
     """
     if _aawm_audit_persist._aawm_alias_route_healthy_json_enabled():
         return True
+    if _xai_deferred_stream_is_post_terminal_cancel(payload):
+        return False
     phase = payload.get("phase")
     if phase in _XAI_DEFERRED_STREAM_FAILURE_PHASES:
         return True

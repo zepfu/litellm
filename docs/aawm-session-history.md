@@ -2284,8 +2284,9 @@ failures, cooldowns, redispatches, no-candidate outcomes, and explicit warning
 events remain logged, while healthy selected/session-affinity continuation
 events are skipped unless `AAWM_ALIAS_ROUTE_LOG_HEALTHY=1` is set for a targeted
 debug window. The same flag also gates healthy `AAWM_XAI_DEFERRED_STREAM`
-validator-pass / iterator-progress snapshots; renewal, validation, and iterator
-failure phases still emit. Terminal no-candidate and pre-attempt terminal warnings
+validator-pass / iterator-progress snapshots and completed-valid
+post-terminal ASGI cancel; renewal, validation, mid-stream cancel, and
+iterator failure phases still emit. Terminal no-candidate and pre-attempt terminal warnings
 additionally emit one sanitized `AAWM_ALIAS_ROUTE: terminal warning` line even
 when `AAWM_ALIAS_ROUTE_VERBOSE_JSON` and `AAWM_ALIAS_ROUTE_LOG_HEALTHY` are both
 off. The pre-attempt variants identify pinned-session cooldown and provider-lane

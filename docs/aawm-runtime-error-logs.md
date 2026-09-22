@@ -499,8 +499,12 @@ candidate inventories, or upstream error text). Full structured
 The same flag controls healthy `AAWM_OPENAI_FINAL_SEND_BINDING` console logs
 (`validated`, `reserved`, and `transport_returned`) and healthy
 `AAWM_XAI_DEFERRED_STREAM` console logs (validator-pass / iterator-progress
-phases such as `validator_decision` with `validation_ok=true`). Rejection,
-transport failure, renewal failure, validation failure, and other deferred-stream
+phases such as `validator_decision` with `validation_ok=true`, and
+completed-valid post-terminal ASGI cancel:
+`iterator_cancelled` / `stream_response_cancelled` /
+`finalize_enter` with `requested_success=false` after
+`terminal_status=completed`). Rejection, transport failure, renewal
+failure, validation failure, mid-stream cancel, and other deferred-stream
 failure phases remain enabled; observation persistence is unchanged.
 
 `provider_terminal_error` and `candidate_unavailable` alias cooldowns are
