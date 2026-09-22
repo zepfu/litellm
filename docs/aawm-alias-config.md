@@ -748,8 +748,10 @@ used for the new attempt, so the replacement key stays eligible. A different
 key has a different sentinel. Other providers do not use it. A missing
 credential stays on an unscoped sentinel and cannot publish a shared cooldown.
 A 429 that mentions a trial, or a monthly-trial plan, together with a
-per-minute rate limit stays on the model key. Credential scope for HTTP 429
-requires evidence that monthly quota or capacity is exhausted.
+per-minute rate limit stays on the model key. Exhausting an explicitly
+per-minute quota while naming that plan also stays on the model key.
+Credential scope for HTTP 429 requires exhaustion of the monthly quota or
+capacity itself.
 Raw credentials never enter the sentinel, cooldown keys, logs, or public error
 details. How long a stored cooldown lasts remains the existing cooldown
 duration; this scope decision does not choose a monthly reset horizon.
