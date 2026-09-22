@@ -738,15 +738,20 @@ Direct Cohere alias cooldowns keep three explicit scopes. Authentication
 share one credential sentinel. Per-model RPM stays on that model's cooldown
 key. Validation and cancellation publish no cooldown.
 
-The sentinel is a truncated SHA-256 of the canonical `COHERE_API_KEY`, shaped
-`cohere:credential:<12 hex>`. Sibling models on that key read and write
-`cohere:__credential__:<sentinel>` through the existing memory and durable
-cooldown stores. A different key has a different sentinel. Other providers do
-not use it. A missing credential stays on an unscoped sentinel and cannot
-publish a shared cooldown. Raw credentials never enter the sentinel, cooldown
-keys, logs, or public error details. How long a stored cooldown lasts remains
-the existing cooldown duration; this scope decision does not choose a monthly
-reset horizon.
+The sentinel is a truncated SHA-256 of the key the failed attempt selected,
+shaped `cohere:credential:<12 hex>`. Failure publication writes that captured
+fingerprint as `cohere:__credential__:<sentinel>` through the existing memory
+and durable cooldown stores. It does not re-read the canonical key at
+publication time, so a key change while a request is in flight cools only the
+key that request used. Later sibling selection checks the key that would be
+used for the new attempt, so the replacement key stays eligible. A different
+key has a different sentinel. Other providers do not use it. A missing
+credential stays on an unscoped sentinel and cannot publish a shared cooldown.
+A 429 that mentions a trial together with a per-minute rate limit stays on the
+model key; credential scope for HTTP 429 requires monthly quota exhaustion.
+Raw credentials never enter the sentinel, cooldown keys, logs, or public error
+details. How long a stored cooldown lasts remains the existing cooldown
+duration; this scope decision does not choose a monthly reset horizon.
 
 For COHERE-002 usage observations, the source identity is limited to accepted
 direct Codex Cohere terminal HTTP 200 `/v2/chat` calls with

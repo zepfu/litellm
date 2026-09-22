@@ -61,6 +61,10 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.opencode_go_rejecti
     opencode_go_tool_types,
     record_opencode_go_rejection_evidence,
 )
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.lane_keys import (
+    capture_cohere_attempt_credential_sentinel,
+    stamp_cohere_attempt_credential_sentinel,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     CODEX_AUTO_AGENT_OPENROUTER_RESPONSES_ROUTE_FAMILY,
 )
@@ -6602,7 +6606,7 @@ async def _prepare_codex_cohere_chat_completions_adapter_route(
     adapter_model: str,
     use_alias_candidate_probe: bool = False,
 ) -> "_aawm_adapter_driver.CompletionAdapterRoutePlan":
-    _ = request, use_alias_candidate_probe
+    _ = use_alias_candidate_probe
     normalized_model = adapter_model.strip() if isinstance(adapter_model, str) else ""
     provider, separator, upstream_model = normalized_model.partition("/")
     if (
@@ -6686,6 +6690,14 @@ async def _prepare_codex_cohere_chat_completions_adapter_route(
 
     target_url = _cohere_runtime._get_cohere_target_base()
     api_key = _cohere_runtime._require_cohere_api_key()
+    credential_sentinel = capture_cohere_attempt_credential_sentinel(
+        api_key,
+        request=request,
+    )
+
+    def _stamp_selected_cohere_credential(exc: Exception) -> None:
+        stamp_cohere_attempt_credential_sentinel(exc, credential_sentinel)
+
     HttpPassThroughEndpointHelpers.validate_outgoing_egress(
         url=target_url,
         headers={"Authorization": f"Bearer {api_key}"},
@@ -6699,6 +6711,7 @@ async def _prepare_codex_cohere_chat_completions_adapter_route(
         api_key=api_key,
         api_base=target_url,
         client_requested_stream=bool(request_body.get("stream")),
+        handle_exception=_stamp_selected_cohere_credential,
         perform_kwargs={
             "completion_kwargs": completion_kwargs,
             "request_input": request_input,

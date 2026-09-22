@@ -330,6 +330,56 @@ def resolve_cohere_credential_lane_sentinel(
     return "cohere:credential:" + fingerprint
 
 
+_COHERE_ATTEMPT_CREDENTIAL_SENTINEL_ATTR = "_aawm_cohere_attempt_credential_sentinel"
+
+
+def capture_cohere_attempt_credential_sentinel(
+    credential: str,
+    *,
+    request: Any = None,
+) -> str:
+    """Fingerprint the key this attempt selected and retain only the sentinel."""
+
+    sentinel = resolve_cohere_credential_lane_sentinel(credential)
+    _store_cohere_attempt_credential_sentinel(
+        getattr(request, "state", None),
+        sentinel,
+    )
+    return sentinel
+
+
+def stamp_cohere_attempt_credential_sentinel(exc: BaseException, sentinel: str) -> None:
+    """Bind a captured sentinel to the exception from that attempt."""
+
+    _store_cohere_attempt_credential_sentinel(exc, sentinel)
+
+
+def read_cohere_attempt_credential_sentinel(
+    exc: Any = None,
+    request: Any = None,
+) -> Optional[str]:
+    """Return the sentinel captured for this attempt.
+
+    Publication must not re-read the canonical key. A missing or unscoped
+    capture returns None so a later key is not cooled in its place.
+    """
+
+    for source in (exc, getattr(request, "state", None)):
+        value = getattr(source, _COHERE_ATTEMPT_CREDENTIAL_SENTINEL_ATTR, None)
+        if isinstance(value, str) and _COHERE_CREDENTIAL_LANE_RE.fullmatch(value):
+            return value
+    return None
+
+
+def _store_cohere_attempt_credential_sentinel(target: Any, sentinel: str) -> None:
+    if target is None or _COHERE_CREDENTIAL_LANE_RE.fullmatch(sentinel) is None:
+        return
+    try:
+        setattr(target, _COHERE_ATTEMPT_CREDENTIAL_SENTINEL_ATTR, sentinel)
+    except (AttributeError, TypeError):
+        return
+
+
 def cohere_credential_lane_cooldown_key(
     candidate: dict[str, Any],
     sentinel: Optional[str],
