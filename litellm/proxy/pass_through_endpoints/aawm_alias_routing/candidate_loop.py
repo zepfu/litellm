@@ -86,6 +86,7 @@ from . import opencode_go_preflight as _opencode_go_preflight
 from .codex_quota_balance import snapshot_selection
 from .cohere_monthly_cooldown import (
     apply_cohere_monthly_cooldown_horizon,
+    cohere_monthly_publication_duration,
     stamp_cohere_monthly_quota_marker,
 )
 from .interfaces import (
@@ -5738,13 +5739,13 @@ async def handle_alias_route(  # noqa: PLR0915
                 # Post-release only the request-local action remains.
                 plan = probe_failure_plan
                 assert plan is not None
-                cooldown_seconds = plan.duration_seconds
+                cooldown_seconds = cohere_monthly_publication_duration(plan)
                 if plan.request_local_action == "request_local_cooldown":
                     _apply_request_local_cooldown_from_plan(
                         request,
                         candidate=candidate,
                         lane_key=selection.get("lane_key"),
-                        cooldown_seconds=plan.duration_seconds,
+                        cooldown_seconds=cooldown_seconds,
                     )
                 cooldown_scope = plan.applied_scope
                 error_tokens = _update_codex_auto_agent_retryable_attempt_record(

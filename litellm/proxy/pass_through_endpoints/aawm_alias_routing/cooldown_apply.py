@@ -23,6 +23,10 @@ from typing import Any, Awaitable, Callable, Optional, Sequence
 
 from fastapi import Request
 
+from .cohere_monthly_cooldown import (
+    align_cohere_monthly_publication_plan,
+    expire_cohere_monthly_cooldown_hold,
+)
 from .interfaces import CooldownPublicationPlan
 from .failure_vocabulary import OPENROUTER_CREDIT_EXHAUSTED
 from .lane_keys import (
@@ -750,6 +754,18 @@ async def execute_cooldown_publication_transaction(  # noqa: PLR0915
             for lock in unique_locks:
                 await lock.acquire()
                 acquired.append(lock)
+
+            # Recompute a Cohere monthly hold from its absolute deadline now
+            # that the lock is held. A passed deadline clears these same keys
+            # instead of publishing a one-second Redis cooldown.
+            plan, monthly_deadline_passed = align_cohere_monthly_publication_plan(plan)
+            if monthly_deadline_passed:
+                await expire_cohere_monthly_cooldown_hold(
+                    alias_family=index_family,
+                    plan=plan,
+                    family_state=family_state,
+                )
+                return None
 
             # Step 3: Mutation under complete lock set.
             #
