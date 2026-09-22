@@ -26,6 +26,10 @@ from pydantic import BaseModel
 import litellm
 from litellm import verbose_logger
 from litellm._uuid import uuid
+from litellm.llms.cohere.cancellation import (
+    aclose_upstream_response_once,
+    is_cohere_provider_name,
+)
 from litellm.litellm_core_utils.model_response_utils import (
     is_model_response_stream_empty,
 )
@@ -226,6 +230,10 @@ class CustomStreamWrapper:
                         result = stream_to_close.close()
                         if result is not None:
                             await result
+                    if is_cohere_provider_name(self.custom_llm_provider):
+                        await aclose_upstream_response_once(
+                            getattr(stream_to_close, "_aawm_raw_response", None)
+                        )
                 except BaseException as e:
                     verbose_logger.debug(
                         "CustomStreamWrapper.aclose: error closing completion_stream: %s",
@@ -1966,6 +1974,14 @@ class CustomStreamWrapper:
                     cache_hit,
                 )  # log response
                 return processed_chunk
+        except GeneratorExit:
+            if is_cohere_provider_name(self.custom_llm_provider):
+                stream = self.completion_stream
+                self.completion_stream = None
+                close = getattr(stream, "close", None)
+                if callable(close):
+                    close()
+            raise
         except Exception as e:
             traceback_exception = traceback.format_exc()
             # LOG FAILURE - handle streaming failure logging in the _next_ object, remove `handle_failure` once it's deprecated
@@ -2194,6 +2210,10 @@ class CustomStreamWrapper:
                     self.logging_obj.async_failure_handler(e, traceback_exception)
                 )
             raise e
+        except asyncio.CancelledError:
+            if is_cohere_provider_name(self.custom_llm_provider):
+                await self.aclose()
+            raise
         except Exception as e:
             traceback_exception = traceback.format_exc()
             if self.logging_obj is not None:

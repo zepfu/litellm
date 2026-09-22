@@ -41,6 +41,8 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence
 import httpx
 from fastapi import HTTPException
 
+from litellm.llms.cohere.cancellation import COHERE_CANCELLATION_FAILURE_CLASS
+from litellm.llms.cohere.common_utils import CohereError
 from litellm.llms.zai_coding_plan.chat.transformation import (
     ZAICodingPlanAuthenticationError,
 )
@@ -1088,6 +1090,11 @@ def _classify_codex_cohere_candidate_failure(
         selected_upstream_model=selected_upstream_model or None,
     )
     if (
+        classification is not None
+        and classification.failure_class == COHERE_CANCELLATION_FAILURE_CLASS
+    ):
+        return COHERE_CANCELLATION_FAILURE_CLASS
+    if (
         classification is None
         or classification.cooldown_scope != "candidate"
         or not classification.advance_fresh_candidate
@@ -1873,6 +1880,85 @@ async def handle_alias_route(  # noqa: PLR0915
             attempt_record["provider_attempt_budget_refunded"] = True
         else:
             attempt_record["provider_attempt_budget_refunded"] = False
+
+    def _preserve_sent_cohere_cancellation(failure_exc: BaseException) -> None:
+        """Keep an already-sent Cohere call counted when it is cancelled."""
+
+        status_code = _error_signals._extract_adapter_exception_status_code(
+            failure_exc
+        )
+        provider_returned = getattr(
+            failure_exc, "_aawm_provider_returned", False
+        ) is True or (
+            status_code == 499
+            and (
+                getattr(failure_exc, "response", None) is not None
+                or isinstance(failure_exc, CohereError)
+            )
+        )
+        if provider_returned:
+            attempt_record["attempted_provider_call"] = True
+            attempt_record["provider_returned"] = True
+            attempt_record["provider_attempt_budget_refunded"] = False
+        elif (
+            attempt_record.get("attempted_provider_call") is True
+            or selection_provider_egress_reached
+        ):
+            attempt_record["provider_attempt_budget_refunded"] = False
+        attempt_record["status"] = "cancelled"
+        attempt_record["error_class"] = COHERE_CANCELLATION_FAILURE_CLASS
+        attempt_record["failure_class"] = COHERE_CANCELLATION_FAILURE_CLASS
+        attempt_record["cooldown_scope"] = "none"
+        attempt_record["cooldown_seconds"] = 0.0
+        if status_code == 499:
+            attempt_record["error_status_code"] = 499
+
+    def _raise_cohere_cancellation(failure_exc: BaseException) -> None:
+        _preserve_sent_cohere_cancellation(failure_exc)
+        try:
+            if attempt_record not in attempts:
+                attempts.append(attempt_record)
+            _record_auto_agent_alias_attempt_failure(
+                alias_family=alias_family,
+                alias_model=alias_model,
+                request=request,
+                prepared_request_body=prepared_request_body,
+                selection=selection,
+                attempts=attempts,
+                attempt_record=attempt_record,
+                error_class=COHERE_CANCELLATION_FAILURE_CLASS,
+                add_alias_metadata_fn=add_alias_metadata_fn,
+            )
+        except Exception:
+            # Telemetry must not replace the cancellation outcome.
+            pass
+        if isinstance(failure_exc, asyncio.CancelledError):
+            raise failure_exc
+        status_code = _error_signals._extract_adapter_exception_status_code(
+            failure_exc
+        )
+        if status_code != 499:
+            raise failure_exc
+        cancelled = HTTPException(
+            status_code=499,
+            detail={
+                "error": {
+                    "message": "Cohere request cancelled",
+                    "type": "cancellation",
+                    "code": "cohere_cancellation",
+                }
+            },
+        )
+        setattr(cancelled, "_aawm_cohere_cancellation", True)
+        setattr(cancelled, "llm_provider", "cohere")
+        setattr(
+            cancelled,
+            "attempted_provider_call",
+            attempt_record.get("attempted_provider_call"),
+        )
+        if attempt_record.get("provider_returned") is True:
+            setattr(cancelled, "_aawm_provider_returned", True)
+        raise cancelled
 
     def _persist_no_io_skipped_selection() -> None:
         """Keep refunded no-I/O selections on the terminal attempt list."""
@@ -3954,21 +4040,31 @@ async def handle_alias_route(  # noqa: PLR0915
                                 )
                             else:
                                 response = await _run_candidate_operation()
-                        except ClientDisconnectedCancellation:
+                        except ClientDisconnectedCancellation as cancel_exc:
                             if capacity_retry_coordinator is not None:
                                 capacity_retry_coordinator.record_terminal(
                                     "client_disconnected",
                                     error_class="client_disconnected",
                                     status_code=None,
                                 )
+                            if (
+                                str(candidate.get("provider") or "").strip().lower()
+                                == "cohere"
+                            ):
+                                _preserve_sent_cohere_cancellation(cancel_exc)
                             raise
-                        except asyncio.CancelledError:
+                        except asyncio.CancelledError as cancel_exc:
                             if capacity_retry_coordinator is not None:
                                 capacity_retry_coordinator.record_terminal(
                                     "cancelled",
                                     error_class="cancelled",
                                     status_code=None,
                                 )
+                            if (
+                                str(candidate.get("provider") or "").strip().lower()
+                                == "cohere"
+                            ):
+                                _preserve_sent_cohere_cancellation(cancel_exc)
                             raise
                         is_auto_review = (
                             alias_model in {"codex-auto-review", "auto-review"}
@@ -4834,6 +4930,16 @@ async def handle_alias_route(  # noqa: PLR0915
                 # --- failure handling (post-release) ---------------------------
                 failure_exc = probe_failure_exc
                 assert failure_exc is not None
+                if (
+                    _classify_codex_cohere_candidate_failure(
+                        failure_exc,
+                        candidate=candidate,
+                        is_codex_alias=codex_failure_evidence_alias is not None,
+                        attempted_provider_call=attempted_provider_call,
+                    )
+                    == COHERE_CANCELLATION_FAILURE_CLASS
+                ):
+                    _raise_cohere_cancellation(failure_exc)
                 if isinstance(failure_exc, ProviderCallReplayBlocked) or getattr(
                     failure_exc,
                     "aawm_openai_wire_replay_blocked",
@@ -5930,7 +6036,7 @@ async def handle_alias_route(  # noqa: PLR0915
     )
 
 
-def _resolve_failure_plan(
+def _resolve_failure_plan(  # noqa: PLR0915
     *,
     resolve_cooldown_publication_fn: ResolveCooldownPublicationFn,
     record_codex_failure_evidence_fn: RecordCodexFailureEvidenceFn,
@@ -6042,6 +6148,8 @@ def _resolve_failure_plan(
             is_codex_alias=codex_failure_evidence_alias is not None,
             attempted_provider_call=attempted_provider_call,
         )
+    if error_class == COHERE_CANCELLATION_FAILURE_CLASS:
+        return CooldownPublicationPlan()
     if error_class is None:
         error_class = _classify_codex_zai_coding_plan_candidate_failure(
             exc,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass
 from typing import Any, Optional, Union
@@ -9,6 +10,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from litellm.llms.cohere.cancellation import COHERE_CANCELLATION_FAILURE_CLASS
 from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.common import (
     _coerce_upstream_error_payload,
     _extract_passthrough_exception_detail,
@@ -242,6 +244,20 @@ def classify_cohere_failure(
         return None
     if not is_cohere_api_url(url):
         return None
+
+    if (
+        status_code == 499
+        or isinstance(exc, (asyncio.CancelledError, GeneratorExit))
+        or getattr(exc, "_aawm_cohere_cancellation", False) is True
+    ):
+        return CohereFailureClassification(
+            name="cohere_cancellation",
+            failure_kind="cohere_cancellation",
+            failure_class=COHERE_CANCELLATION_FAILURE_CLASS,
+            cooldown_scope="none",
+            advance_fresh_candidate=False,
+            log_error_summary="Cohere request cancelled",
+        )
 
     text = _normalized_error_text(exc)
     if status_code in (401, 403):

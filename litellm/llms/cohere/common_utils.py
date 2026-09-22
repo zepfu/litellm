@@ -1,8 +1,13 @@
+import asyncio
 import json
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from litellm.llms.base_llm.base_utils import BaseLLMModelInfo
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
+from litellm.llms.cohere.cancellation import (
+    aclose_upstream_response_once,
+    close_upstream_response_once,
+)
 from litellm.types.llms.openai import AllMessageValues
 from litellm.types.utils import (
     ChatCompletionToolCallChunk,
@@ -243,6 +248,28 @@ class CohereV2ModelResponseIterator:
         self._next_tool_index = 0
         self._pending_sse_payloads: List[str] = []
         self._message_end_received = False
+        self._aawm_stream_closed = False
+
+    def _cohere_upstream_target(self) -> Any:
+        raw_response = getattr(self, "_aawm_raw_response", None)
+        if raw_response is not None:
+            return raw_response
+        return self.streaming_response
+
+    def close(self) -> None:
+        if self._aawm_stream_closed:
+            return
+        target = self._cohere_upstream_target()
+        if not callable(getattr(target, "close", None)):
+            return
+        self._aawm_stream_closed = True
+        close_upstream_response_once(target)
+
+    async def aclose(self) -> None:
+        if self._aawm_stream_closed:
+            return
+        self._aawm_stream_closed = True
+        await aclose_upstream_response_once(self._cohere_upstream_target())
 
     @staticmethod
     def _empty_chunk() -> GenericStreamingChunk:
@@ -627,6 +654,9 @@ class CohereV2ModelResponseIterator:
                 raise StopIteration
             except ValueError as e:
                 raise RuntimeError(f"Error receiving chunk from stream: {e}")
+            except GeneratorExit:
+                self.close()
+                raise
 
             try:
                 if parsed_chunk is None:
@@ -678,6 +708,9 @@ class CohereV2ModelResponseIterator:
                 raise StopAsyncIteration
             except ValueError as e:
                 raise RuntimeError(f"Error receiving chunk from stream: {e}")
+            except asyncio.CancelledError:
+                await self.aclose()
+                raise
 
             try:
                 if parsed_chunk is None:
