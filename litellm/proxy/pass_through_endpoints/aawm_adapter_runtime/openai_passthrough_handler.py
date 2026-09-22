@@ -99,6 +99,33 @@ def _identity_codex_adapter_model_resolver(
     return None
 
 
+def _direct_responses_go_model_after_alias(
+    request_body: Any,
+    *,
+    alias_resolved: bool,
+    codex_dispatch_entered: bool,
+) -> Optional[str]:
+    """Return a bare Go model for a direct Responses claim.
+
+    Alias resolution has already run. Codex-authenticated requests enter
+    ``try_dispatch_codex_request``, which performs the same check. This path
+    covers every other Responses request, including ordinary API keys, and
+    does not consult Codex authentication or inventory classification. Bare
+    catalog ids and foreign namespaces stay unclaimed. A claimed empty or
+    unsupported suffix raises before any provider call.
+    """
+
+    if alias_resolved or codex_dispatch_entered:
+        return None
+    if not isinstance(request_body, dict):
+        return None
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.model_resolution import (
+        _opencode_go_direct_model_or_reject,
+    )
+
+    return _opencode_go_direct_model_or_reject(request_body.get("model"))
+
+
 # ---------------------------------------------------------------------------
 # Typed runtime / dependency bundle
 # ---------------------------------------------------------------------------
@@ -687,6 +714,13 @@ class BaseOpenAIPassThroughHandler:
                     request_body=prepared_request_body,
                     extra_headers=extra_headers,
                 )
+                direct_go_model = None
+                if grok_native_context is None:
+                    direct_go_model = _direct_responses_go_model_after_alias(
+                        prepared_request_body,
+                        alias_resolved=codex_auto_agent_alias_model is not None,
+                        codex_dispatch_entered=is_codex_responses_request,
+                    )
                 if grok_native_context is not None:
                     body_was_prepared = True
                     grok_native_oauth_request = True
@@ -701,7 +735,7 @@ class BaseOpenAIPassThroughHandler:
                     forward_headers = False
                     egress_credential_family = GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY
                     expected_target_family = GROK_NATIVE_OAUTH_ROUTE_FAMILY
-                elif is_codex_responses_request:
+                elif is_codex_responses_request or direct_go_model is not None:
                     try:
                         dispatched_response = await rt.try_dispatch_codex_request_fn(
                             endpoint=endpoint,
@@ -757,6 +791,22 @@ class BaseOpenAIPassThroughHandler:
                         raise
                     if dispatched_response is not None:
                         return dispatched_response
+                    if direct_go_model is not None:
+                        # The dispatcher did not consume a supported Go claim.
+                        # Send the canonical bare model to the existing adapter
+                        # instead of the default OpenAI pass-through.
+                        from litellm.proxy.pass_through_endpoints import (
+                            llm_passthrough_endpoints as _go_host,
+                        )
+
+                        return await _go_host._handle_codex_opencode_go_adapter_route(
+                            endpoint=endpoint,
+                            request=request,
+                            fastapi_response=fastapi_response,
+                            user_api_key_dict=user_api_key_dict,
+                            prepared_request_body=prepared_request_body,
+                            adapter_model=direct_go_model,
+                        )
             else:
                 prepared_request_body = (
                     rt.add_route_family_logging_metadata_fn(
