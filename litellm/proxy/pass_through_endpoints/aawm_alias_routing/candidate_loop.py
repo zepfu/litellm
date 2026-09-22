@@ -84,6 +84,10 @@ from . import dev_fault_plan as _dev_fault_plan
 from . import error_signals as _error_signals
 from . import opencode_go_preflight as _opencode_go_preflight
 from .codex_quota_balance import snapshot_selection
+from .cohere_monthly_cooldown import (
+    apply_cohere_monthly_cooldown_horizon,
+    stamp_cohere_monthly_quota_marker,
+)
 from .interfaces import (
     AliasRouteServices,
     ClassifyKimiFailureFn,
@@ -1190,7 +1194,7 @@ def _classify_codex_cohere_candidate_failure(
         return "upstream_timeout"
     if classification.name in {"cohere_timeout_status", "cohere_transient_upstream"}:
         return "upstream_transient_internal"
-    return {
+    mapped_error_class = {
         "auth": "provider_terminal_error",
         "quota_exhausted": "usage_limit_reached",
         "rate_limit": "rate_limited",
@@ -1199,6 +1203,12 @@ def _classify_codex_cohere_candidate_failure(
         "provider_5xx": "provider_terminal_error",
         "transient": "provider_terminal_error",
     }.get(classification.failure_class)
+    if (
+        classification.name == "cohere_monthly_trial_exhausted"
+        and mapped_error_class == "usage_limit_reached"
+    ):
+        stamp_cohere_monthly_quota_marker(exc)
+    return mapped_error_class
 
 
 def _classify_codex_opencode_go_candidate_failure(
@@ -6314,25 +6324,28 @@ def _resolve_failure_plan(  # noqa: PLR0915
                 cooldown_seconds if error_class == "usage_limit_reached" else None
             ),
         )
-    plan = _apply_cohere_credential_cooldown_scope(
-        resolve_cooldown_publication_fn(
-            request=request,
+    plan = apply_cohere_monthly_cooldown_horizon(
+        _apply_cohere_credential_cooldown_scope(
+            resolve_cooldown_publication_fn(
+                request=request,
+                candidate=candidate,
+                lane_key=selection.get("lane_key"),
+                selected_cooldown_key=selection["cooldown_key"],
+                cooldown_seconds=cooldown_seconds,
+                error_class=error_class,
+                grok_account_quota_exhausted=grok_account_quota_exhausted,
+                kimi_failure_metadata=kimi_failure_metadata,
+                codex_failure_evidence_alias=codex_failure_evidence_alias,
+            ),
             candidate=candidate,
-            lane_key=selection.get("lane_key"),
-            selected_cooldown_key=selection["cooldown_key"],
+            scope=_recall_cohere_cooldown_scope(exc),
             cooldown_seconds=cooldown_seconds,
-            error_class=error_class,
-            grok_account_quota_exhausted=grok_account_quota_exhausted,
-            kimi_failure_metadata=kimi_failure_metadata,
-            codex_failure_evidence_alias=codex_failure_evidence_alias,
+            credential_sentinel=read_cohere_attempt_credential_sentinel(
+                exc,
+                request,
+            ),
         ),
-        candidate=candidate,
-        scope=_recall_cohere_cooldown_scope(exc),
-        cooldown_seconds=cooldown_seconds,
-        credential_sentinel=read_cohere_attempt_credential_sentinel(
-            exc,
-            request,
-        ),
+        exc,
     )
     if getattr(plan, "applied_scope", "none") != "none":
         attempt_record["cooldown_seconds"] = round(
