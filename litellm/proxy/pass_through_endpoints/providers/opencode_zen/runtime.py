@@ -13,6 +13,7 @@ import errno
 import json
 import os
 import stat
+import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
@@ -69,15 +70,33 @@ _runtime: Optional[Runtime] = None
 _ZEN_AUTH_MAX_BYTES = 1_048_576
 _ZEN_AUTH_READ_ATTEMPTS = 3
 _ZEN_AUTH_CACHE_MAX_ENTRIES = 8
+_ZEN_AUTH_CACHE_TTL_SECONDS = 300.0
 _ZenAuthGeneration = tuple[int, int, int, int, int]
+
+
+class _ZenAuthContentError(ValueError):
+    """Stable Zen auth content failed. The generation is not part of the message."""
+
+    def __init__(self, message: str, generation: "_ZenAuthGeneration") -> None:
+        super().__init__(message)
+        self.generation = generation
 
 
 @dataclass(frozen=True)
 class _ZenAuthCacheEntry:
-    """One Zen file generation. The key stays out of repr."""
+    """One Zen file generation. Secrets stay out of repr and error text."""
 
     generation: _ZenAuthGeneration
-    api_key: str = field(repr=False, compare=False)
+    api_key: Optional[str] = field(default=None, repr=False, compare=False)
+    loaded_at: float = field(default_factory=time.monotonic)
+    error_message: Optional[str] = field(default=None, repr=False, compare=False)
+
+    def reveal(self) -> str:
+        if self.error_message:
+            raise ValueError(self.error_message)
+        if not self.api_key:
+            raise ValueError("OpenCode Zen auth file is not readable.")
+        return self.api_key
 
 
 @dataclass(frozen=True)
@@ -673,12 +692,16 @@ def _read_one_zen_auth_attempt_sync(
             after
         ) or _zen_auth_text_differs(path_text, descriptor_text):
             return None
-        api_key = _api_key_from_opencode_auth_text(
-            descriptor_text,
-            source_label=source_label,
-            source_family=_constants._OPENCODE_ZEN_CREDENTIAL_FAMILY,
-        )
-        return api_key, _zen_auth_generation(after)
+        generation = _zen_auth_generation(after)
+        try:
+            api_key = _api_key_from_opencode_auth_text(
+                descriptor_text,
+                source_label=source_label,
+                source_family=_constants._OPENCODE_ZEN_CREDENTIAL_FAMILY,
+            )
+        except ValueError as exc:
+            raise _ZenAuthContentError(str(exc), generation) from None
+        return api_key, generation
     finally:
         try:
             os.close(descriptor)
@@ -716,6 +739,17 @@ def _get_zen_auth_lock() -> asyncio.Lock:
         _zen_auth_lock_loop_id = loop_id
         _zen_auth_flights.clear()
     return _zen_auth_lock
+
+
+def _zen_auth_entry_is_fresh(
+    entry: Optional[_ZenAuthCacheEntry],
+    generation: _ZenAuthGeneration,
+    now: float,
+) -> bool:
+    if entry is None or entry.generation != generation:
+        return False
+    age = now - entry.loaded_at
+    return 0 <= age < _ZEN_AUTH_CACHE_TTL_SECONDS
 
 
 def _remember_zen_auth_unlocked(
@@ -776,6 +810,41 @@ async def _publish_zen_auth_if_current(
         _remember_zen_auth_unlocked(path_key, generation, api_key)
 
 
+async def _publish_zen_auth_failure(
+    path: Path,
+    source_label: str,
+    path_key: str,
+    generation: _ZenAuthGeneration,
+    message: str,
+) -> None:
+    """Record a sanitized content failure and do not keep the previous key."""
+
+    task = asyncio.current_task()
+    async with _get_zen_auth_lock():
+        flight = _zen_auth_flights.get(path_key)
+        if flight is None or flight.task is not task:
+            return
+        try:
+            current = await asyncio.to_thread(
+                _stat_zen_auth_generation_sync,
+                path,
+                source_label,
+            )
+        except Exception:
+            _zen_auth_cache.pop(path_key, None)
+            return
+        if current != generation:
+            _zen_auth_cache.pop(path_key, None)
+            return
+        _zen_auth_cache[path_key] = _ZenAuthCacheEntry(
+            generation=generation,
+            error_message=message,
+        )
+        _zen_auth_cache.move_to_end(path_key)
+        while len(_zen_auth_cache) > _ZEN_AUTH_CACHE_MAX_ENTRIES:
+            _zen_auth_cache.popitem(last=False)
+
+
 async def _run_zen_auth_flight(
     path: Path,
     source_label: str,
@@ -787,6 +856,15 @@ async def _run_zen_auth_flight(
             path,
             source_label,
         )
+    except _ZenAuthContentError as exc:
+        await _publish_zen_auth_failure(
+            path,
+            source_label,
+            path_key,
+            exc.generation,
+            str(exc),
+        )
+        raise ValueError(str(exc)) from None
     except BaseException:
         await _drop_zen_auth_cache_if_owner(path_key)
         raise
@@ -813,10 +891,12 @@ async def _load_cached_zen_file_api_key() -> str:
         except Exception:
             _zen_auth_cache.pop(path_key, None)
             raise
+        now = time.monotonic()
         cached = _zen_auth_cache.get(path_key)
-        if cached is not None and cached.generation == generation:
+        if _zen_auth_entry_is_fresh(cached, generation, now):
             _zen_auth_cache.move_to_end(path_key)
-            return cached.api_key
+            assert cached is not None
+            return cached.reveal()
         _zen_auth_cache.pop(path_key, None)
         flight = _zen_auth_flights.get(path_key)
         if flight is None or flight.generation != generation or flight.task.done():
