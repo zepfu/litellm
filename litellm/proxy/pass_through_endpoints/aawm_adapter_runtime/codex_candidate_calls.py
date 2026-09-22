@@ -8164,16 +8164,23 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
             request_body=identity_request_body,
         )
 
+    def _decoder_held_bytes() -> int:
+        buffered = decoder.getstate()[0]
+        if isinstance(buffered, (bytes, bytearray)):
+            return len(buffered)
+        return 0
+
     def _incomplete_buffer_bytes() -> int:
         incomplete = parser_original_bytes
         if trailing_cr:
             incomplete += 1
-        return incomplete
+        return incomplete + _decoder_held_bytes()
 
-    def _hold_exceeded() -> bool:
+    def _hold_exceeded(*, include_incomplete: bool = True) -> bool:
+        incomplete = _incomplete_buffer_bytes() if include_incomplete else 0
         return (
             len(held_chunks) >= max(0, max_chunks)
-            or (held_bytes + _incomplete_buffer_bytes()) > max(0, max_bytes)
+            or (held_bytes + incomplete) > max(0, max_bytes)
         )
 
     def _normalize_sse_text(text: str) -> tuple[str, list[int]]:
@@ -8366,9 +8373,10 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
         if trailing_cr:
             text = f"\r{text}"
             trailing_cr = False
+        deferred_trailing_cr = False
         if text.endswith("\r"):
             text = text[:-1]
-            trailing_cr = True
+            deferred_trailing_cr = True
         normalized, new_original_widths = _normalize_sse_text(text)
         leftover_text = parser_buffer
         leftover_original_bytes = parser_original_bytes
@@ -8402,21 +8410,24 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
                 parser_buffer = ""
                 parser_original_bytes = 0
                 pending = ""
+                deferred_trailing_cr = False
                 break
         if not final:
+            trailing_cr = deferred_trailing_cr
             return
         if frozen_precommit_action in {"fail", "fail_empty"}:
             parser_buffer = ""
             parser_original_bytes = 0
             return
-        if trailing_cr:
+        if deferred_trailing_cr:
             parser_buffer += "\n"
             parser_original_bytes += 1
-            trailing_cr = False
-        if parser_buffer:
-            _capture_complete_frame(parser_buffer, parser_original_bytes)
-            parser_buffer = ""
-            parser_original_bytes = 0
+        leftover_event = parser_buffer
+        leftover_bytes = parser_original_bytes
+        parser_buffer = ""
+        parser_original_bytes = 0
+        if leftover_event:
+            _capture_complete_frame(leftover_event, leftover_bytes)
 
     def _decode_chunk_text(raw_chunk: Any) -> str:
         nonlocal decoder_failed
@@ -8437,14 +8448,14 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
     def _feed_chunk(raw_chunk: Any) -> None:
         _consume_sse_text(_decode_chunk_text(raw_chunk))
 
-    def _compute_precommit_action() -> str:
+    def _compute_precommit_action(*, include_incomplete: bool = True) -> str:
         if decoder_failed:
             return "fail_empty"
         if saw_failed and not saw_content:
             return "fail"
         if saw_substantive or terminal_seen:
             return "commit"
-        if _hold_exceeded():
+        if _hold_exceeded(include_incomplete=include_incomplete):
             if complete_frame_count == 0:
                 return "fail_empty"
             return "commit"
@@ -8455,7 +8466,7 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
         nonlocal frozen_precommit_terminal_seen, frozen_precommit_saw_content
         if committed or frozen_precommit_action is not None:
             return
-        action = _compute_precommit_action()
+        action = _compute_precommit_action(include_incomplete=False)
         if action != "hold":
             frozen_precommit_action = action
             frozen_precommit_complete = bool(state.get("complete"))
