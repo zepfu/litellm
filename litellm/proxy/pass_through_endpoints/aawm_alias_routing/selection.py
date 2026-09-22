@@ -6134,6 +6134,68 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         "cache_key": _cache_key,
     }
 
+    async def _cross_provider_derived_owner() -> Optional[
+        tuple[str, dict[str, Any], Optional[str]]
+    ]:
+        """Return a derived owner already serving this alias on another host.
+
+        Luna can own the canonical session while an earlier turn of a spawned
+        sota-zai or basic Z.AI agent promoted ``aawm-session-owner-redispatch-v1``
+        onto Z.AI. Later turns of that agent must follow the derived owner.
+        A missing or same-host derived record leaves the canonical owner in
+        place. A durable-cache error also leaves it in place so this extra
+        read cannot fail a request the canonical path could still serve.
+        """
+
+        if is_auto_review or session_owner_identity is None:
+            return None
+        if sa.is_session_owner_redispatch_effective_identity(
+            session_owner_identity
+        ):
+            return None
+        if sa.request_has_effective_session_identity(request):
+            return None
+        if not isinstance(session_owner_record, dict):
+            return None
+        derived_identity = sa.derive_session_owner_effective_identity(
+            session_owner_identity
+        )
+        if derived_identity is None:
+            return None
+        derived_record, derived_cache_key, derived_error = (
+            await sa.get_session_owner_record(
+                session_identity=derived_identity,
+                request=request,
+                wait_for_foreign_reservation=True,
+            )
+        )
+        if derived_error is not None or not isinstance(derived_record, dict):
+            return None
+        if sa._record_state(derived_record) != "owned":
+            return None
+        canonical_host = sa._hosted_provider_from_attributes(
+            sa._owner_attributes(session_owner_record)
+        )
+        derived_host = sa._hosted_provider_from_attributes(
+            sa._owner_attributes(derived_record)
+        )
+        if not derived_host or derived_host == canonical_host:
+            return None
+        derived_affinity = sa.owner_record_as_affinity_hint(derived_record)
+        if derived_affinity is None:
+            return None
+        if (
+            _find_codex_auto_agent_affinity_candidate(
+                derived_affinity,
+                alias_model=alias_model,
+                client_product_label=client_product_label,
+                request=request,
+            )
+            is None
+        ):
+            return None
+        return derived_identity, derived_record, derived_cache_key
+
     async def _reselect_owned_affinity_with_effective_identity(
         *,
         candidate: Optional[dict[str, Any]],
@@ -6400,6 +6462,29 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                     request=request,
                 )
         else:
+            derived_owner = await _cross_provider_derived_owner()
+            if derived_owner is not None:
+                derived_identity, derived_record, derived_cache_key = (
+                    derived_owner
+                )
+                lease_cleared = (
+                    sa.clear_expected_non_held_request_session_owner_lease(
+                        request,
+                        expected_session_identity=session_owner_identity,
+                    )
+                )
+                activated_identity = (
+                    sa.activate_session_owner_redispatch_effective_identity(
+                        request=request,
+                        base_session_identity=session_owner_identity,
+                    )
+                    if lease_cleared
+                    else None
+                )
+                if activated_identity == derived_identity:
+                    session_owner_identity = derived_identity
+                    session_owner_record = derived_record
+                    _cache_key = derived_cache_key
             affinity = sa.owner_record_as_affinity_hint(
                 session_owner_record,
                 preserve_account_identity=True,
