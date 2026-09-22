@@ -15,6 +15,7 @@ from typing import (
 import httpx
 
 import litellm
+from litellm.exceptions import UnsupportedParamsError
 from litellm.litellm_core_utils.core_helpers import map_finish_reason
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.types.llms.cohere import CohereV2ChatResponse
@@ -116,6 +117,208 @@ def apply_cohere_nonstream_finish_reason(
     error = resolved.get("error")
     if error is not None:
         model_response.error = error
+
+
+_COHERE_TOOL_CHOICE_AUTO = "auto"
+_COHERE_TOOL_CHOICE_REQUIRED = "required"
+_COHERE_TOOL_CHOICE_NONE = "none"
+_COHERE_SUPPORTED_TOOL_CHOICE_FORMS = frozenset(
+    {
+        _COHERE_TOOL_CHOICE_AUTO,
+        _COHERE_TOOL_CHOICE_REQUIRED,
+        _COHERE_TOOL_CHOICE_NONE,
+    }
+)
+_COHERE_WIRE_TOOL_CHOICE = {
+    _COHERE_TOOL_CHOICE_REQUIRED: "REQUIRED",
+    _COHERE_TOOL_CHOICE_NONE: "NONE",
+}
+_COHERE_CHAT_PROVIDERS = frozenset({"cohere", "cohere_chat"})
+
+
+class CohereUnsupportedToolChoiceError(UnsupportedParamsError):
+    """Tool choice rejected locally, before any Cohere provider request."""
+
+    def __init__(self, message: str, model: str) -> None:
+        super().__init__(
+            message=message,
+            llm_provider="cohere",
+            model=model,
+            status_code=400,
+        )
+        self.attempted_provider_call = False
+        self.failure_phase = "cohere_tool_choice_preflight"
+        self.detail = {
+            "attempted_provider_call": False,
+            "param": "tool_choice",
+        }
+        self.args = (self.message,)
+
+    def __str__(self) -> str:
+        return str(self.message)
+
+
+def _has_cohere_tools(params: dict) -> bool:
+    tools = params.get("tools")
+    return isinstance(tools, list) and len(tools) > 0
+
+
+def _cohere_model_info(model: str) -> Optional[dict]:
+    """Return Cohere catalog metadata for ``model``, or None when unmapped."""
+    from litellm.utils import get_model_info
+
+    normalized = model.split("/", 1)[1] if model.startswith("cohere/") else model
+    lookups = (
+        (model, "cohere_chat"),
+        (model, "cohere"),
+        (normalized, "cohere_chat"),
+        (normalized, "cohere"),
+        (f"cohere/{normalized}", "cohere"),
+        (model, None),
+        (normalized, None),
+    )
+    seen = set()
+    for candidate_model, provider in lookups:
+        key = (candidate_model, provider)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if provider is None:
+                info = get_model_info(model=candidate_model)
+            else:
+                info = get_model_info(
+                    model=candidate_model,
+                    custom_llm_provider=provider,
+                )
+        except Exception:
+            continue
+        if info.get("litellm_provider") in _COHERE_CHAT_PROVIDERS:
+            return info
+    return None
+
+
+def _model_supports_forced_tool_choice(model: str) -> bool:
+    """Cohere REQUIRED/NONE exists only on models flagged for forced tools."""
+    info = _cohere_model_info(model)
+    if info is None:
+        return False
+    provider_specific_entry = info.get("provider_specific_entry")
+    if not isinstance(provider_specific_entry, dict):
+        return False
+    cohere_entry = provider_specific_entry.get("cohere")
+    if not isinstance(cohere_entry, dict):
+        return False
+    return cohere_entry.get("supports_forced_tool_choice") is True
+
+
+def _tool_choice_names_a_function(tool_choice: dict) -> bool:
+    function = tool_choice.get("function")
+    if isinstance(function, dict) and function.get("name"):
+        return True
+    if tool_choice.get("type") == "function":
+        return True
+    name = tool_choice.get("name")
+    return isinstance(name, str) and bool(name.strip())
+
+
+def _classify_cohere_tool_choice(tool_choice: Any, model: str) -> str:
+    """Return auto, required, or none. Raise for forms Cohere cannot preserve."""
+    if isinstance(tool_choice, str):
+        form = tool_choice.strip().casefold()
+        if form in _COHERE_SUPPORTED_TOOL_CHOICE_FORMS:
+            return form
+        raise CohereUnsupportedToolChoiceError(
+            message=(
+                "Cohere V2 does not support tool_choice "
+                f"{tool_choice.strip()!r}. Supported forms are auto, required, "
+                "and none. The request was rejected before provider transport."
+            ),
+            model=model,
+        )
+    if isinstance(tool_choice, dict):
+        if _tool_choice_names_a_function(tool_choice):
+            raise CohereUnsupportedToolChoiceError(
+                message=(
+                    "Cohere V2 cannot constrain a named function through "
+                    "tool_choice. Supported forms are auto, required, and none. "
+                    "The request was rejected before provider transport."
+                ),
+                model=model,
+            )
+        choice_type = tool_choice.get("type")
+        if isinstance(choice_type, str):
+            form = choice_type.strip().casefold()
+            if form in _COHERE_SUPPORTED_TOOL_CHOICE_FORMS:
+                return form
+        raise CohereUnsupportedToolChoiceError(
+            message=(
+                "Cohere V2 does not support this tool_choice object. Supported "
+                "forms are auto, required, and none. The request was rejected "
+                "before provider transport."
+            ),
+            model=model,
+        )
+    raise CohereUnsupportedToolChoiceError(
+        message=(
+            "Cohere V2 does not support this tool_choice value. Supported forms "
+            "are auto, required, and none. The request was rejected before "
+            "provider transport."
+        ),
+        model=model,
+    )
+
+
+def _map_cohere_v2_tool_choice(
+    tool_choice: Any,
+    *,
+    model: str,
+    tools_present: bool,
+) -> Optional[str]:
+    """Map one OpenAI tool_choice onto a Cohere V2 wire value.
+
+    ``auto`` is Cohere's documented default and is preserved by omitting
+    ``tool_choice``. ``required`` and ``none`` stay REQUIRED and NONE.
+    Unsupported forms, including a named function, are rejected instead of
+    being weakened to automatic selection.
+    """
+    if tool_choice is None:
+        return None
+    form = _classify_cohere_tool_choice(tool_choice, model)
+    if form == _COHERE_TOOL_CHOICE_AUTO:
+        return None
+    if not _model_supports_forced_tool_choice(model):
+        raise CohereUnsupportedToolChoiceError(
+            message=(
+                f"Cohere model {model} does not support forced tool_choice "
+                f"{form!r}. The request was rejected before provider transport."
+            ),
+            model=model,
+        )
+    if form == _COHERE_TOOL_CHOICE_REQUIRED and not tools_present:
+        raise CohereUnsupportedToolChoiceError(
+            message=(
+                "Cohere V2 tool_choice required needs at least one tool. The "
+                "request was rejected before provider transport."
+            ),
+            model=model,
+        )
+    return _COHERE_WIRE_TOOL_CHOICE[form]
+
+
+def _project_cohere_v2_tool_choice(model: str, optional_params: dict) -> dict:
+    if "tool_choice" not in optional_params:
+        return optional_params
+    mapped_tool_choice = _map_cohere_v2_tool_choice(
+        optional_params.get("tool_choice"),
+        model=model,
+        tools_present=_has_cohere_tools(optional_params),
+    )
+    if mapped_tool_choice is None:
+        return {
+            key: value for key, value in optional_params.items() if key != "tool_choice"
+        }
+    return {**optional_params, "tool_choice": mapped_tool_choice}
 
 
 class CohereV2ChatConfig(OpenAIGPTConfig):
@@ -229,7 +432,27 @@ class CohereV2ChatConfig(OpenAIGPTConfig):
         model: str,
         drop_params: bool,
     ) -> dict:
+        # drop_params must not rewrite an unsupported tool_choice into auto.
+        _ = drop_params
+        if "tool_choice" in non_default_params:
+            tool_choice_params = {
+                "tool_choice": non_default_params["tool_choice"],
+            }
+            if _has_cohere_tools(non_default_params):
+                tool_choice_params["tools"] = non_default_params["tools"]
+            elif _has_cohere_tools(optional_params):
+                tool_choice_params["tools"] = optional_params["tools"]
+            projected_tool_choice = _project_cohere_v2_tool_choice(
+                model,
+                tool_choice_params,
+            )
+            if "tool_choice" in projected_tool_choice:
+                optional_params["tool_choice"] = projected_tool_choice["tool_choice"]
+            else:
+                optional_params.pop("tool_choice", None)
         for param, value in non_default_params.items():
+            if param == "tool_choice":
+                continue
             if param == "stream":
                 optional_params["stream"] = value
             if param == "temperature":
@@ -266,7 +489,7 @@ class CohereV2ChatConfig(OpenAIGPTConfig):
         data = super().transform_request(
             model,
             self._project_messages_for_cohere_v2(messages),
-            optional_params,
+            _project_cohere_v2_tool_choice(model, optional_params),
             litellm_params,
             headers,
         )
@@ -284,7 +507,7 @@ class CohereV2ChatConfig(OpenAIGPTConfig):
         return await super().async_transform_request(
             model=model,
             messages=self._project_messages_for_cohere_v2(messages),
-            optional_params=optional_params,
+            optional_params=_project_cohere_v2_tool_choice(model, optional_params),
             litellm_params=litellm_params,
             headers=headers,
         )
