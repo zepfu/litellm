@@ -8115,6 +8115,9 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
     terminal_event_type: Optional[str] = None
     terminal_seen = False
     frozen_precommit_action: Optional[str] = None
+    frozen_precommit_complete = False
+    frozen_precommit_terminal_seen = False
+    frozen_precommit_saw_content = False
     held_chunks: list[Any] = []
     held_bytes = 0
     empty_success_body = {
@@ -8410,17 +8413,30 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
         return "hold"
 
     def _note_precommit_frame_boundary() -> None:
-        nonlocal frozen_precommit_action
+        nonlocal frozen_precommit_action, frozen_precommit_complete
+        nonlocal frozen_precommit_terminal_seen, frozen_precommit_saw_content
         if committed or frozen_precommit_action is not None:
             return
         action = _compute_precommit_action()
         if action != "hold":
             frozen_precommit_action = action
+            frozen_precommit_complete = bool(state.get("complete"))
+            frozen_precommit_terminal_seen = terminal_seen
+            frozen_precommit_saw_content = saw_content
 
     def _precommit_action() -> str:
         if frozen_precommit_action is not None:
             return frozen_precommit_action
         return _compute_precommit_action()
+
+    def _precommit_terminal_policy_boundary() -> tuple[bool, bool, bool]:
+        if frozen_precommit_action is not None:
+            return (
+                frozen_precommit_complete,
+                frozen_precommit_terminal_seen,
+                frozen_precommit_saw_content,
+            )
+        return (bool(state.get("complete")), terminal_seen, saw_content)
 
     def _run_precommit_action(action: str) -> str:
         if action == "hold":
@@ -8431,11 +8447,16 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
         if action == "fail":
             _raise_precommit_failure()
             raise AssertionError("unreachable")
-        if not state.get("complete"):
-            if terminal_seen and not saw_content:
+        complete_at_decision, terminal_at_decision, content_at_decision = (
+            _precommit_terminal_policy_boundary()
+        )
+        if not complete_at_decision:
+            if terminal_at_decision and not content_at_decision:
                 _apply_terminal_policy(raise_errors=True)
-            elif terminal_seen:
+            elif terminal_at_decision:
                 _apply_terminal_policy(raise_errors=False)
+        if terminal_seen and not state.get("complete"):
+            _apply_terminal_policy(raise_errors=False)
         return "commit"
 
     _set_state()
