@@ -576,6 +576,25 @@ def test_should_accept_clean_rollup_logs(hv, config) -> None:
     assert scan["rollup_hits"]
 
 
+def test_should_accept_codex_tui_rollup_when_xai_stamps_repository_prefixed_grok_identity(
+    hv, config
+) -> None:
+    text = (
+        "20260922 14:18:49 litellm#Grok[0.155.1]@thoth /openai_passthrough/responses\n"
+        " - grok-4.7(sota-xai):low - Turns: 4 -> cli-chat-proxy.grok.com/v1/responses\n"
+        "20260922 14:18:49 litellm#Codex[0.155.1]@thoth /openai_passthrough/responses\n"
+    )
+    scan = hv.scan_log_text(
+        text,
+        config,
+        require_rollup=True,
+        tui="codex",
+    )
+    assert scan["ok"] is True
+    assert scan["failures"] == []
+    assert any("litellm#Grok[" in item for item in scan["rollup_hits"])
+
+
 def test_should_fail_ohmypi_tui_rollup_without_client_name_version_and_repo(
     hv, config
 ) -> None:
