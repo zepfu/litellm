@@ -81,7 +81,7 @@ def test_should_keep_grok_47_catalog_entries_in_parity() -> None:
         assert native["supports_tool_choice"] is True
         assert native["supports_vision"] is True
         assert native["supports_xhigh_reasoning_effort"] is True
-        assert native["unsupported_input_item_types"] == []
+        assert native["unsupported_input_item_types"] == ["reasoning"]
         assert grok_46["source"] == "https://docs.x.ai/developers/models/grok-4.6"
         assert grok_46["created"] == 1785974400
         assert grok_46["input_cost_per_token"] == pytest.approx(2e-6)
@@ -102,7 +102,9 @@ def test_should_advertise_grok_47_xhigh_support_and_encrypted_reasoning_history(
                 "reasoningEffort",
             ]
             assert "reasoning" not in entry["unsupported_request_params"]
-            assert entry["unsupported_input_item_types"] == []
+            # Grok 4.7 still returns encrypted reasoning; inbound compaction
+            # blobs are dropped the same way grok-4.6 does.
+            assert entry["unsupported_input_item_types"] == ["reasoning"]
 
 
 def test_should_report_grok_47_xhigh_support_through_capability_lookup() -> None:

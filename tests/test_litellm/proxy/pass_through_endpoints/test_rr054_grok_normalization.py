@@ -279,6 +279,7 @@ def test_grok_passthrough_unwraps_wrapped_encrypted_reasoning_for_grok_47() -> N
     """Grok 4.7 always returns encrypted reasoning; wrappers must not egress."""
 
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+        unwrap_encrypted_content_wrappers_in_place,
         wrap_encrypted_content_with_provenance,
     )
     from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
@@ -312,8 +313,17 @@ def test_grok_passthrough_unwraps_wrapped_encrypted_reasoning_for_grok_47() -> N
             ],
         },
     )
-    reasoning = prepared["input"][1]
-    assert reasoning["type"] == "reasoning"
-    assert reasoning["encrypted_content"] == native_ciphertext
-    assert not str(reasoning["encrypted_content"]).startswith("aawm_erp:")
-    assert "aawm_encrypted_reasoning_provenance" not in reasoning
+    assert [item.get("type") for item in prepared["input"]] == ["message"]
+    leftover = {
+        "type": "reasoning",
+        "encrypted_content": wrapped,
+        "aawm_encrypted_reasoning_provenance": {
+            "producer_provider": "xai",
+            "producer_model": "xai/grok-4.7",
+        },
+        "aawm_route_identity": {"producer_model": "xai/grok-4.7"},
+    }
+    unwrap_encrypted_content_wrappers_in_place([leftover])
+    assert leftover["encrypted_content"] == native_ciphertext
+    assert "aawm_encrypted_reasoning_provenance" not in leftover
+    assert "aawm_route_identity" not in leftover
