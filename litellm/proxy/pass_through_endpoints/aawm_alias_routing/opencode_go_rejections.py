@@ -80,6 +80,7 @@ _ALLOWED_EVIDENCE_KEYS = frozenset(
         "offending_type",
         "request_identity",
         "litellm_call_id",
+        "originating_attempt_id",
         "error",
     }
 )
@@ -281,6 +282,55 @@ def _provider_bound_tool_index_and_type(
     return None, None
 
 
+def _new_originating_attempt_id() -> str:
+    return str(uuid4())
+
+
+def _originating_attempt_id(payload: Any) -> Optional[str]:
+    if not isinstance(payload, Mapping):
+        nested = getattr(payload, OPENCODE_GO_REJECTION_KEY, None)
+        if isinstance(nested, Mapping):
+            payload = nested
+        else:
+            return None
+    nested = payload.get(OPENCODE_GO_REJECTION_KEY)
+    if isinstance(nested, Mapping):
+        identity = _safe_identity(nested.get("originating_attempt_id"))
+        if identity is not None:
+            return identity
+    return _safe_identity(payload.get("originating_attempt_id"))
+
+
+def _ensure_originating_attempt_id(payload: Mapping[str, Any]) -> dict[str, Any]:
+    identity = _originating_attempt_id(payload) or _new_originating_attempt_id()
+    return {**payload, "originating_attempt_id": identity}
+
+
+def _with_correlation_ids(
+    normalized: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    identity: Optional[str],
+) -> dict[str, Any]:
+    extra: dict[str, Any] = {}
+    if identity is not None:
+        extra["request_identity"] = identity
+        extra["litellm_call_id"] = identity
+    originating_attempt_id = _originating_attempt_id(payload)
+    if originating_attempt_id is not None:
+        extra["originating_attempt_id"] = originating_attempt_id
+    return {**normalized, **extra}
+
+
+def _evidence_matches_originating_attempt(
+    diagnostic: Mapping[str, Any],
+    originating_attempt_id: Optional[str],
+) -> bool:
+    if originating_attempt_id is None:
+        return True
+    source_id = _originating_attempt_id(diagnostic)
+    return source_id is not None and source_id == originating_attempt_id
+
+
 def _bind_request_identity(request: Any) -> Optional[str]:
     state = getattr(request, "state", None)
     if state is None:
@@ -332,6 +382,7 @@ def build_opencode_go_rejection_evidence(
     )
     actual_target_path = _bounded_target_path(target_url)
     identity = _bind_request_identity(request)
+    originating_attempt_id = _new_originating_attempt_id()
     failure_class = _failure_class_from_status(status=status, exc=exc)
     evidence: dict[str, Any] = {
         "provider": OPENCODE_GO_PROVIDER,
@@ -364,6 +415,7 @@ def build_opencode_go_rejection_evidence(
     if identity is not None:
         evidence["request_identity"] = identity
         evidence["litellm_call_id"] = identity
+    evidence["originating_attempt_id"] = originating_attempt_id
     return normalize_opencode_go_rejection(evidence) or evidence
 
 
@@ -477,30 +529,16 @@ def normalize_opencode_go_rejection(
         normalized["offending_type"] = tool_type
     if tool_types:
         normalized["tool_types"] = tool_types
-    if identity is not None:
-        normalized["request_identity"] = identity
-        normalized["litellm_call_id"] = identity
+    normalized = _with_correlation_ids(normalized, payload, identity)
     return {key: value for key, value in normalized.items() if key in _ALLOWED_EVIDENCE_KEYS}
 
 
-def _iter_rejection_sources(
-    *sources: Any,
-    request: Any = None,
-    exc: Any = None,
-) -> list[Any]:
+def _iter_explicit_rejection_sources(*sources: Any) -> list[Any]:
+    return [source for source in sources if source is not None]
+
+
+def _iter_exception_rejection_sources(exc: Any = None) -> list[Any]:
     collected: list[Any] = []
-    for source in sources:
-        if source is not None:
-            collected.append(source)
-    if request is not None:
-        state = getattr(request, "state", None)
-        if state is not None:
-            collected.append(getattr(state, OPENCODE_GO_REJECTION_STATE_KEY, None))
-            collected.append(getattr(state, OPENCODE_GO_REJECTION_KEY, None))
-            extra = getattr(state, "opencode_go_logger_extra", None)
-            if isinstance(extra, Mapping):
-                collected.append(extra.get(OPENCODE_GO_LOGGER_EXTRA_KEY))
-                collected.append(extra.get(OPENCODE_GO_REJECTION_KEY))
     current = exc
     seen: set[int] = set()
     while current is not None and id(current) not in seen:
@@ -516,21 +554,89 @@ def _iter_rejection_sources(
     return collected
 
 
+def _iter_request_rejection_sources(request: Any = None) -> list[Any]:
+    collected: list[Any] = []
+    if request is None:
+        return collected
+    state = getattr(request, "state", None)
+    if state is None:
+        return collected
+    collected.append(getattr(state, OPENCODE_GO_REJECTION_STATE_KEY, None))
+    collected.append(getattr(state, OPENCODE_GO_REJECTION_KEY, None))
+    extra = getattr(state, "opencode_go_logger_extra", None)
+    if isinstance(extra, Mapping):
+        collected.append(extra.get(OPENCODE_GO_LOGGER_EXTRA_KEY))
+        collected.append(extra.get(OPENCODE_GO_REJECTION_KEY))
+    return collected
+
+
+def _first_recognizable_rejection(
+    sources: Any,
+    *,
+    provider: Any = None,
+    route_family: Any = None,
+    originating_attempt_id: Optional[str] = None,
+    require_originating_attempt: bool = False,
+) -> Optional[dict[str, Any]]:
+    bound_id = _safe_identity(originating_attempt_id)
+    if require_originating_attempt and bound_id is None:
+        return None
+    for source in sources:
+        diagnostic = normalize_opencode_go_rejection(
+            source,
+            provider=provider,
+            route_family=route_family,
+        )
+        if diagnostic is None:
+            continue
+        if not _evidence_matches_originating_attempt(diagnostic, bound_id):
+            continue
+        return diagnostic
+    return None
+
+
 def extract_opencode_go_rejection(
     *sources: Any,
     request: Any = None,
     exc: Any = None,
     provider: Any = None,
     route_family: Any = None,
+    originating_attempt_id: Any = None,
 ) -> Optional[dict[str, Any]]:
-    for source in _iter_rejection_sources(*sources, request=request, exc=exc):
-        diagnostic = normalize_opencode_go_rejection(
-            source,
-            provider=provider,
-            route_family=route_family,
-        )
-        if diagnostic is not None:
-            return diagnostic
+    bound_id = _safe_identity(originating_attempt_id)
+    explicit = _first_recognizable_rejection(
+        _iter_explicit_rejection_sources(*sources),
+        provider=provider,
+        route_family=route_family,
+        originating_attempt_id=bound_id,
+    )
+    if explicit is not None:
+        return explicit
+    from_exception = _first_recognizable_rejection(
+        _iter_exception_rejection_sources(exc),
+        provider=provider,
+        route_family=route_family,
+        originating_attempt_id=bound_id,
+    )
+    if from_exception is not None:
+        return from_exception
+    return _first_recognizable_rejection(
+        _iter_request_rejection_sources(request),
+        provider=provider,
+        route_family=route_family,
+        originating_attempt_id=bound_id,
+        require_originating_attempt=True,
+    )
+
+
+def _bound_originating_attempt_id(*payloads: Any) -> Optional[str]:
+    for payload in payloads:
+        diagnostic = normalize_opencode_go_rejection(payload)
+        if diagnostic is None:
+            continue
+        identity = _originating_attempt_id(diagnostic)
+        if identity is not None:
+            return identity
     return None
 
 
@@ -549,11 +655,17 @@ def attach_opencode_go_rejection(
     route_family = candidate_mapping.get("route_family") or target.get(
         "route_family"
     )
+    bound_id = _bound_originating_attempt_id(target, candidate_mapping)
     recorded = normalize_opencode_go_rejection(
         diagnostic,
         provider=provider,
         route_family=route_family,
     )
+    if recorded is not None and not _evidence_matches_originating_attempt(
+        recorded,
+        bound_id,
+    ):
+        recorded = None
     if recorded is None:
         recorded = extract_opencode_go_rejection(
             target,
@@ -562,9 +674,20 @@ def attach_opencode_go_rejection(
             exc=exc,
             provider=provider,
             route_family=route_family,
+            originating_attempt_id=bound_id,
         )
     if recorded is None:
         return None
+    existing = normalize_opencode_go_rejection(
+        target,
+        provider=provider,
+        route_family=route_family,
+    )
+    if existing is not None:
+        existing_id = _originating_attempt_id(existing)
+        recorded_id = _originating_attempt_id(recorded)
+        if existing_id is not None and existing_id != recorded_id:
+            recorded = existing
     if recorded.get("request_identity") is None:
         identity = _bind_request_identity(request) or _safe_identity(
             target.get("request_identity") or target.get("litellm_call_id")
@@ -597,6 +720,7 @@ def record_opencode_go_rejection_evidence(
         normalize_opencode_go_rejection(evidence)
         or dict(evidence)
     )
+    recorded = _ensure_originating_attempt_id(recorded)
     identity = recorded.get("request_identity") or _bind_request_identity(request)
     if identity is not None and recorded.get("request_identity") is None:
         recorded = {
