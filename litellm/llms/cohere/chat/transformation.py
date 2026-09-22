@@ -258,11 +258,11 @@ class CohereChatConfig(BaseConfig):
                     },
                 }
                 tool_calls.append(tool_call)
-            _message = litellm.Message(
+            current_message = model_response.choices[0].message  # type: ignore
+            # Keep assistant text already stored on this message.
+            current_message.tool_calls = litellm.Message(
                 tool_calls=tool_calls,
-                content=None,
-            )
-            model_response.choices[0].message = _message  # type: ignore
+            ).tool_calls
 
         ## CALCULATING USAGE - use cohere `billed_units` for returning usage
         billed_units = raw_response_json.get("meta", {}).get("billed_units", {})

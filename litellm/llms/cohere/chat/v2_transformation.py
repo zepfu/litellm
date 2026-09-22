@@ -265,6 +265,7 @@ class CohereV2ChatConfig(OpenAIGPTConfig):
 
         ## Tool calling response
         cohere_tools_response = cohere_v2_chat_response["message"].get("tool_calls", [])
+        current_message = model_response.choices[0].message  # type: ignore
         if cohere_tools_response is not None and cohere_tools_response != []:
             # convert cohere_tools_response to OpenAI response format
             tool_calls: List[ChatCompletionToolCallChunk] = []
@@ -274,16 +275,14 @@ class CohereV2ChatConfig(OpenAIGPTConfig):
                     "index": index,
                 }
                 tool_calls.append(tool_call)
-            _message = litellm.Message(
+            # Attach calls to the message that already holds assistant text so
+            # Chat-to-Responses can emit that text once and one function_call
+            # item per call.
+            current_message.tool_calls = litellm.Message(
                 tool_calls=tool_calls,
-                content=None,
-                annotations=annotations,
-            )
-            model_response.choices[0].message = _message  # type: ignore
-        else:
-            if annotations:
-                current_message = model_response.choices[0].message  # type: ignore
-                current_message.annotations = annotations
+            ).tool_calls
+        if annotations:
+            current_message.annotations = annotations
 
         ## CALCULATING USAGE - use cohere `billed_units` for returning usage
         token_usage = cohere_v2_chat_response["usage"].get("tokens", {})
