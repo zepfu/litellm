@@ -7,10 +7,14 @@ into the host module while retaining live monkeypatch lookups.
 
 from __future__ import annotations
 
+import asyncio
+import errno
 import json
 import os
+import stat
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Never, NoReturn, Optional
@@ -58,6 +62,33 @@ class Runtime:
 
 
 _runtime: Optional[Runtime] = None
+
+# Zen file credentials only. OpenCode Go keeps its own uncached read so the
+# two families cannot reuse each other's keys or invalidation state.
+_ZEN_AUTH_MAX_BYTES = 1_048_576
+_ZEN_AUTH_READ_ATTEMPTS = 3
+_ZEN_AUTH_CACHE_MAX_ENTRIES = 8
+_ZenAuthGeneration = tuple[int, int, int, int, int]
+
+
+@dataclass(frozen=True)
+class _ZenAuthCacheEntry:
+    """One Zen file generation. The key stays out of repr."""
+
+    generation: _ZenAuthGeneration
+    api_key: str = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class _ZenAuthFlight:
+    generation: _ZenAuthGeneration
+    task: "asyncio.Task[str]"
+
+
+_zen_auth_cache: "OrderedDict[str, _ZenAuthCacheEntry]" = OrderedDict()
+_zen_auth_flights: dict[str, _ZenAuthFlight] = {}
+_zen_auth_lock: Optional[asyncio.Lock] = None
+_zen_auth_lock_loop_id: Optional[int] = None
 
 
 _HOST_FUNCTION_NAMES = (
@@ -117,15 +148,15 @@ def install(host_globals: dict[str, Any]) -> None:
             clean_secret_string=lambda value: _host("_clean_secret_string")(
                 value if isinstance(value, str) else None
             ),
-            merge_metadata=lambda *args, **kwargs: _host(
-                "_merge_litellm_metadata"
-            )(*args, **kwargs),
+            merge_metadata=lambda *args, **kwargs: _host("_merge_litellm_metadata")(
+                *args, **kwargs
+            ),
             add_logging_metadata=lambda *args, **kwargs: _host(
                 "_add_opencode_zen_logging_metadata"
             )(*args, **kwargs),
-            build_span=lambda *args, **kwargs: _host(
-                "_build_langfuse_span_descriptor"
-            )(*args, **kwargs),
+            build_span=lambda *args, **kwargs: _host("_build_langfuse_span_descriptor")(
+                *args, **kwargs
+            ),
             transform_responses_api_request_to_chat_completion_request=(
                 LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request
             ),
@@ -184,9 +215,7 @@ def install(host_globals: dict[str, Any]) -> None:
             get_anthropic_adapter_model_candidates=lambda body: _host(
                 "_get_anthropic_adapter_model_candidates"
             )(body),
-            load_local_api_key=lambda: _host(
-                "_load_local_opencode_zen_api_key"
-            )(),
+            load_local_api_key=lambda: _host("_load_local_opencode_zen_api_key")(),
             raise_candidate_unavailable=lambda exc: _host(
                 "_raise_opencode_zen_auto_agent_candidate_unavailable"
             )(exc),
@@ -203,11 +232,7 @@ def _clean_secret_string(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
     cleaned = value.strip()
-    if (
-        len(cleaned) >= 2
-        and cleaned[0] == cleaned[-1]
-        and cleaned[0] in {'"', "'"}
-    ):
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {'"', "'"}:
         cleaned = cleaned[1:-1].strip()
     return cleaned or None
 
@@ -225,9 +250,7 @@ def _get_opencode_zen_target_base() -> str:
     runtime = _require_runtime()
     cleaned = (
         _clean_secret_string(runtime.get_secret_str("OPENCODE_ZEN_API_BASE"))
-        or _clean_secret_string(
-            runtime.get_secret_str("AAWM_OPENCODE_ZEN_API_BASE")
-        )
+        or _clean_secret_string(runtime.get_secret_str("AAWM_OPENCODE_ZEN_API_BASE"))
         or _clean_secret_string(os.getenv("OPENCODE_ZEN_API_BASE"))
         or _clean_secret_string(os.getenv("AAWM_OPENCODE_ZEN_API_BASE"))
         or _constants._OPENCODE_ZEN_DEFAULT_BASE_URL
@@ -241,9 +264,7 @@ def _get_opencode_go_target_base() -> str:
     runtime = _require_runtime()
     cleaned = (
         _clean_secret_string(runtime.get_secret_str("OPENCODE_GO_API_BASE"))
-        or _clean_secret_string(
-            runtime.get_secret_str("AAWM_OPENCODE_GO_API_BASE")
-        )
+        or _clean_secret_string(runtime.get_secret_str("AAWM_OPENCODE_GO_API_BASE"))
         or _clean_secret_string(os.getenv("OPENCODE_GO_API_BASE"))
         or _clean_secret_string(os.getenv("AAWM_OPENCODE_GO_API_BASE"))
         or _constants._OPENCODE_GO_DEFAULT_BASE_URL
@@ -329,39 +350,115 @@ def _raise_invalid_opencode_auth_file(
     )
 
 
-async def _load_local_opencode_auth_api_key(*, source_family: str) -> str:
-    explicit_key = _get_first_secret_value(
-        _constants._OPENCODE_ZEN_API_KEY_ENV_VARS
-    )
-    if explicit_key is not None:
-        return explicit_key
+def _configured_opencode_auth_source_label() -> str:
+    """Name the first configured auth-file variable, never its path."""
 
-    # Identify the configured source for error attribution (env var name
-    # only, never the path value).
-    configured_source: Optional[str] = None
     for env_name in _constants._OPENCODE_ZEN_AUTH_FILE_ENV_VARS:
         if _clean_secret_string(os.getenv(env_name)):
-            configured_source = env_name
-            break
+            return env_name
+    return "default"
 
+
+def _missing_opencode_auth_file_error() -> FileNotFoundError:
+    return FileNotFoundError(
+        "OpenCode Zen auth file not found. Expected "
+        "'~/.local/share/opencode/auth.json' or set "
+        "'LITELLM_OPENCODE_AUTH_FILE'."
+    )
+
+
+def _require_opencode_auth_path() -> Path:
     auth_path = _get_opencode_zen_auth_file_path()
     if auth_path is None:
-        raise FileNotFoundError(
-            "OpenCode Zen auth file not found. Expected "
-            "'~/.local/share/opencode/auth.json' or set "
-            "'LITELLM_OPENCODE_AUTH_FILE'."
+        raise _missing_opencode_auth_file_error()
+    return auth_path
+
+
+def _zen_auth_file_error(source_label: str, reason: str) -> ValueError:
+    return ValueError(f"OpenCode Zen auth file configured via {source_label} {reason}")
+
+
+def _zen_auth_cache_key(path: Path) -> str:
+    """Cache by the authoritative path without following a symlink."""
+
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def _zen_auth_generation(stat_result: os.stat_result) -> _ZenAuthGeneration:
+    return (
+        int(stat_result.st_dev),
+        int(stat_result.st_ino),
+        int(stat_result.st_mtime_ns),
+        int(stat_result.st_ctime_ns),
+        int(stat_result.st_size),
+    )
+
+
+def _zen_auth_read_fingerprint(
+    stat_result: os.stat_result,
+) -> tuple[int, int, int, int]:
+    # A replaced inode can change ctime/link metadata while an open
+    # descriptor still exposes the previous bytes.
+    return (
+        int(stat_result.st_dev),
+        int(stat_result.st_ino),
+        int(stat_result.st_mtime_ns),
+        int(stat_result.st_size),
+    )
+
+
+def _open_zen_auth_descriptor(path: Path) -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise OSError(errno.EINVAL, "secure open is unavailable")
+    flags = os.O_RDONLY | nofollow
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    if cloexec is not None:
+        flags |= cloexec
+    return os.open(os.fspath(path), flags)
+
+
+def _map_zen_auth_open_error(exc: OSError, source_label: str) -> ValueError:
+    if exc.errno in (errno.ELOOP, errno.EMLINK):
+        return _zen_auth_file_error(
+            source_label,
+            "is missing or not a regular file.",
         )
+    return _zen_auth_file_error(source_label, "is not readable.")
 
-    source_label = configured_source or "default"
 
-    try:
-        raw_text = auth_path.read_text(encoding="utf-8")
-    except Exception:
-        raise ValueError(
-            f"OpenCode Zen auth file configured via {source_label} "
-            "is not readable."
-        ) from None
+def _read_descriptor_bounded(descriptor: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    limit = _ZEN_AUTH_MAX_BYTES
+    while total <= limit:
+        try:
+            chunk = os.read(descriptor, min(8192, limit + 1 - total))
+        except OSError:
+            raise OSError(errno.EIO, "auth file read failed") from None
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    if total > limit:
+        raise ValueError("auth file exceeds the maximum size")
+    return b"".join(chunks)
 
+
+def _zen_auth_text_differs(path_text: str, descriptor_text: str) -> bool:
+    if path_text == descriptor_text:
+        return False
+    normalized_path = path_text.replace("\r\n", "\n").replace("\r", "\n")
+    normalized_descriptor = descriptor_text.replace("\r\n", "\n").replace("\r", "\n")
+    return normalized_path != normalized_descriptor
+
+
+def _api_key_from_opencode_auth_text(
+    raw_text: str,
+    *,
+    source_label: str,
+    source_family: str,
+) -> str:
     try:
         auth_data = json.loads(raw_text)
     except Exception:
@@ -396,6 +493,289 @@ async def _load_local_opencode_auth_api_key(*, source_family: str) -> str:
         )
     assert api_key is not None
     return api_key
+
+
+def _stat_zen_auth_generation_sync(
+    path: Path,
+    source_label: str,
+) -> _ZenAuthGeneration:
+    try:
+        descriptor = _open_zen_auth_descriptor(path)
+    except OSError as exc:
+        raise _map_zen_auth_open_error(exc, source_label) from None
+    try:
+        try:
+            metadata = os.fstat(descriptor)
+        except OSError:
+            raise _zen_auth_file_error(
+                source_label,
+                "is not readable.",
+            ) from None
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+    if not stat.S_ISREG(metadata.st_mode):
+        raise _zen_auth_file_error(
+            source_label,
+            "is missing or not a regular file.",
+        )
+    if metadata.st_size > _ZEN_AUTH_MAX_BYTES:
+        raise _zen_auth_file_error(
+            source_label,
+            "exceeds the maximum auth-file size.",
+        )
+    return _zen_auth_generation(metadata)
+
+
+def _read_one_zen_auth_attempt_sync(
+    path: Path,
+    source_label: str,
+) -> Optional[tuple[str, _ZenAuthGeneration]]:
+    """Read one generation. Return None when the file changes mid-read."""
+
+    try:
+        descriptor = _open_zen_auth_descriptor(path)
+    except OSError as exc:
+        raise _map_zen_auth_open_error(exc, source_label) from None
+    try:
+        try:
+            before = os.fstat(descriptor)
+        except OSError:
+            raise _zen_auth_file_error(
+                source_label,
+                "is not readable.",
+            ) from None
+        if not stat.S_ISREG(before.st_mode):
+            raise _zen_auth_file_error(
+                source_label,
+                "is missing or not a regular file.",
+            )
+        if before.st_size > _ZEN_AUTH_MAX_BYTES:
+            raise _zen_auth_file_error(
+                source_label,
+                "exceeds the maximum auth-file size.",
+            )
+        try:
+            # Path.read_text stays on this path so an unreadable replacement
+            # fails closed with the existing sanitized error.
+            path_text = path.read_text(encoding="utf-8")
+        except Exception:
+            raise _zen_auth_file_error(
+                source_label,
+                "is not readable.",
+            ) from None
+        try:
+            descriptor_text = _read_descriptor_bounded(descriptor).decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            raise _zen_auth_file_error(
+                source_label,
+                "is not readable.",
+            ) from None
+        except ValueError:
+            raise _zen_auth_file_error(
+                source_label,
+                "exceeds the maximum auth-file size.",
+            ) from None
+        try:
+            after = os.fstat(descriptor)
+        except OSError:
+            raise _zen_auth_file_error(
+                source_label,
+                "is not readable.",
+            ) from None
+        if _zen_auth_read_fingerprint(before) != _zen_auth_read_fingerprint(
+            after
+        ) or _zen_auth_text_differs(path_text, descriptor_text):
+            return None
+        api_key = _api_key_from_opencode_auth_text(
+            descriptor_text,
+            source_label=source_label,
+            source_family=_constants._OPENCODE_ZEN_CREDENTIAL_FAMILY,
+        )
+        return api_key, _zen_auth_generation(after)
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _read_stable_zen_auth_api_key_sync(
+    path: Path,
+    source_label: str,
+) -> tuple[str, _ZenAuthGeneration]:
+    for _attempt in range(_ZEN_AUTH_READ_ATTEMPTS):
+        loaded = _read_one_zen_auth_attempt_sync(path, source_label)
+        if loaded is not None:
+            return loaded
+    raise _zen_auth_file_error(
+        source_label,
+        "changed while it was read.",
+    )
+
+
+def _load_opencode_go_auth_api_key_sync() -> str:
+    """Go file reads stay synchronous and uncached (OC-029 owns that cache)."""
+
+    source_label = _configured_opencode_auth_source_label()
+    auth_path = _require_opencode_auth_path()
+    try:
+        raw_text = auth_path.read_text(encoding="utf-8")
+    except Exception:
+        raise _zen_auth_file_error(
+            source_label,
+            "is not readable.",
+        ) from None
+    return _api_key_from_opencode_auth_text(
+        raw_text,
+        source_label=source_label,
+        source_family=_constants._OPENCODE_GO_CREDENTIAL_FAMILY,
+    )
+
+
+def _resolve_zen_auth_load_inputs_sync() -> tuple[Path, str]:
+    return (
+        _require_opencode_auth_path(),
+        _configured_opencode_auth_source_label(),
+    )
+
+
+def _get_zen_auth_lock() -> asyncio.Lock:
+    global _zen_auth_lock, _zen_auth_lock_loop_id
+
+    loop_id = id(asyncio.get_running_loop())
+    if _zen_auth_lock is None or _zen_auth_lock_loop_id != loop_id:
+        _zen_auth_lock = asyncio.Lock()
+        _zen_auth_lock_loop_id = loop_id
+        _zen_auth_flights.clear()
+    return _zen_auth_lock
+
+
+def _remember_zen_auth_unlocked(
+    path_key: str,
+    generation: _ZenAuthGeneration,
+    api_key: str,
+) -> None:
+    _zen_auth_cache[path_key] = _ZenAuthCacheEntry(
+        generation=generation,
+        api_key=api_key,
+    )
+    _zen_auth_cache.move_to_end(path_key)
+    while len(_zen_auth_cache) > _ZEN_AUTH_CACHE_MAX_ENTRIES:
+        _zen_auth_cache.popitem(last=False)
+
+
+def _finish_zen_auth_flight(path_key: str, task: "asyncio.Task[str]") -> None:
+    flight = _zen_auth_flights.get(path_key)
+    if flight is not None and flight.task is task:
+        _zen_auth_flights.pop(path_key, None)
+    if task.cancelled():
+        return
+    task.exception()
+
+
+async def _drop_zen_auth_cache_if_owner(path_key: str) -> None:
+    task = asyncio.current_task()
+    async with _get_zen_auth_lock():
+        flight = _zen_auth_flights.get(path_key)
+        if flight is not None and flight.task is task:
+            _zen_auth_cache.pop(path_key, None)
+
+
+async def _publish_zen_auth_if_current(
+    path: Path,
+    source_label: str,
+    path_key: str,
+    generation: _ZenAuthGeneration,
+    api_key: str,
+) -> None:
+    task = asyncio.current_task()
+    async with _get_zen_auth_lock():
+        flight = _zen_auth_flights.get(path_key)
+        if flight is None or flight.task is not task:
+            return
+        try:
+            current = await asyncio.to_thread(
+                _stat_zen_auth_generation_sync,
+                path,
+                source_label,
+            )
+        except Exception:
+            _zen_auth_cache.pop(path_key, None)
+            return
+        if current != generation:
+            _zen_auth_cache.pop(path_key, None)
+            return
+        _remember_zen_auth_unlocked(path_key, generation, api_key)
+
+
+async def _run_zen_auth_flight(
+    path: Path,
+    source_label: str,
+    path_key: str,
+) -> str:
+    try:
+        api_key, generation = await asyncio.to_thread(
+            _read_stable_zen_auth_api_key_sync,
+            path,
+            source_label,
+        )
+    except BaseException:
+        await _drop_zen_auth_cache_if_owner(path_key)
+        raise
+    await _publish_zen_auth_if_current(
+        path,
+        source_label,
+        path_key,
+        generation,
+        api_key,
+    )
+    return api_key
+
+
+async def _load_cached_zen_file_api_key() -> str:
+    path, source_label = await asyncio.to_thread(_resolve_zen_auth_load_inputs_sync)
+    path_key = _zen_auth_cache_key(path)
+    async with _get_zen_auth_lock():
+        try:
+            generation = await asyncio.to_thread(
+                _stat_zen_auth_generation_sync,
+                path,
+                source_label,
+            )
+        except Exception:
+            _zen_auth_cache.pop(path_key, None)
+            raise
+        cached = _zen_auth_cache.get(path_key)
+        if cached is not None and cached.generation == generation:
+            _zen_auth_cache.move_to_end(path_key)
+            return cached.api_key
+        _zen_auth_cache.pop(path_key, None)
+        flight = _zen_auth_flights.get(path_key)
+        if flight is None or flight.generation != generation or flight.task.done():
+            task = asyncio.create_task(
+                _run_zen_auth_flight(path, source_label, path_key)
+            )
+            flight = _ZenAuthFlight(generation=generation, task=task)
+            _zen_auth_flights[path_key] = flight
+            task.add_done_callback(
+                lambda done, key=path_key: _finish_zen_auth_flight(key, done)
+            )
+        task = flight.task
+    return await asyncio.shield(task)
+
+
+async def _load_local_opencode_auth_api_key(*, source_family: str) -> str:
+    explicit_key = _get_first_secret_value(_constants._OPENCODE_ZEN_API_KEY_ENV_VARS)
+    if explicit_key is not None:
+        return explicit_key
+
+    normalized_family = str(source_family or "").strip().casefold()
+    if normalized_family == _constants._OPENCODE_GO_CREDENTIAL_FAMILY:
+        return _load_opencode_go_auth_api_key_sync()
+    return await _load_cached_zen_file_api_key()
 
 
 async def _load_local_opencode_zen_api_key() -> str:
@@ -490,9 +870,7 @@ def _add_opencode_zen_logging_metadata(
 
 
 @lru_cache(maxsize=1)
-def _get_anthropic_opencode_zen_normalization_runtime() -> (
-    _normalization.Runtime
-):
+def _get_anthropic_opencode_zen_normalization_runtime() -> _normalization.Runtime:
     return _require_runtime().normalization_runtime_factory()
 
 
@@ -655,9 +1033,10 @@ def _join_opencode_zen_passthrough_url(
     )
 
 
-
 def _extract_opencode_zen_failure(
-    exc: Exception, *, use_alias_candidate_probe: bool = False,
+    exc: Exception,
+    *,
+    use_alias_candidate_probe: bool = False,
     model: Optional[str] = None,
     route_family: Optional[str] = None,
 ) -> ZenFailure:
@@ -671,14 +1050,18 @@ def _extract_opencode_zen_failure(
         "model": model,
     }
     return classify_opencode_zen_failure(
-        exc, candidate=candidate,
+        exc,
+        candidate=candidate,
         route="alias" if use_alias_candidate_probe else "direct",
-        attempted_provider_call=getattr(exc, "attempted_provider_call", True) is not False,
+        attempted_provider_call=getattr(exc, "attempted_provider_call", True)
+        is not False,
     )
 
 
 def _raise_opencode_zen_failure(
-    exc: Exception, *, use_alias_candidate_probe: bool = False,
+    exc: Exception,
+    *,
+    use_alias_candidate_probe: bool = False,
     model: Optional[str] = None,
     route_family: Optional[str] = None,
 ) -> Never:
@@ -695,12 +1078,23 @@ def _raise_opencode_zen_failure(
     headers = {"Retry-After": str(retry_after)} if retry_after is not None else None
     mapped = ProxyException(
         message=failure.public_detail,
-        type="rate_limit_error" if failure.public_status_code == 429 else "upstream_error",
-        param="model", code=failure.public_status_code, headers=headers,
+        type="rate_limit_error"
+        if failure.public_status_code == 429
+        else "upstream_error",
+        param="model",
+        code=failure.public_status_code,
+        headers=headers,
     )
     mapped.status_code = failure.public_status_code
     mapped._aawm_zen_failure = failure
     mapped._aawm_provider_returned = failure.origin == "upstream"
-    mapped.attempted_provider_call = getattr(exc, "attempted_provider_call", True) is not False
-    mapped.detail = {"error": {"message": failure.public_detail, "code": failure.error_class or "provider_terminal_error"}}
+    mapped.attempted_provider_call = (
+        getattr(exc, "attempted_provider_call", True) is not False
+    )
+    mapped.detail = {
+        "error": {
+            "message": failure.public_detail,
+            "code": failure.error_class or "provider_terminal_error",
+        }
+    }
     raise mapped from exc
