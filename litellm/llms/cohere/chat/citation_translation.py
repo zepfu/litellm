@@ -105,9 +105,9 @@ def _translate_source(source: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(document, dict):
         document = None
 
-    source_id = _nonempty_str(source.get("id"))
+    source_id = _source_id(source.get("id"))
     if source_id is None and document is not None:
-        source_id = _nonempty_str(document.get("id"))
+        source_id = _source_id(document.get("id"))
     if source_id is None:
         return None
 
@@ -168,19 +168,26 @@ def _document_url_annotation(
 
 def _source_type(source: dict) -> Optional[str]:
     raw_type = source.get("type")
-    if raw_type in _ALLOWED_SOURCE_TYPES:
-        return raw_type
-    if raw_type is not None:
+    if raw_type is None:
+        if isinstance(source.get("document"), dict):
+            return _DOCUMENT_SOURCE
+        if "tool_output" in source:
+            return _TOOL_SOURCE
         return None
-    if isinstance(source.get("document"), dict):
-        return _DOCUMENT_SOURCE
-    if "tool_output" in source:
-        return _TOOL_SOURCE
-    return None
+    if not isinstance(raw_type, str) or raw_type not in _ALLOWED_SOURCE_TYPES:
+        return None
+    return raw_type
 
 
 def _index(value: Any) -> Optional[int]:
     if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _source_id(value: Any) -> Optional[str]:
+    """Keep a nonempty source id exactly, including surrounding whitespace."""
+    if not isinstance(value, str) or not value.strip():
         return None
     return value
 
