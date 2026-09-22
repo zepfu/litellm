@@ -1064,6 +1064,28 @@ def test_should_match_wrapped_grok_pass_token_after_prompt_echo() -> None:
     assert _pane_tool_command_pass(pane, prompt, ["hv2-grok-child"]) is True
 
 
+def test_should_wait_for_same_line_grok_pass_token_when_token_is_in_prompt() -> None:
+    from hv2.pane import _pane_has_any
+
+    prompt = (
+        "Execute a harmless local shell command (`pwd`) in this workspace and "
+        "return only that command's stdout. Do not guess the result. Do not skip "
+        "the command.\n\n"
+        "Then print that exact stdout on its own line, then reply with the exact "
+        "token hv2-grok-child on its own line. Do not print the token until the "
+        "stdout is visible."
+    )
+    pane = (
+        "     ❯ Execute a harmless local shell command (`pwd`) in this        9:42 AM\n"
+        "       workspace and return only that command's stdout. Do not\n"
+        "       guess the result. Do not skip the command. …\n"
+        "     ◆ Run Print the current workspace directory\n"
+        "     /tmp/hv2-grok-workspace hv2-grok-child                          9:42 AM\n"
+        "  │ ❯                                                                        │\n"
+    )
+    assert _pane_has_any(pane, ["hv2-grok-child", "PONG"], prompt=prompt) is True
+
+
 def test_should_reject_wrap_token_theater_as_grok_spawn_tool_evidence() -> None:
     from hv2.checks.orch_evidence import grok_spawn_tool_evidence
 
