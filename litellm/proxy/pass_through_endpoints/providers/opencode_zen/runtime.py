@@ -322,21 +322,41 @@ def _caller_secret_from_proxy_headers(request: Any) -> Optional[str]:
     return None
 
 
+def _established_internal_caller_identity_hash(metadata: Any) -> Optional[str]:
+    """Return the trusted caller fingerprint already stored on internal metadata."""
+
+    if not isinstance(metadata, dict):
+        return None
+    existing = metadata.get("caller_identity_hash")
+    if isinstance(existing, str) and existing.strip():
+        return existing
+    return None
+
+
 def _bind_direct_zen_caller_identity(
     user_api_key_dict: Any,
     request: Any,
+    litellm_metadata: Any = None,
     *metadata_targets: Any,
 ) -> Optional[str]:
-    """Record the authenticated proxy caller without changing the Zen account digest."""
+    """Record the authenticated proxy caller without changing the Zen account digest.
 
-    caller_secret = _caller_secret_from_authenticated_user(user_api_key_dict)
-    if caller_secret is None:
-        caller_secret = _caller_secret_from_proxy_headers(request)
-    if caller_secret is None:
-        return None
-    fingerprint = _short_hash(caller_secret.encode("utf-8"))
+    An established caller_identity_hash on internal logging metadata is kept.
+    The authenticated proxy caller supplies that fingerprint only when internal
+    metadata does not already have one. Request and completion metadata cannot
+    supply it.
+    """
+
+    fingerprint = _established_internal_caller_identity_hash(litellm_metadata)
+    if fingerprint is None:
+        caller_secret = _caller_secret_from_authenticated_user(user_api_key_dict)
+        if caller_secret is None:
+            caller_secret = _caller_secret_from_proxy_headers(request)
+        if caller_secret is None:
+            return None
+        fingerprint = _short_hash(caller_secret.encode("utf-8"))
     stamped = False
-    for metadata in metadata_targets:
+    for metadata in (litellm_metadata, *metadata_targets):
         if not isinstance(metadata, dict):
             continue
         metadata["caller_identity_hash"] = fingerprint
