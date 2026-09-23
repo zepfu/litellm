@@ -64,21 +64,30 @@ _RPM_PERIODS = frozenset(
         "requests",
     }
 )
-_NON_EXHAUSTED_MONTHLY_STATUSES = frozenset(
-    {"available", "ok", "active", "remaining", "healthy"}
-)
-# Exhaustion must attach to the monthly quota. Naming a monthly plan, or
-# reporting monthly usage that is still available, is not exhaustion.
+_NON_EXHAUSTED_MONTHLY_STATUSES = frozenset({"available", "ok", "active", "remaining", "healthy"})
+# Affirmative exhaustion of the monthly quota or limit itself. Copulas may
+# sit between the subject and the verb. Arbitrary words, a usage figure, or
+# a denial ("is not exhausted", "usage has reached 25%") do not qualify.
+_MONTHLY_SUBJECT = r"monthly\s+(?:trial(?:\s+limit|\s+quota)?|quota|limit|usage|allowance|capacity)"
 _MONTHLY_QUOTA_EXHAUSTED_RE = re.compile(
-    r"(?:"
-    r"monthly\s+(?:trial|quota|limit|usage|allowance|capacity)"
-    r"(?:\s+\w+){0,5}\s+"
-    r"(?:exhausted|exceeded|reached|depleted)"
-    r"|"
-    r"(?:exhausted|exceeded|reached|depleted)"
-    r"(?:\s+\w+){0,6}\s+"
-    r"monthly\s+(?:trial|quota|limit|usage|allowance|capacity)"
-    r")",
+    rf"(?:"
+    rf"{_MONTHLY_SUBJECT}"
+    rf"(?:\s+(?:is|has\s+been|been))?"
+    rf"\s+(?:exhausted|exceeded|reached|depleted)\b"
+    rf"(?!\s+\d)"
+    rf"|"
+    rf"(?<!not\s)(?:exhausted|exceeded|reached|depleted)"
+    rf"\s+(?:your|the|its|our|this)?\s*"
+    rf"{_MONTHLY_SUBJECT}\b"
+    rf")",
+    re.IGNORECASE,
+)
+_MONTHLY_EXHAUSTION_DENIAL_RE = re.compile(
+    r"\b(?:not|never|no)\s+(?:exhausted|exceeded|reached|depleted)\b",
+    re.IGNORECASE,
+)
+_PARTIAL_USAGE_FIGURE_RE = re.compile(
+    r"\b(?:reached|at)\s+\d+(?:\.\d+)?\s*%?",
     re.IGNORECASE,
 )
 _RPM_EXHAUSTION_RE = re.compile(
@@ -162,25 +171,33 @@ def cohere_monthly_exhaustion_marker(value: Any) -> Optional[Mapping[str, Any]]:
 def cohere_failure_has_monthly_exhaustion_evidence(exc: Exception) -> bool:
     """Return whether the monthly quota itself is exhausted.
 
-    A monthly plan name, a monthly usage percentage, or a structured monthly
-    period whose status is still available does not qualify.
+    A monthly plan name, a partial usage figure, or an explicit denial of
+    exhaustion does not qualify. A structured monthly status of available
+    vetoes nearby exhaustion wording.
     """
 
     try:
         text = _exception_text(exc)
     except _RESET_CONVERSION_ERRORS:
         text = ""
-    if _text_says_monthly_quota_exhausted(text):
-        return True
     try:
         payloads = _exception_payloads(exc)
     except _RESET_CONVERSION_ERRORS:
-        return False
+        payloads = []
+    saw_structured_exhausted = False
+    saw_structured_available = False
     for payload in payloads:
         for error_object in _walk_error_dicts(payload):
-            if _structured_monthly_quota_exhausted(error_object):
-                return True
-    return False
+            verdict = _structured_monthly_quota_verdict(error_object)
+            if verdict == "exhausted":
+                saw_structured_exhausted = True
+            elif verdict == "available":
+                saw_structured_available = True
+    if saw_structured_exhausted:
+        return True
+    if saw_structured_available:
+        return False
+    return _text_says_monthly_quota_exhausted(text)
 
 
 def stamp_cohere_monthly_quota_marker(exc: Exception) -> Optional[Mapping[str, Any]]:
@@ -424,29 +441,47 @@ def _as_utc(value: datetime) -> datetime:
 
 
 def _text_says_monthly_quota_exhausted(text: str) -> bool:
-    """Return whether text says the monthly quota itself is exhausted."""
+    """Return whether text affirms that the monthly quota or limit is exhausted."""
 
     if not text:
         return False
     for clause in re.split(r"[;:.!?]|\n+", text):
-        without_rpm = _RPM_EXHAUSTION_RE.sub(" ", clause)
-        if _MONTHLY_QUOTA_EXHAUSTED_RE.search(without_rpm):
+        if _clause_affirms_monthly_quota_exhaustion(clause):
             return True
     return False
+
+
+def _clause_affirms_monthly_quota_exhaustion(clause: str) -> bool:
+    """Return whether one clause affirms monthly quota or limit exhaustion."""
+
+    if _PARTIAL_USAGE_FIGURE_RE.search(clause):
+        return False
+    if _MONTHLY_EXHAUSTION_DENIAL_RE.search(clause):
+        return False
+    without_rpm = _RPM_EXHAUSTION_RE.sub(" ", clause)
+    return _MONTHLY_QUOTA_EXHAUSTED_RE.search(without_rpm) is not None
+
+
+def _structured_monthly_quota_verdict(error_object: Mapping[str, Any]) -> Optional[str]:
+    """Return ``exhausted``, ``available``, or None for one monthly object."""
+
+    if not _is_monthly_period(_period_token(error_object)):
+        return None
+    status = str(error_object.get("status") or error_object.get("quota_status") or "").strip().lower()
+    if status in _NON_EXHAUSTED_MONTHLY_STATUSES:
+        return "available"
+    if status in _EXHAUSTED_STATUSES:
+        return "exhausted"
+    failure_kind = str(error_object.get("failure_kind") or "").strip().lower()
+    if failure_kind == COHERE_MONTHLY_FAILURE_KIND:
+        return "exhausted"
+    return None
 
 
 def _structured_monthly_quota_exhausted(error_object: Mapping[str, Any]) -> bool:
     """Return whether this object says the monthly quota is exhausted."""
 
-    if not _is_monthly_period(_period_token(error_object)):
-        return False
-    status = str(error_object.get("status") or error_object.get("quota_status") or "").strip().lower()
-    if status in _NON_EXHAUSTED_MONTHLY_STATUSES:
-        return False
-    if status in _EXHAUSTED_STATUSES:
-        return True
-    failure_kind = str(error_object.get("failure_kind") or "").strip().lower()
-    return failure_kind == COHERE_MONTHLY_FAILURE_KIND
+    return _structured_monthly_quota_verdict(error_object) == "exhausted"
 
 
 def _dict_has_monthly_scope(error_object: Mapping[str, Any]) -> bool:
