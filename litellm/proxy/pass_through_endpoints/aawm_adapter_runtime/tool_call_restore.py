@@ -7,7 +7,7 @@ Do not import llm_passthrough_endpoints at module scope.
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from typing import TYPE_CHECKING
 
@@ -110,6 +110,12 @@ def install(host_globals: dict) -> None:
             _rebound.__dict__.update(_obj.__dict__)
         _mod[_name] = _rebound
         host_globals[_name] = _rebound
+    # Not a host-owned facade: _HOST_FUNCTION_NAMES stays the installed
+    # symbol set. The rebound adapter map still resolves this helper by
+    # name in host_globals, including when the request has no namespace map.
+    host_globals["_explicit_cohere_v2_namespace_function_map"] = _mod[
+        "_explicit_cohere_v2_namespace_function_map"
+    ]
 
 
 # ── Extracted functions ─────────────────────────────────────────────
@@ -202,6 +208,9 @@ def _advertised_namespace_tool_function_adapter_map(
     request_body: Optional[dict[str, Any]],
     *,
     adapter_model: str,
+    _explicit_cohere_v2_namespace_function_map: Callable[
+        [dict[str, Any]], dict[str, str]
+    ] = _explicit_cohere_v2_namespace_function_map,
 ) -> dict[str, str]:
     if not isinstance(request_body, dict):
         return {}
@@ -244,9 +253,9 @@ def _advertised_namespace_tool_argument_schemas(
             if not isinstance(parameters, dict):
                 parameters = function_block.get("parameters")
 
-        normalized_name = _normalize_low_cardinality_tag_value(name)  # noqa: F821
-        if normalized_name and isinstance(parameters, dict):
-            schemas[normalized_name] = parameters
+        exact_name = name if isinstance(name, str) and name else None
+        if exact_name is not None and isinstance(parameters, dict):
+            schemas[exact_name] = parameters
 
         children = tool.get("tools")
         if isinstance(children, list):
@@ -413,17 +422,18 @@ def _restore_adapted_namespace_tool_call_item(
     if not isinstance(item, dict) or item.get("type") != "function_call":
         return item, 0
 
-    item_name = _normalize_low_cardinality_tag_value(item.get("name"))  # noqa: F821
+    raw_name = item.get("name")
+    item_name = raw_name if isinstance(raw_name, str) and raw_name else ""
     restored_item = item
     restored_count = 0
 
-    namespace = namespace_by_name.get(item_name or "")
+    namespace = namespace_by_name.get(item_name)
     if namespace is not None and item.get("namespace") is None:
         restored_item = dict(item)
         restored_item["namespace"] = namespace
         restored_count = 1
 
-    schema = None if schema_by_name is None else schema_by_name.get(item_name or "")
+    schema = None if schema_by_name is None else schema_by_name.get(item_name)
     if schema is not None:
         repaired_arguments, repaired_fields = _repair_adapted_namespace_tool_arguments(
             restored_item.get("arguments"),
@@ -885,12 +895,18 @@ def _restore_adapted_namespace_tool_calls_in_stream_event_payload(
         restored_count += item_restored_count
 
     if event_payload.get("type") == "response.function_call_arguments.done":
-        item_name = _normalize_low_cardinality_tag_value(  # noqa: F821
-            event_payload.get("name")
-        )
+        raw_name = event_payload.get("name")
+        item_name = raw_name if isinstance(raw_name, str) and raw_name else None
         if item_name is None and isinstance(item, dict):
-            item_name = _normalize_low_cardinality_tag_value(item.get("name"))  # noqa: F821
-        schema = None if schema_by_name is None else schema_by_name.get(item_name or "")
+            nested_name = item.get("name")
+            item_name = (
+                nested_name if isinstance(nested_name, str) and nested_name else None
+            )
+        schema = (
+            None
+            if schema_by_name is None or item_name is None
+            else schema_by_name.get(item_name)
+        )
         if schema is not None:
             repaired_arguments, repaired_fields = (
                 _repair_adapted_namespace_tool_arguments(

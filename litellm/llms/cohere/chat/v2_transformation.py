@@ -919,13 +919,13 @@ def translate_cohere_v2_tool_choice(
     tool_choice: Any,
     namespace_by_name: dict[str, str],
 ) -> Any:
-    """Keep a namespace function choice pointed at the same function name.
+    """Reject a namespace-specific named choice before its namespace is removed.
 
-    Cohere V2 ``tool_choice`` itself only accepts ``REQUIRED`` and ``NONE``.
-    Mapping those enums belongs to COHERE-010. A choice that names one
-    translated function keeps that name in the OpenAI function-choice shape
-    so later mapping cannot collapse it to an unnamed required choice.
-    A namespace container, or a name that was not translated, fails closed.
+    Cohere V2 ``tool_choice`` only accepts ``REQUIRED`` and ``NONE``.
+    Mapping those enums belongs to COHERE-010. A choice such as
+    ``{"type": "function", "name": "run", "namespace": "ops"}`` must not be
+    rewritten to an OpenAI function choice: ``map_openai_params`` would then
+    omit it. Fail while the namespace is still visible.
     """
     if not isinstance(tool_choice, dict):
         return tool_choice
@@ -940,12 +940,15 @@ def translate_cohere_v2_tool_choice(
     if function_name is None:
         _reject_cohere_v2_tool_schema("tool_choice has a namespace without a function name")
     advertised_namespace = namespace_by_name.get(function_name)
-    if advertised_namespace is None or advertised_namespace != namespace:
+    if advertised_namespace != namespace:
         _reject_cohere_v2_tool_schema(
             f"tool_choice names {function_name!r} in namespace {namespace!r}, "
             "which is not an advertised translated function"
         )
-    return {"type": "function", "function": {"name": function_name}}
+    _reject_cohere_v2_tool_schema(
+        f"tool_choice names {function_name!r} in namespace {namespace!r}; "
+        "Cohere V2 cannot represent a namespace-specific named selection"
+    )
 
 
 def reject_unrepresentable_cohere_v2_tool_choice(tool_choice: Any) -> None:
