@@ -50,6 +50,18 @@ class ConfigCompileError(Exception):
 
 PROVIDER_ALIAS_PREFIX = "provider-"
 
+# Operator-selected public alias spellings. YAML alias names may differ from
+# the underlying registered provider identifier.
+_PROVIDER_ALIAS_IDS: dict[str, str] = {
+    "alibaba": "alibaba_token_plan",
+    "cursor": "cursor_agent",
+    "zai": "zai_coding_plan",
+}
+
+
+def _provider_alias_id(name: str) -> str:
+    return _PROVIDER_ALIAS_IDS.get(name[len(PROVIDER_ALIAS_PREFIX):], name[len(PROVIDER_ALIAS_PREFIX):])
+
 # Closed route-family vocabulary per registered provider. Provider-pinned
 # aliases may only use families from this map; a newly registered provider
 # stays uncovered until both an alias and an allowed-family entry exist.
@@ -153,7 +165,7 @@ def _assert_provider_alias_coverage(aliases: dict[str, RoutingAlias]) -> None:
     errors: list[str] = []
     seen_providers: dict[str, str] = {}
     for name in provider_names:
-        provider_id = name[len(PROVIDER_ALIAS_PREFIX) :]
+        provider_id = _provider_alias_id(name)
         if provider_id not in schema.REGISTERED_PROVIDERS:
             errors.append(
                 f"alias {name!r} does not name a registered provider"

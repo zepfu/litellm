@@ -5,7 +5,7 @@
 defaults: {}
 
 aliases:
-  - name: provider-zai_coding_plan
+  - name: provider-zai
     candidates:
       - provider: zai_coding_plan
         model: zai_coding_plan/glm-5.3-flash

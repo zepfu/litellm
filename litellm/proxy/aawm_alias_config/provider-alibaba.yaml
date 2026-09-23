@@ -3,7 +3,7 @@
 defaults: {}
 
 aliases:
-  - name: provider-alibaba_token_plan
+  - name: provider-alibaba
     candidates:
       - provider: alibaba_token_plan
         model: alibaba_token_plan/qwen3.8-max

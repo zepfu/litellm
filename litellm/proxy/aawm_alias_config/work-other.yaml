@@ -8,6 +8,10 @@ aliases:
         model: zai_coding_plan/glm-5.3-flash
         route_family: codex_zai_coding_plan_chat_completions_adapter
         priority: 120
+        schedule:
+          start_time: "23:00:00"
+          end_time: "09:00:00"
+          utc_offset: "+08:00"
 
       - alias_reference: sota-deepseek
         priority: 110

@@ -1,6 +1,6 @@
 # Provider-pinned acceptance alias (CFG-029 / CFG-038). Closed xAI
 # candidate set. Prefer native OIDC before managed OAuth. Cursor Grok
-# belongs to provider-cursor_agent, not this alias.
+# belongs to provider-cursor, not this alias.
 
 defaults: {}
 

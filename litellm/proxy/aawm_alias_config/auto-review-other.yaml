@@ -9,6 +9,10 @@ aliases:
         route_family: codex_zai_coding_plan_chat_completions_adapter
         priority: 110
         reasoning_effort: low
+        schedule:
+          start_time: "23:00:00"
+          end_time: "09:00:00"
+          utc_offset: "+08:00"
 
       - provider: alibaba_token_plan
         model: alibaba_token_plan/deepseek-v4.1-flash

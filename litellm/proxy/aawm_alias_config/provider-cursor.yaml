@@ -5,7 +5,7 @@
 defaults: {}
 
 aliases:
-  - name: provider-cursor_agent
+  - name: provider-cursor
     candidates:
       - provider: cursor_agent
         model: cursor_agent/composer-2.5
