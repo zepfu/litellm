@@ -66,28 +66,40 @@ _RPM_PERIODS = frozenset(
 )
 _NON_EXHAUSTED_MONTHLY_STATUSES = frozenset({"available", "ok", "active", "remaining", "healthy"})
 # Affirmative exhaustion of the monthly quota or limit itself. Copulas may
-# sit between the subject and the verb. Arbitrary words, a usage figure, or
-# a denial ("is not exhausted", "usage has reached 25%") do not qualify.
+# sit between the subject and the verb. A denial may put words or a
+# contraction between the negation and the verb ("not yet exhausted",
+# "haven't exhausted"). A partial usage value may follow the verb after a
+# colon ("reached: 25%"). Neither is exhaustion.
+_EXHAUSTION_VERB = r"(?:exhausted|exceeded|reached|depleted)"
 _MONTHLY_SUBJECT = r"monthly\s+(?:trial(?:\s+limit|\s+quota)?|quota|limit|usage|allowance|capacity)"
-_MONTHLY_QUOTA_EXHAUSTED_RE = re.compile(
+_NEGATED_EXHAUSTION = (
     rf"(?:"
-    rf"{_MONTHLY_SUBJECT}"
-    rf"(?:\s+(?:is|has\s+been|been))?"
-    rf"\s+(?:exhausted|exceeded|reached|depleted)\b"
-    rf"(?!\s+\d)"
+    rf"\b(?:not|never|no)\b(?:\s+\w+){{0,4}}\s+{_EXHAUSTION_VERB}\b"
     rf"|"
-    rf"(?<!not\s)(?:exhausted|exceeded|reached|depleted)"
+    rf"\b(?:have|has|had|is|are|was|were|do|does|did|would|should|could|will|wo)"
+    rf"n['’]?t\s+{_EXHAUSTION_VERB}\b"
+    rf"|"
+    rf"\bcannot\s+{_EXHAUSTION_VERB}\b"
+    rf")"
+)
+# The match starts at the beginning of the clause, so a negated verb cannot
+# be accepted by a later substring such as "exhausted your monthly quota".
+_MONTHLY_QUOTA_EXHAUSTED_RE = re.compile(
+    rf"\A(?:(?!{_NEGATED_EXHAUSTION}).)*?(?:"
+    rf"{_MONTHLY_SUBJECT}"
+    rf"(?:\s+(?:is|was|has\s+been|been))?"
+    rf"\s+{_EXHAUSTION_VERB}\b"
+    rf"(?![\s:.,]*\d)"
+    rf"|"
+    rf"{_EXHAUSTION_VERB}"
     rf"\s+(?:your|the|its|our|this)?\s*"
     rf"{_MONTHLY_SUBJECT}\b"
     rf")",
     re.IGNORECASE,
 )
-_MONTHLY_EXHAUSTION_DENIAL_RE = re.compile(
-    r"\b(?:not|never|no)\s+(?:exhausted|exceeded|reached|depleted)\b",
-    re.IGNORECASE,
-)
+_MONTHLY_EXHAUSTION_DENIAL_RE = re.compile(_NEGATED_EXHAUSTION, re.IGNORECASE)
 _PARTIAL_USAGE_FIGURE_RE = re.compile(
-    r"\b(?:reached|at)\s+\d+(?:\.\d+)?\s*%?",
+    r"\b(?:reached|at)\s*[:.]?\s*\d+(?:\.\d+)?\s*%?",
     re.IGNORECASE,
 )
 _RPM_EXHAUSTION_RE = re.compile(
@@ -445,7 +457,11 @@ def _text_says_monthly_quota_exhausted(text: str) -> bool:
 
     if not text:
         return False
-    for clause in re.split(r"[;:.!?]|\n+", text):
+    # Keep a usage value with the label that introduces it. A colon is
+    # otherwise a clause break, which would leave "monthly usage reached"
+    # behind and hide the partial figure.
+    preserved = re.sub(r"\s*:\s*(?=\d)", " ", text)
+    for clause in re.split(r"[;:.!?]|\n+", preserved):
         if _clause_affirms_monthly_quota_exhaustion(clause):
             return True
     return False
