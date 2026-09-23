@@ -340,6 +340,73 @@ def test_aawm_error_log_context_allowlist_preserves_request_shape_fields(monkeyp
         assert opt_in_context[field_name] == field_name
 
 
+def test_aawm_error_log_context_allowlist_preserves_terminal_structural_fields(
+    monkeypatch,
+):
+    """Structured terminal extras persist by default; body previews stay opt-in."""
+    from litellm._logging import (
+        _AAWM_ERROR_LOG_CONTENT_BEARING_CONTEXT_FIELDS,
+        _AAWM_ERROR_LOG_DEFAULT_CONTEXT_FIELDS,
+    )
+
+    structural_fields = {
+        "error_code",
+        "error_type",
+        "failure_class",
+        "terminal_outcome",
+        "selected_provider",
+        "selected_model",
+        "selected_route",
+        "alias_model",
+        "alias_family",
+        "correlation_id",
+        "provider_terminal_event_type",
+        "failure_origin",
+        "upstream_status_code",
+        "provider_returned",
+    }
+    content_fields = {
+        "aawm_passthrough_request_shape_error_body_preview",
+        "grok_side_channel_request_body_digest_source",
+    }
+
+    assert structural_fields.issubset(set(_AAWM_ERROR_LOG_DEFAULT_CONTEXT_FIELDS))
+    assert structural_fields.issubset(set(_AAWM_ERROR_LOG_CONTEXT_FIELDS))
+    assert not structural_fields.intersection(
+        set(_AAWM_ERROR_LOG_CONTENT_BEARING_CONTEXT_FIELDS)
+    )
+    assert content_fields.issubset(set(_AAWM_ERROR_LOG_CONTENT_BEARING_CONTEXT_FIELDS))
+    assert not content_fields.intersection(set(_AAWM_ERROR_LOG_DEFAULT_CONTEXT_FIELDS))
+
+    record = logging.LogRecord(
+        name="litellm.proxy",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=1,
+        msg="terminal failure",
+        args=(),
+        exc_info=None,
+    )
+    for field_name in structural_fields | content_fields:
+        setattr(record, field_name, field_name)
+
+    monkeypatch.delenv("LITELLM_AAWM_ERROR_LOG_INCLUDE_CONTENT_FIELDS", raising=False)
+    default_context = _build_aawm_error_log_record(
+        record, formatter=logging.Formatter()
+    )["context"]
+    for field_name in structural_fields:
+        assert default_context[field_name] == field_name
+    for field_name in content_fields:
+        assert field_name not in default_context
+
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_INCLUDE_CONTENT_FIELDS", "1")
+    opt_in_context = _build_aawm_error_log_record(
+        record, formatter=logging.Formatter()
+    )["context"]
+    for field_name in structural_fields | content_fields:
+        assert opt_in_context[field_name] == field_name
+
+
 def test_passthrough_input_item_shape_samples_capture_head_and_tail_without_values():
     secret_prompt = "PROMPT_VALUE_MUST_NOT_APPEAR"
     secret_arguments = "TOOL_ARGUMENTS_MUST_NOT_APPEAR"

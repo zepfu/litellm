@@ -412,6 +412,20 @@ _AAWM_ERROR_LOG_DEFAULT_CONTEXT_FIELDS = (
     "aiohttp_container_hostname",
     "aiohttp_context_keys",
     "aiohttp_context_resource",
+    "error_code",
+    "error_type",
+    "failure_class",
+    "terminal_outcome",
+    "selected_provider",
+    "selected_model",
+    "selected_route",
+    "alias_model",
+    "alias_family",
+    "correlation_id",
+    "provider_terminal_event_type",
+    "failure_origin",
+    "upstream_status_code",
+    "provider_returned",
 )
 
 # Opt-in only: may carry body-preview / content-bearing values that regex redaction

@@ -4037,6 +4037,7 @@ class PassThroughStreamingHandler:
                     or error_code
                     or classification
                 ),
+                "error_type": extracted_type,
                 "failure_class": (
                     policy_failure_class
                     or policy_failure_kind

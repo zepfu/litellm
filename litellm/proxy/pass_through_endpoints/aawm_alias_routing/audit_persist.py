@@ -271,6 +271,7 @@ def _build_terminal_error_log_fields(
         ("account_hash", ("account_hash", "selected_account_hash")),
         ("account_lane", ("account_lane", "selected_account_lane")),
         ("error_code", ("error_code", "code")),
+        ("error_type", ("error_type",)),
         (
             "failure_class",
             ("failure_class", "error_class", "failure_kind"),
