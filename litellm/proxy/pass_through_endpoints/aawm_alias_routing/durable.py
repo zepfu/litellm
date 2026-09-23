@@ -1010,20 +1010,35 @@ local txn_id = ARGV[5]
 local receipt_json = ARGV[6]
 local cd_value_json = ARGV[7]
 local allow_ttl_shrink = tonumber(ARGV[8]) == 1
+local function redis_time_ms()
+  -- TIME is {seconds, microseconds}. Keep the millisecond part so a
+  -- sub-second deadline is not compared as a whole second.
+  local parts = redis.call('TIME')
+  return tonumber(parts[1]) * 1000 + math.floor(tonumber(parts[2]) / 1000)
+end
 local seed_payload = cjson.decode(cd_value_json)
 local absolute_deadline = tonumber(seed_payload['absolute_expires_at_epoch'])
--- A monthly deadline is absolute. Recompute from Redis TIME at this write.
--- A deadline that has already passed deletes the cooldown keys and does not
--- store server time plus the caller's relative TTL.
+local absolute_deadline_ms = nil
+-- A monthly deadline is absolute. Floor to milliseconds so expiry is never
+-- later than the deadline. A deadline that has already passed deletes the
+-- cooldown keys instead of starting a new one-second hold.
 if absolute_deadline ~= nil and absolute_deadline > 0 then
-  local now_pre = tonumber(redis.call('TIME')[1])
-  if absolute_deadline <= now_pre then
+  absolute_deadline_ms = math.floor(absolute_deadline * 1000)
+  local now_ms = redis_time_ms()
+  if absolute_deadline_ms <= now_ms then
     for i = 1, num_cd do
       redis.call('DEL', KEYS[1 + i])
     end
     return 1
   end
-  req_ttl = math.ceil(absolute_deadline - now_pre)
+  -- Identity-set EXPIRE is whole seconds. Floor so it cannot land after
+  -- the deadline; the cooldown key itself uses PEXPIREAT below.
+  local remain_ms = absolute_deadline_ms - now_ms
+  if remain_ms >= 1000 then
+    req_ttl = math.floor(remain_ms / 1000)
+  else
+    req_ttl = 0
+  end
 end
 
 -- Phase 1: Aggregate unique-member capacity preflight.
@@ -1076,11 +1091,15 @@ for i = 1, num_id do
     -- with a genuinely persistent key.
     local pre_ttl = redis.call('TTL', id_key)
     redis.call('SADD', id_key, member)
+    -- A new identity key follows the absolute deadline. An existing key
+    -- keeps the monotonic whole-second TTL below.
+    if absolute_deadline_ms ~= nil and pre_ttl == -2 then
+        redis.call('PEXPIREAT', id_key, absolute_deadline_ms)
     -- Monotonic TTL on identity key using pre-image TTL:
     --   -2 (absent)  -> apply ceil(requested finite TTL)
     --   -1 (persist) -> remain persistent (no EXPIRE)
     --   positive     -> monotonic max(pre_ttl, req_ttl)
-    if pre_ttl == -2 then
+    elseif pre_ttl == -2 then
         if req_ttl > 0 then
             redis.call('EXPIRE', id_key, req_ttl)
         end
@@ -1115,15 +1134,17 @@ for i = 1, num_cd do
         end
     end
     local payload = cjson.decode(cd_value_json)
-    if absolute_deadline ~= nil and absolute_deadline > 0 then
-        local remain = absolute_deadline - now_ts
-        if remain <= 0 then
+    if absolute_deadline_ms ~= nil then
+        local now_ms = redis_time_ms()
+        if absolute_deadline_ms <= now_ms then
             redis.call('DEL', cd_key)
         else
             payload['expires_at_epoch'] = absolute_deadline
             payload['absolute_expires_at_epoch'] = absolute_deadline
             redis.call('SET', cd_key, cjson.encode(payload))
-            redis.call('EXPIRE', cd_key, math.ceil(remain))
+            -- Absolute millisecond expiry. floor(deadline * 1000) never
+            -- rounds the hold past the deadline.
+            redis.call('PEXPIREAT', cd_key, absolute_deadline_ms)
         end
     else
         if effective_ttl == -1 then
