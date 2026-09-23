@@ -1188,13 +1188,19 @@ class CohereV2ModelResponseIterator:
         if not callable(getattr(target, "close", None)):
             return
         self._aawm_stream_closed = True
-        close_upstream_response_once(target)
+        try:
+            close_upstream_response_once(target)
+        except OSError:
+            return
 
     async def aclose(self) -> None:
         if self._aawm_stream_closed:
             return
         self._aawm_stream_closed = True
-        await aclose_upstream_response_once(self._cohere_upstream_target())
+        try:
+            await aclose_upstream_response_once(self._cohere_upstream_target())
+        except OSError:
+            return
 
     @staticmethod
     def _empty_chunk() -> GenericStreamingChunk:
@@ -1568,9 +1574,12 @@ class CohereV2ModelResponseIterator:
                 self._push_source_chunk(self._read_sync_chunk())
         except StopIteration:
             raise
-        except GeneratorExit:
-            self.close()
-            raise
+        except GeneratorExit as cancellation:
+            try:
+                self.close()
+            except OSError:
+                pass
+            raise cancellation
         except CohereError as exc:
             _raise_iterator_terminal(exc)
         except ValueError as exc:
@@ -1620,9 +1629,12 @@ class CohereV2ModelResponseIterator:
             raise
         except StopIteration:
             raise StopAsyncIteration from None
-        except asyncio.CancelledError:
-            await self.aclose()
-            raise
+        except asyncio.CancelledError as cancellation:
+            try:
+                await self.aclose()
+            except OSError:
+                pass
+            raise cancellation
         except CohereError as exc:
             _raise_iterator_terminal(exc)
         except ValueError as exc:

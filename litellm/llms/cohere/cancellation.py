@@ -85,7 +85,10 @@ def close_upstream_response_once(response: Any) -> None:
     if not callable(close):
         return
     setattr(response, _UPSTREAM_CLOSED_ONCE, True)
-    close()
+    try:
+        close()
+    except OSError:
+        return
 
 
 async def aclose_upstream_response_once(response: Any) -> None:
@@ -93,18 +96,21 @@ async def aclose_upstream_response_once(response: Any) -> None:
         return
     setattr(response, _UPSTREAM_CLOSED_ONCE, True)
     with anyio.CancelScope(shield=True):
-        aclose = getattr(response, "aclose", None)
-        if callable(aclose):
-            result = aclose()
+        try:
+            aclose = getattr(response, "aclose", None)
+            if callable(aclose):
+                result = aclose()
+                if isawaitable(result):
+                    await result
+                return
+            close = getattr(response, "close", None)
+            if not callable(close):
+                return
+            result = close()
             if isawaitable(result):
                 await result
+        except OSError:
             return
-        close = getattr(response, "close", None)
-        if not callable(close):
-            return
-        result = close()
-        if isawaitable(result):
-            await result
 
 
 def close_cohere_cancelled_response(response: Any) -> None:

@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 import litellm
 from litellm._logging import verbose_router_logger
 from litellm.integrations.custom_logger import CustomLogger
+from litellm.llms.cohere.cancellation import is_cohere_request_cancellation
 from litellm.router_utils.add_retry_fallback_headers import (
     add_fallback_headers_to_response,
 )
@@ -152,6 +153,8 @@ async def run_async_fallback(
             )
             return response
         except Exception as e:
+            if is_cohere_request_cancellation(e):
+                raise
             error_from_fallbacks = e
             await log_failure_fallback_event(
                 original_model_group=original_model_group,
