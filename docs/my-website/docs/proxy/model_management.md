@@ -20,7 +20,17 @@ model_list:
 Retrieve detailed information about each model listed in the `/model/info` endpoint, including descriptions from the `config.yaml` file, and additional model info (e.g. max tokens, cost per input token, etc.) pulled from the model_info you set and the [litellm model cost map](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json). Sensitive details like API keys are excluded for security purposes.
 
 
-## AAWM OpenAI gpt-5.6 catalog (D1-478)
+## AAWM OpenAI catalog
+
+The canonical and bundled cost maps include `gpt-6-sol` and `gpt-6-luna`
+at standard list prices, excluding promotional, Batch, and Flex discounts.
+Per million tokens, Sol costs $2 input, $0.20 cache read, $2.50 cache write,
+and $10 output; Luna costs $0.10 input, $0.01 cache read, $0.125 cache write,
+and $0.50 output. Above 272K input tokens, input and cache rates double
+and output rates increase by 50%. Sources:
+[OpenAI pricing](https://developers.openai.com/api/docs/pricing),
+[GPT-6 Sol](https://developers.openai.com/api/docs/models/gpt-6-sol), and
+[GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna).
 
 LiteLLM's canonical cost map includes `gpt-5.6-sol`, `gpt-5.6-terra`, and
 `gpt-5.6-luna` in both `model_prices_and_context_window.json` and
