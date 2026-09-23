@@ -242,7 +242,7 @@ tuis:
           prompt: pong
           reply_needles:
             - PONG
-        provider-zai_coding_plan:
+        provider-zai:
           pass_mode: exact_pong
           tools_for_model: false
           prompt: pong

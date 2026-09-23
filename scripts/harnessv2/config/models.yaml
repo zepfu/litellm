@@ -18,17 +18,16 @@ models:
     - auto-review
     - auto-review-other
     - codex-auto-review
-    - provider-alibaba_token_plan
-    - provider-anthropic
+    - provider-alibaba
     - provider-cohere
-    - provider-cursor_agent
+    - provider-cursor
     - provider-kimi_code
     - provider-nvidia
     - provider-openai
     - provider-opencode_zen
     - provider-openrouter
     - provider-xai
-    - provider-zai_coding_plan
+      - provider-zai
   skip_prefixes:
     - aawm-
     - claude-
@@ -80,17 +79,16 @@ models:
       - auto-review
       - auto-review-other
     provider_coverage:
-      - provider-alibaba_token_plan
-      - provider-anthropic
-      - provider-cohere
-      - provider-cursor_agent
+    - provider-alibaba
+    - provider-cohere
+    - provider-cursor
       - provider-kimi_code
       - provider-nvidia
       - provider-openai
       - provider-opencode_zen
       - provider-openrouter
       - provider-xai
-      - provider-zai_coding_plan
+    - provider-zai
     catalog_picker: catalog_picker_sample
   default_model_group: all
   default_orchestration_parent: sota-openai
