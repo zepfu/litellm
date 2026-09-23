@@ -234,6 +234,45 @@ def extract_and_raise_litellm_exception(
                 )
 
 
+def _cohere_provider_status_code(original_exception: Any) -> Any:
+    status_code = getattr(original_exception, "status_code", None)
+    if status_code is None:
+        provider_response = getattr(original_exception, "response", None)
+        if provider_response is not None:
+            status_code = getattr(provider_response, "status_code", None)
+    return status_code
+
+
+def _raise_cohere_provider_http_499(
+    *,
+    original_exception: BaseException,
+    error_str: str,
+    model: str,
+) -> None:
+    """Map a provider-returned Cohere HTTP 499 to a cancellation-marked APIError."""
+
+    provider_response = getattr(original_exception, "response", None)
+    cohere_message = getattr(original_exception, "message", error_str)
+    raised_exception = APIError(
+        status_code=499,
+        message=f"CohereException - {cohere_message}",
+        llm_provider="cohere",
+        model=model,
+        request=getattr(original_exception, "request", None),
+    )
+    if provider_response is not None:
+        setattr(raised_exception, "response", provider_response)
+    mark_cohere_cancellation(
+        raised_exception,
+        provider_returned=(
+            provider_response is not None
+            or getattr(original_exception, "_aawm_provider_returned", False) is True
+            or type(original_exception).__name__ == "CohereError"
+        ),
+    )
+    raise raised_exception
+
+
 def exception_type(  # type: ignore  # noqa: PLR0915
     model,
     original_exception,
@@ -332,6 +371,18 @@ def exception_type(  # type: ignore  # noqa: PLR0915
             ################################################################################
             #################### Start of Provider Exception mapping ####################
             ################################################################################
+
+            # Provider HTTP 499 is cancellation even when the body says the request timed out.
+            # This stays ahead of the shared timeout-text heuristic and does not change 5xx mapping.
+            if (
+                custom_llm_provider == "cohere" or custom_llm_provider == "cohere_chat"
+            ) and _cohere_provider_status_code(original_exception) == 499:
+                exception_mapping_worked = True
+                _raise_cohere_provider_http_499(
+                    original_exception=original_exception,
+                    error_str=error_str,
+                    model=model,
+                )
 
             if (
                 "Request Timeout Error" in error_str
@@ -1531,36 +1582,13 @@ def exception_type(  # type: ignore  # noqa: PLR0915
                     original_exception, (asyncio.CancelledError, GeneratorExit)
                 ):
                     raise original_exception
-                cohere_status_code = getattr(original_exception, "status_code", None)
-                provider_response = getattr(original_exception, "response", None)
-                if cohere_status_code is None and provider_response is not None:
-                    cohere_status_code = getattr(provider_response, "status_code", None)
-                if cohere_status_code == 499:
+                if _cohere_provider_status_code(original_exception) == 499:
                     exception_mapping_worked = True
-                    cohere_message = getattr(original_exception, "message", error_str)
-                    raised_exception = APIError(
-                        status_code=499,
-                        message=f"CohereException - {cohere_message}",
-                        llm_provider="cohere",
+                    _raise_cohere_provider_http_499(
+                        original_exception=original_exception,
+                        error_str=error_str,
                         model=model,
-                        request=getattr(original_exception, "request", None),
                     )
-                    if provider_response is not None:
-                        setattr(raised_exception, "response", provider_response)
-                    mark_cohere_cancellation(
-                        raised_exception,
-                        provider_returned=(
-                            provider_response is not None
-                            or getattr(
-                                original_exception,
-                                "_aawm_provider_returned",
-                                False,
-                            )
-                            is True
-                            or type(original_exception).__name__ == "CohereError"
-                        ),
-                    )
-                    raise raised_exception
                 if (
                     "invalid api token" in error_str
                     or "No API key provided." in error_str

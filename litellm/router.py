@@ -5193,6 +5193,8 @@ class Router:
         """
         Common utilities for async_function_with_fallbacks
         """
+        if is_cohere_request_cancellation(e):
+            raise e
         verbose_router_logger.debug(f"Traceback{traceback.format_exc()}")
         original_exception = e
         fallback_model_group = None
@@ -5342,6 +5344,8 @@ class Router:
 
                 return response
         except Exception as new_exception:
+            if is_cohere_request_cancellation(new_exception):
+                raise
             parent_otel_span = _get_parent_otel_span_from_kwargs(kwargs)
             verbose_router_logger.error(
                 "litellm.router.py::async_function_with_fallbacks() - Error occurred while trying to do fallbacks - {}\n{}\n\nDebug Information:\nCooldown Deployments={}".format(
@@ -5612,6 +5616,8 @@ class Router:
                     return response
 
                 except Exception as e:
+                    if is_cohere_request_cancellation(e):
+                        raise
                     # Always track the latest error so we raise the most
                     # recent exception instead of the first one.
                     original_exception = e
