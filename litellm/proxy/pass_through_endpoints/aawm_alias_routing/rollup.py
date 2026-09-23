@@ -19,6 +19,7 @@ from litellm.llms.alibaba_token_plan.chat.transformation import (
     ALIBABA_TOKEN_PLAN_CHAT_COMPLETIONS_URL,
 )
 from litellm.proxy.aawm_route_logging import (
+    _AAWM_ROUTE_ROLLUP_REQUEST_TERMINAL_STATUS_VALUES,
     _normalize_aawm_route_log_reasoning_effort,
     _resolve_aawm_route_rollup_reasoning_effort,
     _safe_aawm_route_target_label,
@@ -547,6 +548,7 @@ def _record_auto_agent_alias_route_status_rollup(  # noqa: PLR0915
             if has_candidate_local_attribution
             and candidate_index == len(candidate_entries) - 1
             and status is not None
+            and status in _AAWM_ROUTE_ROLLUP_REQUEST_TERMINAL_STATUS_VALUES
             else {}
         )
         candidate_outgoing_target = (
