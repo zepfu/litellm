@@ -1,13 +1,13 @@
 ---
-name: provider-alibaba_token_plan
-description: Harness v2 child for AAWM alias provider-alibaba_token_plan. MUST be used when the parent asks to spawn agent=provider-alibaba_token_plan.
+name: provider-cursor
+description: Harness v2 child for AAWM alias provider-cursor. MUST be used when the parent asks to spawn agent=provider-cursor.
 spawns: "*"
 model:
-  - "litellm-alpha-passthrough/provider-alibaba_token_plan"
+  - "litellm-alpha-passthrough/provider-cursor"
 thinkingLevel: auto
 ---
 
-Worker for the LiteLLM-alpha passthrough alias `provider-alibaba_token_plan`.
+Worker for the LiteLLM-alpha passthrough alias `provider-cursor`.
 
 Tools: FULL access (bash, read, grep, etc.). MUST hyperfocus the assigned task.
 

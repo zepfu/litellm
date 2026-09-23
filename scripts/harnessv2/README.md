@@ -94,17 +94,18 @@ tmux -L tmux37 attach -t <hv2-ohmypi-…>
 Leftover count: platform 0, catalog 0 (HTTP; optional picker does not
 leave a dedicated inspect session as a baseline leftover), optional
 `--test model` / `--model all` = one dedicated session per compiled
-alias (including `provider-*` except `provider-anthropic` and all
-`claude-*` aliases, which current closeout must not select or run),
+alias (including `provider-*` but excluding all `claude-*` aliases,
+which current closeout must not select or run),
 orchestration = 1 parent session.
 Baseline walk leftover is the orch parent session, not the full
 `--model all` leftover set.
 
 Ohmypi `--model all` expands compiled aliases, including OMP-facing
 `auto-review`, Codex-client compatibility `codex-auto-review`, and the
-`provider-<id>` aliases except `provider-anthropic` and all `claude-*`
-aliases. Those remain catalog/history facts, not current closeout
-selection/run targets. Codex `--test model` defaults to `basic` only.
+`provider-<id>` aliases except all `claude-*` aliases. The removed
+`provider-anthropic` alias remains historical evidence only. Claude aliases
+are not current closeout selection/run targets. Codex `--test model`
+defaults to `basic` only.
 Do not treat Ohmypi
 `--model all` as the Codex OC-003 surface. Codex model/orchestration is
 tool-bearing (child `date`/`pwd`); it is not Ohmypi `--no-tools` PONG.
@@ -158,8 +159,8 @@ python scripts/harnessv2/run.py \
 ```
 
 That plan must stay tools-on. Each child is a `provider-<id>` Ohmypi
-`agent=` profile except `provider-anthropic` and all `claude-*` aliases,
-which current closeout `provider_coverage` must not select or run.
+`agent=` profile. The removed `provider-anthropic` profile and all `claude-*`
+aliases must not be selected or run by current closeout `provider_coverage`.
 Credential, quota, tool-contract, and provider errors fail that
 provider; they are not converted into a mixed-alias pass. Never
 target `aawm-litellm` or `litellm-dev`.

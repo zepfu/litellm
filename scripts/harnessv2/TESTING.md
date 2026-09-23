@@ -158,8 +158,8 @@ DB / `LITELLM_MASTER_KEY` secrets (`checks.yaml` `child_env`).
 `--model all` expands `compiled_aliases` only, including both
 OMP-facing `auto-review` and Codex-client compatibility
 `codex-auto-review`. Current closeout selection/run omits
-`provider-anthropic` and all `claude-*` aliases from that expansion;
-they remain catalog/history facts:
+all `claude-*` aliases from that expansion. The removed `provider-anthropic`
+alias remains historical evidence only:
 
 - `basic`, `basic-other`, `work`, `work-other`, `expert`, `expert-other`,
   `sota`
@@ -167,9 +167,9 @@ they remain catalog/history facts:
   `sota-deepseek`, `sota-zai`
 - `auto-review`, `auto-review-other`, `codex-auto-review`
 - configured non-empty `provider-<id>` aliases
-  (`provider-openai`, `provider-anthropic`, `provider-openrouter`,
-  `provider-xai`, `provider-kimi_code`, `provider-alibaba_token_plan`,
-  `provider-zai_coding_plan`, `provider-cohere`, `provider-cursor_agent`,
+  (`provider-openai`, `provider-openrouter`,
+  `provider-xai`, `provider-kimi_code`, `provider-alibaba`,
+  `provider-zai`, `provider-cohere`, `provider-cursor`,
   `provider-opencode_zen`, `provider-nvidia`). This list is the configured
   provider-pinned inventory, not every direct identity in
   `REGISTERED_PROVIDERS`. `provider-nvidia` is a closed same-provider NVIDIA
@@ -180,12 +180,12 @@ they remain catalog/history facts:
 
 Skip prefixes: `aawm-`, `claude-`. Absent catalog ids
 (`aawm-sota-zai`, …) are recorded so a picker must not treat them as
-present. `provider-anthropic` and `claude-*` are catalog/history facts,
-not current closeout selection/run targets.
+present. The removed `provider-anthropic` alias and any `claude-*` aliases
+are not current closeout selection/run targets.
 
 Groups:
 
-- `all` → compiled aliases except `provider-anthropic` and all
+- `all` → compiled aliases except all
   `claude-*` aliases (catalog/history only; do not select or run)
 - `all-sota` → the six `sota-*` parents
 - `orchestration_children` (thirteen) → `basic`, `basic-other`, `work`,
@@ -195,7 +195,7 @@ Groups:
   Spawn name is `auto-review`, not `codex-auto-review`. Not orchestration
   children: `sota-deepseek`, `codex-auto-review`.
 - `provider_coverage` → the configured non-empty `provider-<id>` aliases
-  listed in `models.yaml`, except `provider-anthropic`. It is not derived
+  listed in `models.yaml`. It is not derived
   from every direct identity in `REGISTERED_PROVIDERS`. All `claude-*`
   aliases stay omitted from current closeout selection/run. This is the
   provider-pinned Ohmypi orchestration group. It is not mixed into
@@ -488,7 +488,7 @@ From `config/tuis.yaml`:
 | Forbid | `-p`, `--print`, `--profile`, `exec` |
 | Model tools | on (not `--no-tools` PONG) |
 | Orchestration tools | on |
-| Model pass | standalone `hv2-codex-child` **and** a current-turn child spawn plus `Ran date` / `Ran pwd` context with compatible stdout after `spawn_agent` with `model=basic` and a non-empty message (Codex may prefix the token with `• `). Local `/root/hv2_child_*` or `/root/hv2_codex_child*` chrome, a workspace path alone, or a token with no stdout, is not a pass. Provider 404 needles do not pass Codex `tool_command`. Do not spawn ChatGPT-unsupported child models (`qwen`/`kimi`/`deepseek`/`grok`/`moonshot`). Leftover trust-nux `Working with untrusted contents` is not a busy needle; in-flight work is `Working (`. `sota-zai` and `provider-zai_coding_plan` override this walk: exact `PONG`, tools off. A `basic` child in that Z.AI session is a session-owner 409, not Z.AI acceptance. |
+| Model pass | standalone `hv2-codex-child` **and** a current-turn child spawn plus `Ran date` / `Ran pwd` context with compatible stdout after `spawn_agent` with `model=basic` and a non-empty message (Codex may prefix the token with `• `). Local `/root/hv2_child_*` or `/root/hv2_codex_child*` chrome, a workspace path alone, or a token with no stdout, is not a pass. Provider 404 needles do not pass Codex `tool_command`. Do not spawn ChatGPT-unsupported child models (`qwen`/`kimi`/`deepseek`/`grok`/`moonshot`). Leftover trust-nux `Working with untrusted contents` is not a busy needle; in-flight work is `Working (`. `sota-zai` and `provider-zai` override this walk: exact `PONG`, tools off. A `basic` child in that Z.AI session is a session-owner 409, not Z.AI acceptance. |
 
 `--tui grok` and `--tui opencode` remain stubs. `--tui claude` stays out
 of scope and is excluded from current closeout (do not select or run;

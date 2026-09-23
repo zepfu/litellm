@@ -1,13 +1,13 @@
 ---
-name: provider-zai_coding_plan
-description: Harness v2 child for AAWM alias provider-zai_coding_plan. MUST be used when the parent asks to spawn agent=provider-zai_coding_plan.
+name: provider-zai
+description: Harness v2 child for AAWM alias provider-zai. MUST be used when the parent asks to spawn agent=provider-zai.
 spawns: "*"
 model:
-  - "litellm-alpha-passthrough/provider-zai_coding_plan"
+  - "litellm-alpha-passthrough/provider-zai"
 thinkingLevel: auto
 ---
 
-Worker for the LiteLLM-alpha passthrough alias `provider-zai_coding_plan`.
+Worker for the LiteLLM-alpha passthrough alias `provider-zai`.
 
 Tools: FULL access (bash, read, grep, etc.). MUST hyperfocus the assigned task.
 

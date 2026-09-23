@@ -137,10 +137,10 @@ generated from every snapshot alias and do not invent a denylist.
 
 Provider-pinned aliases are configured acceptance surfaces, not a required
 one-to-one inventory of `REGISTERED_PROVIDERS`. The current configured
-`provider-<id>` aliases are `provider-openai`, `provider-anthropic`,
+`provider-<id>` aliases are `provider-openai`,
 `provider-openrouter`, `provider-xai`, `provider-kimi_code`,
-`provider-alibaba_token_plan`, `provider-zai_coding_plan`, `provider-cohere`,
-`provider-cursor_agent`, `provider-opencode_zen`, and `provider-nvidia`.
+`provider-alibaba`, `provider-zai`, `provider-cohere`,
+`provider-cursor`, `provider-opencode_zen`, and `provider-nvidia`.
 These aliases are not operational routing policy. They do not change
 `basic` / `work` / `expert` / `sota` candidate order.
 
@@ -163,9 +163,8 @@ substitute OpenRouter free Nemotron (`nvidia/nemotron-*:free` stays on
 OpenCode Zen keeps both adapter forms (`anthropic_opencode_zen_responses_adapter`
 and `anthropic_opencode_zen_completion_adapter`). xAI keeps managed
 `oa_xai/grok-4.7` and native `xai/grok-4.7` lanes distinct. Cursor Grok
-stays on `provider-cursor_agent`. Anthropic coverage remains
-Anthropic-native (`anthropic_messages`); Codex ingress still drops that
-family.
+stays on `provider-cursor`. The `provider-anthropic` alias is removed;
+Anthropic-native provider implementation remains unchanged.
 
 Auto-agent xAI dispatch has a closed route-family pair per ingress:
 `codex_xai_oauth_responses_adapter` /
@@ -200,20 +199,22 @@ thirteen mixed `orchestration_children`. Provider coverage is selected with
 The `basic` alias references `basic-other` (priority 110), then falls back to
 OpenAI `gpt-6-luna` (priority 0, `reasoning_effort: low`).
 
-`basic-other` orders Alibaba Token Plan
-`alibaba_token_plan/deepseek-v4.1-flash` (priority 100, admitted only during
-the recurring half-open `22:00-08:00 UTC+8` window), Z.AI Coding Plan
-`zai_coding_plan/glm-5.3-flash` (priority 90, admitted only from
-`18:00-14:00 UTC+8`), and Cursor Agent
-`cursor_agent/composer-2.5` (priority 80). These three candidates have no
-configured reasoning-effort override. The helper has no OpenAI or Anthropic
+`basic-other` orders Z.AI Coding Plan `zai_coding_plan/glm-5.3-flash`
+(priority 170, admitted only from `23:00-09:00 UTC+8`), Cohere (160),
+Nous (150), NVIDIA (140), OpenRouter (130), OpenCode Go `omen-alpha` (120),
+OpenCode Go `muse-spark-1.3-contributor` (110), then Alibaba Token Plan
+`alibaba_token_plan/deepseek-v4.1-flash` (100, `22:00-08:00 UTC+8`).
+These candidates have no configured reasoning-effort override.
+The helper has no OpenAI or Anthropic
 tail; Luna is configured only on `basic`.
 
-Alibaba candidates reached through `basic*`, `work*`, and `expert*` are gated
+Alibaba candidates in `basic-other`, `work-other`, `expert-other`, and
+`auto-review-other` are gated
 by `start_time: "22:00:00"`, `end_time: "08:00:00"`,
-`utc_offset: "+08:00"`. Z.AI candidates in those aliases use
-`start_time: "18:00:00"`, `end_time: "14:00:00"`,
-`utc_offset: "+08:00"`, excluding the daily 14:00-18:00 peak period.
+`utc_offset: "+08:00"`. Z.AI candidates in `basic-other`, `work-other`,
+and `auto-review-other` use `start_time: "23:00:00"`,
+`end_time: "09:00:00"`, `utc_offset: "+08:00"`.
+Dedicated Z.AI aliases are unchanged and have no daily schedule.
 Both windows recur every day, include the start, and exclude the end;
 there is no weekday distinction. The `work-other` Alibaba gate is on its
 `sota-deepseek` reference, so direct `sota-deepseek` use is unchanged.
@@ -339,14 +340,14 @@ The `work` alias is compiled from `work.yaml`. Candidate order is:
 It is a valid exact-name route, a valid `alias_reference` target, and an
 Ohmypi orchestration child.
 
-Its candidates are `alias_reference: sota-deepseek` (priority 110, scheduled
-for the daily half-open window `22:00-08:00 UTC+8`), Z.AI Coding Plan
-`zai_coding_plan/glm-5.3-flash` (priority 100, admitted only from
-`18:00-14:00 UTC+8`), `alias_reference: sota-moonshot`
+Its candidates are Z.AI Coding Plan `zai_coding_plan/glm-5.3-flash`
+(priority 120, admitted only from `23:00-09:00 UTC+8`),
+`alias_reference: sota-deepseek` (priority 110, scheduled
+for the daily half-open window `22:00-08:00 UTC+8`),
+`alias_reference: sota-moonshot`
 (priority 90), Muse `muse-spark-1.3-contributor` (`provider: muse_code`,
 `route_family: muse_code`, priority 85, no reasoning-effort override),
-and `alias_reference: sota-xai` (priority 80). The Z.AI candidate is skipped
-during its daily `14:00-18:00 UTC+8` peak window.
+and `alias_reference: sota-xai` (priority 80).
 `sota-xai` currently expands in this order: native xAI/OIDC `xai/grok-4.7`,
 then managed xAI/OAuth `oa_xai/grok-4.7`. Cursor Grok remains on
 `sota-cursor`. Luna remains the final OpenAI fallback
@@ -367,12 +368,10 @@ xAI/OAuth, Cursor Grok, or Anthropic candidates.
 `auto-review` first references `auto-review-other` (priority 100), then uses
 OpenAI `gpt-6-luna` (priority 90, `reasoning_effort: low`).
 
-`auto-review-other` orders scheduled Alibaba Token Plan
-`alibaba_token_plan/deepseek-v4.1-flash` (priority 100,
-`22:00-08:00 UTC+8`), Z.AI Coding Plan
-`zai_coding_plan/glm-5.3-flash` (priority 90, admitted only from
-`18:00-14:00 UTC+8` daily, excluding 14:00-18:00 peak hours), and Cursor Agent
-`cursor_agent/composer-2.5` (priority 80), all at low effort.
+`auto-review-other` orders Z.AI Coding Plan
+`zai_coding_plan/glm-5.3-flash` (priority 110, `23:00-09:00 UTC+8`),
+then Alibaba Token Plan `alibaba_token_plan/deepseek-v4.1-flash`
+(priority 100, `22:00-08:00 UTC+8`), both at low effort.
 `codex-auto-review` remains a public name but contains only
 `alias_reference: auto-review`; both public aliases are defined in
 `auto-review.yaml`.
