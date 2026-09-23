@@ -27,7 +27,7 @@ models:
     - provider-opencode_zen
     - provider-openrouter
     - provider-xai
-      - provider-zai
+    - provider-zai
   skip_prefixes:
     - aawm-
     - claude-
@@ -79,16 +79,16 @@ models:
       - auto-review
       - auto-review-other
     provider_coverage:
-    - provider-alibaba
-    - provider-cohere
-    - provider-cursor
+      - provider-alibaba
+      - provider-cohere
+      - provider-cursor
       - provider-kimi_code
       - provider-nvidia
       - provider-openai
       - provider-opencode_zen
       - provider-openrouter
       - provider-xai
-    - provider-zai
+      - provider-zai
     catalog_picker: catalog_picker_sample
   default_model_group: all
   default_orchestration_parent: sota-openai
