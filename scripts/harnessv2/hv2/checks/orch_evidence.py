@@ -32,6 +32,11 @@ _COMPLETION_TOOLS = {"task", "hub", "bash", "yield"}
 _JSONL_SCAN_CAP = 64
 _JSONL_MAX_BYTES = 2 * 1024 * 1024
 _JSONL_MAX_LINES = 20000
+_PROVIDER_ALIAS_IDS = {
+    "provider-alibaba": "alibaba_token_plan",
+    "provider-cursor": "cursor_agent",
+    "provider-zai": "zai_coding_plan",
+}
 
 class _BoundedJSONLRead:
     def __init__(self, records: list[dict[str, Any]], truncated: bool) -> None:
@@ -165,7 +170,7 @@ def _alias_tail(value: Any) -> str:
 
 def _provider_id_from_alias(alias: str) -> str:
     if alias.startswith("provider-"):
-        return alias[len("provider-") :]
+        return _PROVIDER_ALIAS_IDS.get(alias, alias[len("provider-") :])
     return ""
 
 

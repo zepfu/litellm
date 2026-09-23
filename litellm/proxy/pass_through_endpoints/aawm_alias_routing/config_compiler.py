@@ -57,6 +57,9 @@ _PROVIDER_ALIAS_IDS: dict[str, str] = {
     "cursor": "cursor_agent",
     "zai": "zai_coding_plan",
 }
+_PROVIDER_ID_ALIAS_NAMES = {
+    provider_id: alias_id for alias_id, provider_id in _PROVIDER_ALIAS_IDS.items()
+}
 
 
 def _provider_alias_id(name: str) -> str:
@@ -126,27 +129,25 @@ _PROVIDER_ALLOWED_ROUTE_FAMILIES: dict[str, frozenset[str]] = {
 
 
 def provider_alias_name(provider_id: str) -> str:
-    """Return the canonical ``provider-<id>`` alias spelling."""
+    """Return the canonical provider-pinned alias spelling."""
 
-    return f"{PROVIDER_ALIAS_PREFIX}{provider_id}"
+    alias_id = _PROVIDER_ID_ALIAS_NAMES.get(provider_id, provider_id)
+    return f"{PROVIDER_ALIAS_PREFIX}{alias_id}"
 
 
 def iter_provider_alias_names(aliases: Mapping[str, object]) -> tuple[str, ...]:
-    """Return sorted ``provider-<id>`` alias names present in *aliases*."""
+    """Return sorted provider-pinned alias names present in *aliases*."""
 
     return tuple(sorted(name for name in aliases if name.startswith(PROVIDER_ALIAS_PREFIX)))
 
 
 def uncovered_registered_providers(aliases: Mapping[str, object]) -> tuple[str, ...]:
-    """Return registered providers without a configured ``provider-<id>`` alias.
+    """Return registered providers without a configured ``provider-*`` alias.
 
     Direct provider registration does not require a provider-pinned alias.
     """
 
-    present = {
-        name[len(PROVIDER_ALIAS_PREFIX) :]
-        for name in iter_provider_alias_names(aliases)
-    }
+    present = {_provider_alias_id(name) for name in iter_provider_alias_names(aliases)}
     return tuple(sorted(schema.REGISTERED_PROVIDERS - present))
 
 
