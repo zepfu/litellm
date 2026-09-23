@@ -518,6 +518,11 @@ candidate-unavailable, or a generic provider-returned `401` after provider
 I/O. Each account is attempted at most once for those failover cases, and each
 failed account receives only its own lane cooldown.
 
+Cooldown publication runs through the host-globals bindings installed by
+`cooldown_state.install()`. The shared `_publish_family_cooldown_memory`
+helper must be included in that binding set so an account-scoped failure can
+publish its cooldown before selecting an overflow account (OPENAI-073).
+
 Continuations are owner-first. Each continuation gets one owner-first attempt
 against the recorded upstream owner account and remains pinned unless the
 complete request is replay-safe, fully client-carried, still pre-commit, and
