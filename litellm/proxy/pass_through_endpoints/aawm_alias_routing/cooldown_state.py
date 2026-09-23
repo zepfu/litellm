@@ -1036,6 +1036,7 @@ _HOST_FUNCTION_NAMES = (
     "_set_anthropic_auto_agent_session_affinity",
     "_format_merged_alias_family_cooldown_state_source",
     "_get_anthropic_auto_agent_merged_codex_openai_cooldown_state",
+    "_publish_family_cooldown_memory",
     "_publish_codex_cooldown_memory",
     "_publish_anthropic_cooldown_memory",
     "_attach_aawm_alias_routing_state_sources",
