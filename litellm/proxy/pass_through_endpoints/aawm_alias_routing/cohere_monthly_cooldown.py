@@ -66,20 +66,21 @@ _RPM_PERIODS = frozenset(
 )
 _NON_EXHAUSTED_MONTHLY_STATUSES = frozenset({"available", "ok", "active", "remaining", "healthy"})
 # Affirmative exhaustion of the monthly quota or limit itself. Copulas may
-# sit between the subject and the verb. A denial may put words or a
-# contraction between the negation and the verb ("not yet exhausted",
-# "haven't exhausted"). A partial usage value may follow the verb after a
-# colon ("reached: 25%"). Neither is exhaustion.
+# sit between the subject and the verb. A denial may put words between the
+# negation and the verb for both forms ("not yet exhausted", "haven't yet
+# exhausted"). A partial usage value may follow the verb after a colon
+# ("reached: 25%"). Neither is exhaustion.
 _EXHAUSTION_VERB = r"(?:exhausted|exceeded|reached|depleted)"
 _MONTHLY_SUBJECT = r"monthly\s+(?:trial(?:\s+limit|\s+quota)?|quota|limit|usage|allowance|capacity)"
+_NEGATION_GAP = r"(?:\s+\w+){0,4}\s+"
 _NEGATED_EXHAUSTION = (
     rf"(?:"
-    rf"\b(?:not|never|no)\b(?:\s+\w+){{0,4}}\s+{_EXHAUSTION_VERB}\b"
+    rf"\b(?:not|never|no)\b{_NEGATION_GAP}{_EXHAUSTION_VERB}\b"
     rf"|"
     rf"\b(?:have|has|had|is|are|was|were|do|does|did|would|should|could|will|wo)"
-    rf"n['’]?t\s+{_EXHAUSTION_VERB}\b"
+    rf"n['’]?t{_NEGATION_GAP}{_EXHAUSTION_VERB}\b"
     rf"|"
-    rf"\bcannot\s+{_EXHAUSTION_VERB}\b"
+    rf"\bcannot{_NEGATION_GAP}{_EXHAUSTION_VERB}\b"
     rf")"
 )
 # The match starts at the beginning of the clause, so a negated verb cannot
