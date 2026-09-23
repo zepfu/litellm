@@ -155,13 +155,13 @@ The current canonical alias YAML exposes these alpha test paths:
   promotion, Z.AI Coding Plan, Cursor Composer, and mutually exclusive
   Luna/Haiku tails.
 - `work` references `work-other`, then keeps its Claude-only native Sonnet
-  leaves and OpenAI `gpt-5.6-luna`. `work-other` orders the nightly DeepSeek
+  leaves and OpenAI `gpt-6-luna`. `work-other` orders the nightly DeepSeek
   promotion, Z.AI Coding Plan, Moonshot, then xAI.
 - `expert` references `expert-other` before OpenAI `gpt-5.6-terra`;
   `expert-other` orders nightly Alibaba Qwen Max, Cursor Grok, then native xAI.
 - `auto-review` references `auto-review-other`, then Luna and OpenRouter
   DeepSeek. `codex-auto-review` references that same public graph.
-- `sota-openai` uses OpenAI `gpt-5.6-sol`.
+- `sota-openai` uses OpenAI `gpt-6-astra`.
 - `sota-xai` orders native xAI/OIDC `xai/grok-4.7`, then managed
   xAI/OAuth `oa_xai/grok-4.7`. Cursor Agent
   `cursor_agent/cursor-grok-4.6-high` stays on `sota-cursor`.

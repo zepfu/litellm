@@ -191,14 +191,14 @@ thirteen mixed `orchestration_children`. Provider coverage is selected with
 `sota` / OpenAI is a provider-specific failure, not a pass.
 
 `provider-openai` is the closed egress-validation sequence
-`gpt-5.6-luna` (priority 100), `gpt-5.6-terra` (priority 90), then
-`gpt-5.6-sol` (priority 0). All three candidates use
+`gpt-6-luna` (priority 100), `gpt-5.6-terra` (priority 90),
+`gpt-6-sol` (priority 80), then `gpt-6-astra` (priority 0). All candidates use
 `reasoning_effort: low`; this does not change `sota-openai`.
 
 ## Maintained `basic` and `basic-other` alias behavior
 
 The `basic` alias references `basic-other` (priority 110), then falls back to
-OpenAI `gpt-5.6-luna` (priority 0, `reasoning_effort: low`).
+OpenAI `gpt-6-luna` (priority 0, `reasoning_effort: low`).
 
 `basic-other` orders Alibaba Token Plan
 `alibaba_token_plan/deepseek-v4.1-flash` (priority 100, admitted only during
@@ -267,7 +267,7 @@ actual routed fallback.
 ## Provider-specific basic aliases
 
 These Codex aliases select a native provider first, then OpenAI
-`gpt-5.6-luna` with `reasoning_effort: low` as the last resort:
+`gpt-6-luna` with `reasoning_effort: low` as the last resort:
 
 | Alias | Native candidate |
 | --- | --- |
@@ -333,7 +333,7 @@ request-local.
 The `work` alias is compiled from `work.yaml`. Candidate order is:
 
 1. Nested `alias_reference: work-other` (priority 110)
-2. OpenAI `gpt-5.6-luna` (priority 0, `reasoning_effort: high`)
+2. OpenAI `gpt-6-luna` (priority 0, `reasoning_effort: high`)
 
 `work-other` is an ordinary configured alias compiled from `work-other.yaml`.
 It is a valid exact-name route, a valid `alias_reference` target, and an
@@ -365,7 +365,7 @@ xAI/OAuth, Cursor Grok, or Anthropic candidates.
 ## Maintained `auto-review` aliases
 
 `auto-review` first references `auto-review-other` (priority 100), then uses
-OpenAI `gpt-5.6-luna` (priority 90, `reasoning_effort: low`).
+OpenAI `gpt-6-luna` (priority 90, `reasoning_effort: low`).
 
 `auto-review-other` orders scheduled Alibaba Token Plan
 `alibaba_token_plan/deepseek-v4.1-flash` (priority 100,
@@ -380,8 +380,8 @@ OpenAI `gpt-5.6-luna` (priority 90, `reasoning_effort: low`).
 ## Maintained `sota-openai` alias behavior
 
 The `sota-openai` alias is compiled from `sota-openai.yaml` and currently has
-one candidate: OpenAI/Codex `gpt-5.6-sol` (`codex_responses`, priority 100,
-`reasoning_effort: medium`). The generic `sota` dispatch selects
+one candidate: OpenAI/Codex `gpt-6-astra` (`codex_responses`, priority 100,
+`reasoning_effort: high`). The generic `sota` dispatch selects
 `sota-openai` for Codex and default origins. Its `grok` branch selects
 `sota-xai`, whose order is native xAI/OIDC `xai/grok-4.7`, then managed
 xAI/OAuth `oa_xai/grok-4.7`. Cursor Grok remains on `sota-cursor`.
@@ -664,7 +664,7 @@ curl -sS http://127.0.0.1:4001/aawm/alias-routing/cooldowns/clear \
 An exact target uses the actual snapshot identity:
 
 ```json
-{"provider":"openai","model":"gpt-5.6-luna","ingress":"codex"}
+{"provider":"openai","model":"gpt-6-luna","ingress":"codex"}
 ```
 
 5. Require `cleared` or `not_active`, inspect the returned candidates, source,

@@ -46,7 +46,8 @@ API value `max` (`none`, `low`, `medium`, `high`, `xhigh`, `max`) using the
 config-driven `supports_max_reasoning_effort` capability. Context-window and
 unrelated capability fields remain omitted until independently verified.
 
-The user-level Codex model catalog exposes `max` for Sol, Terra, and Luna.
+The user-level Codex model catalog includes GPT-6 Sol and Luna alongside
+the retained GPT-5.6 entries, with `max` available for Sol, Terra, and Luna.
 `ultra` is exposed only for Sol: it is a Codex product intelligence mode that
 combines maximum reasoning with proactive subagent delegation, not an API
 `reasoning.effort` value sent by LiteLLM.
@@ -71,13 +72,13 @@ Config-driven alias routing uses:
 - `sota-alibaba`: `alibaba_token_plan/qwen3.8-max` → `alibaba_token_plan/qwen3.7-max`
 - `sota-zai`: `zai_coding_plan/glm-5.3` (priority 110), then last-resort
   `alibaba_token_plan/glm-5.2` (priority 100)
-- `provider-openai`: egress-validation order `gpt-5.6-luna` (priority 100) →
-  `gpt-5.6-terra` (priority 90) → `gpt-5.6-sol` (priority 80) → `gpt-6-astra`
+- `provider-openai`: egress-validation order `gpt-6-luna` (priority 100) →
+  `gpt-5.6-terra` (priority 90) → `gpt-6-sol` (priority 80) → `gpt-6-astra`
   (priority 0), all with `reasoning_effort: low`
 - `basic`: Cohere `cohere/north-mini-code-1-0` (90) → OpenRouter `openrouter/cohere/north-mini-code:free` (80) → OpenCode Zen `big-pickle` (50) → `basic-other`
 - `basic-other`: during `22:00-08:00 UTC+8`, Alibaba `alibaba_token_plan/deepseek-v4.1-flash` (100) is admitted before Z.AI `zai_coding_plan/glm-5.3-flash` (90) and Cursor Composer `cursor_agent/composer-2.5` (80); the priority-zero tail is Luna at low effort for non-Claude/missing/unknown origins or native Haiku for Claude origins
 - `work`: nested `work-other` alias reference (priority 110) → Claude-only native
-  Sonnet tail → `gpt-5.6-luna` (priority 0) with `reasoning_effort: high`
+  Sonnet tail → `gpt-6-luna` (priority 0) with `reasoning_effort: high`
 - `work-other`: ordinary configured alias and valid exact-name / `alias_reference` target. During `22:00-08:00 UTC+8` the order is `sota-deepseek` (`alibaba_token_plan/deepseek-v4-pro`), Z.AI `zai_coding_plan/glm-5.3-flash`, `sota-moonshot`, then `sota-xai` in its declared order: native xAI OIDC `xai/grok-4.7`, then managed xAI OAuth `oa_xai/grok-4.7`. Outside that window DeepSeek is omitted from new selection.
 - `expert`: `expert-other` (priority 100) → OpenAI/Codex `gpt-6-astra`
   (`codex_responses`, priority 0) with authoritative `reasoning_effort: low`
@@ -121,7 +122,7 @@ An alias YAML candidate may optionally set an authoritative reasoning effort:
 
 ```yaml
 candidates:
-  - model: gpt-5.6-luna
+  - model: gpt-6-luna
     reasoning_effort: low
 ```
 
