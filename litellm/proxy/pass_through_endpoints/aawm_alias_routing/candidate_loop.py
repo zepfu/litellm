@@ -1309,6 +1309,7 @@ _ZAI_CODING_PLAN_KIND_TO_ERROR_CLASS = {
     ZAICodingPlanFailureKind.MODEL_UNAVAILABLE: "candidate_unavailable",
     ZAICodingPlanFailureKind.VALIDATION: "provider_terminal_error",
     ZAICodingPlanFailureKind.ROUTING: "provider_terminal_error",
+    ZAICodingPlanFailureKind.FORBIDDEN: "provider_forbidden",
 }
 
 
@@ -1323,8 +1324,10 @@ def _classify_codex_zai_coding_plan_candidate_failure(
     1113 on the coding base is a wrong-base / wrong-key routing defect, not
     ordinary-balance recharge. Model-unavailable business codes require both
     an attempted call, explicit provider-return attribution, and an HTTP 400
-    or 404 response. Unknown codes return ``None`` so generic classifiers can
-    still inspect HTTP status.
+    or 404 response. A 401 or 403 with no recognized business code is a
+    bounded ``provider_forbidden`` outcome only after an attempted,
+    provider-returned call. Unknown codes return ``None`` so generic
+    classifiers can still inspect HTTP status.
     """
 
     if (
@@ -1350,11 +1353,19 @@ def _classify_codex_zai_coding_plan_candidate_failure(
         or failure.status_code not in {400, 404}
     ):
         return "provider_terminal_error"
+    if failure.kind == ZAICodingPlanFailureKind.FORBIDDEN and (
+        not attempted_provider_call
+        or (
+            getattr(exc, "_aawm_provider_returned", False) is not True
+            and getattr(exc, "provider_returned", False) is not True
+        )
+    ):
+        return None
+    if failure.kind == ZAICodingPlanFailureKind.FORBIDDEN:
+        setattr(exc, "_aawm_zai_coding_plan_safe_failure", "provider_forbidden")
     if failure.kind != ZAICodingPlanFailureKind.UNKNOWN:
         return _ZAI_CODING_PLAN_KIND_TO_ERROR_CLASS.get(failure.kind)
     if _exception_chain_contains_type(exc, ZAICodingPlanAuthenticationError):
-        return "provider_terminal_error"
-    if _error_signals._extract_adapter_exception_status_code(exc) == 401:
         return "provider_terminal_error"
     return None
 
