@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import time
@@ -78,7 +79,11 @@ def _settings_cache_ttl_seconds() -> float:
         configured = float(raw.strip())
     except ValueError:
         return ALIBABA_TOKEN_PLAN_SETTINGS_CACHE_TTL_SECONDS
-    if configured <= 0 or configured > _ALIBABA_TOKEN_PLAN_SETTINGS_CACHE_MAX_TTL_SECONDS:
+    if (
+        not math.isfinite(configured)
+        or configured <= 0
+        or configured > _ALIBABA_TOKEN_PLAN_SETTINGS_CACHE_MAX_TTL_SECONDS
+    ):
         return ALIBABA_TOKEN_PLAN_SETTINGS_CACHE_TTL_SECONDS
     return configured
 
@@ -132,7 +137,7 @@ def _fresh_settings_api_key(
     if cached is None:
         return None
     age = now - cached.loaded_at
-    if age < 0 or age >= ttl_seconds:
+    if not math.isfinite(ttl_seconds) or ttl_seconds <= 0 or age < 0 or age >= ttl_seconds:
         return None
     _settings_file_cache.move_to_end(cache_key)
     return cached
@@ -293,21 +298,19 @@ class AlibabaTokenPlanChatConfig(DashScopeChatConfig):
             if cached is not None:
                 return cached.api_key
 
-        generation = _settings_file_generation(settings_path)
-        with _settings_file_cache_lock:
+            generation = _settings_file_generation(settings_path)
             cached = _settings_file_cache.get(cache_key)
             if cached is not None and cached.generation == generation:
                 cached.loaded_at = time.monotonic()
                 _settings_file_cache.move_to_end(cache_key)
                 return cached.api_key
 
-        api_key = AlibabaTokenPlanChatConfig._parse_qwen_settings_api_key(settings_file.strip())
-        confirmed = _settings_file_generation(settings_path)
-        if confirmed != generation:
-            return api_key
-        with _settings_file_cache_lock:
+            api_key = AlibabaTokenPlanChatConfig._parse_qwen_settings_api_key(settings_file.strip())
+            confirmed = _settings_file_generation(settings_path)
+            if confirmed != generation:
+                return api_key
             _remember_settings_file_cache(cache_key, confirmed, api_key)
-        return api_key
+            return api_key
 
     @classmethod
     def _get_canonical_api_key(cls) -> str:
