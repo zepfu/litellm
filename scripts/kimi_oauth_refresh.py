@@ -220,6 +220,10 @@ class _KimiCodeLock:
         self.retry_sleep = retry_sleep
         self.now = now
         self._identity: Optional[Tuple[int, int, int]] = None
+        # Heartbeat utime changes ctime. Hold this across that mutation and the
+        # matching identity update so a concurrent owner check cannot observe
+        # the in-between ctime and reject the rightful holder.
+        self._ownership_lock = threading.Lock()
         self._heartbeat_failure: Optional[KimiOAuthLockOwnershipError] = None
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: Optional[threading.Thread] = None
@@ -272,6 +276,10 @@ class _KimiCodeLock:
             return
 
     def assert_owned(self) -> None:
+        with self._ownership_lock:
+            self._assert_owned_unlocked()
+
+    def _assert_owned_unlocked(self) -> None:
         if self._heartbeat_failure is not None:
             raise self._heartbeat_failure
         if self._identity is None:
@@ -343,6 +351,22 @@ class _KimiCodeLock:
             raise KimiOAuthLockOwnershipError(f"Kimi OAuth lock path is no longer a directory: {self.lock_path}")
         return lock_stat.st_dev, lock_stat.st_ino, lock_stat.st_ctime_ns
 
+    def _open_lock_directory(self) -> int:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        return os.open(self.lock_path, flags)
+
+    def _descriptor_identity(self, directory_fd: int) -> Tuple[int, int, int]:
+        lock_stat = os.fstat(directory_fd)
+        if not stat.S_ISDIR(lock_stat.st_mode):
+            raise KimiOAuthLockOwnershipError(f"Kimi OAuth lock path is no longer a directory: {self.lock_path}")
+        return lock_stat.st_dev, lock_stat.st_ino, lock_stat.st_ctime_ns
+
     def _retry_delay(self, retry_index: int) -> float:
         delay = self.min_delay_seconds * (self.factor**retry_index)
         return min(max(delay, 0.0), self.max_delay_seconds)
@@ -359,23 +383,39 @@ class _KimiCodeLock:
 
     def _heartbeat(self) -> None:
         while not self._heartbeat_stop.wait(self.heartbeat_seconds):
-            try:
-                self.assert_owned()
+            with self._ownership_lock:
+                directory_fd: Optional[int] = None
                 try:
-                    os.utime(self.lock_path, None, follow_symlinks=False)
-                except TypeError:
-                    os.utime(self.lock_path, None)
-                # utime advances ctime, so record the post-heartbeat identity
-                # only after verifying that the directory was ours beforehand.
-                self._identity = self._directory_identity()
-            except KimiOAuthLockOwnershipError as exc:
-                self._heartbeat_failure = exc
-                return
-            except OSError as exc:
-                self._heartbeat_failure = KimiOAuthLockOwnershipError(
-                    f"Unable to heartbeat Kimi OAuth lock directory {self.lock_path}: {exc}"
-                )
-                return
+                    self._assert_owned_unlocked()
+                    directory_fd = self._open_lock_directory()
+                    pinned = self._descriptor_identity(directory_fd)
+                    if pinned != self._identity:
+                        raise KimiOAuthLockOwnershipError(
+                            "Kimi OAuth lock ownership changed while refresh was in progress."
+                        )
+                    # Heartbeat the pinned directory, then publish its ctime
+                    # only if the pathname still names that descriptor.
+                    os.utime(directory_fd, None)
+                    updated = self._descriptor_identity(directory_fd)
+                    if updated[:2] != pinned[:2] or self._directory_identity() != updated:
+                        raise KimiOAuthLockOwnershipError(
+                            "Kimi OAuth lock ownership changed while refresh was in progress."
+                        )
+                    self._identity = updated
+                except KimiOAuthLockOwnershipError as exc:
+                    self._heartbeat_failure = exc
+                    return
+                except OSError as exc:
+                    self._heartbeat_failure = KimiOAuthLockOwnershipError(
+                        f"Unable to heartbeat Kimi OAuth lock directory {self.lock_path}: {exc}"
+                    )
+                    return
+                finally:
+                    if directory_fd is not None:
+                        try:
+                            os.close(directory_fd)
+                        except OSError:
+                            pass
 
 
 def refresh_kimi_oauth_auth_file(
