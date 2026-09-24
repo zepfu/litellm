@@ -7959,6 +7959,7 @@ def install(host_globals: dict) -> None:
         "_get_openrouter_account_lane_cooldown_state",
         "_apply_openrouter_account_lane_cooldown",
         "_apply_cohere_credential_lane_cooldown",
+        "_apply_zen_account_lane_cooldown",
         "_apply_openrouter_credit_lane_cooldown",
         "_is_finite_number",
         "_cohere_observation_exhausted",
