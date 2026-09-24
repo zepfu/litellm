@@ -19,7 +19,6 @@ from litellm.llms.alibaba_token_plan.chat.transformation import (
     ALIBABA_TOKEN_PLAN_CHAT_COMPLETIONS_URL,
 )
 from litellm.proxy.aawm_route_logging import (
-    _AAWM_ROUTE_ROLLUP_REQUEST_TERMINAL_STATUS_VALUES,
     _normalize_aawm_route_log_reasoning_effort,
     _resolve_aawm_route_rollup_reasoning_effort,
     _safe_aawm_route_target_label,
@@ -192,13 +191,6 @@ def _auto_agent_alias_route_rollup_status(event: dict[str, Any]) -> Optional[str
         return "Recovered"
     if _auto_agent_alias_request_outcome_is_pending_failover(event):
         # Same-request account failover is diagnostic until the request ends.
-        if (
-            event.get("attempted_provider_call") is True
-            and _clean_codex_auth_value(event.get("provider"))
-            == _CODEX_AUTO_AGENT_NATIVE_PROVIDER
-            and _clean_codex_auth_value(event.get("account_hash"))
-        ):
-            return "Failed"
         return None
     if "auth_degraded" in candidate_status or "auth_degraded" in selection_reason:
         return "Degraded"
@@ -261,19 +253,14 @@ def _should_emit_auto_agent_alias_route_status_event(
 ) -> bool:
     """Keep routine successful OAuth failover recovery out of standalone logs."""
 
+    recovery_reason = (
+        _clean_codex_auth_value(event.get("selection_reason"))
+        or _clean_codex_auth_value(event.get("reason"))
+    )
     if (
         status != "Recovered"
-        or event.get("selection_reason") != "codex_oauth_account_failover"
+        or recovery_reason != "codex_oauth_account_failover"
     ):
-        if (
-            status == "Failed"
-            and _auto_agent_alias_request_outcome_is_pending_failover(event)
-            and event.get("attempted_provider_call") is True
-            and _clean_codex_auth_value(event.get("provider"))
-            == _CODEX_AUTO_AGENT_NATIVE_PROVIDER
-            and _clean_codex_auth_value(event.get("account_hash"))
-        ):
-            return False
         return True
     if event.get("redispatch_required") or event.get("redispatch_threshold_crossed"):
         return True
@@ -464,6 +451,11 @@ def _record_auto_agent_alias_route_status_rollup(  # noqa: PLR0915
                 )
             }
         )
+        request_status_kwargs = (
+            {"request_status": status}
+            if status in {"Failed", "Exhausted", "Recovered"}
+            else {}
+        )
         record_aawm_route_rollup(
             group_header_label=group_header_label,
             incoming_endpoint=incoming_endpoint,
@@ -471,7 +463,7 @@ def _record_auto_agent_alias_route_status_rollup(  # noqa: PLR0915
             model_label="",
             effort=effort,
             turns=0,
-            request_status=status,
+            **request_status_kwargs,
             request_only=True,
             **request_origin_kwargs,
         )
@@ -548,7 +540,6 @@ def _record_auto_agent_alias_route_status_rollup(  # noqa: PLR0915
             if has_candidate_local_attribution
             and candidate_index == len(candidate_entries) - 1
             and status is not None
-            and status in _AAWM_ROUTE_ROLLUP_REQUEST_TERMINAL_STATUS_VALUES
             else {}
         )
         candidate_outgoing_target = (
