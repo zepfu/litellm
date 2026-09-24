@@ -127,25 +127,64 @@ def resolve_alibaba_token_plan_subscription_identity() -> Optional[str]:
     return _subscription_identity_from_settings()
 
 
+def _candidate_subscription_identity(value: Any) -> Optional[str]:
+    """Accept only the contract hash. Empty and non-string values are unknown."""
+
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if not _is_alibaba_subscription_identity(normalized):
+        return None
+    return normalized
+
+
+def _candidate_instance_identity(value: Any) -> Optional[str]:
+    """Hash a candidate instance code. Empty and non-string values are unknown."""
+
+    if not isinstance(value, str):
+        return None
+    return alibaba_token_plan_subscription_identity(value)
+
+
 def subscription_identity_for_candidate(
     candidate: Optional[Mapping[str, Any]],
 ) -> Optional[str]:
     """Return the lane identity, or None when it is missing or mismatched.
 
-    An explicit identity that is not the contract hash does not fall through
-    to another configured subscription.
+    A present identity field that is empty, non-string, or not the contract
+    hash stays unknown. When both the hash and instance code are supplied,
+    they must name the same subscription. The process-wide identity is used
+    only for an Alibaba Token Plan candidate that did not supply either field.
     """
 
-    if isinstance(candidate, Mapping):
-        explicit = candidate.get("subscription_identity")
-        if isinstance(explicit, str) and explicit.strip():
-            normalized = explicit.strip().lower()
-            if _is_alibaba_subscription_identity(normalized):
-                return normalized
+    if not isinstance(candidate, Mapping):
+        return None
+    has_identity = "subscription_identity" in candidate
+    has_instance = "instance_code" in candidate
+    if has_identity or has_instance:
+        identity = (
+            _candidate_subscription_identity(candidate.get("subscription_identity"))
+            if has_identity
+            else None
+        )
+        if has_identity and identity is None:
             return None
-        instance_code = candidate.get("instance_code")
-        if isinstance(instance_code, str) and instance_code.strip():
-            return alibaba_token_plan_subscription_identity(instance_code)
+        instance_identity = (
+            _candidate_instance_identity(candidate.get("instance_code"))
+            if has_instance
+            else None
+        )
+        if has_instance and instance_identity is None:
+            return None
+        if (
+            identity is not None
+            and instance_identity is not None
+            and identity != instance_identity
+        ):
+            return None
+        return identity or instance_identity
+    if candidate.get("provider") != ALIBABA_TOKEN_PLAN_PROVIDER_NAME:
+        return None
     return resolve_alibaba_token_plan_subscription_identity()
 
 
