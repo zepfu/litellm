@@ -2140,12 +2140,14 @@ display label does not change routing or session-history identity; model,
 masked account, effort, turn count, and destination formatting remain unchanged.
 Managed OpenAI provider egress uses ` - model(alias) (masked-account):effort`
 only for the attempted account; configured or pre-egress-skipped accounts do not
-render. Same-account retries aggregate, and distinct attempted accounts remain
-separate sublines in attempt order. Missing or invalid account display metadata
-renders as `OpenAI-account(redacted)`.
+render. Same-account retries aggregate, and distinct accounts with visible
+rollup activity remain separate sublines in attempt order. Missing or invalid
+account display metadata renders as `OpenAI-account(redacted)`.
 `Cooling Down` is reserved for actual candidate-scoped cooldown or
 skipped-cooldown state; `retryable_no_cooldown`, scope `none`, and request-local
-redispatch/failover failures render as `Failed` instead of `Cooling Down`.
+terminal redispatch/failover failures render as `Failed` instead of `Cooling Down`.
+Pending same-request Codex OAuth account failover remains diagnostic rather
+than terminal and does not emit failed-attempt status rows in normal rollups.
 Exhausted and Degraded labels are unchanged. The subline appends ` -> outgoing`
 only when the model's destination differs from the incoming endpoint's default
 upstream target for the group. For example, native Anthropic traffic under `/anthropic/v1/messages`
@@ -2194,11 +2196,16 @@ Terminal rollup state is request-scoped when LiteLLM has a stable call ID: a
 `Recovered` event reconciles only that request's prior terminal state, so an
 unrelated direct or alias `Failed`/`Exhausted` event on the same
 model/effort/target subline remains visible. A routine successful
-`codex_oauth_account_failover` recovery with no error evidence skips only its
+`codex_oauth_account_failover` recovery with no error evidence, identified by
+the event's selection reason or attempt reason, skips only its
 standalone status line; its request audit record and zero-turn aggregate state
 remain intact. Recoveries carrying a `409`, provider-error evidence, or
 redispatch state, as well as non-routine recovery, failure, and exhaustion
 events, continue to emit standalone status lines.
+Pending quota-failover diagnostics remain in the audit trail, not in logical
+request failure state, even when recovery crosses a rollup interval. Successful
+completion contributes its normal turn count in the completion interval; a
+zero-turn recovery status does not count as a completed turn.
 
 Successful streaming and non-streaming Codex auto-agent requests adapted to
 OpenCode Zen chat completions or OpenRouter chat completions also register
