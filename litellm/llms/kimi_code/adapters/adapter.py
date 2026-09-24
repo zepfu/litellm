@@ -206,17 +206,50 @@ def _apply_kimi_reasoning_effort(
         completion_kwargs["reasoning_effort"] = mapped_effort
 
 
-def _normalize_kimi_forced_tool_choice_for_k3_reasoning(
+def _kimi_named_tool_choice_name(tool_choice: Any) -> Optional[str]:
+    """Return the forced function name, or the Kimi ``specified`` marker.
+
+    Kimi's chat contract forces one function with
+    ``{"type": "function", "function": {"name": "<name>"}}``. Responses and
+    custom ingress use a top-level ``name`` on ``function``, ``custom``, or
+    ``tool``. The string ``specified`` is Kimi's name for that same forced
+    shape. ``auto``, ``none``, ``required``, and omitted choices are not named.
+    """
+
+    if tool_choice == "specified":
+        return "specified"
+    if not isinstance(tool_choice, dict):
+        return None
+    tool_name = None
+    function = tool_choice.get("function")
+    if isinstance(function, dict):
+        tool_name = function.get("name")
+    elif (
+        tool_choice.get("type") in {"custom", "function", "tool"}
+        and "name" in tool_choice
+    ):
+        tool_name = tool_choice.get("name")
+    if isinstance(tool_name, str) and tool_name:
+        return tool_name
+    return None
+
+
+def _reject_incompatible_kimi_named_tool_choice(
     *,
     completion_kwargs: dict[str, Any],
     upstream_model: str,
     original_tool_choice: Any = None,
 ) -> None:
-    """Kimi returns 400 when a forced tool choice is paired with thinking.
+    """Reject a named Kimi tool choice before egress.
 
-    K3 uses thinking by default even when no reasoning effort is provided.
-    Normalize specific tool choices to `auto` so function tools continue to
-    flow while avoiding the incompatible `tool_choice='specified'` shape.
+    K3 always thinks. Kimi documents ``auto``, ``none``, and ``required`` for
+    that model. The forced-function object
+    ``{"type": "function", "function": {"name": "<name>"}}`` is the only
+    named representation, and Kimi returns 400
+    ``tool_choice 'specified' is incompatible with thinking enabled`` for it.
+    ``auto`` and ``required`` drop the named target, so they are not
+    substitutes. ``auto``, ``none``, ``required``, and an omitted choice are
+    left unchanged.
     """
 
     if not is_k3_model_id(upstream_model):
@@ -225,22 +258,22 @@ def _normalize_kimi_forced_tool_choice_for_k3_reasoning(
     tool_choice = original_tool_choice
     if tool_choice is None:
         tool_choice = completion_kwargs.get("tool_choice")
+    if _kimi_named_tool_choice_name(tool_choice) is None:
+        return
 
-    if isinstance(tool_choice, dict):
-        tool_name = None
-        if isinstance(tool_choice.get("function"), dict):
-            tool_name = tool_choice["function"].get("name")
-        elif tool_choice.get("type") in {"custom", "function", "tool"} and "name" in tool_choice:
-            tool_name = tool_choice.get("name")
-        if not isinstance(tool_name, str) or not tool_name:
-            return
-        completion_kwargs["tool_choice"] = "auto"
-        return
-    elif tool_choice == "specified":
-        completion_kwargs["tool_choice"] = "auto"
-        return
-    else:
-        return
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "error": {
+                "message": (
+                    "Kimi K3 cannot force a named tool while thinking is "
+                    "enabled."
+                ),
+                "type": "invalid_request_error",
+                "code": "kimi_named_tool_choice_incompatible_with_thinking",
+            }
+        },
+    )
 
 
 def _get_kimi_message_field(message: Any, field: str) -> Any:
@@ -759,7 +792,7 @@ async def prepare_codex_kimi_chat_completions_adapter_route(
         forced_effort=forced_effort,
         completion_kwargs=completion_kwargs,
     )
-    _normalize_kimi_forced_tool_choice_for_k3_reasoning(
+    _reject_incompatible_kimi_named_tool_choice(
         completion_kwargs=completion_kwargs,
         upstream_model=upstream_model,
         original_tool_choice=request_body.get("tool_choice"),
