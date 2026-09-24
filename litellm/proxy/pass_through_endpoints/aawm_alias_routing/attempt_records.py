@@ -1525,17 +1525,27 @@ def _confirmed_pre_egress_failure(error: BaseException) -> bool:
     return False
 
 
+def _explicit_provider_send(source: Any) -> bool:
+    """Honor an authoritative positive send marker without inferring one."""
+
+    if getattr(source, "attempted_provider_call", None) is True:
+        return True
+    detail = getattr(source, "detail", None)
+    if isinstance(detail, Mapping) and detail.get("attempted_provider_call") is True:
+        return True
+    return isinstance(source, Mapping) and source.get("attempted_provider_call") is True
+
+
 def _provider_send_provenance(source: Any) -> bool:
     """Return whether *source* records that provider I/O actually started."""
 
     if source is None:
         return False
+    if _explicit_provider_send(source):
+        return True
     if getattr(source, "_aawm_provider_returned", None) is True:
         return True
     if getattr(source, "provider_returned", None) is True:
-        return True
-    status_code = getattr(source, "status_code", None)
-    if isinstance(status_code, int) and not isinstance(status_code, bool):
         return True
     for logging_obj in (
         getattr(source, "litellm_logging_obj", None),
@@ -1550,10 +1560,25 @@ def _provider_send_provenance(source: Any) -> bool:
     if isinstance(source, Mapping):
         if source.get("_aawm_provider_returned") is True or source.get("provider_returned") is True:
             return True
-        mapped_status = source.get("status_code")
-        if isinstance(mapped_status, int) and not isinstance(mapped_status, bool):
-            return True
         if source.get("api_call_start_time") is not None:
+            return True
+    return False
+
+
+def _alibaba_subattempt_egress_started(
+    attempt_record: Mapping[str, Any],
+    ordinal: Any,
+) -> bool:
+    subattempts = attempt_record.get("subattempts")
+    if not isinstance(subattempts, list):
+        return False
+    for subattempt in reversed(subattempts):
+        if (
+            isinstance(subattempt, Mapping)
+            and subattempt.get("ordinal") == ordinal
+            and subattempt.get("kind") == "alibaba_ciphertext_generation"
+            and subattempt.get("attempted_provider_call") is True
+        ):
             return True
     return False
 
@@ -1563,6 +1588,10 @@ def _alibaba_provider_call_was_sent(
     response: Any = None,
     error: Optional[BaseException] = None,
 ) -> bool:
+    if error is not None and _explicit_provider_send(error):
+        return True
+    if response is not None and _explicit_provider_send(response):
+        return True
     if error is not None and _confirmed_pre_egress_failure(error):
         return False
     if response is not None and _provider_send_provenance(response):
@@ -1612,11 +1641,14 @@ def finish_alibaba_ciphertext_subattempt(
     attempt_record = _alibaba_attempt_record()
     if attempt_record is None:
         return None
+    egress_started = _alibaba_subattempt_egress_started(attempt_record, ordinal)
     if attempted_provider_call is None:
         attempted_provider_call = _alibaba_provider_call_was_sent(
             response=response,
             error=error,
         )
+    if egress_started:
+        attempted_provider_call = True
     ended = time.monotonic()
     payload: dict[str, Any] = {
         "ordinal": ordinal,
@@ -1662,6 +1694,7 @@ def _settle_outstanding_alibaba_ciphertext_subattempt(
         ordinal=ordinal,
         outcome="cancelled",
         retry_eligible=False,
+        attempted_provider_call=current.get("attempted_provider_call") is True,
         error_class="cancelled",
     )
 
