@@ -728,6 +728,7 @@ def note_direct_openai_managed_success(
                 ),
             }
         )
+    attempt_record["attempted_provider_call"] = True
     attempt_record["attempt_number"] = max(1, _provider_attempt_count(attempts))
     _apply_direct_attempt_trace(
         request,
@@ -760,7 +761,6 @@ def note_direct_openai_managed_success(
         _OPENAI_FAULT_PLAN_DIRECT_SUCCESS_STATE_KEY,
         True,
     )
-    attempt_record["attempted_provider_call"] = True
     attempts = _direct_attempts(request)
     if (
         _authorized_plan_injected_failure(request)
