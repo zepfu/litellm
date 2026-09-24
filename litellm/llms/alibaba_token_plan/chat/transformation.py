@@ -11,15 +11,18 @@ from litellm.llms.dashscope.chat.transformation import DashScopeChatConfig
 from litellm.secret_managers.main import get_secret_str
 from litellm.types.llms.openai import AllMessageValues
 from litellm.types.utils import ModelResponse
+from litellm.utils import get_model_info
 
 from ...openai.common_utils import OpenAIError
 
-ALIBABA_TOKEN_PLAN_API_BASE = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
-ALIBABA_TOKEN_PLAN_CHAT_COMPLETIONS_URL = f"{ALIBABA_TOKEN_PLAN_API_BASE}/chat/completions"
-ALIBABA_TOKEN_PLAN_API_KEY_ENV = "ALIBABA_KEY"
-ALIBABA_TOKEN_PLAN_SETTINGS_FILE_ENV = (
-    "LITELLM_ALIBABA_TOKEN_PLAN_SETTINGS_FILE"
+ALIBABA_TOKEN_PLAN_API_BASE = (
+    "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
 )
+ALIBABA_TOKEN_PLAN_CHAT_COMPLETIONS_URL = (
+    f"{ALIBABA_TOKEN_PLAN_API_BASE}/chat/completions"
+)
+ALIBABA_TOKEN_PLAN_API_KEY_ENV = "ALIBABA_KEY"
+ALIBABA_TOKEN_PLAN_SETTINGS_FILE_ENV = "LITELLM_ALIBABA_TOKEN_PLAN_SETTINGS_FILE"
 ALIBABA_TOKEN_PLAN_PROVIDER_NAME = "alibaba_token_plan"
 ALIBABA_TOKEN_PLAN_RAW_CHOICES_HIDDEN_PARAM = "_alibaba_token_plan_raw_choices"
 # Catalog metadata only: credential discovery and model admission are
@@ -214,3 +217,157 @@ class AlibabaTokenPlanChatConfig(DashScopeChatConfig):
         _ = api_base, api_key, optional_params, litellm_params, stream
         self._model_id(model)
         return ALIBABA_TOKEN_PLAN_CHAT_COMPLETIONS_URL
+
+    def _reasoning_effort_contract(self, model: str) -> Optional[dict[str, Any]]:
+        """Read the provider-bound reasoning contract from model metadata."""
+
+        model_id = self._model_id(model)
+        try:
+            model_info = get_model_info(
+                model=f"{ALIBABA_TOKEN_PLAN_PROVIDER_NAME}/{model_id}",
+                custom_llm_provider=ALIBABA_TOKEN_PLAN_PROVIDER_NAME,
+            )
+        except Exception:
+            return None
+        provider_entries = model_info.get("provider_specific_entry")
+        if not isinstance(provider_entries, dict):
+            return None
+        provider_entry = provider_entries.get(ALIBABA_TOKEN_PLAN_PROVIDER_NAME)
+        if not isinstance(provider_entry, dict):
+            return None
+        contract = provider_entry.get("reasoning_effort_wire")
+        if not isinstance(contract, dict):
+            return None
+        return contract
+
+    @staticmethod
+    def _requested_reasoning_effort(optional_params: dict) -> Any:
+        if "reasoning_effort" in optional_params:
+            return optional_params.get("reasoning_effort")
+        reasoning = optional_params.get("reasoning")
+        if isinstance(reasoning, dict) and "effort" in reasoning:
+            return reasoning.get("effort")
+        return None
+
+    def _apply_reasoning_effort_contract(
+        self, model: str, optional_params: dict
+    ) -> dict:
+        """Translate a requested effort into the metadata-declared wire field.
+
+        Model names do not select the field. The catalog contract does.
+        """
+
+        requested = self._requested_reasoning_effort(optional_params)
+        if requested is None and "reasoning" not in optional_params:
+            return optional_params
+        params = {
+            key: value
+            for key, value in optional_params.items()
+            if key not in {"reasoning_effort", "reasoning"}
+        }
+        if requested is None:
+            return params
+        contract = self._reasoning_effort_contract(model)
+        if contract is None:
+            raise ValueError(
+                f"Alibaba Token Plan model {model!r} has no reasoning-effort "
+                "wire policy. Refusing to forward reasoning_effort."
+            )
+        policy = contract.get("policy")
+        if policy == "reject":
+            raise ValueError(
+                f"Alibaba Token Plan model {model!r} does not support "
+                f"reasoning_effort={requested!r}. Unsupported policy: omit the "
+                "effort field."
+            )
+        if policy == "enable_thinking_only":
+            accepted = contract.get("accepted_efforts")
+            if not isinstance(accepted, list) or requested not in accepted:
+                supported = (
+                    ", ".join(str(value) for value in accepted)
+                    if isinstance(accepted, list)
+                    else ""
+                )
+                raise ValueError(
+                    f"Alibaba Token Plan model {model!r} does not support "
+                    f"reasoning_effort={requested!r}. Supported efforts: "
+                    f"{supported}. Wire field is enable_thinking only."
+                )
+            params["enable_thinking"] = (
+                contract.get("enabled_value")
+                if requested != "none"
+                else contract.get("disabled_value")
+            )
+            return params
+        if policy != "map_reasoning_effort":
+            raise ValueError(
+                f"Alibaba Token Plan model {model!r} has an unknown "
+                f"reasoning-effort policy {policy!r}."
+            )
+        if requested == "none" and contract.get("none_disables_thinking") is True:
+            params["enable_thinking"] = False
+            return params
+        native_values = contract.get("native_values")
+        value_map = contract.get("value_map")
+        if not isinstance(native_values, list) or not isinstance(value_map, dict):
+            raise ValueError(
+                f"Alibaba Token Plan model {model!r} has an incomplete "
+                "reasoning-effort wire contract."
+            )
+        mapped = value_map.get(requested)
+        wire_field = contract.get("wire_field")
+        if (
+            not isinstance(wire_field, str)
+            or not wire_field
+            or not isinstance(mapped, str)
+            or mapped not in native_values
+        ):
+            supported = ", ".join(str(value) for value in value_map)
+            raise ValueError(
+                f"Alibaba Token Plan model {model!r} does not support "
+                f"reasoning_effort={requested!r}. Supported efforts: {supported}."
+            )
+        params[wire_field] = mapped
+        return params
+
+    def map_openai_params(
+        self,
+        non_default_params: dict,
+        optional_params: dict,
+        model: str,
+        drop_params: bool,
+    ) -> dict:
+        mapped = super().map_openai_params(
+            non_default_params=non_default_params,
+            optional_params=optional_params,
+            model=model,
+            drop_params=drop_params,
+        )
+        if "reasoning_effort" in non_default_params:
+            mapped = {
+                **mapped,
+                "reasoning_effort": non_default_params["reasoning_effort"],
+            }
+        if "reasoning" in non_default_params:
+            mapped = {**mapped, "reasoning": non_default_params["reasoning"]}
+        return self._apply_reasoning_effort_contract(model, mapped)
+
+    def transform_request(
+        self,
+        model: str,
+        messages: List[AllMessageValues],
+        optional_params: dict,
+        litellm_params: dict,
+        headers: dict,
+    ) -> dict:
+        """Serialize the provider-bound body after the reasoning-effort contract."""
+
+        return super().transform_request(
+            model=model,
+            messages=messages,
+            optional_params=self._apply_reasoning_effort_contract(
+                model, optional_params
+            ),
+            litellm_params=litellm_params,
+            headers=headers,
+        )
