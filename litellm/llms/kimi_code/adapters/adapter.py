@@ -420,66 +420,120 @@ def _restore_kimi_codex_agent_message_payloads(
     }
 
 
+def _kimi_assistant_tool_call_ids(message: Any) -> Optional[list[str]]:
+    if _get_kimi_message_field(message, "role") != "assistant":
+        return None
+    tool_calls = _get_kimi_message_field(message, "tool_calls")
+    if not tool_calls:
+        return None
+    if not isinstance(tool_calls, list):
+        raise ValueError("Kimi Code continuation history contains invalid assistant tool_calls.")
+    call_ids: list[str] = []
+    for tool_call in tool_calls:
+        call_id = _get_kimi_message_field(tool_call, "id")
+        if not isinstance(call_id, str) or not call_id.strip():
+            raise ValueError(
+                "Kimi Code continuation history contains an assistant tool call " "without a valid id."
+            )
+        call_ids.append(call_id)
+    return call_ids
+
+
+def _kimi_tool_result_call_id(message: Any) -> Optional[str]:
+    if _get_kimi_message_field(message, "role") != "tool":
+        return None
+    tool_call_id = _get_kimi_message_field(message, "tool_call_id")
+    if not isinstance(tool_call_id, str) or not tool_call_id.strip():
+        raise ValueError(
+            "Kimi Code continuation history contains a tool result without a " "valid tool_call_id."
+        )
+    return tool_call_id
+
+
+def _format_kimi_tool_call_ids(call_ids: set[str]) -> str:
+    return ", ".join(repr(call_id) for call_id in sorted(call_ids))
+
+
+def _raise_kimi_open_tool_results(
+    messages: list[Any],
+    start_index: int,
+    pending_ids: set[str],
+) -> None:
+    """Reject a still-open tool turn without moving later results."""
+
+    for message in messages[start_index:]:
+        tool_call_id = _kimi_tool_result_call_id(message)
+        if tool_call_id in pending_ids:
+            raise ValueError(
+                "Kimi Code continuation history cannot represent an intervening turn "
+                "before tool results for "
+                f"tool_call_id(s): {_format_kimi_tool_call_ids(pending_ids)}."
+            )
+    raise ValueError(
+        "Kimi Code continuation history is missing tool results for "
+        f"tool_call_id(s): {_format_kimi_tool_call_ids(pending_ids)}."
+    )
+
+
 def _normalize_kimi_tool_result_adjacency(messages: list[Any]) -> list[Any]:
-    """Place replayed tool results immediately after their assistant calls."""
+    """Keep representable tool-result chronology unchanged.
+
+    Adjacent results stay in their existing order. Unknown, duplicate, missing,
+    and intervening-turn histories raise instead of being rewritten.
+    """
 
     assistant_call_ids_by_index: dict[int, list[str]] = {}
     assistant_call_ids: set[str] = set()
     for index, message in enumerate(messages):
-        if _get_kimi_message_field(message, "role") != "assistant":
+        call_ids = _kimi_assistant_tool_call_ids(message)
+        if not call_ids:
             continue
-        tool_calls = _get_kimi_message_field(message, "tool_calls")
-        if not tool_calls:
-            continue
-        if not isinstance(tool_calls, list):
-            raise ValueError("Kimi Code continuation history contains invalid assistant tool_calls.")
-        call_ids: list[str] = []
-        for tool_call in tool_calls:
-            call_id = _get_kimi_message_field(tool_call, "id")
-            if not isinstance(call_id, str) or not call_id.strip():
-                raise ValueError(
-                    "Kimi Code continuation history contains an assistant tool call " "without a valid id."
-                )
+        for call_id in call_ids:
             if call_id in assistant_call_ids:
                 raise ValueError(
                     "Kimi Code continuation history contains duplicate assistant " f"tool_call_id {call_id!r}."
                 )
             assistant_call_ids.add(call_id)
-            call_ids.append(call_id)
         assistant_call_ids_by_index[index] = call_ids
 
-    tool_results_by_id: dict[str, Any] = {}
-    for message in messages:
-        if _get_kimi_message_field(message, "role") != "tool":
+    pending_ids: set[str] = set()
+    seen_result_ids: set[str] = set()
+    for index, message in enumerate(messages):
+        if index in assistant_call_ids_by_index:
+            if pending_ids:
+                _raise_kimi_open_tool_results(messages, index, pending_ids)
+            pending_ids = set(assistant_call_ids_by_index[index])
             continue
-        tool_call_id = _get_kimi_message_field(message, "tool_call_id")
-        if not isinstance(tool_call_id, str) or not tool_call_id.strip():
-            raise ValueError("Kimi Code continuation history contains a tool result without a " "valid tool_call_id.")
+
+        tool_call_id = _kimi_tool_result_call_id(message)
+        if tool_call_id is None:
+            if pending_ids:
+                _raise_kimi_open_tool_results(messages, index, pending_ids)
+            continue
         if tool_call_id not in assistant_call_ids:
             raise ValueError(
-                "Kimi Code continuation history contains a tool result for unknown " f"tool_call_id {tool_call_id!r}."
+                "Kimi Code continuation history contains a tool result for unknown "
+                f"tool_call_id {tool_call_id!r}."
             )
-        if tool_call_id in tool_results_by_id:
+        if tool_call_id in seen_result_ids:
             raise ValueError(
-                "Kimi Code continuation history contains duplicate tool results for " f"tool_call_id {tool_call_id!r}."
+                "Kimi Code continuation history contains duplicate tool results for "
+                f"tool_call_id {tool_call_id!r}."
             )
-        tool_results_by_id[tool_call_id] = message
+        if tool_call_id not in pending_ids:
+            raise ValueError(
+                "Kimi Code continuation history cannot represent an intervening turn "
+                f"before the tool result for tool_call_id {tool_call_id!r}."
+            )
+        pending_ids.remove(tool_call_id)
+        seen_result_ids.add(tool_call_id)
 
-    missing_result_ids = assistant_call_ids.difference(tool_results_by_id)
-    if missing_result_ids:
-        formatted_ids = ", ".join(repr(call_id) for call_id in sorted(missing_result_ids))
+    if pending_ids:
         raise ValueError(
-            "Kimi Code continuation history is missing tool results for " f"tool_call_id(s): {formatted_ids}."
+            "Kimi Code continuation history is missing tool results for "
+            f"tool_call_id(s): {_format_kimi_tool_call_ids(pending_ids)}."
         )
-
-    normalized_messages: list[Any] = []
-    for index, message in enumerate(messages):
-        if _get_kimi_message_field(message, "role") == "tool":
-            continue
-        normalized_messages.append(message)
-        for call_id in assistant_call_ids_by_index.get(index, []):
-            normalized_messages.append(tool_results_by_id[call_id])
-    return normalized_messages
+    return messages
 
 
 def _clone_kimi_stream_chunk(chunk: Any) -> Any:
