@@ -10,25 +10,27 @@ Deployment gate
 ---------------
 Set ``LITELLM_KIMI_NATIVE_CONTRACT_PATH`` to the descriptor file path
 and ``LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=true`` to require a resolved
-identity for Kimi routes.  A missing or structurally invalid descriptor
-(unknown or missing fields, digest mismatch, malformed values, identity
-incoherence, or a future ``issued_at``) never fails closed: it falls
-back to the conservative installed-client identity with sanitized
-builtin-source telemetry.  Only actual auth/provider failures remain
-terminal for callers.
+identity for Kimi routes.  Required mode uses only a current descriptor
+or a bounded last-known-good descriptor.  It never fabricates a native
+identity.
 
-MS-035 resilience: descriptor publication failures must never make an
-installed Kimi client unavailable.  An expired but otherwise valid
-descriptor stays usable with a ``stale`` source classification; when no
-usable descriptor exists (missing or malformed), the resolver derives a
-conservative built-in identity from the installed Kimi client contract
-(version, User-Agent shape, device identity) and returns that with a
-``builtin`` source classification.  ``required=true`` therefore only
-selects between the builtin identity and ``None`` when the descriptor is
-missing or malformed; it never raises for publication staleness, absence,
-or structural invalidity.  Without the required flag the resolver returns
-``None`` in those cases and callers fall back to the built-in constants
-(honest fallback that does not claim native parity).
+MS-050 required-mode states:
+
+* ``current`` -- the file just read is structurally valid and unexpired;
+* ``lkg`` -- a structurally valid descriptor whose ``expires_at`` has
+  passed, but ``now`` is still within
+  ``expires_at + LITELLM_KIMI_NATIVE_CONTRACT_LKG_WINDOW_SECONDS``
+  (default 3600).  The same bounded snapshot is reused when a later read
+  is missing, malformed, digest-invalid, or future-dated;
+* ``unavailable`` -- no current or in-window descriptor exists, including
+  a descriptor past the LKG window.  Required mode raises
+  :class:`KimiNativeContractError` with status 503 and a sanitized
+  message that contains no descriptor body, digest, or identity.
+
+Without the required flag the resolver returns ``None`` for unavailable
+cases and callers fall back to built-in constants (honest fallback that
+does not claim native parity).  Bounded fail-closed behavior can reduce
+availability during publisher outages.
 
 This module is strictly read-only: it never writes the descriptor, the
 OAuth credential, or any other file, and it never logs descriptor
@@ -56,6 +58,7 @@ from typing import Dict, Optional, Tuple
 # ---------------------------------------------------------------------------
 KIMI_NATIVE_CONTRACT_PATH_ENV = "LITELLM_KIMI_NATIVE_CONTRACT_PATH"
 KIMI_NATIVE_CONTRACT_REQUIRED_ENV = "LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED"
+KIMI_NATIVE_CONTRACT_LKG_WINDOW_ENV = "LITELLM_KIMI_NATIVE_CONTRACT_LKG_WINDOW_SECONDS"
 
 _logger = logging.getLogger("litellm.secret_managers.kimi_native_contract")
 
@@ -66,12 +69,20 @@ KIMI_NATIVE_BASE_URL = "https://api.kimi.com/coding/v1"
 KIMI_NATIVE_SCHEMA_VERSION = 2
 KIMI_NATIVE_CONTRACT_MAX_BYTES = 65_536  # 64 KiB
 
-# Conservative identity used when the published descriptor is expired but
-# otherwise valid (``stale``), or when no usable descriptor exists and the
-# resolver must derive the installed-client identity (``builtin``).
+# Required-mode states.  ``current`` and ``lkg`` are published identities.
+# ``unavailable`` is not an identity.
+KIMI_NATIVE_CONTRACT_SOURCE_CURRENT = "current"
+KIMI_NATIVE_CONTRACT_SOURCE_LKG = "lkg"
+KIMI_NATIVE_CONTRACT_SOURCE_UNAVAILABLE = "unavailable"
+KIMI_NATIVE_CONTRACT_LKG_WINDOW_SECONDS = 3600
+KIMI_NATIVE_CONTRACT_UNAVAILABLE_STATUS = 503
+KIMI_NATIVE_CONTRACT_UNAVAILABLE_DETAIL = "Kimi native contract is unavailable."
+# Historical source labels kept for callers that still import them.
+# Required mode does not emit builtin or unbounded stale identities.
 KIMI_NATIVE_CONTRACT_SOURCE_DESCRIPTOR = "descriptor"
 KIMI_NATIVE_CONTRACT_SOURCE_STALE = "stale"
 KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN = "builtin"
+_LKG_WINDOW_RE = re.compile(r"\A(?:0|[1-9][0-9]*)\Z")
 
 # Conservative built-in identity floor for the installed Kimi Code client.
 # This is a lower bound on the installed client contract, not the claimed
@@ -125,50 +136,74 @@ _SOURCE_TELEMETRY_STATE: Dict[str, object] = {
     "descriptor": False,
     "stale": False,
     "builtin": False,
+    "current": False,
+    "lkg": False,
+    "unavailable": False,
     "path": None,
 }
+_LKG_BY_PATH: Dict[str, KimiNativeContract] = {}
 
 
 def _reset_source_telemetry_state() -> None:
-    """Test seam: reset the per-process source-telemetry transition state."""
+    """Test seam: reset per-process source telemetry and the LKG snapshot."""
     _SOURCE_TELEMETRY_STATE["descriptor"] = False
     _SOURCE_TELEMETRY_STATE["stale"] = False
     _SOURCE_TELEMETRY_STATE["builtin"] = False
+    _SOURCE_TELEMETRY_STATE["current"] = False
+    _SOURCE_TELEMETRY_STATE["lkg"] = False
+    _SOURCE_TELEMETRY_STATE["unavailable"] = False
     _SOURCE_TELEMETRY_STATE["path"] = None
+    _LKG_BY_PATH.clear()
 
 
 def _record_contract_source(source: str, path: Optional[str]) -> None:
-    """Emit sanitized transition telemetry for stale/builtin resolution.
+    """Emit sanitized transition telemetry for LKG and unavailable resolution.
 
     Only the source classification and descriptor path are logged; the
     descriptor body and credential material are never logged.
     """
+    if source == KIMI_NATIVE_CONTRACT_SOURCE_CURRENT:
+        _SOURCE_TELEMETRY_STATE["current"] = True
+        _SOURCE_TELEMETRY_STATE["path"] = path
+        return
     if source == KIMI_NATIVE_CONTRACT_SOURCE_DESCRIPTOR:
         _SOURCE_TELEMETRY_STATE["descriptor"] = True
         _SOURCE_TELEMETRY_STATE["path"] = path
         return
-    if _SOURCE_TELEMETRY_STATE.get(source) and _SOURCE_TELEMETRY_STATE.get("path") == path:
+    if (
+        _SOURCE_TELEMETRY_STATE.get(source)
+        and _SOURCE_TELEMETRY_STATE.get("path") == path
+    ):
         return
     _SOURCE_TELEMETRY_STATE[source] = True
     _SOURCE_TELEMETRY_STATE["path"] = path
-    if source == KIMI_NATIVE_CONTRACT_SOURCE_STALE:
+    if source == KIMI_NATIVE_CONTRACT_SOURCE_LKG:
         _logger.warning(
-            "Kimi native contract source=stale: descriptor at %s is expired; "
-            "continuing with its older claimed client identity until "
-            "publication catches up.",
-            path,
-        )
-    elif source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN:
-        _logger.warning(
-            "Kimi native contract source=builtin: no usable descriptor at %s; "
-            "using the conservative installed-client identity version=%s.",
+            "Kimi native contract source=lkg: descriptor at %s is inside "
+            "the bounded last-known-good window.",
             path if path else "<unset>",
-            KIMI_NATIVE_BUILTIN_CLIENT_VERSION,
+        )
+    elif source == KIMI_NATIVE_CONTRACT_SOURCE_UNAVAILABLE:
+        _logger.warning(
+            "Kimi native contract source=unavailable: descriptor at %s "
+            "has no current or in-window identity.",
+            path if path else "<unset>",
         )
 
 
 class KimiNativeContractError(Exception):
-    """Raised when the contract descriptor is missing, stale, or malformed."""
+    """Raised when required mode has no current or in-window descriptor.
+
+    ``status_code`` is 503.  The message is sanitized and contains no
+    descriptor body, digest, path, or identity fields.
+    """
+
+    status_code = KIMI_NATIVE_CONTRACT_UNAVAILABLE_STATUS
+
+    def __init__(self, message: str = KIMI_NATIVE_CONTRACT_UNAVAILABLE_DETAIL) -> None:
+        super().__init__(message)
+        self.status_code = KIMI_NATIVE_CONTRACT_UNAVAILABLE_STATUS
+        self.source = KIMI_NATIVE_CONTRACT_SOURCE_UNAVAILABLE
 
 
 @dataclasses.dataclass(frozen=True)
@@ -177,11 +212,10 @@ class KimiNativeContract:
 
     ``source`` classifies where the identity came from:
 
-    * ``descriptor`` -- a current published descriptor;
-    * ``stale`` -- an expired but structurally valid published descriptor
-      (its claimed client identity may be stale);
-    * ``builtin`` -- the conservative installed-client identity derived
-      locally when no usable descriptor exists.
+    * ``current`` -- the descriptor file just read is valid and unexpired;
+    * ``lkg`` -- a published descriptor inside the bounded LKG window;
+    * ``unavailable`` is not stored on a contract.  Required mode raises
+      instead of fabricating an identity.
     """
 
     schema_version: int
@@ -213,9 +247,7 @@ def compute_canonical_digest(payload: Dict) -> str:
     as compact JSON with sorted keys.
     """
     canonical = {k: v for k, v in payload.items() if k != "digest"}
-    blob = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode(
-        "utf-8"
-    )
+    blob = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return "sha256:" + hashlib.sha256(blob).hexdigest()
 
 
@@ -234,9 +266,7 @@ def _parse_timestamp(value: object) -> float:
     if isinstance(value, str):
         # ISO-8601
         try:
-            normalized = (
-                value.replace("Z", "+00:00") if value.endswith("Z") else value
-            )
+            normalized = value.replace("Z", "+00:00") if value.endswith("Z") else value
             dt = datetime.fromisoformat(normalized)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
@@ -249,9 +279,7 @@ def _parse_timestamp(value: object) -> float:
             return ts / 1000.0 if ts > 10_000_000_000 else ts
         except ValueError:
             pass
-    raise KimiNativeContractError(
-        f"unparseable timestamp: {type(value).__name__}"
-    )
+    raise KimiNativeContractError(f"unparseable timestamp: {type(value).__name__}")
 
 
 # ---------------------------------------------------------------------------
@@ -292,16 +320,12 @@ def _validate_and_build(
     for field in ("client_name", "client_version", "user_agent"):
         val = payload[field]
         if not isinstance(val, str) or not val.strip():
-            raise KimiNativeContractError(
-            f"{field} must be a non-empty string"
-            )
+            raise KimiNativeContractError(f"{field} must be a non-empty string")
 
     for field in _X_MSH_DESCRIPTOR_FIELDS:
         val = payload[field]
         if not isinstance(val, str) or not val:
-            raise KimiNativeContractError(
-                f"{field} must be a non-empty string"
-            )
+            raise KimiNativeContractError(f"{field} must be a non-empty string")
         if not _ASCII_PRINTABLE_RE.match(val):
             raise KimiNativeContractError(
                 f"{field} must contain only printable ASCII characters"
@@ -315,17 +339,14 @@ def _validate_and_build(
         )
     expected_ua = f"{_KIMI_USER_AGENT_PREFIX}{client_version}"
     if payload["user_agent"] != expected_ua:
-        raise KimiNativeContractError(
-            f"user_agent must be exactly {expected_ua!r}"
-        )
+        raise KimiNativeContractError(f"user_agent must be exactly {expected_ua!r}")
     if payload["x_msh_platform"] != _KIMI_X_MSH_PLATFORM:
         raise KimiNativeContractError(
             f"x_msh_platform must be exactly {_KIMI_X_MSH_PLATFORM!r}"
         )
     if payload["x_msh_version"] != client_version:
         raise KimiNativeContractError(
-            "x_msh_version must equal client_version "
-            f"({client_version!r})"
+            "x_msh_version must equal client_version " f"({client_version!r})"
         )
     try:
         device_id = payload["x_msh_device_id"]
@@ -350,35 +371,36 @@ def _validate_and_build(
 
     digest = payload["digest"]
     if not isinstance(digest, str) or not digest.startswith("sha256:"):
-        raise KimiNativeContractError(
-            "digest must be a sha256: prefixed string"
-        )
+        raise KimiNativeContractError("digest must be a sha256: prefixed string")
     if digest != compute_canonical_digest(payload):
         raise KimiNativeContractError(
             "digest mismatch: contract may have been tampered with"
         )
 
-    return KimiNativeContract(
-        schema_version=schema_version,
-        client_name=payload["client_name"],
-        client_version=payload["client_version"],
-        base_url=base_url,
-        user_agent=payload["user_agent"],
-        issued_at=issued_at,
-        expires_at=expires_at,
-        digest=digest,
-        x_msh_platform=payload["x_msh_platform"],
-        x_msh_version=payload["x_msh_version"],
-        x_msh_device_name=payload["x_msh_device_name"],
-        x_msh_device_model=payload["x_msh_device_model"],
-        x_msh_os_version=payload["x_msh_os_version"],
-        x_msh_device_id=payload["x_msh_device_id"],
-        source=(
-            KIMI_NATIVE_CONTRACT_SOURCE_STALE
-            if expired
-            else KIMI_NATIVE_CONTRACT_SOURCE_DESCRIPTOR
+    return (
+        KimiNativeContract(
+            schema_version=schema_version,
+            client_name=payload["client_name"],
+            client_version=payload["client_version"],
+            base_url=base_url,
+            user_agent=payload["user_agent"],
+            issued_at=issued_at,
+            expires_at=expires_at,
+            digest=digest,
+            x_msh_platform=payload["x_msh_platform"],
+            x_msh_version=payload["x_msh_version"],
+            x_msh_device_name=payload["x_msh_device_name"],
+            x_msh_device_model=payload["x_msh_device_model"],
+            x_msh_os_version=payload["x_msh_os_version"],
+            x_msh_device_id=payload["x_msh_device_id"],
+            source=(
+                KIMI_NATIVE_CONTRACT_SOURCE_STALE
+                if expired
+                else KIMI_NATIVE_CONTRACT_SOURCE_DESCRIPTOR
+            ),
         ),
-    ), expired
+        expired,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -462,113 +484,205 @@ def _build_builtin_contract() -> KimiNativeContract:
 # ---------------------------------------------------------------------------
 
 
+@dataclasses.dataclass(frozen=True)
+class KimiNativeContractDecision:
+    """Exact required-mode result for one descriptor read.
+
+    ``source`` and ``state`` are ``current``, ``lkg``, or ``unavailable``.
+    ``target`` is the canonical chat-completions URL.  ``headers`` carries
+    descriptor identity only for ``current`` and ``lkg``; unavailable
+    results have no identity headers.  ``status`` is 200 while a published
+    identity is in use and 503 when required mode has nothing to serve.
+    """
+
+    state: str
+    source: str
+    target: str
+    headers: Dict[str, str]
+    status: int
+    contract: Optional[KimiNativeContract] = None
+
+
+def _resolve_lkg_window(explicit: Optional[int]) -> int:
+    if explicit is not None:
+        if isinstance(explicit, bool) or not isinstance(explicit, int) or explicit < 0:
+            raise KimiNativeContractError()
+        return explicit
+    raw = os.environ.get(KIMI_NATIVE_CONTRACT_LKG_WINDOW_ENV)
+    if raw is None or raw.strip() == "":
+        return KIMI_NATIVE_CONTRACT_LKG_WINDOW_SECONDS
+    if _LKG_WINDOW_RE.fullmatch(raw.strip()) is None:
+        raise KimiNativeContractError()
+    return int(raw)
+
+
+def _lkg_key(path: Optional[str]) -> str:
+    return path or ""
+
+
+def _classify_published(
+    contract: KimiNativeContract, *, now: float, window: int
+) -> str:
+    if contract.expires_at > now:
+        return KIMI_NATIVE_CONTRACT_SOURCE_CURRENT
+    if now <= contract.expires_at + window:
+        return KIMI_NATIVE_CONTRACT_SOURCE_LKG
+    return KIMI_NATIVE_CONTRACT_SOURCE_UNAVAILABLE
+
+
+def _remember_lkg(path: Optional[str], contract: KimiNativeContract) -> None:
+    _LKG_BY_PATH[_lkg_key(path)] = contract
+
+
+def _recall_lkg(
+    path: Optional[str], *, now: float, window: int
+) -> Optional[KimiNativeContract]:
+    remembered = _LKG_BY_PATH.get(_lkg_key(path))
+    if remembered is None:
+        return None
+    if now <= remembered.expires_at + window:
+        return dataclasses.replace(remembered, source=KIMI_NATIVE_CONTRACT_SOURCE_LKG)
+    _LKG_BY_PATH.pop(_lkg_key(path), None)
+    return None
+
+
+def _read_descriptor_payload(path: str) -> Optional[Dict]:
+    """Return a JSON object, or ``None`` when the file cannot be used.
+
+    Structural rejection here is not an identity.  Callers may still
+    serve a bounded in-memory LKG snapshot.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode) or st.st_size > KIMI_NATIVE_CONTRACT_MAX_BYTES:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw_text = fh.read()
+    except OSError:
+        return None
+    try:
+        payload = json.loads(raw_text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _decision_for(
+    state: str, contract: Optional[KimiNativeContract]
+) -> KimiNativeContractDecision:
+    target = resolve_endpoint_url(contract, "chat_completions")
+    if contract is None or state == KIMI_NATIVE_CONTRACT_SOURCE_UNAVAILABLE:
+        return KimiNativeContractDecision(
+            state=KIMI_NATIVE_CONTRACT_SOURCE_UNAVAILABLE,
+            source=KIMI_NATIVE_CONTRACT_SOURCE_UNAVAILABLE,
+            target=target,
+            headers={},
+            status=KIMI_NATIVE_CONTRACT_UNAVAILABLE_STATUS,
+            contract=None,
+        )
+    stamped = dataclasses.replace(contract, source=state)
+    return KimiNativeContractDecision(
+        state=state,
+        source=state,
+        target=target,
+        headers=build_outbound_headers(stamped),
+        status=200,
+        contract=stamped,
+    )
+
+
+def resolve_managed_contract_decision(
+    path: Optional[str] = None,
+    *,
+    required: Optional[bool] = None,
+    now: Optional[float] = None,
+    lkg_window_seconds: Optional[int] = None,
+) -> KimiNativeContractDecision:
+    """Classify one descriptor read as current, bounded LKG, or unavailable.
+
+    Does not raise for a missing or invalid descriptor.  Required-mode
+    callers that need the sanitized 503 use :func:`resolve_contract`.
+    """
+    if path is None:
+        path = os.environ.get(KIMI_NATIVE_CONTRACT_PATH_ENV)
+    if required is None:
+        raw = os.environ.get(KIMI_NATIVE_CONTRACT_REQUIRED_ENV, "").strip().lower()
+        required = raw in ("1", "true", "yes")
+    if now is None:
+        now = time.time()
+    window = _resolve_lkg_window(lkg_window_seconds)
+    _ = required
+
+    published: Optional[KimiNativeContract] = None
+    if path:
+        payload = _read_descriptor_payload(path)
+        if payload is not None:
+            try:
+                published, _expired = _validate_and_build(payload, now=now)
+            except KimiNativeContractError:
+                published = None
+
+    if published is not None:
+        state = _classify_published(published, now=now, window=window)
+        if state == KIMI_NATIVE_CONTRACT_SOURCE_UNAVAILABLE:
+            # A readable descriptor past the LKG window is definitive.
+            # Do not keep serving an older snapshot.
+            _LKG_BY_PATH.pop(_lkg_key(path), None)
+            return _decision_for(KIMI_NATIVE_CONTRACT_SOURCE_UNAVAILABLE, None)
+        stamped = dataclasses.replace(published, source=state)
+        _remember_lkg(path, stamped)
+        return _decision_for(state, stamped)
+
+    recalled = _recall_lkg(path, now=now, window=window)
+    if recalled is not None:
+        return _decision_for(KIMI_NATIVE_CONTRACT_SOURCE_LKG, recalled)
+    return _decision_for(KIMI_NATIVE_CONTRACT_SOURCE_UNAVAILABLE, None)
+
+
 def resolve_contract(
     path: Optional[str] = None,
     *,
     required: Optional[bool] = None,
     now: Optional[float] = None,
+    lkg_window_seconds: Optional[int] = None,
 ) -> Optional[KimiNativeContract]:
-    """Resolve the native contract from the configured descriptor file.
+    """Resolve a current or bounded last-known-good native contract.
 
-    MS-035 source classification:
-
-    * ``descriptor`` -- current published descriptor;
-    * ``stale`` -- expired but structurally valid descriptor (kept usable
-      with sanitized stale-source telemetry);
-    * ``builtin`` -- conservative installed-client identity used when the
-      descriptor is missing or malformed.  Publication failures never make
-      an installed Kimi client unavailable, even when *required* is true.
-
-    Returns ``None`` when the descriptor is absent or invalid and not
-    required (honest fallback: callers use their built-in constants).
-    Never raises for descriptor staleness, absence, or structural
-    invalidity: with *required* true those cases resolve the conservative
-    builtin identity with sanitized source telemetry.  Only actual
-    auth/provider failures (raised by callers, never here) remain
-    terminal.
+    Required mode never fabricates identity.  A current descriptor or an
+    in-window LKG descriptor is returned.  Missing, malformed,
+    digest-invalid, future, and beyond-LKG reads with no in-window
+    snapshot raise :class:`KimiNativeContractError` (status 503, sanitized
+    message).  Without the required flag those cases return ``None``.
     """
     if path is None:
         path = os.environ.get(KIMI_NATIVE_CONTRACT_PATH_ENV)
     if required is None:
-        raw = os.environ.get(
-            KIMI_NATIVE_CONTRACT_REQUIRED_ENV, ""
-        ).strip().lower()
+        raw = os.environ.get(KIMI_NATIVE_CONTRACT_REQUIRED_ENV, "").strip().lower()
         required = raw in ("1", "true", "yes")
-    if now is None:
-        now = time.time()
-
-    if not path:
-        if required:
-            contract = _build_builtin_contract()
-            _record_contract_source(contract.source, None)
-            return contract
-        return None
-
-    # -- file-level checks --------------------------------------------------
     try:
-        st = os.stat(path)
-    except OSError:
-        if required:
-            contract = _build_builtin_contract()
-            _record_contract_source(contract.source, path)
-            return contract
-        return None
-
-    if not stat.S_ISREG(st.st_mode):
-        if required:
-            contract = _build_builtin_contract()
-            _record_contract_source(contract.source, path)
-            return contract
-        return None
-
-    if st.st_size > KIMI_NATIVE_CONTRACT_MAX_BYTES:
-        if required:
-            contract = _build_builtin_contract()
-            _record_contract_source(contract.source, path)
-            return contract
-        return None
-
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            raw_text = fh.read()
-    except OSError:
-        if required:
-            contract = _build_builtin_contract()
-            _record_contract_source(contract.source, path)
-            return contract
-        return None
-
-    try:
-        payload = json.loads(raw_text)
-    except (json.JSONDecodeError, ValueError):
-        if required:
-            contract = _build_builtin_contract()
-            _record_contract_source(contract.source, path)
-            return contract
-        return None
-
-    if not isinstance(payload, dict):
-        if required:
-            contract = _build_builtin_contract()
-            _record_contract_source(contract.source, path)
-            return contract
-        return None
-
-    try:
-        contract, _expired = _validate_and_build(payload, now=now)
+        decision = resolve_managed_contract_decision(
+            path,
+            required=required,
+            now=now,
+            lkg_window_seconds=lkg_window_seconds,
+        )
     except KimiNativeContractError:
-        # MS-035: a malformed / schema-invalid / digest-invalid /
-        # identity-incoherent descriptor is treated like an absent one:
-        # required=true falls back to the conservative installed-client
-        # identity with sanitized builtin-source telemetry. Only actual
-        # auth/provider failures remain terminal for callers.
         if required:
-            contract = _build_builtin_contract()
-            _record_contract_source(contract.source, path)
-            return contract
+            _record_contract_source(KIMI_NATIVE_CONTRACT_SOURCE_UNAVAILABLE, path)
+            raise
         return None
-    _record_contract_source(contract.source, path)
-    return contract
+    if decision.contract is None:
+        if required:
+            _record_contract_source(KIMI_NATIVE_CONTRACT_SOURCE_UNAVAILABLE, path)
+            raise KimiNativeContractError()
+        return None
+    _record_contract_source(decision.contract.source, path)
+    return decision.contract
 
 
 def resolve_endpoint_url(
@@ -583,9 +697,7 @@ def resolve_endpoint_url(
     endpoint_path = _ENDPOINT_PATHS.get(usage)
     if endpoint_path is None:
         raise ValueError(f"unknown contract usage: {usage!r}")
-    base = (
-        contract.base_url if contract is not None else KIMI_NATIVE_BASE_URL
-    )
+    base = contract.base_url if contract is not None else KIMI_NATIVE_BASE_URL
     return f"{base}/{endpoint_path}"
 
 
@@ -608,11 +720,7 @@ def build_outbound_headers(
     *accept_json* is ``True`` an ``Accept: application/json`` header is
     emitted (models/usages GET parity).
     """
-    user_agent = (
-        contract.user_agent
-        if contract is not None
-        else fallback_user_agent
-    )
+    user_agent = contract.user_agent if contract is not None else fallback_user_agent
     headers: Dict[str, str] = {"User-Agent": user_agent}
     if contract is not None:
         headers["X-Msh-Platform"] = contract.x_msh_platform
@@ -625,9 +733,7 @@ def build_outbound_headers(
         headers["Accept"] = "application/json"
     if access_token is not None:
         if not isinstance(access_token, str) or not access_token.strip():
-            raise KimiNativeContractError(
-                "access_token must be a non-empty string"
-            )
+            raise KimiNativeContractError("access_token must be a non-empty string")
         headers["Authorization"] = f"Bearer {access_token}"
     if json_body:
         headers["Content-Type"] = "application/json"
