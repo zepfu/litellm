@@ -561,7 +561,7 @@ def _read_descriptor_payload(path: str) -> Optional[Dict]:
     try:
         with open(path, "r", encoding="utf-8") as fh:
             raw_text = fh.read()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
     try:
         payload = json.loads(raw_text)
@@ -630,9 +630,11 @@ def resolve_managed_contract_decision(
     if published is not None:
         state = _classify_published(published, now=now, window=window)
         if state == KIMI_NATIVE_CONTRACT_SOURCE_UNAVAILABLE:
-            # A readable descriptor past the LKG window is definitive.
-            # Do not keep serving an older snapshot.
-            _LKG_BY_PATH.pop(_lkg_key(path), None)
+            # The publication is past its own window. Keep a remembered
+            # snapshot only while that snapshot's deadline is still open.
+            recalled = _recall_lkg(path, now=now, window=window)
+            if recalled is not None:
+                return _decision_for(KIMI_NATIVE_CONTRACT_SOURCE_LKG, recalled)
             return _decision_for(KIMI_NATIVE_CONTRACT_SOURCE_UNAVAILABLE, None)
         stamped = dataclasses.replace(published, source=state)
         _remember_lkg(path, stamped)
