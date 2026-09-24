@@ -132,6 +132,10 @@ from litellm.secret_managers.xai_oauth_credentials import (
     resolve_xai_oauth_lock_path,
     resolve_xai_oauth_scope,
 )
+from litellm.llms.alibaba_token_plan.chat.transformation import (
+    ALIBABA_TOKEN_PLAN_SUBSCRIPTION_IDENTITY_SOURCE,
+    alibaba_token_plan_subscription_identity,
+)
 from litellm.llms.cursor_agent.constants import CURSOR_AGENT_DASHBOARD_HOST
 from litellm.llms.cursor_agent.dashboard import (
     build_dashboard_headers,
@@ -12678,9 +12682,11 @@ def _parse_alibaba_subscription_payload(
         or float(remaining_days) < 0
     ):
         remaining_days = None
-    account_material = f"alibaba-token-plan|instanceCode={instance_code.strip()}".encode("utf-8")
+    account_hash = alibaba_token_plan_subscription_identity(instance_code)
+    if account_hash is None:
+        raise ValueError("Alibaba subscription response has no instanceCode.")
     return {
-        "account_hash": hashlib.sha256(account_material).hexdigest(),
+        "account_hash": account_hash,
         "spec_code": spec_code.strip(),
         "status": status,
         "remaining_days": remaining_days,
@@ -12870,6 +12876,10 @@ def _build_alibaba_quota_rate_limit_payloads(
             "subscription_remaining_days": subscription.get("remaining_days"),
             "subscription_start_at": subscription["start_at"].isoformat(),
             "subscription_end_at": subscription["end_at"].isoformat(),
+            "subscription_identity": subscription["account_hash"],
+            "subscription_identity_source": (
+                ALIBABA_TOKEN_PLAN_SUBSCRIPTION_IDENTITY_SOURCE
+            ),
         }
         evidence = {
             "signals": [
@@ -12878,6 +12888,10 @@ def _build_alibaba_quota_rate_limit_payloads(
                 "alibaba_token_plan_percentage_only",
                 f"alibaba_token_plan_reset_{reset_state}",
             ],
+            "subscription_identity": subscription["account_hash"],
+            "subscription_identity_source": (
+                ALIBABA_TOKEN_PLAN_SUBSCRIPTION_IDENTITY_SOURCE
+            ),
             "parser_version": ALIBABA_TOKEN_PLAN_PARSER_VERSION,
             "telemetry_status": "valid",
             "environment": config.environment,
