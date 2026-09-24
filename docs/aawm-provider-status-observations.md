@@ -1112,8 +1112,7 @@ A previously visible `available` card that disappears before expiry becomes
 `used`, while one that disappears at or after expiry becomes `expired`.
 Unchanged inventories dedupe through the shared credit writer. An empty list is
 valid and transitions any previously available cards without fabricating a
-card row. The poll event exposes the aggregate as
-`reset_card_available_count`.
+card row. The reset-card inventory event exposes the aggregate as `available_count`.
 
 Authentication uses international RAM access-key credentials, not a console
 ticket file, cookie jar, or `sec_token`. On each due poll the sidecar reads
@@ -1135,7 +1134,11 @@ envelope (`NotLogined`, `NoPermission`, `Team.NotAuthorised`,
 an HTTP 401/403 triggers at most one remint per endpoint fetch, followed by a
 single replay. A still-failing replay fails closed as `auth` with no second
 mint. Mint HTTP 401/403 or a `NoPermission` mint envelope is also `auth`.
-Failed polls keep last-good subscription and reset-card current state.
+A failed usage or subscription poll keeps the last-good subscription payload in
+memory only when the refresh was not attempted. A due subscription refresh
+that fails clears the cached subscription and does not collect reset-card
+inventory. A failed reset-card inventory leaves stored reset-card current
+rows unchanged and does not mark the current quota poll degraded.
 
 Each `alibaba_quota_poll` event reports value-free mint telemetry:
 `auth_source`, `token_cached`, `mint_attempted`, `mint_succeeded`,
@@ -1178,16 +1181,21 @@ Relevant environment variables:
 - `AAWM_ALIBABA_QUOTA_POLL_RETRY_BACKOFF_SECONDS`: base exponential backoff for
   transient failures; the managed sidecar default is `0.5`.
 
-Each due attempt emits one sanitized `alibaba_quota_poll` JSON event. Reset-card
-telemetry includes status/attempt counts, visible and available card counts,
-credit observation/insert counts, and whether the reset-card state was
-persisted. Runtime success requires HTTP 200 responses, an active subscription,
-valid recognized usage windows, a valid reset-card array (including an empty
-array), successful configured persistence, and no credential, raw response,
-raw card number, account identity, RAM secret, Bearer token, or traceback in
-container logs. Authentication, transport, HTTP, envelope, or field-validation
-failures are degraded and leave the last-known reset-card current state
-unchanged. The reset-card poll is list-only and never calls `/reset-card/use`.
+Each due attempt emits two sanitized JSON events. `alibaba_quota_poll` reports
+current usage and subscription normalization only. `alibaba_reset_card_inventory`
+reports reset-card status, attempt counts, `freshness_at`, `freshness_status`,
+visible and available card counts, credit observation/insert counts, and
+whether this inventory was persisted. A timeout, malformed reset-card payload,
+or inventory persistence failure sets that event's own error state and leaves
+`current_provider_evidence` false. It does not copy stored cards into the
+event or change `alibaba_quota_poll` to degraded. `freshness_at` stays at the
+last successful inventory time, or null when none exists. Runtime quota
+success requires HTTP 200 responses, an active subscription, valid recognized
+usage windows, successful configured persistence, and no credential, raw
+response, account identity, RAM secret, Bearer token, or traceback in
+container logs. Reset-card success additionally requires a valid reset-card
+array, including an empty array. The reset-card poll is list-only and never
+calls `/reset-card/use`.
 
 Anthropic unified response headers persist separate weekly buckets:
 

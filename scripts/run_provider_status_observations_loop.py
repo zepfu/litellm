@@ -407,6 +407,7 @@ ALIBABA_TOKEN_PLAN_RESET_CARD_CREDIT_FAMILY = "alibaba_token_plan_manual_quota_r
 ALIBABA_TOKEN_PLAN_RESET_CARD_CREDIT_TYPE = "manual_reset_card"
 ALIBABA_TOKEN_PLAN_RESET_CARD_SOURCE = "alibaba_token_plan_reset_card_list"
 ALIBABA_TOKEN_PLAN_RESET_CARD_PARSER_VERSION = "alibaba_token_plan_reset_card_v1"
+ALIBABA_RESET_CARD_INVENTORY_EVENT = "alibaba_reset_card_inventory"
 ALIBABA_QUOTA_RETRYABLE_HTTP_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 ALIBABA_QUOTA_POLL_SLEEP_FN: Callable[[float], None] = time.sleep
 DEFAULT_CURSOR_AGENT_USAGE_POLL_ENABLED = False
@@ -1801,6 +1802,7 @@ class SidecarTaskState:
     alibaba_quota_last_attempt_monotonic: Optional[float] = None
     alibaba_subscription_last_attempt_monotonic: Optional[float] = None
     alibaba_subscription_payload: Optional[Dict[str, Any]] = None
+    alibaba_reset_card_last_success_at: Optional[datetime] = None
     alibaba_auth_fingerprint: Optional[str] = None
     alibaba_access_token: Optional[str] = None
     alibaba_console_session: Optional[AlibabaConsoleSession] = None
@@ -18203,6 +18205,291 @@ def _merge_alibaba_fetch_summary(
     )
 
 
+def _alibaba_reset_card_timestamp(value: Optional[datetime]) -> Optional[str]:
+    if value is None:
+        return None
+    return value.isoformat().replace("+00:00", "Z")
+
+
+def _new_alibaba_reset_card_inventory_summary() -> Dict[str, Any]:
+    return {
+        "attempted": False,
+        "collected": False,
+        "persisted": False,
+        "status_code": None,
+        "attempt_count": 0,
+        "retry_count": 0,
+        "visible_count": None,
+        "available_count": None,
+        "observation_count": 0,
+        "inserted_count": 0,
+        "telemetry_class": None,
+        "telemetry_status": None,
+        "error_endpoint": None,
+        "error_class": None,
+        "error_message": None,
+        "freshness_at": None,
+        "freshness_status": "unavailable",
+        "current_provider_evidence": False,
+        "stale_inventory_reused": False,
+        "inventory_state_unchanged": True,
+        "mint_attempted": False,
+        "mint_succeeded": False,
+        "refresh_attempted": False,
+        "refresh_succeeded": False,
+    }
+
+
+def _record_alibaba_reset_card_inventory_failure(
+    summary: Dict[str, Any],
+    exc: BaseException,
+    *,
+    last_success_at: Optional[datetime],
+) -> None:
+    """Record an inventory failure without promoting stored cards to current evidence."""
+    summary["attempted"] = True
+    summary["collected"] = False
+    summary["persisted"] = False
+    summary["visible_count"] = None
+    summary["available_count"] = None
+    summary["observation_count"] = 0
+    summary["inserted_count"] = 0
+    summary["telemetry_status"] = "degraded"
+    summary["current_provider_evidence"] = False
+    summary["stale_inventory_reused"] = False
+    summary["inventory_state_unchanged"] = True
+    summary["freshness_at"] = _alibaba_reset_card_timestamp(last_success_at)
+    summary["freshness_status"] = (
+        "stale" if last_success_at is not None else "unavailable"
+    )
+    summary["error_class"] = exc.__class__.__name__
+    summary["error_message"] = _redacted_failure_message(str(exc))
+    if isinstance(exc, AlibabaQuotaPollError):
+        summary["telemetry_class"] = exc.telemetry_class
+        summary["error_endpoint"] = exc.endpoint
+        summary["status_code"] = exc.status_code
+        summary["attempt_count"] = exc.attempt_count
+        summary["retry_count"] = exc.retry_count
+        summary["mint_attempted"] = bool(
+            summary.get("mint_attempted") or exc.mint_attempted
+        )
+        summary["mint_succeeded"] = bool(
+            summary.get("mint_succeeded") or exc.mint_succeeded
+        )
+        summary["refresh_attempted"] = bool(
+            summary.get("refresh_attempted") or exc.refresh_attempted
+        )
+        summary["refresh_succeeded"] = bool(
+            summary.get("refresh_succeeded") or exc.refresh_succeeded
+        )
+    elif isinstance(exc, probes.ProviderStatusDatabaseWriteSkipped):
+        summary["telemetry_class"] = "database_write_skipped"
+        summary["error_endpoint"] = "database"
+    elif isinstance(exc, ValueError):
+        summary["telemetry_class"] = "malformed_telemetry"
+        summary["error_endpoint"] = "reset_cards"
+    else:
+        summary["telemetry_class"] = "internal"
+        summary["error_endpoint"] = "reset_cards"
+
+
+def _mark_alibaba_reset_card_inventory_not_collected(
+    summary: Dict[str, Any],
+    *,
+    last_success_at: Optional[datetime],
+    reason: str,
+) -> None:
+    summary["attempted"] = False
+    summary["collected"] = False
+    summary["persisted"] = False
+    summary["telemetry_status"] = "not_collected"
+    summary["telemetry_class"] = "not_collected"
+    summary["error_class"] = "AlibabaResetCardInventoryNotCollected"
+    summary["error_message"] = reason
+    summary["freshness_at"] = _alibaba_reset_card_timestamp(last_success_at)
+    summary["freshness_status"] = (
+        "stale" if last_success_at is not None else "unavailable"
+    )
+    summary["current_provider_evidence"] = False
+    summary["stale_inventory_reused"] = False
+    summary["inventory_state_unchanged"] = True
+
+
+def _collect_alibaba_current_quota(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    summary: Dict[str, Any],
+    *,
+    now_monotonic: float,
+    observed_at: datetime,
+) -> Optional[Dict[str, Any]]:
+    """Fetch and normalize current usage. Reset-card inventory is not collected here."""
+    auth = _load_alibaba_ram_auth(config)
+    summary["auth_source"] = auth["auth_source"]
+    summary["credential_reloaded"] = bool(auth["credential_reloaded"])
+    session, credential_reset = _ensure_alibaba_console_session(
+        state,
+        auth=auth,
+    )
+    summary["credential_reset"] = credential_reset
+    summary["token_cached"] = bool(session.access_token)
+    subscription_due = _alibaba_subscription_refresh_due(
+        config,
+        state,
+        now_monotonic=now_monotonic,
+        credential_fingerprint=str(auth["credential_fingerprint"]),
+    )
+    if subscription_due:
+        state.alibaba_subscription_last_attempt_monotonic = now_monotonic
+        state.alibaba_subscription_payload = None
+        fetched_subscription = _fetch_alibaba_quota_payload(
+            config,
+            api_name=ALIBABA_TOKEN_PLAN_SUBSCRIPTION_API,
+            endpoint="subscription",
+            auth=auth,
+            session=session,
+            task_state=state,
+        )
+        _merge_alibaba_fetch_summary(
+            summary,
+            fetched_subscription,
+            endpoint="subscription",
+        )
+        state.alibaba_subscription_payload = _parse_alibaba_subscription_payload(
+            fetched_subscription["payload"],
+        )
+        summary["subscription_refreshed"] = True
+
+    subscription = state.alibaba_subscription_payload
+    if subscription is None:
+        raise ValueError("Alibaba Token Plan subscription metadata is unavailable.")
+
+    fetched_usage = _fetch_alibaba_quota_payload(
+        config,
+        api_name=ALIBABA_TOKEN_PLAN_USAGE_API,
+        endpoint="usage",
+        auth=auth,
+        session=session,
+        task_state=state,
+    )
+    _merge_alibaba_fetch_summary(summary, fetched_usage, endpoint="usage")
+    payloads = _build_alibaba_quota_rate_limit_payloads(
+        config,
+        observed_at=observed_at,
+        usage_payload=fetched_usage["payload"],
+        subscription=subscription,
+        auth_source=str(auth["auth_source"]),
+    )
+    summary["observation_count"] = len(payloads)
+    if config.apply:
+        summary["inserted_count"] = _persist_alibaba_quota_observations(
+            config,
+            payloads,
+        )
+        summary["persisted"] = bool(payloads)
+    summary["telemetry_status"] = "valid"
+    summary["token_cached"] = bool(state.alibaba_access_token)
+    return {
+        "auth": auth,
+        "session": session,
+        "subscription": subscription,
+    }
+
+
+def _collect_alibaba_reset_card_inventory(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    summary: Dict[str, Any],
+    *,
+    observed_at: datetime,
+    auth: Mapping[str, Any],
+    session: AlibabaConsoleSession,
+    subscription: Mapping[str, Any],
+) -> None:
+    """Collect and persist reset-card inventory. Failures stay on this summary."""
+    last_success_at = state.alibaba_reset_card_last_success_at
+    summary["attempted"] = True
+    summary["freshness_at"] = _alibaba_reset_card_timestamp(last_success_at)
+    summary["freshness_status"] = (
+        "stale" if last_success_at is not None else "unavailable"
+    )
+    try:
+        fetched_reset_cards = _fetch_alibaba_quota_payload(
+            config,
+            api_name=ALIBABA_TOKEN_PLAN_RESET_CARD_LIST_API,
+            endpoint="reset_cards",
+            auth=auth,
+            session=session,
+            task_state=state,
+        )
+        _merge_alibaba_fetch_summary(
+            summary,
+            fetched_reset_cards,
+            endpoint="reset_cards",
+        )
+        summary["status_code"] = fetched_reset_cards["status_code"]
+        summary["attempt_count"] = fetched_reset_cards.get("attempt_count", 1)
+        summary["retry_count"] = fetched_reset_cards.get("retry_count", 0)
+        try:
+            reset_card_observations, reset_card_available_count = (
+                _build_alibaba_reset_card_observations(
+                    config,
+                    observed_at=observed_at,
+                    reset_cards=fetched_reset_cards["payload"],
+                    subscription=subscription,
+                    status_code=int(fetched_reset_cards["status_code"]),
+                    attempt_count=int(fetched_reset_cards.get("attempt_count", 1)),
+                    retry_count=int(fetched_reset_cards.get("retry_count", 0)),
+                    auth_source=str(auth["auth_source"]),
+                )
+            )
+        except ValueError as exc:
+            raise _alibaba_quota_poll_error(
+                endpoint="reset_cards",
+                status_code=int(fetched_reset_cards["status_code"]),
+                telemetry_class="malformed_telemetry",
+                attempt_count=int(fetched_reset_cards.get("attempt_count", 1)),
+                retry_count=int(fetched_reset_cards.get("retry_count", 0)),
+                message=str(exc),
+            ) from exc
+        summary["visible_count"] = len(reset_card_observations)
+        summary["available_count"] = reset_card_available_count
+        summary["observation_count"] = len(reset_card_observations)
+        if config.apply:
+            (
+                summary["observation_count"],
+                summary["inserted_count"],
+            ) = _persist_alibaba_reset_card_observations(
+                config,
+                observed_at=observed_at,
+                observations=reset_card_observations,
+                account_hash=str(subscription["account_hash"]),
+                available_count=reset_card_available_count,
+                status_code=int(fetched_reset_cards["status_code"]),
+                attempt_count=int(fetched_reset_cards.get("attempt_count", 1)),
+                retry_count=int(fetched_reset_cards.get("retry_count", 0)),
+            )
+            summary["persisted"] = True
+        summary["collected"] = True
+        summary["telemetry_status"] = "valid"
+        summary["telemetry_class"] = None
+        summary["error_class"] = None
+        summary["error_message"] = None
+        summary["error_endpoint"] = None
+        summary["freshness_at"] = _alibaba_reset_card_timestamp(observed_at)
+        summary["freshness_status"] = "fresh"
+        summary["current_provider_evidence"] = True
+        summary["stale_inventory_reused"] = False
+        summary["inventory_state_unchanged"] = not summary["persisted"]
+        state.alibaba_reset_card_last_success_at = observed_at
+    except Exception as exc:
+        _record_alibaba_reset_card_inventory_failure(
+            summary,
+            exc,
+            last_success_at=state.alibaba_reset_card_last_success_at,
+        )
+
+
 def _record_alibaba_poll_failure(
     summary: Dict[str, Any],
     exc: BaseException,
@@ -18246,7 +18533,7 @@ def _run_alibaba_quota_poll_task(
     state: SidecarTaskState,
     *,
     now_monotonic: float,
-) -> Optional[Dict[str, Any]]:
+) -> Optional[List[Dict[str, Any]]]:
     if not config.alibaba_quota_poll_enabled:
         return None
     last_attempt = state.alibaba_quota_last_attempt_monotonic
@@ -18255,6 +18542,7 @@ def _run_alibaba_quota_poll_task(
 
     state.alibaba_quota_last_attempt_monotonic = now_monotonic
     observed_at = datetime.now(timezone.utc)
+    observed_at_text = observed_at.isoformat().replace("+00:00", "Z")
     summary: Dict[str, Any] = {
         "attempted": True,
         "persisted": False,
@@ -18264,18 +18552,10 @@ def _run_alibaba_quota_poll_task(
         "inserted_count": 0,
         "usage_status_code": None,
         "subscription_status_code": None,
-        "reset_cards_status_code": None,
         "usage_attempt_count": 0,
         "usage_retry_count": 0,
         "subscription_attempt_count": 0,
         "subscription_retry_count": 0,
-        "reset_cards_attempt_count": 0,
-        "reset_cards_retry_count": 0,
-        "reset_card_visible_count": 0,
-        "reset_card_available_count": 0,
-        "reset_card_observation_count": 0,
-        "reset_card_inserted_count": 0,
-        "reset_card_persisted": False,
         "telemetry_class": None,
         "telemetry_status": None,
         "error_endpoint": None,
@@ -18286,136 +18566,56 @@ def _run_alibaba_quota_poll_task(
         "last_good_state_retained": False,
         **_alibaba_quota_request_contract_summary(config),
     }
+    reset_summary = _new_alibaba_reset_card_inventory_summary()
+    quota_context: Optional[Dict[str, Any]] = None
     try:
-        auth = _load_alibaba_ram_auth(config)
-        summary["auth_source"] = auth["auth_source"]
-        summary["credential_reloaded"] = bool(auth["credential_reloaded"])
-        session, credential_reset = _ensure_alibaba_console_session(
-            state,
-            auth=auth,
-        )
-        summary["credential_reset"] = credential_reset
-        summary["token_cached"] = bool(session.access_token)
-        subscription_due = _alibaba_subscription_refresh_due(
+        quota_context = _collect_alibaba_current_quota(
             config,
             state,
-            now_monotonic=now_monotonic,
-            credential_fingerprint=str(auth["credential_fingerprint"]),
-        )
-        if subscription_due:
-            state.alibaba_subscription_last_attempt_monotonic = now_monotonic
-            state.alibaba_subscription_payload = None
-            fetched_subscription = _fetch_alibaba_quota_payload(
-                config,
-                api_name=ALIBABA_TOKEN_PLAN_SUBSCRIPTION_API,
-                endpoint="subscription",
-                auth=auth,
-                session=session,
-                task_state=state,
-            )
-            _merge_alibaba_fetch_summary(
-                summary,
-                fetched_subscription,
-                endpoint="subscription",
-            )
-            state.alibaba_subscription_payload = _parse_alibaba_subscription_payload(
-                fetched_subscription["payload"],
-            )
-            summary["subscription_refreshed"] = True
-
-        subscription = state.alibaba_subscription_payload
-        if subscription is None:
-            raise ValueError("Alibaba Token Plan subscription metadata is unavailable.")
-
-        fetched_usage = _fetch_alibaba_quota_payload(
-            config,
-            api_name=ALIBABA_TOKEN_PLAN_USAGE_API,
-            endpoint="usage",
-            auth=auth,
-            session=session,
-            task_state=state,
-        )
-        _merge_alibaba_fetch_summary(summary, fetched_usage, endpoint="usage")
-        payloads = _build_alibaba_quota_rate_limit_payloads(
-            config,
-            observed_at=observed_at,
-            usage_payload=fetched_usage["payload"],
-            subscription=subscription,
-            auth_source=str(auth["auth_source"]),
-        )
-        summary["observation_count"] = len(payloads)
-        if config.apply:
-            summary["inserted_count"] = _persist_alibaba_quota_observations(
-                config,
-                payloads,
-            )
-            summary["persisted"] = bool(payloads)
-
-        fetched_reset_cards = _fetch_alibaba_quota_payload(
-            config,
-            api_name=ALIBABA_TOKEN_PLAN_RESET_CARD_LIST_API,
-            endpoint="reset_cards",
-            auth=auth,
-            session=session,
-            task_state=state,
-        )
-        _merge_alibaba_fetch_summary(
             summary,
-            fetched_reset_cards,
-            endpoint="reset_cards",
+            now_monotonic=now_monotonic,
+            observed_at=observed_at,
         )
-        try:
-            reset_card_observations, reset_card_available_count = (
-                _build_alibaba_reset_card_observations(
-                    config,
-                    observed_at=observed_at,
-                    reset_cards=fetched_reset_cards["payload"],
-                    subscription=subscription,
-                    status_code=int(fetched_reset_cards["status_code"]),
-                    attempt_count=int(fetched_reset_cards.get("attempt_count", 1)),
-                    retry_count=int(fetched_reset_cards.get("retry_count", 0)),
-                    auth_source=str(auth["auth_source"]),
-                )
-            )
-        except ValueError as exc:
-            raise _alibaba_quota_poll_error(
-                endpoint="reset_cards",
-                status_code=int(fetched_reset_cards["status_code"]),
-                telemetry_class="malformed_telemetry",
-                attempt_count=int(fetched_reset_cards.get("attempt_count", 1)),
-                retry_count=int(fetched_reset_cards.get("retry_count", 0)),
-                message=str(exc),
-            ) from exc
-        summary["reset_card_visible_count"] = len(reset_card_observations)
-        summary["reset_card_available_count"] = reset_card_available_count
-        summary["reset_card_observation_count"] = len(reset_card_observations)
-        if config.apply:
-            (
-                summary["reset_card_observation_count"],
-                summary["reset_card_inserted_count"],
-            ) = _persist_alibaba_reset_card_observations(
-                config,
-                observed_at=observed_at,
-                observations=reset_card_observations,
-                account_hash=str(subscription["account_hash"]),
-                available_count=reset_card_available_count,
-                status_code=int(fetched_reset_cards["status_code"]),
-                attempt_count=int(fetched_reset_cards.get("attempt_count", 1)),
-                retry_count=int(fetched_reset_cards.get("retry_count", 0)),
-            )
-            summary["reset_card_persisted"] = True
-        summary["telemetry_status"] = "valid"
-        summary["token_cached"] = bool(state.alibaba_access_token)
     except Exception as exc:
         summary["token_cached"] = bool(state.alibaba_access_token)
         _record_alibaba_poll_failure(summary, exc)
 
-    return {
-        "event": "alibaba_quota_poll",
-        "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
-        "environment": config.environment,
-        **summary,
-    }
+    if quota_context is None:
+        _mark_alibaba_reset_card_inventory_not_collected(
+            reset_summary,
+            last_success_at=state.alibaba_reset_card_last_success_at,
+            reason=(
+                "Alibaba reset-card inventory was not collected because "
+                "current quota polling did not succeed."
+            ),
+        )
+    else:
+        _collect_alibaba_reset_card_inventory(
+            config,
+            state,
+            reset_summary,
+            observed_at=observed_at,
+            auth=quota_context["auth"],
+            session=quota_context["session"],
+            subscription=quota_context["subscription"],
+        )
+
+    return [
+        {
+            "event": "alibaba_quota_poll",
+            "observed_at": observed_at_text,
+            "environment": config.environment,
+            **summary,
+        },
+        {
+            "event": ALIBABA_RESET_CARD_INVENTORY_EVENT,
+            "observed_at": observed_at_text,
+            "environment": config.environment,
+            "provider": ALIBABA_TOKEN_PLAN_PROVIDER,
+            "source": ALIBABA_TOKEN_PLAN_RESET_CARD_SOURCE,
+            **reset_summary,
+        },
+    ]
 
 
 def _run_grok_billing_poll_task(
