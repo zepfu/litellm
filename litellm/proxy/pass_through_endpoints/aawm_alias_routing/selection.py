@@ -210,6 +210,8 @@ SELECT DISTINCT ON (
     quota_type,
     expected_reset_at,
     remaining_pct,
+    quota_limit,
+    quota_remaining,
     raw_provider_fields,
     evidence,
     NULLIF(BTRIM(evidence->>'environment'), '') AS environment,
@@ -2434,6 +2436,45 @@ async def _clear_alibaba_token_plan_account_quota_cooldown(
     return bool(result)
 
 
+def _zai_coding_plan_quota_number(value: Any) -> Optional[float]:
+    """Parse a persisted quota number without rounding it to a whole percent."""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _zai_coding_plan_control_remaining_pct(
+    *,
+    remaining_pct: Optional[float],
+    quota_type: str,
+    quota_limit: Optional[float],
+    quota_remaining: Optional[float],
+) -> Optional[float]:
+    """Use absolute CREDIT_LIMIT remaining; keep other windows on their percent."""
+    if (
+        quota_type == "credits"
+        and quota_limit is not None
+        and quota_limit > 0.0
+        and quota_remaining is not None
+        and quota_remaining >= 0.0
+    ):
+        return max(0.0, min(100.0, quota_remaining / quota_limit * 100.0))
+    if remaining_pct is None or not 0.0 <= remaining_pct <= 100.0:
+        return None
+    return remaining_pct
+
+
+def _zai_coding_plan_quota_exhausted(remaining_pct: float) -> bool:
+    """0% remaining is exhausted. Any positive fraction stays available."""
+    return remaining_pct <= 0.0
+
+
 def _zai_coding_plan_quota_observation_from_row(
     row: Any,
     *,
@@ -2496,14 +2537,15 @@ def _zai_coding_plan_quota_observation_from_row(
     expected_reset_at = alias_routing_state._quota_observation_timestamp(
         values.get("expected_reset_at")
     )
-    remaining_pct = values.get("remaining_pct")
-    if (
-        observed_at is None
-        or isinstance(remaining_pct, bool)
-        or not isinstance(remaining_pct, (int, float))
-        or not math.isfinite(float(remaining_pct))
-        or not 0.0 <= float(remaining_pct) <= 100.0
-    ):
+    remaining_pct = _zai_coding_plan_control_remaining_pct(
+        remaining_pct=_zai_coding_plan_quota_number(values.get("remaining_pct")),
+        quota_type=quota_type,
+        quota_limit=_zai_coding_plan_quota_number(values.get("quota_limit")),
+        quota_remaining=_zai_coding_plan_quota_number(
+            values.get("quota_remaining")
+        ),
+    )
+    if observed_at is None or remaining_pct is None:
         return None
     now = time.time() if now_epoch is None else float(now_epoch)
     if now < observed_at or now - observed_at > _ZAI_CODING_PLAN_QUOTA_MAX_AGE_SECONDS:
@@ -2519,11 +2561,11 @@ def _zai_coding_plan_quota_observation_from_row(
         "quota_key": values.get("quota_key"),
         "quota_period": row_window,
         "quota_type": quota_type,
-        "remaining_pct": float(remaining_pct),
+        "remaining_pct": remaining_pct,
         "observed_at": observed_at,
         "expected_reset_at": expected_reset_at,
         "status": "fresh",
-        "exhausted": float(remaining_pct) <= 0.0,
+        "exhausted": _zai_coding_plan_quota_exhausted(remaining_pct),
         "source": _ZAI_CODING_PLAN_QUOTA_SOURCE,
         "evidence": evidence,
     }
