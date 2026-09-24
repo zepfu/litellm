@@ -1625,6 +1625,26 @@ def begin_alibaba_ciphertext_subattempt(*, ordinal: int) -> float:
     return started
 
 
+def note_alibaba_ciphertext_egress_started(*, ordinal: int) -> None:
+    """Record that this generation has entered provider I/O."""
+
+    attempt_record = _alibaba_attempt_record()
+    if attempt_record is None:
+        return
+    subattempts = attempt_record.get("subattempts")
+    if not isinstance(subattempts, list):
+        return
+    for subattempt in reversed(subattempts):
+        if (
+            isinstance(subattempt, dict)
+            and subattempt.get("ordinal") == ordinal
+            and subattempt.get("kind") == "alibaba_ciphertext_generation"
+        ):
+            subattempt["attempted_provider_call"] = True
+            _refresh_alibaba_ciphertext_repair_aggregates(attempt_record)
+            return
+
+
 def finish_alibaba_ciphertext_subattempt(
     started_at: float,
     *,

@@ -58,6 +58,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.attempt_records imp
     alibaba_ciphertext_repair_prohibited,
     begin_alibaba_ciphertext_subattempt,
     finish_alibaba_ciphertext_subattempt,
+    note_alibaba_ciphertext_egress_started,
     mark_alibaba_downstream_response_committed,
     note_alibaba_ciphertext_repair_blocked,
 )
@@ -2193,6 +2194,7 @@ def install(
         "_validate_codex_alibaba_auto_review_completion_or_raise",
         "_validate_codex_alibaba_auto_review_response_body_or_raise",
         "_begin_alibaba_ciphertext_subattempt",
+        "_note_alibaba_ciphertext_egress_started",
         "_finish_alibaba_ciphertext_subattempt",
         "_alibaba_ciphertext_repair_prohibited",
         "_mark_alibaba_downstream_response_committed",
@@ -9090,6 +9092,10 @@ def _begin_alibaba_ciphertext_subattempt(*, ordinal: int) -> float:
     return begin_alibaba_ciphertext_subattempt(ordinal=ordinal)
 
 
+def _note_alibaba_ciphertext_egress_started(*, ordinal: int) -> None:
+    note_alibaba_ciphertext_egress_started(ordinal=ordinal)
+
+
 def _finish_alibaba_ciphertext_subattempt(started_at: float, **payload: Any) -> None:
     finish_alibaba_ciphertext_subattempt(started_at, **payload)
 
@@ -9185,6 +9191,7 @@ async def _run_codex_alibaba_ciphertext_generations(  # noqa: PLR0915
             _note_alibaba_ciphertext_repair_blocked()
             break
         _started = _begin_alibaba_ciphertext_subattempt(ordinal=_ordinal)
+        _note_alibaba_ciphertext_egress_started(ordinal=_ordinal)
         try:
             completion_response = await litellm.acompletion(**_call_kwargs)
         except Exception as exc:
