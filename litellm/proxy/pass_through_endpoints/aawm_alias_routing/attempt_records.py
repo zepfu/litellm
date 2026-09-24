@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import copy
 import math
+import time
+from contextvars import ContextVar, Token
 from typing import Any, Callable, Mapping, Optional
 from uuid import uuid4
 
@@ -1284,6 +1286,24 @@ def _stamp_openrouter_inner_send_fields(
     target["hidden_logical_retry_count"] = attempt_record.get(
         "hidden_logical_retry_count"
     )
+    if attempt_record.get("provider_call_count") is not None:
+        target["provider_call_count"] = attempt_record.get("provider_call_count")
+    if attempt_record.get("aggregate_usage") is not None:
+        target["aggregate_usage"] = copy.deepcopy(attempt_record.get("aggregate_usage"))
+    if attempt_record.get("aggregate_usage_status") is not None:
+        target["aggregate_usage_status"] = attempt_record.get("aggregate_usage_status")
+    if attempt_record.get("aggregate_usage_subtotal") is not None:
+        target["aggregate_usage_subtotal"] = copy.deepcopy(
+            attempt_record.get("aggregate_usage_subtotal")
+        )
+    if "ciphertext_repair_retry_eligible" in attempt_record:
+        target["ciphertext_repair_retry_eligible"] = attempt_record.get(
+            "ciphertext_repair_retry_eligible"
+        )
+    if attempt_record.get("ciphertext_repair_blocked") is True:
+        target["ciphertext_repair_blocked"] = True
+    if attempt_record.get("downstream_response_committed") is True:
+        target["downstream_response_committed"] = True
 
 
 def bind_openrouter_inner_send_sink(attempt_record: dict[str, Any]) -> object:
@@ -1342,6 +1362,433 @@ def reset_openrouter_inner_send_sink(
     if attempt_record is not None:
         _settle_outstanding_openrouter_inner_subattempt(attempt_record)
     _openrouter_retry_transport.reset_inner_send_sink(token)
+
+
+# ---------------------------------------------------------------------------
+# Alibaba ciphertext-repair subattempts
+# ---------------------------------------------------------------------------
+
+_ALIBABA_CIPHERTEXT_REPAIR_SINK: ContextVar[Optional[dict[str, Any]]] = ContextVar(
+    "aawm_alibaba_ciphertext_repair_sink",
+    default=None,
+)
+_ALIBABA_DOWNSTREAM_COMMITTED_STATE_KEY = "aawm_downstream_response_committed"
+_ALIBABA_USAGE_FIELDS = (
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
+
+
+def bind_alibaba_ciphertext_repair_sink(
+    attempt_record: dict[str, Any],
+) -> Token[Optional[dict[str, Any]]]:
+    """Bind ciphertext-repair generations onto the current outer attempt."""
+
+    return _ALIBABA_CIPHERTEXT_REPAIR_SINK.set(attempt_record)
+
+
+def _alibaba_attempt_record() -> Optional[dict[str, Any]]:
+    attempt_record = _ALIBABA_CIPHERTEXT_REPAIR_SINK.get()
+    if isinstance(attempt_record, dict):
+        return attempt_record
+    return None
+
+
+def _coerce_usage_mapping(response: Any) -> Optional[dict[str, int]]:
+    usage = getattr(response, "usage", None)
+    if usage is None and isinstance(response, Mapping):
+        usage = response.get("usage")
+    if usage is None:
+        return None
+    if hasattr(usage, "model_dump"):
+        raw = usage.model_dump()
+    elif isinstance(usage, Mapping):
+        raw = dict(usage)
+    else:
+        raw = {name: getattr(usage, name, None) for name in _ALIBABA_USAGE_FIELDS}
+    if not isinstance(raw, Mapping):
+        return None
+    cleaned: dict[str, int] = {}
+    for key in _ALIBABA_USAGE_FIELDS:
+        value = raw.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if not math.isfinite(float(value)):
+            continue
+        cleaned[key] = int(value)
+    return cleaned or None
+
+
+def _refresh_alibaba_ciphertext_repair_aggregates(
+    attempt_record: dict[str, Any],
+) -> None:
+    subattempts = attempt_record.get("subattempts")
+    if not isinstance(subattempts, list):
+        subattempts = []
+    sent_subattempts = [
+        subattempt
+        for subattempt in subattempts
+        if isinstance(subattempt, Mapping)
+        and subattempt.get("kind") == "alibaba_ciphertext_generation"
+        and subattempt.get("attempted_provider_call") is True
+    ]
+    provider_call_count = len(sent_subattempts)
+    attempt_record["subattempt_count"] = len(subattempts)
+    attempt_record["provider_call_count"] = provider_call_count
+    attempt_record["logical_provider_send_count"] = provider_call_count
+    # Repair generations are visible subattempts, so they are not hidden retries.
+    attempt_record["hidden_logical_retry_count"] = 0
+    aggregate: dict[str, int] = {}
+    known_usage_count = 0
+    for subattempt in sent_subattempts:
+        usage = subattempt.get("usage")
+        if not isinstance(usage, Mapping) or not usage:
+            continue
+        known_usage_count += 1
+        for key, value in usage.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            aggregate[key] = aggregate.get(key, 0) + int(value)
+    usage_complete = (
+        provider_call_count > 0 and known_usage_count == provider_call_count
+    )
+    if usage_complete:
+        attempt_record["aggregate_usage"] = aggregate
+        attempt_record.pop("aggregate_usage_status", None)
+        attempt_record.pop("aggregate_usage_subtotal", None)
+    else:
+        attempt_record.pop("aggregate_usage", None)
+        if provider_call_count == 0:
+            attempt_record.pop("aggregate_usage_status", None)
+            attempt_record.pop("aggregate_usage_subtotal", None)
+        elif known_usage_count == 0:
+            attempt_record["aggregate_usage_status"] = "unknown"
+            attempt_record.pop("aggregate_usage_subtotal", None)
+        else:
+            attempt_record["aggregate_usage_status"] = "partial"
+            attempt_record["aggregate_usage_subtotal"] = aggregate
+    latest_eligible = False
+    for subattempt in reversed(subattempts):
+        if (
+            isinstance(subattempt, Mapping)
+            and subattempt.get("kind") == "alibaba_ciphertext_generation"
+        ):
+            latest_eligible = subattempt.get("retry_eligible") is True
+            break
+    attempt_record["ciphertext_repair_retry_eligible"] = latest_eligible
+
+
+def _append_alibaba_ciphertext_subattempt(
+    attempt_record: dict[str, Any],
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    subattempts = attempt_record.get("subattempts")
+    if not isinstance(subattempts, list):
+        subattempts = []
+        attempt_record["subattempts"] = subattempts
+    ordinal = payload.get("ordinal")
+    if (
+        subattempts
+        and isinstance(subattempts[-1], dict)
+        and subattempts[-1].get("ordinal") == ordinal
+        and subattempts[-1].get("kind") == "alibaba_ciphertext_generation"
+    ):
+        subattempts[-1].update(payload)
+        current = subattempts[-1]
+    else:
+        subattempts.append(payload)
+        current = payload
+    _refresh_alibaba_ciphertext_repair_aggregates(attempt_record)
+    return current
+
+
+def _failure_phase_is_pre_egress(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip().lower().replace("-", "_")
+    return "pre_egress" in normalized
+
+
+def _confirmed_pre_egress_failure(error: BaseException) -> bool:
+    if getattr(error, "attempted_provider_call", None) is False:
+        return True
+    if _failure_phase_is_pre_egress(getattr(error, "failure_phase", None)):
+        return True
+    detail = getattr(error, "detail", None)
+    if isinstance(detail, Mapping):
+        if detail.get("attempted_provider_call") is False:
+            return True
+        if _failure_phase_is_pre_egress(detail.get("failure_phase")):
+            return True
+    return False
+
+
+def _explicit_provider_send(source: Any) -> bool:
+    """Honor an authoritative positive send marker without inferring one."""
+
+    if getattr(source, "attempted_provider_call", None) is True:
+        return True
+    detail = getattr(source, "detail", None)
+    if isinstance(detail, Mapping) and detail.get("attempted_provider_call") is True:
+        return True
+    return isinstance(source, Mapping) and source.get("attempted_provider_call") is True
+
+
+def _provider_send_provenance(source: Any) -> bool:
+    """Return whether *source* records that provider I/O actually started."""
+
+    if source is None:
+        return False
+    if _explicit_provider_send(source):
+        return True
+    if getattr(source, "_aawm_provider_returned", None) is True:
+        return True
+    if getattr(source, "provider_returned", None) is True:
+        return True
+    for logging_obj in (
+        getattr(source, "litellm_logging_obj", None),
+        getattr(source, "logging_obj", None),
+    ):
+        details = getattr(logging_obj, "model_call_details", None)
+        if isinstance(details, Mapping) and details.get("api_call_start_time") is not None:
+            return True
+    hidden = getattr(source, "_hidden_params", None)
+    if isinstance(hidden, Mapping) and hidden.get("api_call_start_time") is not None:
+        return True
+    if isinstance(source, Mapping):
+        if source.get("_aawm_provider_returned") is True or source.get("provider_returned") is True:
+            return True
+        if source.get("api_call_start_time") is not None:
+            return True
+    return False
+
+
+def _alibaba_subattempt_egress_started(
+    attempt_record: Mapping[str, Any],
+    ordinal: Any,
+) -> bool:
+    subattempts = attempt_record.get("subattempts")
+    if not isinstance(subattempts, list):
+        return False
+    for subattempt in reversed(subattempts):
+        if (
+            isinstance(subattempt, Mapping)
+            and subattempt.get("ordinal") == ordinal
+            and subattempt.get("kind") == "alibaba_ciphertext_generation"
+            and subattempt.get("attempted_provider_call") is True
+        ):
+            return True
+    return False
+
+
+def _alibaba_provider_call_was_sent(
+    *,
+    response: Any = None,
+    error: Optional[BaseException] = None,
+) -> bool:
+    if error is not None and _explicit_provider_send(error):
+        return True
+    if response is not None and _explicit_provider_send(response):
+        return True
+    if error is not None and _confirmed_pre_egress_failure(error):
+        return False
+    if response is not None and _provider_send_provenance(response):
+        return True
+    if error is not None and _provider_send_provenance(error):
+        return True
+    # A completion object is itself the send result. Local exceptions are not.
+    return response is not None and error is None
+
+
+def begin_alibaba_ciphertext_subattempt(*, ordinal: int) -> float:
+    """Open one Alibaba generation before provider I/O is known."""
+
+    started = time.monotonic()
+    attempt_record = _alibaba_attempt_record()
+    if attempt_record is None:
+        return started
+    _append_alibaba_ciphertext_subattempt(
+        attempt_record,
+        {
+            "ordinal": ordinal,
+            "kind": "alibaba_ciphertext_generation",
+            "role": "ciphertext_repair" if ordinal > 1 else "initial",
+            "status": "in_flight",
+            "outcome": "in_flight",
+            "attempted_provider_call": False,
+            "started_at_monotonic": round(started, 6),
+            "retry_eligible": False,
+        },
+    )
+    return started
+
+
+def note_alibaba_ciphertext_egress_started(*, ordinal: int) -> None:
+    """Record that this generation has entered provider I/O."""
+
+    attempt_record = _alibaba_attempt_record()
+    if attempt_record is None:
+        return
+    subattempts = attempt_record.get("subattempts")
+    if not isinstance(subattempts, list):
+        return
+    for subattempt in reversed(subattempts):
+        if (
+            isinstance(subattempt, dict)
+            and subattempt.get("ordinal") == ordinal
+            and subattempt.get("kind") == "alibaba_ciphertext_generation"
+        ):
+            subattempt["attempted_provider_call"] = True
+            _refresh_alibaba_ciphertext_repair_aggregates(attempt_record)
+            return
+
+
+def note_alibaba_ciphertext_transport_egress() -> None:
+    """Mark the in-flight generation only once provider transport send starts."""
+
+    attempt_record = _alibaba_attempt_record()
+    if attempt_record is None:
+        return
+    subattempts = attempt_record.get("subattempts")
+    if not isinstance(subattempts, list):
+        return
+    for subattempt in reversed(subattempts):
+        if (
+            isinstance(subattempt, dict)
+            and subattempt.get("kind") == "alibaba_ciphertext_generation"
+            and subattempt.get("outcome") == "in_flight"
+            and isinstance(subattempt.get("ordinal"), int)
+            and not isinstance(subattempt.get("ordinal"), bool)
+        ):
+            note_alibaba_ciphertext_egress_started(ordinal=subattempt["ordinal"])
+            return
+
+
+def finish_alibaba_ciphertext_subattempt(
+    started_at: float,
+    *,
+    ordinal: int,
+    outcome: str,
+    retry_eligible: bool,
+    response: Any = None,
+    error: Optional[BaseException] = None,
+    attempted_provider_call: Optional[bool] = None,
+    error_class: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Close one Alibaba generation with a terminal outcome and usage."""
+
+    attempt_record = _alibaba_attempt_record()
+    if attempt_record is None:
+        return None
+    egress_started = _alibaba_subattempt_egress_started(attempt_record, ordinal)
+    if attempted_provider_call is None:
+        attempted_provider_call = _alibaba_provider_call_was_sent(
+            response=response,
+            error=error,
+        )
+    if egress_started:
+        attempted_provider_call = True
+    ended = time.monotonic()
+    payload: dict[str, Any] = {
+        "ordinal": ordinal,
+        "kind": "alibaba_ciphertext_generation",
+        "role": "ciphertext_repair" if ordinal > 1 else "initial",
+        "status": outcome,
+        "outcome": outcome,
+        "attempted_provider_call": attempted_provider_call,
+        "started_at_monotonic": round(float(started_at), 6),
+        "ended_at_monotonic": round(ended, 6),
+        "duration_seconds": round(max(0.0, ended - float(started_at)), 3),
+        "retry_eligible": bool(retry_eligible),
+    }
+    usage = _coerce_usage_mapping(response)
+    if usage is not None:
+        payload["usage"] = usage
+    if error_class:
+        payload["error_class"] = error_class
+    return _append_alibaba_ciphertext_subattempt(attempt_record, payload)
+
+
+def _settle_outstanding_alibaba_ciphertext_subattempt(
+    attempt_record: dict[str, Any],
+) -> None:
+    subattempts = attempt_record.get("subattempts")
+    if not isinstance(subattempts, list) or not subattempts:
+        return
+    current = subattempts[-1]
+    if (
+        not isinstance(current, dict)
+        or current.get("kind") != "alibaba_ciphertext_generation"
+        or current.get("outcome") != "in_flight"
+    ):
+        return
+    ordinal = current.get("ordinal")
+    if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 1:
+        return
+    started = current.get("started_at_monotonic")
+    if not isinstance(started, (int, float)):
+        started = time.monotonic()
+    finish_alibaba_ciphertext_subattempt(
+        float(started),
+        ordinal=ordinal,
+        outcome="cancelled",
+        retry_eligible=False,
+        attempted_provider_call=current.get("attempted_provider_call") is True,
+        error_class="cancelled",
+    )
+
+
+def reset_alibaba_ciphertext_repair_sink(
+    token: Token[Optional[dict[str, Any]]],
+    attempt_record: Optional[dict[str, Any]] = None,
+) -> None:
+    if attempt_record is not None:
+        _settle_outstanding_alibaba_ciphertext_subattempt(attempt_record)
+    _ALIBABA_CIPHERTEXT_REPAIR_SINK.reset(token)
+
+
+def alibaba_ciphertext_repair_prohibited(request: Any) -> bool:
+    """Repair cannot start after a downstream response has been committed."""
+
+    state = getattr(request, "state", None)
+    if (
+        state is not None
+        and getattr(state, _ALIBABA_DOWNSTREAM_COMMITTED_STATE_KEY, False) is True
+    ):
+        return True
+    attempt_record = _alibaba_attempt_record()
+    return (
+        isinstance(attempt_record, dict)
+        and attempt_record.get("downstream_response_committed") is True
+    )
+
+
+def mark_alibaba_downstream_response_committed(request: Any) -> None:
+    """Record that a downstream response has been handed to the caller."""
+
+    state = getattr(request, "state", None)
+    if state is not None:
+        try:
+            setattr(state, _ALIBABA_DOWNSTREAM_COMMITTED_STATE_KEY, True)
+        except Exception:
+            pass
+    attempt_record = _alibaba_attempt_record()
+    if isinstance(attempt_record, dict):
+        attempt_record["downstream_response_committed"] = True
+        attempt_record["ciphertext_repair_retry_eligible"] = False
+
+
+def note_alibaba_ciphertext_repair_blocked() -> None:
+    attempt_record = _alibaba_attempt_record()
+    if not isinstance(attempt_record, dict):
+        return
+    attempt_record["ciphertext_repair_blocked"] = True
+    attempt_record["ciphertext_repair_retry_eligible"] = False
 
 
 # ---------------------------------------------------------------------------

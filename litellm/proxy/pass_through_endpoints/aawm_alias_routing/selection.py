@@ -946,6 +946,13 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
         "subattempt_count",
         "logical_provider_send_count",
         "hidden_logical_retry_count",
+        "provider_call_count",
+        "aggregate_usage",
+        "aggregate_usage_status",
+        "aggregate_usage_subtotal",
+        "ciphertext_repair_blocked",
+        "ciphertext_repair_retry_eligible",
+        "downstream_response_committed",
     )
 
     def _apply_skip_overlay(

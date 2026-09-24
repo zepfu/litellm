@@ -4019,12 +4019,22 @@ async def handle_alias_route(  # noqa: PLR0915
                             attempt_record["attempted_provider_call"] = False
                             attempted_provider_call = False
                             openrouter_sink_token = None
+                            alibaba_repair_sink_token = None
                             if (
                                 str(candidate.get("provider") or "").strip().lower()
                                 == CODEX_AUTO_AGENT_OPENROUTER_PROVIDER
                             ):
                                 openrouter_sink_token = (
                                     _attempt_records.bind_openrouter_inner_send_sink(
+                                        attempt_record
+                                    )
+                                )
+                            if (
+                                str(candidate.get("provider") or "").strip().lower()
+                                == "alibaba_token_plan"
+                            ):
+                                alibaba_repair_sink_token = (
+                                    _attempt_records.bind_alibaba_ciphertext_repair_sink(
                                         attempt_record
                                     )
                                 )
@@ -4057,6 +4067,11 @@ async def handle_alias_route(  # noqa: PLR0915
                                 if openrouter_sink_token is not None:
                                     _attempt_records.reset_openrouter_inner_send_sink(
                                         openrouter_sink_token,
+                                        attempt_record,
+                                    )
+                                if alibaba_repair_sink_token is not None:
+                                    _attempt_records.reset_alibaba_ciphertext_repair_sink(
+                                        alibaba_repair_sink_token,
                                         attempt_record,
                                     )
                                 if request_ledger is None and candidate_is_openai:
