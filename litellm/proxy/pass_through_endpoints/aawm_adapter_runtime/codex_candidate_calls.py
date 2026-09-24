@@ -2663,8 +2663,13 @@ def _scan_encrypted_reasoning_argument_tree(
     if isinstance(value, dict):
         for key, child in value.items():
             key_text = key if isinstance(key, str) else str(key)
-            key_bytes = len(key_text.encode("utf-8"))
-            if state["bytes"] + key_bytes > _ENCRYPTED_REASONING_ARGUMENT_MAX_BYTES:
+            remaining_bytes = (
+                _ENCRYPTED_REASONING_ARGUMENT_MAX_BYTES - state["bytes"]
+            )
+            # Size the key before encoding it. A key past the budget never
+            # becomes a bytes object.
+            key_bytes = _structural_utf8_bytes(key_text, remaining_bytes)
+            if key_bytes is None:
                 findings.append(
                     _encrypted_reasoning_argument_finding(
                         name=name,
@@ -2704,24 +2709,387 @@ def _scan_encrypted_reasoning_argument_tree(
     return False
 
 
-def _parse_encrypted_reasoning_arguments(arguments: Any) -> Any:
+def _utf8_size(codepoint: int) -> int:
+    if codepoint < 0x80:
+        return 1
+    if codepoint < 0x800:
+        return 2
+    if codepoint < 0x10000:
+        return 3
+    return 4
+
+
+def _structural_utf8_bytes(text: str, limit: int) -> Optional[int]:
+    """Return the UTF-8 size of ``text`` when it fits in ``limit``.
+
+    Counting stops at the first code point past ``limit`` and does not
+    allocate ``text.encode(...)``.
+    """
+    if limit < 0:
+        return None
+    total = 0
+    for char in text:
+        total += _utf8_size(ord(char))
+        if total > limit:
+            return None
+    return total
+
+
+_JSON_WS = " \t\r\n"
+_JSON_SIMPLE_ESCAPES = {'"', "\\", "/", "b", "f", "n", "r", "t"}
+
+
+def _skip_json_ws(text: str, index: int) -> int:
+    length = len(text)
+    while index < length and text[index] in _JSON_WS:
+        index += 1
+    return index
+
+
+def _read_json_hex_codepoint(text: str, index: int) -> tuple[Optional[int], int]:
+    """Read a ``\\u`` escape body. ``index`` points at the first hex digit."""
+    if index + 4 > len(text):
+        return None, index
+    try:
+        codepoint = int(text[index : index + 4], 16)
+    except ValueError:
+        return None, index
+    index += 4
+    if (
+        0xD800 <= codepoint <= 0xDBFF
+        and index + 6 <= len(text)
+        and text[index : index + 2] == "\\u"
+    ):
+        try:
+            low = int(text[index + 2 : index + 6], 16)
+        except ValueError:
+            return codepoint, index
+        if 0xDC00 <= low <= 0xDFFF:
+            codepoint = 0x10000 + ((codepoint - 0xD800) << 10) + (low - 0xDC00)
+            index += 6
+    return codepoint, index
+
+
+def _measure_json_string(
+    text: str,
+    index: int,
+    byte_limit: Optional[int],
+) -> tuple[int, Optional[str], int]:
+    """Measure one JSON string without building it.
+
+    ``index`` points at the opening quote. String values pass ``byte_limit``
+    of None so a long plaintext value is not charged and is not classified.
+    Object keys pass the remaining structural budget. A key past that budget
+    returns ``bytes`` at the overflowing code point and leaves the rest of
+    the document unread.
+    """
+    length = len(text)
+    index += 1
+    size = 0
+    while index < length:
+        char = text[index]
+        if char == '"':
+            return index + 1, None, size
+        if char == "\\":
+            if index + 1 >= length:
+                return index, "invalid", size
+            escape = text[index + 1]
+            if escape in _JSON_SIMPLE_ESCAPES:
+                addition = 1
+                index += 2
+            elif escape == "u":
+                codepoint, index = _read_json_hex_codepoint(text, index + 2)
+                if codepoint is None:
+                    return index, "invalid", size
+                addition = _utf8_size(codepoint)
+            else:
+                return index, "invalid", size
+        elif ord(char) < 0x20:
+            return index, "invalid", size
+        else:
+            addition = _utf8_size(ord(char))
+            index += 1
+        if byte_limit is None:
+            continue
+        size += addition
+        if size > byte_limit:
+            return index, "bytes", size
+    return index, "invalid", size
+
+
+def _decode_json_string(text: str, index: int) -> Optional[str]:
+    """Decode a JSON string already known to fit in the structural budget."""
+    length = len(text)
+    index += 1
+    chars: list[str] = []
+    while index < length:
+        char = text[index]
+        if char == '"':
+            return "".join(chars)
+        if char == "\\":
+            if index + 1 >= length:
+                return None
+            escape = text[index + 1]
+            mapped = {
+                '"': '"',
+                "\\": "\\",
+                "/": "/",
+                "b": "\b",
+                "f": "\f",
+                "n": "\n",
+                "r": "\r",
+                "t": "\t",
+            }.get(escape)
+            if mapped is not None:
+                chars.append(mapped)
+                index += 2
+                continue
+            if escape != "u":
+                return None
+            codepoint, index = _read_json_hex_codepoint(text, index + 2)
+            if codepoint is None:
+                return None
+            chars.append(chr(codepoint))
+            continue
+        if ord(char) < 0x20:
+            return None
+        chars.append(char)
+        index += 1
+    return None
+
+
+def _match_json_literal(
+    text: str,
+    index: int,
+    literal: str,
+    state: dict[str, Any],
+) -> tuple[int, Optional[str]]:
+    if text.startswith(literal, index):
+        return index + len(literal), None
+    state["invalid"] = True
+    return index, None
+
+
+def _scan_json_number(
+    text: str,
+    index: int,
+    state: dict[str, Any],
+) -> tuple[int, Optional[str]]:
+    length = len(text)
+    start = index
+    if text[index] == "-":
+        index += 1
+    digit_start = index
+    while index < length and text[index].isdigit():
+        index += 1
+    if index == digit_start:
+        state["invalid"] = True
+        return start, None
+    if index < length and text[index] == ".":
+        index += 1
+        fraction = index
+        while index < length and text[index].isdigit():
+            index += 1
+        if index == fraction:
+            state["invalid"] = True
+            return start, None
+    if index < length and text[index] in "eE":
+        index += 1
+        if index < length and text[index] in "+-":
+            index += 1
+        exponent = index
+        while index < length and text[index].isdigit():
+            index += 1
+        if index == exponent:
+            state["invalid"] = True
+            return start, None
+    return index, None
+
+
+def _prescan_json_value(
+    text: str,
+    index: int,
+    depth: int,
+    path: str,
+    state: dict[str, Any],
+) -> tuple[int, Optional[str]]:
+    """Count one JSON value. Return a bound name without building it."""
+    index = _skip_json_ws(text, index)
+    if index >= len(text):
+        state["invalid"] = True
+        return index, None
+    state["nodes"] += 1
+    if state["nodes"] > _ENCRYPTED_REASONING_ARGUMENT_MAX_NODES:
+        state["bound_path"] = path
+        return index, "nodes"
+    if depth > _ENCRYPTED_REASONING_ARGUMENT_MAX_DEPTH:
+        state["bound_path"] = path
+        return index, "depth"
+    char = text[index]
+    if char == "{":
+        return _prescan_json_object(text, index, depth, path, state)
+    if char == "[":
+        return _prescan_json_array(text, index, depth, path, state)
+    if char == '"':
+        end, error, _size = _measure_json_string(text, index, None)
+        if error is not None:
+            state["invalid"] = True
+            return end, None
+        return end, None
+    if char == "t":
+        return _match_json_literal(text, index, "true", state)
+    if char == "f":
+        return _match_json_literal(text, index, "false", state)
+    if char == "n":
+        return _match_json_literal(text, index, "null", state)
+    if char == "-" or char.isdigit():
+        return _scan_json_number(text, index, state)
+    state["invalid"] = True
+    return index, None
+
+
+def _prescan_json_object(
+    text: str,
+    index: int,
+    depth: int,
+    path: str,
+    state: dict[str, Any],
+) -> tuple[int, Optional[str]]:
+    index = _skip_json_ws(text, index + 1)
+    if index < len(text) and text[index] == "}":
+        return index + 1, None
+    while index < len(text):
+        if text[index] != '"':
+            state["invalid"] = True
+            return index, None
+        remaining = _ENCRYPTED_REASONING_ARGUMENT_MAX_BYTES - state["bytes"]
+        end, error, key_bytes = _measure_json_string(text, index, remaining)
+        if error == "bytes":
+            state["bound_path"] = path
+            return end, "bytes"
+        if error is not None:
+            state["invalid"] = True
+            return end, None
+        decoded = _decode_json_string(text, index)
+        if decoded is None:
+            state["invalid"] = True
+            return end, None
+        state["bytes"] += key_bytes
+        index = _skip_json_ws(text, end)
+        if index >= len(text) or text[index] != ":":
+            state["invalid"] = True
+            return index, None
+        child_path = _join_encrypted_reasoning_argument_path(path, decoded)
+        index, bound = _prescan_json_value(
+            text,
+            index + 1,
+            depth + 1,
+            child_path,
+            state,
+        )
+        if bound is not None or state["invalid"]:
+            return index, bound
+        index = _skip_json_ws(text, index)
+        if index < len(text) and text[index] == "}":
+            return index + 1, None
+        if index >= len(text) or text[index] != ",":
+            state["invalid"] = True
+            return index, None
+        index = _skip_json_ws(text, index + 1)
+        if index < len(text) and text[index] == "}":
+            state["invalid"] = True
+            return index, None
+    state["invalid"] = True
+    return index, None
+
+
+def _prescan_json_array(
+    text: str,
+    index: int,
+    depth: int,
+    path: str,
+    state: dict[str, Any],
+) -> tuple[int, Optional[str]]:
+    index = _skip_json_ws(text, index + 1)
+    if index < len(text) and text[index] == "]":
+        return index + 1, None
+    element = 0
+    while index < len(text):
+        child_path = _join_encrypted_reasoning_argument_path(path, f"[{element}]")
+        index, bound = _prescan_json_value(
+            text,
+            index,
+            depth + 1,
+            child_path,
+            state,
+        )
+        if bound is not None or state["invalid"]:
+            return index, bound
+        element += 1
+        index = _skip_json_ws(text, index)
+        if index < len(text) and text[index] == "]":
+            return index + 1, None
+        if index >= len(text) or text[index] != ",":
+            state["invalid"] = True
+            return index, None
+        index = _skip_json_ws(text, index + 1)
+        if index < len(text) and text[index] == "]":
+            state["invalid"] = True
+            return index, None
+    state["invalid"] = True
+    return index, None
+
+
+def _prescan_encrypted_reasoning_json(text: str) -> Optional[tuple[str, str]]:
+    """Return ``(bound, path)`` when a JSON document exceeds a structural budget.
+
+    The scan does not call ``json.loads`` and does not build containers or
+    decoded keys that are already over budget. None means the text is either
+    safe to parse or not JSON.
+    """
+    state: dict[str, Any] = {
+        "nodes": 0,
+        "bytes": 0,
+        "invalid": False,
+        "bound_path": "",
+    }
+    _index, bound = _prescan_json_value(text, 0, 0, "", state)
+    if bound is not None:
+        return bound, str(state.get("bound_path") or "")
+    if state["invalid"]:
+        return None
+    end = _skip_json_ws(text, _index)
+    if end != len(text):
+        return None
+    return None
+
+
+def _parse_encrypted_reasoning_arguments(
+    arguments: Any,
+) -> tuple[Any, Optional[str], str]:
     """Return a JSON object, array, or bare string ready for the walk.
 
-    List roots and nested containers stay structured. A non-JSON string is
-    scanned as itself so a bare Fernet token is not treated as absent.
-    Other scalars are ignored.
+    Structural depth, node, and key-byte budgets are applied to JSON text
+    before ``json.loads``. An overrun returns ``(None, bound, path)`` and
+    does not materialize the document. List roots and nested containers stay
+    structured once they fit. A non-JSON string is scanned as itself so a
+    bare Fernet token is not treated as absent. Other scalars are ignored.
     """
     if isinstance(arguments, (dict, list)):
-        return arguments
+        return arguments, None, ""
     if not isinstance(arguments, str) or not arguments:
-        return None
+        return None, None, ""
+    overrun = _prescan_encrypted_reasoning_json(arguments)
+    if overrun is not None:
+        bound, path = overrun
+        return None, bound, path
     try:
         parsed = json.loads(arguments)
     except (json.JSONDecodeError, TypeError, ValueError):
-        return arguments
+        return arguments, None, ""
     if isinstance(parsed, (dict, list, str)):
-        return parsed
-    return None
+        return parsed, None, ""
+    return None, None, ""
 
 
 def _responses_output_contains_encrypted_reasoning_arguments(
@@ -2746,13 +3114,23 @@ def _responses_output_contains_encrypted_reasoning_arguments(
     for item in output:
         if getattr(item, "type", None) != "function_call":
             continue
-        parsed = _parse_encrypted_reasoning_arguments(
-            getattr(item, "arguments", None)
-        )
-        if parsed is None:
-            continue
         name = getattr(item, "name", None) or ""
         call_id = getattr(item, "call_id", None) or ""
+        parsed, bound, bound_path = _parse_encrypted_reasoning_arguments(
+            getattr(item, "arguments", None)
+        )
+        if bound is not None:
+            findings.append(
+                _encrypted_reasoning_argument_finding(
+                    name=name,
+                    call_id=call_id,
+                    argument_key=bound_path,
+                    bound=bound,
+                )
+            )
+            continue
+        if parsed is None:
+            continue
         _scan_encrypted_reasoning_argument_tree(
             parsed,
             name=name,
