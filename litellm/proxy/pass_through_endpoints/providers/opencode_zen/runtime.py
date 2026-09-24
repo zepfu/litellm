@@ -67,7 +67,7 @@ class Runtime:
 
 _runtime: Optional[Runtime] = None
 
-# Zen file credentials only. OpenCode Go keeps its own uncached read so the
+# Zen file credentials only. OpenCode Go uses a separate bounded cache so the
 # two families cannot reuse each other's keys or invalidation state.
 _ZEN_AUTH_MAX_BYTES = 1_048_576
 _ZEN_AUTH_READ_ATTEMPTS = 3
@@ -112,6 +112,51 @@ _zen_auth_cache: "OrderedDict[str, _ZenAuthCacheEntry]" = OrderedDict()
 _zen_auth_flights: dict[str, _ZenAuthFlight] = {}
 _zen_auth_lock: Optional[asyncio.Lock] = None
 _zen_auth_lock_loop_id: Optional[int] = None
+
+# Go file credentials only. This namespace is not the Zen cache.
+_GO_AUTH_MAX_BYTES = 1_048_576
+_GO_AUTH_READ_ATTEMPTS = 3
+_GO_AUTH_CACHE_MAX_ENTRIES = 8
+_GO_AUTH_CACHE_TTL_SECONDS = 300.0
+_GoAuthGeneration = tuple[int, int, int, int, int]
+
+
+class _GoAuthContentError(ValueError):
+    """Stable Go auth content failed. The generation is not part of the message."""
+
+    def __init__(self, message: str, generation: "_GoAuthGeneration") -> None:
+        super().__init__(message)
+        self.generation = generation
+
+
+@dataclass(frozen=True)
+class _GoAuthCacheEntry:
+    """One Go file generation. Secrets stay out of repr and error text."""
+
+    generation: _GoAuthGeneration
+    api_key: Optional[str] = field(default=None, repr=False, compare=False)
+    loaded_at: float = field(default_factory=time.monotonic)
+    error_message: Optional[str] = field(default=None, repr=False, compare=False)
+
+    def reveal(self) -> str:
+        if self.error_message:
+            raise ValueError(self.error_message)
+        if not self.api_key:
+            raise ValueError("OpenCode Go auth file is not readable.")
+        return self.api_key
+
+
+@dataclass(frozen=True)
+class _GoAuthFlight:
+    """One in-flight Go read for a path, independent of the caller's stat."""
+
+    task: "asyncio.Task[_GoAuthCacheEntry]"
+
+
+_go_auth_cache: "OrderedDict[str, _GoAuthCacheEntry]" = OrderedDict()
+_go_auth_flights: dict[str, _GoAuthFlight] = {}
+_go_auth_lock: Optional[asyncio.Lock] = None
+_go_auth_lock_loop_id: Optional[int] = None
 
 
 _HOST_FUNCTION_NAMES = (
@@ -1237,47 +1282,95 @@ async def _load_local_opencode_zen_api_key() -> str:
     )
 
 
-async def _load_opencode_go_api_key() -> str:
-    """Load an OpenCode Go API key from Go-specific sources only.
+def _go_auth_file_error(source_label: str, reason: str) -> ValueError:
+    return ValueError(f"OpenCode Go auth file configured via {source_label} {reason}")
 
-    Explicit keys come from Go environment names. A shared auth file may
-    be read, but only ``auth_data["opencode-go"]`` is selected. The
-    Zen/general ``auth_data["opencode"]`` entry is never read, copied, or
-    removed. A missing or malformed Go entry fails closed. Credential
-    fingerprint, target family, and cache namespace stay on ``opencode_go``.
-    """
-    explicit_key = _get_first_secret_value(
-        _constants._OPENCODE_GO_API_KEY_ENV_VARS
-    )
-    if explicit_key is not None:
-        return _bind_opencode_go_credential_identity(explicit_key)
 
-    configured_source: Optional[str] = None
+def _configured_opencode_go_auth_source_label() -> str:
+    """Name the first configured Go or shared auth-file variable, never its path."""
+
     for env_name in (
         *_constants._OPENCODE_GO_AUTH_FILE_ENV_VARS,
         *_constants._OPENCODE_ZEN_AUTH_FILE_ENV_VARS,
     ):
         if _clean_secret_string(os.getenv(env_name)):
-            configured_source = env_name
-            break
+            return env_name
+    return "default"
 
-    auth_path = _get_opencode_go_auth_file_path()
-    if auth_path is None:
-        raise FileNotFoundError(
-            "OpenCode Go auth file not found. Expected "
-            "'~/.local/share/opencode/auth.json' or set "
-            "'LITELLM_OPENCODE_GO_AUTH_FILE'."
+
+def _missing_opencode_go_auth_file_error() -> FileNotFoundError:
+    return FileNotFoundError(
+        "OpenCode Go auth file not found. Expected "
+        "'~/.local/share/opencode/auth.json' or set "
+        "'LITELLM_OPENCODE_GO_AUTH_FILE'."
+    )
+
+
+def _go_auth_cache_key(path: Path) -> str:
+    """Cache in the Go namespace by the authoritative path, without following a symlink."""
+
+    authoritative = os.path.normcase(os.path.abspath(os.fspath(path)))
+    namespace = _constants._OPENCODE_GO_CREDENTIAL_CACHE_NAMESPACE
+    return f"{namespace}\0{authoritative}"
+
+
+def _go_auth_generation(stat_result: os.stat_result) -> _GoAuthGeneration:
+    return (
+        int(stat_result.st_dev),
+        int(stat_result.st_ino),
+        int(stat_result.st_mtime_ns),
+        int(stat_result.st_ctime_ns),
+        int(stat_result.st_size),
+    )
+
+
+def _go_auth_read_fingerprint(
+    stat_result: os.stat_result,
+) -> tuple[int, int, int, int]:
+    # A replaced inode can change ctime/link metadata while an open
+    # descriptor still exposes the previous bytes.
+    return (
+        int(stat_result.st_dev),
+        int(stat_result.st_ino),
+        int(stat_result.st_mtime_ns),
+        int(stat_result.st_size),
+    )
+
+
+def _map_go_auth_open_error(exc: OSError, source_label: str) -> ValueError:
+    if exc.errno in (errno.ELOOP, errno.EMLINK, errno.ENXIO, errno.EAGAIN):
+        return _go_auth_file_error(
+            source_label,
+            "is missing or not a regular file.",
         )
+    return _go_auth_file_error(source_label, "is not readable.")
 
-    source_label = configured_source or "default"
+
+def _go_auth_descriptor_metadata(
+    descriptor: int,
+    source_label: str,
+) -> os.stat_result:
+    """Reject anything that is not a bounded regular file before reading it."""
 
     try:
-        raw_text = auth_path.read_text(encoding="utf-8")
-    except Exception:
-        raise ValueError(
-            f"OpenCode Go auth file configured via {source_label} "
-            "is not readable."
-        ) from None
+        metadata = os.fstat(descriptor)
+    except OSError:
+        raise _go_auth_file_error(source_label, "is not readable.") from None
+    if not stat.S_ISREG(metadata.st_mode):
+        raise _go_auth_file_error(
+            source_label,
+            "is missing or not a regular file.",
+        )
+    if metadata.st_size > _GO_AUTH_MAX_BYTES:
+        raise _go_auth_file_error(
+            source_label,
+            "exceeds the maximum auth-file size.",
+        )
+    return metadata
+
+
+def _go_api_key_from_auth_text(raw_text: str, *, source_label: str) -> str:
+    """Select only ``opencode-go``. Never read or return the Zen entry."""
 
     try:
         auth_data = json.loads(raw_text)
@@ -1303,9 +1396,7 @@ async def _load_opencode_go_api_key() -> str:
             auth_data=auth_data,
         )
     api_key = _clean_secret_string(raw_key if isinstance(raw_key, str) else None)
-    auth_type = _clean_secret_string(
-        raw_type if isinstance(raw_type, str) else None
-    )
+    auth_type = _clean_secret_string(raw_type if isinstance(raw_type, str) else None)
     if auth_type not in {None, "api"}:
         raise ValueError(
             f"OpenCode Go auth file configured via {source_label} "
@@ -1318,6 +1409,456 @@ async def _load_opencode_go_api_key() -> str:
         )
     assert api_key is not None
     return _bind_opencode_go_credential_identity(api_key)
+
+
+def _stat_go_auth_generation_sync(
+    path: Path,
+    source_label: str,
+) -> _GoAuthGeneration:
+    try:
+        descriptor = _open_zen_auth_descriptor(path)
+    except OSError as exc:
+        raise _map_go_auth_open_error(exc, source_label) from None
+    try:
+        metadata = _go_auth_descriptor_metadata(descriptor, source_label)
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+    return _go_auth_generation(metadata)
+
+
+def _read_one_go_auth_attempt_sync(
+    path: Path,
+    source_label: str,
+) -> Optional[tuple[str, _GoAuthGeneration]]:
+    """Read one Go generation through the validated descriptor.
+
+    Return None when that inode changes mid-read. Invalid content is a
+    failure for the generation that was read, not a reason to keep the
+    previous key.
+    """
+
+    try:
+        descriptor = _open_zen_auth_descriptor(path)
+    except OSError as exc:
+        raise _map_go_auth_open_error(exc, source_label) from None
+    try:
+        before = _go_auth_descriptor_metadata(descriptor, source_label)
+        try:
+            raw_bytes = _read_descriptor_bounded(descriptor)
+        except OSError:
+            raise _go_auth_file_error(source_label, "is not readable.") from None
+        except ValueError:
+            raise _go_auth_file_error(
+                source_label,
+                "exceeds the maximum auth-file size.",
+            ) from None
+        if len(raw_bytes) > _GO_AUTH_MAX_BYTES:
+            raise _go_auth_file_error(
+                source_label,
+                "exceeds the maximum auth-file size.",
+            )
+        try:
+            after = os.fstat(descriptor)
+        except OSError:
+            raise _go_auth_file_error(source_label, "is not readable.") from None
+        if not stat.S_ISREG(after.st_mode):
+            raise _go_auth_file_error(
+                source_label,
+                "is missing or not a regular file.",
+            )
+        if _go_auth_read_fingerprint(before) != _go_auth_read_fingerprint(after):
+            return None
+        generation = _go_auth_generation(after)
+        try:
+            auth_text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            raise _GoAuthContentError(
+                f"OpenCode Go auth file configured via {source_label} "
+                "does not contain valid UTF-8 text.",
+                generation,
+            ) from None
+        try:
+            api_key = _go_api_key_from_auth_text(
+                auth_text,
+                source_label=source_label,
+            )
+        except ValueError as exc:
+            raise _GoAuthContentError(str(exc), generation) from None
+        return api_key, generation
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _read_stable_go_auth_api_key_sync(
+    path: Path,
+    source_label: str,
+) -> tuple[str, _GoAuthGeneration]:
+    for _attempt in range(_GO_AUTH_READ_ATTEMPTS):
+        loaded = _read_one_go_auth_attempt_sync(path, source_label)
+        if loaded is not None:
+            return loaded
+    raise _go_auth_file_error(source_label, "changed while it was read.")
+
+
+def _resolve_go_auth_load_inputs_sync() -> tuple[Path, str]:
+    source_label = _configured_opencode_go_auth_source_label()
+    auth_path = _get_opencode_go_auth_file_path()
+    if auth_path is None:
+        raise _missing_opencode_go_auth_file_error()
+    return auth_path, source_label
+
+
+def _get_go_auth_lock() -> asyncio.Lock:
+    global _go_auth_lock, _go_auth_lock_loop_id
+
+    loop_id = id(asyncio.get_running_loop())
+    if _go_auth_lock is None or _go_auth_lock_loop_id != loop_id:
+        _go_auth_lock = asyncio.Lock()
+        _go_auth_lock_loop_id = loop_id
+        _go_auth_flights.clear()
+    return _go_auth_lock
+
+
+def _go_auth_entry_is_fresh(
+    entry: Optional[_GoAuthCacheEntry],
+    generation: _GoAuthGeneration,
+    now: float,
+) -> bool:
+    if entry is None or entry.generation != generation:
+        return False
+    age = now - entry.loaded_at
+    return 0 <= age < _GO_AUTH_CACHE_TTL_SECONDS
+
+
+def _remember_go_auth_unlocked(
+    path_key: str,
+    generation: _GoAuthGeneration,
+    api_key: str,
+) -> None:
+    _go_auth_cache[path_key] = _GoAuthCacheEntry(
+        generation=generation,
+        api_key=api_key,
+    )
+    _go_auth_cache.move_to_end(path_key)
+    while len(_go_auth_cache) > _GO_AUTH_CACHE_MAX_ENTRIES:
+        _go_auth_cache.popitem(last=False)
+
+
+def _finish_go_auth_flight(
+    path_key: str,
+    task: "asyncio.Task[_GoAuthCacheEntry]",
+) -> None:
+    flight = _go_auth_flights.get(path_key)
+    if flight is not None and flight.task is task:
+        _go_auth_flights.pop(path_key, None)
+    if task.cancelled():
+        return
+    task.exception()
+
+
+async def _drop_go_auth_cache_if_owner(path_key: str) -> None:
+    task = asyncio.current_task()
+    async with _get_go_auth_lock():
+        flight = _go_auth_flights.get(path_key)
+        if flight is not None and flight.task is task:
+            _go_auth_cache.pop(path_key, None)
+
+
+async def _current_go_auth_generation(
+    path: Path,
+    source_label: str,
+    path_key: str,
+) -> _GoAuthGeneration:
+    """Probe outside the shared lock, then drop a key the probe can no longer see."""
+
+    try:
+        return await asyncio.to_thread(
+            _stat_go_auth_generation_sync,
+            path,
+            source_label,
+        )
+    except Exception:
+        async with _get_go_auth_lock():
+            _go_auth_cache.pop(path_key, None)
+        raise
+
+
+def _go_publish_matches_owner(
+    path_key: str,
+    generation: _GoAuthGeneration,
+    current: Optional[_GoAuthGeneration],
+) -> bool:
+    task = asyncio.current_task()
+    flight = _go_auth_flights.get(path_key)
+    if flight is None or flight.task is not task:
+        return False
+    if current != generation:
+        _go_auth_cache.pop(path_key, None)
+        return False
+    return True
+
+
+async def _publish_go_auth_if_current(
+    path: Path,
+    source_label: str,
+    path_key: str,
+    generation: _GoAuthGeneration,
+    api_key: str,
+) -> None:
+    try:
+        current: Optional[_GoAuthGeneration] = await asyncio.to_thread(
+            _stat_go_auth_generation_sync,
+            path,
+            source_label,
+        )
+    except Exception:
+        current = None
+    async with _get_go_auth_lock():
+        if not _go_publish_matches_owner(path_key, generation, current):
+            return
+        _remember_go_auth_unlocked(path_key, generation, api_key)
+
+
+async def _publish_go_auth_failure(
+    path: Path,
+    source_label: str,
+    path_key: str,
+    generation: _GoAuthGeneration,
+    message: str,
+) -> None:
+    """Record a sanitized content failure and do not keep the previous key."""
+
+    try:
+        current: Optional[_GoAuthGeneration] = await asyncio.to_thread(
+            _stat_go_auth_generation_sync,
+            path,
+            source_label,
+        )
+    except Exception:
+        current = None
+    async with _get_go_auth_lock():
+        if not _go_publish_matches_owner(path_key, generation, current):
+            return
+        _go_auth_cache[path_key] = _GoAuthCacheEntry(
+            generation=generation,
+            error_message=message,
+        )
+        _go_auth_cache.move_to_end(path_key)
+        while len(_go_auth_cache) > _GO_AUTH_CACHE_MAX_ENTRIES:
+            _go_auth_cache.popitem(last=False)
+
+
+async def _run_go_auth_flight(
+    path: Path,
+    source_label: str,
+    path_key: str,
+) -> _GoAuthCacheEntry:
+    try:
+        api_key, generation = await asyncio.to_thread(
+            _read_stable_go_auth_api_key_sync,
+            path,
+            source_label,
+        )
+    except _GoAuthContentError as exc:
+        await _publish_go_auth_failure(
+            path,
+            source_label,
+            path_key,
+            exc.generation,
+            str(exc),
+        )
+        return _GoAuthCacheEntry(
+            generation=exc.generation,
+            error_message=str(exc),
+        )
+    except BaseException:
+        await _drop_go_auth_cache_if_owner(path_key)
+        raise
+    await _publish_go_auth_if_current(
+        path,
+        source_label,
+        path_key,
+        generation,
+        api_key,
+    )
+    return _GoAuthCacheEntry(generation=generation, api_key=api_key)
+
+
+def _fresh_go_auth_unlocked(
+    path_key: str,
+    generation: _GoAuthGeneration,
+    now: float,
+) -> Optional[_GoAuthCacheEntry]:
+    cached = _go_auth_cache.get(path_key)
+    if not _go_auth_entry_is_fresh(cached, generation, now):
+        return None
+    _go_auth_cache.move_to_end(path_key)
+    return cached
+
+
+def _join_go_auth_flight_unlocked(
+    path_key: str,
+) -> "Optional[asyncio.Task[_GoAuthCacheEntry]]":
+    flight = _go_auth_flights.get(path_key)
+    if flight is not None and not flight.task.done():
+        return flight.task
+    return None
+
+
+def _claim_go_auth_flight_unlocked(
+    path: Path,
+    source_label: str,
+    path_key: str,
+) -> "asyncio.Task[_GoAuthCacheEntry]":
+    inflight = _join_go_auth_flight_unlocked(path_key)
+    if inflight is not None:
+        return inflight
+    _go_auth_cache.pop(path_key, None)
+    task = asyncio.create_task(_run_go_auth_flight(path, source_label, path_key))
+    _go_auth_flights[path_key] = _GoAuthFlight(task=task)
+    task.add_done_callback(lambda done, key=path_key: _finish_go_auth_flight(key, done))
+    return task
+
+
+def _go_entry_published_during_probe_unlocked(
+    path_key: str,
+    snapshot: Optional[_GoAuthCacheEntry],
+    now: float,
+) -> Optional[_GoAuthCacheEntry]:
+    """Return an entry another caller stored while a generation probe ran."""
+
+    cached = _go_auth_cache.get(path_key)
+    if cached is None or cached is snapshot:
+        return None
+    if not _go_auth_entry_is_fresh(cached, cached.generation, now):
+        return None
+    _go_auth_cache.move_to_end(path_key)
+    return cached
+
+
+@dataclass(frozen=True)
+class _GoAuthLoadChoice:
+    entry: Optional[_GoAuthCacheEntry] = None
+    task: "Optional[asyncio.Task[_GoAuthCacheEntry]]" = None
+    generation: Optional[_GoAuthGeneration] = None
+    missed: bool = False
+
+
+async def _revalidate_published_go_auth(
+    path: Path,
+    source_label: str,
+    path_key: str,
+) -> _GoAuthLoadChoice:
+    """Stat outside the lock. A probe that started earlier must not evict this entry."""
+
+    async with _get_go_auth_lock():
+        snapshot = _go_auth_cache.get(path_key)
+    generation = await _current_go_auth_generation(path, source_label, path_key)
+    async with _get_go_auth_lock():
+        cached = _fresh_go_auth_unlocked(path_key, generation, time.monotonic())
+        if cached is not None:
+            return _GoAuthLoadChoice(entry=cached, generation=generation)
+        published_during = _go_entry_published_during_probe_unlocked(
+            path_key,
+            snapshot,
+            time.monotonic(),
+        )
+        if published_during is not None:
+            return _GoAuthLoadChoice(
+                entry=published_during,
+                generation=published_during.generation,
+            )
+        task = _join_go_auth_flight_unlocked(path_key)
+        if task is None:
+            task = _claim_go_auth_flight_unlocked(path, source_label, path_key)
+        return _GoAuthLoadChoice(task=task, generation=generation)
+
+
+async def _observe_go_auth_probe(
+    path: Path,
+    source_label: str,
+    path_key: str,
+    *,
+    allow_claim: bool,
+) -> _GoAuthLoadChoice:
+    async with _get_go_auth_lock():
+        snapshot = _go_auth_cache.get(path_key)
+    generation = await _current_go_auth_generation(path, source_label, path_key)
+    async with _get_go_auth_lock():
+        published = _go_entry_published_during_probe_unlocked(
+            path_key,
+            snapshot,
+            time.monotonic(),
+        )
+        if published is None:
+            cached = _fresh_go_auth_unlocked(path_key, generation, time.monotonic())
+            if cached is not None:
+                return _GoAuthLoadChoice(entry=cached, generation=generation)
+            task = _join_go_auth_flight_unlocked(path_key)
+            if task is not None:
+                return _GoAuthLoadChoice(task=task, generation=generation)
+            if not allow_claim:
+                return _GoAuthLoadChoice(missed=True, generation=generation)
+            task = _claim_go_auth_flight_unlocked(path, source_label, path_key)
+            return _GoAuthLoadChoice(task=task, generation=generation)
+    return await _revalidate_published_go_auth(path, source_label, path_key)
+
+
+async def _load_cached_go_file_api_key() -> str:
+    path, source_label = await asyncio.to_thread(_resolve_go_auth_load_inputs_sync)
+    path_key = _go_auth_cache_key(path)
+    for _attempt in range(_GO_AUTH_READ_ATTEMPTS):
+        choice = await _observe_go_auth_probe(
+            path,
+            source_label,
+            path_key,
+            allow_claim=False,
+        )
+        if choice.missed:
+            choice = await _observe_go_auth_probe(
+                path,
+                source_label,
+                path_key,
+                allow_claim=True,
+            )
+        if choice.entry is not None:
+            return choice.entry.reveal()
+        task = choice.task
+        generation = choice.generation
+        if task is None or generation is None:
+            continue
+        result = await asyncio.shield(task)
+        if result.generation == generation:
+            return result.reveal()
+        current = await _current_go_auth_generation(path, source_label, path_key)
+        if current == result.generation:
+            return result.reveal()
+    raise _go_auth_file_error(source_label, "changed while it was read.")
+
+
+async def _load_opencode_go_api_key() -> str:
+    """Load an OpenCode Go API key from Go-specific sources only.
+
+    Explicit keys come from Go environment names. A shared auth file may
+    be read, but only ``auth_data["opencode-go"]`` is selected. The
+    Zen/general ``auth_data["opencode"]`` entry is never read, copied, or
+    returned, and the Zen auth cache is not consulted. File reads run off
+    the event loop, coalesce per path, and are cached by authoritative path
+    plus file generation in the Go namespace. A malformed replacement
+    replaces the cached key for that generation instead of retaining it.
+    Credential fingerprint, target family, and cache namespace stay on
+    ``opencode_go``.
+    """
+    explicit_key = _get_first_secret_value(_constants._OPENCODE_GO_API_KEY_ENV_VARS)
+    if explicit_key is not None:
+        return _bind_opencode_go_credential_identity(explicit_key)
+    return await _load_cached_go_file_api_key()
 
 
 async def _load_local_opencode_go_api_key() -> str:
