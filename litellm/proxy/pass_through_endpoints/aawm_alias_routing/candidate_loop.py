@@ -87,6 +87,7 @@ from .codex_quota_balance import snapshot_selection
 from .cohere_monthly_cooldown import (
     apply_cohere_monthly_cooldown_horizon,
     cohere_monthly_publication_duration,
+    stamp_cohere_billing_ceiling_marker,
     stamp_cohere_monthly_quota_marker,
 )
 from .interfaces import (
@@ -1264,6 +1265,11 @@ def _classify_codex_cohere_candidate_failure(
         and mapped_error_class == "usage_limit_reached"
     ):
         stamp_cohere_monthly_quota_marker(exc)
+    if (
+        classification.name == "cohere_billing_exhausted"
+        and mapped_error_class == "usage_limit_reached"
+    ):
+        stamp_cohere_billing_ceiling_marker(exc)
     return mapped_error_class
 
 

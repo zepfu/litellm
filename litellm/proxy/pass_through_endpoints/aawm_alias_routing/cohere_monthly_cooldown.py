@@ -37,6 +37,7 @@ from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.common im
 
 COHERE_MONTHLY_QUOTA_MARKER_ATTR = "_aawm_cohere_monthly_quota"
 COHERE_MONTHLY_FAILURE_KIND = "cohere_monthly_trial_exhausted"
+COHERE_BILLING_EXHAUSTED_FAILURE_KIND = "cohere_billing_exhausted"
 # Skew allowance after the UTC calendar-month boundary. Capped so the fallback
 # cannot grow into another multi-hour usage-limit hold.
 COHERE_MONTHLY_RESET_SAFETY_MARGIN_SECONDS = 60.0
@@ -238,6 +239,37 @@ def stamp_cohere_monthly_quota_marker(exc: Exception) -> Optional[Mapping[str, A
         "quota_period": "calendar_month",
         "quota_type": "monthly",
         "failure_kind": COHERE_MONTHLY_FAILURE_KIND,
+    }
+    if reset_epoch is not None:
+        marker_fields["expected_reset_at"] = reset_epoch
+    marker = MappingProxyType(marker_fields)
+    try:
+        setattr(exc, COHERE_MONTHLY_QUOTA_MARKER_ATTR, marker)
+    except _RESET_CONVERSION_ERRORS:
+        return marker
+    return marker
+
+
+def stamp_cohere_billing_ceiling_marker(exc: Exception) -> Optional[Mapping[str, Any]]:
+    """Attach the monthly reset marker for a typed Cohere HTTP 402.
+
+    The caller has already attributed an exact Cohere billing ceiling. This
+    does not read failure text, so an unrelated message cannot become billing
+    exhaustion. A usable reset timestamp is kept; otherwise the existing
+    calendar-month horizon applies. The marker carries no upstream body.
+    """
+
+    reset_epoch: Optional[float] = None
+    try:
+        reset_epoch = extract_authoritative_reset_epoch(exc)
+    except _RESET_CONVERSION_ERRORS:
+        reset_epoch = None
+    marker_fields: dict[str, Any] = {
+        "provider": "cohere",
+        "status": "exhausted",
+        "quota_period": "calendar_month",
+        "quota_type": "monthly",
+        "failure_kind": COHERE_BILLING_EXHAUSTED_FAILURE_KIND,
     }
     if reset_epoch is not None:
         marker_fields["expected_reset_at"] = reset_epoch
