@@ -12398,9 +12398,12 @@ def _handle_alibaba_quota_http_error(
     task_state: Optional[SidecarTaskState] = None,
 ) -> None:
     try:
-        exc.read()
-    except Exception:
-        pass
+        try:
+            exc.read()
+        except Exception:
+            pass
+    finally:
+        exc.close()
     auth_failure = exc.code in {401, 403}
     if auth_failure and not state.refresh_attempted:
         _refresh_alibaba_console_access_token(
