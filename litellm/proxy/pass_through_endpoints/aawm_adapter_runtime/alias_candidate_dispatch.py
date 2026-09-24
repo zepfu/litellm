@@ -179,22 +179,63 @@ _runtime: Optional[AliasCandidateDispatchRuntime] = None
 # ---------------------------------------------------------------------------
 
 
+def _reject_alibaba_token_plan_route_contract_mismatch(
+    *,
+    candidate: Payload,
+    provider: str,
+    route_family: str,
+) -> None:
+    """Reject an Alibaba provider/route mismatch before any adapter call."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_compiler import (
+        alibaba_token_plan_route_contract_mismatch,
+    )
+
+    direction = alibaba_token_plan_route_contract_mismatch(
+        provider=provider,
+        route_families=(route_family or None,),
+    )
+    if direction is None:
+        return
+    if direction == "provider_to_route":
+        detail = (
+            "Alibaba Token Plan provider identity does not match "
+            "codex_alibaba_token_plan_chat_completions_adapter; "
+            f"provider={provider} route_family={route_family}."
+        )
+    else:
+        detail = (
+            "codex_alibaba_token_plan_chat_completions_adapter route does not "
+            "match Alibaba Token Plan provider identity; "
+            f"provider={provider} route_family={route_family}."
+        )
+    _raise_alias_route_family_ineligible(
+        candidate=candidate,
+        ingress="alias",
+        provider_label="Alibaba Token Plan",
+        detail=detail,
+    )
+
+
 def _raise_alias_route_family_ineligible(
     *,
     candidate: Payload,
     ingress: str,
     provider_label: str,
+    detail: Optional[str] = None,
 ) -> Never:
     """Reject an unregistered alias route before credential preparation."""
     from litellm.proxy._types import ProxyException
 
     model = str(candidate.get("model") or "")
     route_family = str(candidate.get("route_family") or "")
-    message = (
-        "aawm_codex_auto_agent_candidate_ineligible: "
-        f"{provider_label} alias route family is not registered for this ingress; "
-        f"ingress={ingress} model={model} route_family={route_family}."
-    )
+    if detail is None:
+        message = (
+            "aawm_codex_auto_agent_candidate_ineligible: "
+            f"{provider_label} alias route family is not registered for this ingress; "
+            f"ingress={ingress} model={model} route_family={route_family}."
+        )
+    else:
+        message = f"aawm_codex_auto_agent_candidate_ineligible: {detail}"
     proxy_exc = ProxyException(
         message=message,
         type="invalid_request_error",
@@ -279,6 +320,11 @@ async def _dispatch_auto_agent_alias_candidate_request(
     route_family = str(
         canonicalize_openrouter_native_responses_route_family(raw_route_family)
         or raw_route_family
+    )
+    _reject_alibaba_token_plan_route_contract_mismatch(
+        candidate=candidate,
+        provider=provider,
+        route_family=route_family,
     )
     if route_family_handlers and provider in route_family_handlers:
         family_map = route_family_handlers[provider]

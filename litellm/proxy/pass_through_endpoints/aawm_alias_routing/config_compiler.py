@@ -485,6 +485,63 @@ def _validate_nvidia_credential_domain(
         )
 
 
+def alibaba_token_plan_route_contract_mismatch(
+    *,
+    provider: str,
+    route_families: tuple[Optional[str], ...],
+) -> Optional[str]:
+    """Return which Alibaba Token Plan route-contract direction failed.
+
+    The contract is the existing ``alibaba_token_plan`` route vocabulary,
+    anchored on ``codex_alibaba_token_plan_chat_completions_adapter`` and its
+    Anthropic projection. ``provider_to_route`` means that provider is paired
+    with a family outside the vocabulary. ``route_to_provider`` means a
+    vocabulary family is paired with a different provider. Pairs that use
+    neither side stay untouched so generic providers keep their own routes.
+    """
+
+    allowed = _PROVIDER_ALLOWED_ROUTE_FAMILIES[
+        policy.CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
+    ]
+    present = tuple(value for value in route_families if value is not None)
+    uses_contract_route = any(value in allowed for value in present)
+    is_alibaba_provider = (
+        provider == policy.CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
+    )
+    if is_alibaba_provider and (
+        not present or any(value not in allowed for value in present)
+    ):
+        return "provider_to_route"
+    if uses_contract_route and not is_alibaba_provider:
+        return "route_to_provider"
+    return None
+
+
+def _validate_alibaba_token_plan_route_contract(
+    *,
+    provider: str,
+    model: str,
+    route_family: Optional[str],
+    anthropic_route_family: Optional[str],
+) -> None:
+    direction = alibaba_token_plan_route_contract_mismatch(
+        provider=provider,
+        route_families=(route_family, anthropic_route_family),
+    )
+    if direction == "route_to_provider":
+        raise ConfigCompileError(
+            f"candidate model {model!r}: provider {provider!r} is incompatible "
+            "with Alibaba Token Plan route family "
+            "codex_alibaba_token_plan_chat_completions_adapter"
+        )
+    if direction == "provider_to_route":
+        raise ConfigCompileError(
+            f"candidate model {model!r}: provider {provider!r} requires "
+            "Alibaba Token Plan route family "
+            "codex_alibaba_token_plan_chat_completions_adapter"
+        )
+
+
 def _validate_openrouter_credential_domain(
     *,
     provider: str,
@@ -653,6 +710,12 @@ def _compile_candidate(candidate: schema.CandidateConfig, weight: float) -> Rout
         anthropic_route_family=anthropic_rf,
     )
     _validate_openrouter_credential_domain(
+        provider=candidate.provider,
+        model=candidate.model,
+        route_family=candidate.route_family,
+        anthropic_route_family=anthropic_rf,
+    )
+    _validate_alibaba_token_plan_route_contract(
         provider=candidate.provider,
         model=candidate.model,
         route_family=candidate.route_family,
