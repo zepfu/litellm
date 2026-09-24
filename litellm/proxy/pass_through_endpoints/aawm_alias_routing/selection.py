@@ -36,6 +36,8 @@ from .lane_keys import (
     openrouter_credit_lane_cooldown_key,
     resolve_cohere_credential_lane_sentinel,
     resolve_openrouter_credential_lane_key,
+    resolve_selected_zen_account_sentinel,
+    zen_account_cooldown_key,
     _codex_auto_agent_candidate_key,
     _resolve_anthropic_auto_agent_native_cooldown_lane_key,
     _resolve_codex_auto_agent_openai_cooldown_lane_key,
@@ -210,6 +212,8 @@ SELECT DISTINCT ON (
     quota_type,
     expected_reset_at,
     remaining_pct,
+    quota_limit,
+    quota_remaining,
     raw_provider_fields,
     evidence,
     NULLIF(BTRIM(evidence->>'environment'), '') AS environment,
@@ -1918,6 +1922,41 @@ async def _apply_cohere_credential_lane_cooldown(
     return cooldown_seconds, cooldown_state_source, skip_reason, "credential"
 
 
+async def _apply_zen_account_lane_cooldown(
+    *,
+    request: Request,
+    candidate: dict[str, Any],
+    cooldown_seconds: float,
+    cooldown_state_source: Optional[str],
+    skip_reason: Optional[str],
+    get_active_cooldown_state: Callable[[str], Awaitable[tuple[float, str]]],
+) -> tuple[float, Optional[str], Optional[str], Optional[str]]:
+    """Suppress both Zen models that share the selected account sentinel.
+
+    OpenCode Go and other providers do not match the Zen cooldown key.
+    Model-specific cooldowns stay on the candidate key and are not read here.
+    """
+
+    if candidate.get("provider") != "opencode_zen":
+        return cooldown_seconds, cooldown_state_source, skip_reason, None
+    sentinel = await resolve_selected_zen_account_sentinel()
+    key = zen_account_cooldown_key(candidate, sentinel)
+    if key is None:
+        return cooldown_seconds, cooldown_state_source, skip_reason, None
+    request_local = key in _peek_codex_auto_agent_request_local_excluded_keys(request)
+    seconds, source = await get_active_cooldown_state(key)
+    if seconds <= 0 and not request_local:
+        return cooldown_seconds, cooldown_state_source, skip_reason, None
+    if seconds > cooldown_seconds:
+        cooldown_seconds = seconds
+        cooldown_state_source = source
+    elif request_local and cooldown_state_source is None:
+        cooldown_state_source = "zen_account_request_local"
+    if skip_reason is None:
+        skip_reason = "zen_account_cooldown"
+    return cooldown_seconds, cooldown_state_source, skip_reason, "account"
+
+
 async def _apply_kimi_code_managed_account_lane_cooldown(
     *,
     candidate: dict[str, Any],
@@ -2434,6 +2473,42 @@ async def _clear_alibaba_token_plan_account_quota_cooldown(
     return bool(result)
 
 
+def _zai_coding_plan_quota_number(value: Any) -> Optional[float]:
+    """Parse a persisted quota number without rounding it to a whole percent."""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _zai_coding_plan_control_remaining_pct(
+    *,
+    remaining_pct: Optional[float],
+    quota_type: str,
+    quota_limit: Optional[float],
+    quota_remaining: Optional[float],
+) -> Optional[float]:
+    """Use absolute CREDIT_LIMIT remaining; keep other windows on their percent."""
+    if quota_type == "credits" and quota_remaining is not None and quota_remaining >= 0.0:
+        if quota_remaining == 0.0:
+            return 0.0
+        if quota_limit is not None and quota_limit > 0.0:
+            return max(0.0, min(100.0, quota_remaining / quota_limit * 100.0))
+    if remaining_pct is None or not 0.0 <= remaining_pct <= 100.0:
+        return None
+    return remaining_pct
+
+
+def _zai_coding_plan_quota_exhausted(remaining_pct: float) -> bool:
+    """0% remaining is exhausted. Any positive fraction stays available."""
+    return remaining_pct <= 0.0
+
+
 def _zai_coding_plan_quota_observation_from_row(
     row: Any,
     *,
@@ -2496,14 +2571,15 @@ def _zai_coding_plan_quota_observation_from_row(
     expected_reset_at = alias_routing_state._quota_observation_timestamp(
         values.get("expected_reset_at")
     )
-    remaining_pct = values.get("remaining_pct")
-    if (
-        observed_at is None
-        or isinstance(remaining_pct, bool)
-        or not isinstance(remaining_pct, (int, float))
-        or not math.isfinite(float(remaining_pct))
-        or not 0.0 <= float(remaining_pct) <= 100.0
-    ):
+    remaining_pct = _zai_coding_plan_control_remaining_pct(
+        remaining_pct=_zai_coding_plan_quota_number(values.get("remaining_pct")),
+        quota_type=quota_type,
+        quota_limit=_zai_coding_plan_quota_number(values.get("quota_limit")),
+        quota_remaining=_zai_coding_plan_quota_number(
+            values.get("quota_remaining")
+        ),
+    )
+    if observed_at is None or remaining_pct is None:
         return None
     now = time.time() if now_epoch is None else float(now_epoch)
     if now < observed_at or now - observed_at > _ZAI_CODING_PLAN_QUOTA_MAX_AGE_SECONDS:
@@ -2519,11 +2595,11 @@ def _zai_coding_plan_quota_observation_from_row(
         "quota_key": values.get("quota_key"),
         "quota_period": row_window,
         "quota_type": quota_type,
-        "remaining_pct": float(remaining_pct),
+        "remaining_pct": remaining_pct,
         "observed_at": observed_at,
         "expected_reset_at": expected_reset_at,
         "status": "fresh",
-        "exhausted": float(remaining_pct) <= 0.0,
+        "exhausted": _zai_coding_plan_quota_exhausted(remaining_pct),
         "source": _ZAI_CODING_PLAN_QUOTA_SOURCE,
         "evidence": evidence,
     }
@@ -3936,6 +4012,19 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         cooldown_seconds,
         cooldown_state_source,
         skip_reason,
+        zen_account_cooldown_scope,
+    ) = await _apply_zen_account_lane_cooldown(
+        request=request,
+        candidate=candidate,
+        cooldown_seconds=cooldown_seconds,
+        cooldown_state_source=cooldown_state_source,
+        skip_reason=skip_reason,
+        get_active_cooldown_state=active_cooldown_state,
+    )
+    (
+        cooldown_seconds,
+        cooldown_state_source,
+        skip_reason,
     ) = await _apply_codex_auto_agent_alibaba_token_plan_account_cooldown(
         candidate=candidate,
         cooldown_seconds=cooldown_seconds,
@@ -4060,6 +4149,8 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         state["cooldown_scope"] = openrouter_account_cooldown_scope
     if cohere_credential_cooldown_scope is not None:
         state["cooldown_scope"] = cohere_credential_cooldown_scope
+    if zen_account_cooldown_scope is not None:
+        state["cooldown_scope"] = zen_account_cooldown_scope
     if quota_state.get("cohere_quota_observations"):
         state["cohere_quota_observations"] = quota_state[
             "cohere_quota_observations"
@@ -4737,6 +4828,19 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
         cooldown_seconds,
         cooldown_state_source,
         skip_reason,
+        zen_account_cooldown_scope,
+    ) = await _apply_zen_account_lane_cooldown(
+        request=request,
+        candidate=candidate,
+        cooldown_seconds=cooldown_seconds,
+        cooldown_state_source=cooldown_state_source,
+        skip_reason=skip_reason,
+        get_active_cooldown_state=_get_anthropic_active_cooldown_state,
+    )
+    (
+        cooldown_seconds,
+        cooldown_state_source,
+        skip_reason,
         managed_account_cooldown_scope,
     ) = await _apply_kimi_code_managed_account_lane_cooldown(
         candidate=candidate,
@@ -4833,6 +4937,8 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
         state["cooldown_scope"] = managed_account_cooldown_scope
     if openrouter_account_cooldown_scope is not None:
         state["cooldown_scope"] = openrouter_account_cooldown_scope
+    if zen_account_cooldown_scope is not None:
+        state["cooldown_scope"] = zen_account_cooldown_scope
     return state
 
 

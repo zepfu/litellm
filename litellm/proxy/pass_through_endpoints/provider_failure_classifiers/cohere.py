@@ -405,7 +405,8 @@ def classify_cohere_failure(
             log_error_summary="Cohere request cancelled",
         )
     text = _normalized_error_text(exc)
-    if status_code in (401, 403):
+    # 498 is Cohere Invalid Token: credential-wide, same as 401 and 403.
+    if status_code in (401, 403, 498):
         return _cohere_classification(
             name="cohere_authentication",
             failure_class="auth",

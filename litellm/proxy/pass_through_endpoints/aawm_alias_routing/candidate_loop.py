@@ -87,6 +87,7 @@ from .codex_quota_balance import snapshot_selection
 from .cohere_monthly_cooldown import (
     apply_cohere_monthly_cooldown_horizon,
     cohere_monthly_publication_duration,
+    stamp_cohere_billing_ceiling_marker,
     stamp_cohere_monthly_quota_marker,
 )
 from .interfaces import (
@@ -105,6 +106,8 @@ from .interfaces import (
 from .lane_keys import (
     cohere_credential_lane_cooldown_key,
     read_cohere_attempt_credential_sentinel,
+    read_zen_account_sentinel,
+    zen_account_cooldown_key,
 )
 from .durable import get_aawm_alias_routing_state_namespace
 from .policy import CODEX_AUTO_AGENT_OPENROUTER_PROVIDER
@@ -1148,6 +1151,59 @@ def _apply_cohere_credential_cooldown_scope(
     )
 
 
+def _apply_zen_account_cooldown_scope(
+    plan: CooldownPublicationPlan,
+    *,
+    request: Any,
+    candidate: dict[str, Any],
+    exc: Exception,
+) -> CooldownPublicationPlan:
+    """Retarget a gate-authorized Zen cooldown onto the account sentinel.
+
+    Model and format failures keep the candidate key from the shared resolver.
+    Account scope is taken only from the typed ``ZenFailure``. Message text is
+    not consulted. Each publication channel is retargeted only when that
+    channel already has keys, so a memory-only plan does not gain a durable
+    account cooldown. The same sentinel is excluded for the rest of this
+    request so the other Zen model is not called.
+    """
+
+    from .failure_vocabulary import ZenFailure
+    from .selection import _exclude_codex_auto_agent_request_local_candidate
+
+    if candidate.get("provider") != "opencode_zen":
+        return plan
+    failure = getattr(exc, "_aawm_zen_failure", None)
+    if (
+        not isinstance(failure, ZenFailure)
+        or failure.origin != "upstream"
+        or failure.scope != "account"
+    ):
+        return plan
+    cooldown_key = zen_account_cooldown_key(
+        candidate,
+        read_zen_account_sentinel(exc),
+    )
+    if cooldown_key is None:
+        return plan
+    _exclude_codex_auto_agent_request_local_candidate(
+        request,
+        cooldown_key=cooldown_key,
+    )
+    if not plan.memory_keys and not plan.durable_keys:
+        return plan
+    return CooldownPublicationPlan(
+        memory_keys=(cooldown_key,) if plan.memory_keys else (),
+        durable_keys=(cooldown_key,) if plan.durable_keys else (),
+        duration_seconds=max(0.0, float(plan.duration_seconds)),
+        applied_scope="account",
+        grok_account_quota_exhausted=plan.grok_account_quota_exhausted,
+        kimi_failure_metadata=plan.kimi_failure_metadata,
+        allow_ttl_shrink=False,
+        expires_at_epoch=plan.expires_at_epoch,
+    )
+
+
 def _classify_codex_cohere_candidate_failure(
     exc: Exception,
     *,
@@ -1209,6 +1265,11 @@ def _classify_codex_cohere_candidate_failure(
         and mapped_error_class == "usage_limit_reached"
     ):
         stamp_cohere_monthly_quota_marker(exc)
+    if (
+        classification.name == "cohere_billing_exhausted"
+        and mapped_error_class == "usage_limit_reached"
+    ):
+        stamp_cohere_billing_ceiling_marker(exc)
     return mapped_error_class
 
 
@@ -1254,6 +1315,7 @@ _ZAI_CODING_PLAN_KIND_TO_ERROR_CLASS = {
     ZAICodingPlanFailureKind.MODEL_UNAVAILABLE: "candidate_unavailable",
     ZAICodingPlanFailureKind.VALIDATION: "provider_terminal_error",
     ZAICodingPlanFailureKind.ROUTING: "provider_terminal_error",
+    ZAICodingPlanFailureKind.FORBIDDEN: "provider_forbidden",
 }
 
 
@@ -1268,8 +1330,10 @@ def _classify_codex_zai_coding_plan_candidate_failure(
     1113 on the coding base is a wrong-base / wrong-key routing defect, not
     ordinary-balance recharge. Model-unavailable business codes require both
     an attempted call, explicit provider-return attribution, and an HTTP 400
-    or 404 response. Unknown codes return ``None`` so generic classifiers can
-    still inspect HTTP status.
+    or 404 response. A 401 or 403 with no recognized business code is a
+    bounded ``provider_forbidden`` outcome only after an attempted,
+    provider-returned call. Unknown codes return ``None`` so generic
+    classifiers can still inspect HTTP status.
     """
 
     if (
@@ -1295,11 +1359,19 @@ def _classify_codex_zai_coding_plan_candidate_failure(
         or failure.status_code not in {400, 404}
     ):
         return "provider_terminal_error"
+    if failure.kind == ZAICodingPlanFailureKind.FORBIDDEN and (
+        not attempted_provider_call
+        or (
+            getattr(exc, "_aawm_provider_returned", False) is not True
+            and getattr(exc, "provider_returned", False) is not True
+        )
+    ):
+        return None
+    if failure.kind == ZAICodingPlanFailureKind.FORBIDDEN:
+        setattr(exc, "_aawm_zai_coding_plan_safe_failure", "provider_forbidden")
     if failure.kind != ZAICodingPlanFailureKind.UNKNOWN:
         return _ZAI_CODING_PLAN_KIND_TO_ERROR_CLASS.get(failure.kind)
     if _exception_chain_contains_type(exc, ZAICodingPlanAuthenticationError):
-        return "provider_terminal_error"
-    if _error_signals._extract_adapter_exception_status_code(exc) == 401:
         return "provider_terminal_error"
     return None
 
@@ -6325,28 +6397,33 @@ def _resolve_failure_plan(  # noqa: PLR0915
                 cooldown_seconds if error_class == "usage_limit_reached" else None
             ),
         )
-    plan = apply_cohere_monthly_cooldown_horizon(
-        _apply_cohere_credential_cooldown_scope(
-            resolve_cooldown_publication_fn(
-                request=request,
+    plan = _apply_zen_account_cooldown_scope(
+        apply_cohere_monthly_cooldown_horizon(
+            _apply_cohere_credential_cooldown_scope(
+                resolve_cooldown_publication_fn(
+                    request=request,
+                    candidate=candidate,
+                    lane_key=selection.get("lane_key"),
+                    selected_cooldown_key=selection["cooldown_key"],
+                    cooldown_seconds=cooldown_seconds,
+                    error_class=error_class,
+                    grok_account_quota_exhausted=grok_account_quota_exhausted,
+                    kimi_failure_metadata=kimi_failure_metadata,
+                    codex_failure_evidence_alias=codex_failure_evidence_alias,
+                ),
                 candidate=candidate,
-                lane_key=selection.get("lane_key"),
-                selected_cooldown_key=selection["cooldown_key"],
+                scope=_recall_cohere_cooldown_scope(exc),
                 cooldown_seconds=cooldown_seconds,
-                error_class=error_class,
-                grok_account_quota_exhausted=grok_account_quota_exhausted,
-                kimi_failure_metadata=kimi_failure_metadata,
-                codex_failure_evidence_alias=codex_failure_evidence_alias,
+                credential_sentinel=read_cohere_attempt_credential_sentinel(
+                    exc,
+                    request,
+                ),
             ),
-            candidate=candidate,
-            scope=_recall_cohere_cooldown_scope(exc),
-            cooldown_seconds=cooldown_seconds,
-            credential_sentinel=read_cohere_attempt_credential_sentinel(
-                exc,
-                request,
-            ),
+            exc,
         ),
-        exc,
+        request=request,
+        candidate=candidate,
+        exc=exc,
     )
     if getattr(plan, "applied_scope", "none") != "none":
         attempt_record["cooldown_seconds"] = round(

@@ -25,6 +25,7 @@ class ZAICodingPlanFailureKind(str, Enum):
     VALIDATION = "validation"
     MODEL_UNAVAILABLE = "model_unavailable"
     ROUTING = "routing"
+    FORBIDDEN = "forbidden"
     UNKNOWN = "unknown"
 
 
@@ -76,8 +77,16 @@ def classify_zai_coding_plan_failure(
 
     _ = message
     normalized_code = _safe_error_code(error_code)
+    normalized_status = _safe_status_code(status_code)
     if normalized_code in _CODE_CLASSIFICATION:
         kind, reset_reason = _CODE_CLASSIFICATION[normalized_code]
+    elif normalized_status in {401, 403}:
+        # No recognized business code. 403 is forbidden/auth-shaped, not proof
+        # the credential itself is malformed.
+        kind, reset_reason = (
+            ZAICodingPlanFailureKind.FORBIDDEN,
+            "provider_forbidden",
+        )
     else:
         kind, reset_reason = ZAICodingPlanFailureKind.UNKNOWN, "unclassified_failure"
     return ZAICodingPlanFailureMetadata(

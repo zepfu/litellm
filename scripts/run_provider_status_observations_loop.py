@@ -11014,11 +11014,16 @@ def _build_zai_coding_plan_quota_rate_limit_payloads(  # noqa: PLR0915
         if limit_type == "CREDIT_LIMIT":
             if usage is None or remaining is None or usage < 0 or remaining < 0:
                 continue
-            remaining_pct = _zai_coding_plan_remaining_pct(
-                percentage=percentage,
-                usage=usage,
-                remaining=remaining,
-            )
+            # Raw remaining of zero is exhausted. A positive usage is only
+            # required to turn a positive remainder into a percentage.
+            if remaining == 0.0:
+                remaining_pct = 0.0
+            else:
+                remaining_pct = _zai_coding_plan_remaining_pct(
+                    percentage=None if usage > 0 else percentage,
+                    usage=usage if usage > 0 else None,
+                    remaining=remaining if usage > 0 else None,
+                )
             if remaining_pct is None:
                 continue
             quota_type = "credits"
