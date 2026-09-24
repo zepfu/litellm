@@ -293,10 +293,83 @@ def _copy_kimi_message_without_content(message: Any) -> Any:
     return updated_message
 
 
+_KIMI_EMPTY_CONTENT_PRESERVE_ROLES = frozenset(
+    {"system", "developer", "user", "tool"}
+)
+
+
+def _kimi_message_includes_content(message: Any) -> bool:
+    if isinstance(message, dict):
+        return "content" in message
+    return hasattr(message, "content")
+
+
+def _is_exact_empty_assistant_list_artifact(
+    *,
+    role: Any,
+    content: Any,
+    has_tool_call: bool,
+) -> bool:
+    """Replay placeholder `{role: assistant, content: []}` with no tool call.
+
+    Continuation history can append this empty assistant list after a finished
+    tool exchange. That shape is the only message Kimi's replay path has shown
+    must be removed. Other empty content stays in place or is rejected.
+    """
+
+    return (
+        role == "assistant"
+        and not has_tool_call
+        and isinstance(content, list)
+        and len(content) == 0
+    )
+
+
+def _kimi_empty_content_action(
+    *,
+    role: Any,
+    content: Any,
+    has_tool_call: bool,
+    includes_content: bool,
+) -> str:
+    """Choose preserve, strip, remove, or reject for one history message.
+
+    Empty, whitespace, list, null, tool-call, and ordinary content resolve by
+    role:
+
+    - assistant + tool call + present empty content: strip `content`. Kimi
+      rejects an assistant tool-call message that still carries explicit empty
+      content (`text content is empty`).
+    - assistant + `content: []` and no tool call: remove that replay artifact.
+    - system, developer, user, tool, and every other assistant shape: preserve
+      the message, including empty or whitespace content.
+    - any other role with empty content: reject. Do not drop it.
+    """
+
+    if (
+        role == "assistant"
+        and has_tool_call
+        and includes_content
+        and _is_kimi_empty_text_content(content)
+    ):
+        return "strip"
+    if _is_exact_empty_assistant_list_artifact(
+        role=role,
+        content=content,
+        has_tool_call=has_tool_call,
+    ):
+        return "remove"
+    if role in _KIMI_EMPTY_CONTENT_PRESERVE_ROLES or role == "assistant":
+        return "preserve"
+    if _is_kimi_empty_text_content(content):
+        return "reject"
+    return "preserve"
+
+
 def _sanitize_kimi_chat_messages(
     messages: list[Any],
 ) -> tuple[list[Any], dict[str, Any]]:
-    """Remove replay-only empty text without dropping valid tool history."""
+    """Drop only the proven empty assistant artifact; keep other role boundaries."""
 
     updated_messages: list[Any] = []
     removed_empty_message_count = 0
@@ -304,18 +377,28 @@ def _sanitize_kimi_chat_messages(
     for message in messages:
         role = _get_kimi_message_field(message, "role")
         content = _get_kimi_message_field(message, "content")
-        if role == "tool":
+        has_tool_call = _kimi_message_has_tool_call(message)
+        action = _kimi_empty_content_action(
+            role=role,
+            content=content,
+            has_tool_call=has_tool_call,
+            includes_content=_kimi_message_includes_content(message),
+        )
+        if action == "strip":
+            message = _copy_kimi_message_without_content(message)
+            stripped_tool_call_content_count += 1
             updated_messages.append(message)
             continue
-        if _kimi_message_has_tool_call(message):
-            if _is_kimi_empty_text_content(content):
-                message = _copy_kimi_message_without_content(message)
-                stripped_tool_call_content_count += 1
-            updated_messages.append(message)
-            continue
-        if _is_kimi_empty_text_content(content):
+        if action == "remove":
             removed_empty_message_count += 1
             continue
+        if action == "reject":
+            raise ValueError(
+                "Kimi Code request history contains empty content for role "
+                f"{role!r}. Empty content is preserved for system, developer, "
+                "user, and tool messages, and removed only for the assistant "
+                "replay artifact with content []."
+            )
         updated_messages.append(message)
 
     if (
