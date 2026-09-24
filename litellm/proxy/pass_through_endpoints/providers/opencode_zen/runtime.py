@@ -1324,19 +1324,6 @@ def _go_auth_generation(stat_result: os.stat_result) -> _GoAuthGeneration:
     )
 
 
-def _go_auth_read_fingerprint(
-    stat_result: os.stat_result,
-) -> tuple[int, int, int, int]:
-    # A replaced inode can change ctime/link metadata while an open
-    # descriptor still exposes the previous bytes.
-    return (
-        int(stat_result.st_dev),
-        int(stat_result.st_ino),
-        int(stat_result.st_mtime_ns),
-        int(stat_result.st_size),
-    )
-
-
 def _map_go_auth_open_error(exc: OSError, source_label: str) -> ValueError:
     if exc.errno in (errno.ELOOP, errno.EMLINK, errno.ENXIO, errno.EAGAIN):
         return _go_auth_file_error(
@@ -1435,8 +1422,10 @@ def _read_one_go_auth_attempt_sync(
 ) -> Optional[tuple[str, _GoAuthGeneration]]:
     """Read one Go generation through the validated descriptor.
 
-    Return None when that inode changes mid-read. Invalid content is a
-    failure for the generation that was read, not a reason to keep the
+    Return None when the generation changes mid-read, including a
+    ctime-only change, so the bounded retry reads again. Previously read
+    bytes are not labeled with the post-change generation. Invalid content
+    is a failure for the generation that was read, not a reason to keep the
     previous key.
     """
 
@@ -1469,9 +1458,9 @@ def _read_one_go_auth_attempt_sync(
                 source_label,
                 "is missing or not a regular file.",
             )
-        if _go_auth_read_fingerprint(before) != _go_auth_read_fingerprint(after):
+        generation = _go_auth_generation(before)
+        if generation != _go_auth_generation(after):
             return None
-        generation = _go_auth_generation(after)
         try:
             auth_text = raw_bytes.decode("utf-8")
         except UnicodeDecodeError:
@@ -1575,8 +1564,15 @@ async def _current_go_auth_generation(
     source_label: str,
     path_key: str,
 ) -> _GoAuthGeneration:
-    """Probe outside the shared lock, then drop a key the probe can no longer see."""
+    """Probe outside the shared lock.
 
+    A failed probe drops only the cache entry observed before the probe.
+    A success or negative entry published by another load stays in place,
+    and the probe error still propagates to this caller.
+    """
+
+    async with _get_go_auth_lock():
+        observed = _go_auth_cache.get(path_key)
     try:
         return await asyncio.to_thread(
             _stat_go_auth_generation_sync,
@@ -1585,7 +1581,8 @@ async def _current_go_auth_generation(
         )
     except Exception:
         async with _get_go_auth_lock():
-            _go_auth_cache.pop(path_key, None)
+            if _go_auth_cache.get(path_key) is observed:
+                _go_auth_cache.pop(path_key, None)
         raise
 
 
@@ -1593,15 +1590,22 @@ def _go_publish_matches_owner(
     path_key: str,
     generation: _GoAuthGeneration,
     current: Optional[_GoAuthGeneration],
+    observed: Optional[_GoAuthCacheEntry],
 ) -> bool:
     task = asyncio.current_task()
     flight = _go_auth_flights.get(path_key)
     if flight is None or flight.task is not task:
         return False
     if current != generation:
-        _go_auth_cache.pop(path_key, None)
+        if _go_auth_cache.get(path_key) is observed:
+            _go_auth_cache.pop(path_key, None)
         return False
     return True
+
+
+async def _observe_go_cache_entry(path_key: str) -> Optional[_GoAuthCacheEntry]:
+    async with _get_go_auth_lock():
+        return _go_auth_cache.get(path_key)
 
 
 async def _publish_go_auth_if_current(
@@ -1611,6 +1615,7 @@ async def _publish_go_auth_if_current(
     generation: _GoAuthGeneration,
     api_key: str,
 ) -> None:
+    observed = await _observe_go_cache_entry(path_key)
     try:
         current: Optional[_GoAuthGeneration] = await asyncio.to_thread(
             _stat_go_auth_generation_sync,
@@ -1620,7 +1625,7 @@ async def _publish_go_auth_if_current(
     except Exception:
         current = None
     async with _get_go_auth_lock():
-        if not _go_publish_matches_owner(path_key, generation, current):
+        if not _go_publish_matches_owner(path_key, generation, current, observed):
             return
         _remember_go_auth_unlocked(path_key, generation, api_key)
 
@@ -1634,6 +1639,7 @@ async def _publish_go_auth_failure(
 ) -> None:
     """Record a sanitized content failure and do not keep the previous key."""
 
+    observed = await _observe_go_cache_entry(path_key)
     try:
         current: Optional[_GoAuthGeneration] = await asyncio.to_thread(
             _stat_go_auth_generation_sync,
@@ -1643,7 +1649,7 @@ async def _publish_go_auth_failure(
     except Exception:
         current = None
     async with _get_go_auth_lock():
-        if not _go_publish_matches_owner(path_key, generation, current):
+        if not _go_publish_matches_owner(path_key, generation, current, observed):
             return
         _go_auth_cache[path_key] = _GoAuthCacheEntry(
             generation=generation,
