@@ -35,8 +35,11 @@ from .lane_keys import (
     openrouter_account_lane_cooldown_key,
     openrouter_credit_lane_cooldown_key,
 )
+from litellm.llms.alibaba_token_plan.chat.transformation import (
+    alibaba_token_plan_account_quota_cooldown_key,
+    subscription_identity_for_candidate,
+)
 from .policy import (
-    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES,
     CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS,
     canonicalize_openrouter_native_responses_route_family,
@@ -213,13 +216,20 @@ def _resolve_auto_agent_cooldown_publication_plan(
     is_last_resort = bool(candidate.get("last_resort"))
     duration = max(0.0, float(cooldown_seconds))
     if error_class in CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES:
+        cooldown_key = alibaba_token_plan_account_quota_cooldown_key(
+            subscription_identity_for_candidate(candidate)
+        )
+        if cooldown_key is None:
+            return CooldownPublicationPlan(
+                applied_scope="request_local",
+                duration_seconds=duration,
+                request_local_action="request_local_cooldown",
+                grok_account_quota_exhausted=grok_account_quota_exhausted,
+                kimi_failure_metadata=kimi_failure_metadata,
+            )
         return CooldownPublicationPlan(
-            memory_keys=(
-                CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
-            ),
-            durable_keys=(
-                CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
-            ),
+            memory_keys=(cooldown_key,),
+            durable_keys=(cooldown_key,),
             duration_seconds=duration,
             applied_scope="candidate",
             grok_account_quota_exhausted=grok_account_quota_exhausted,

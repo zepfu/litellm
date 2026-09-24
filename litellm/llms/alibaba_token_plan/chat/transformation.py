@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Mapping, Optional, Tuple
 
 from litellm.llms.dashscope.chat.transformation import DashScopeChatConfig
 from litellm.secret_managers.main import get_secret_str
@@ -21,6 +22,11 @@ ALIBABA_TOKEN_PLAN_SETTINGS_FILE_ENV = (
     "LITELLM_ALIBABA_TOKEN_PLAN_SETTINGS_FILE"
 )
 ALIBABA_TOKEN_PLAN_PROVIDER_NAME = "alibaba_token_plan"
+ALIBABA_TOKEN_PLAN_SUBSCRIPTION_ID_ENV = "ALIBABA_TOKEN_PLAN_SUBSCRIPTION_ID"
+ALIBABA_TOKEN_PLAN_SUBSCRIPTION_IDENTITY_SOURCE = "instance_code_sha256"
+ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY_PREFIX = (
+    "alibaba_token_plan:__account_quota__:alibaba_token_plan"
+)
 ALIBABA_TOKEN_PLAN_RAW_CHOICES_HIDDEN_PARAM = "_alibaba_token_plan_raw_choices"
 # Catalog metadata only: credential discovery and model admission are
 # validated structurally, never against this static enumeration.
@@ -36,6 +42,149 @@ ALIBABA_TOKEN_PLAN_MODEL_IDS = frozenset(
         "glm-5.2",
     }
 )
+
+
+def _is_alibaba_subscription_identity(value: str) -> bool:
+    """True for the sha256 hex identity, never for a raw key or instance code."""
+
+    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def alibaba_token_plan_subscription_identity(instance_code: str) -> Optional[str]:
+    """Hash a non-secret Token Plan instance code.
+
+    The raw instance code is not returned. API keys, RAM secrets, and bearer
+    tokens are not accepted as identity material.
+    """
+
+    if not isinstance(instance_code, str):
+        return None
+    normalized = instance_code.strip()
+    if not normalized or any(ord(character) < 32 for character in normalized):
+        return None
+    material = f"alibaba-token-plan|instanceCode={normalized}".encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
+def alibaba_token_plan_account_quota_cooldown_key(
+    subscription_identity: Optional[str],
+) -> Optional[str]:
+    """Scope account cooldown to one subscription identity."""
+
+    identity = str(subscription_identity or "").strip().lower()
+    if not _is_alibaba_subscription_identity(identity):
+        return None
+    return f"{ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY_PREFIX}:{identity}"
+
+
+def _subscription_identity_from_settings() -> Optional[str]:
+    """Read one non-secret instanceCode from the Qwen settings file."""
+
+    settings_file = os.getenv(ALIBABA_TOKEN_PLAN_SETTINGS_FILE_ENV)
+    if not isinstance(settings_file, str) or not settings_file.strip():
+        return None
+    try:
+        settings = json.loads(Path(settings_file.strip()).read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return None
+    if not isinstance(settings, dict):
+        return None
+    provider_groups = settings.get("modelProviders")
+    if not isinstance(provider_groups, dict):
+        return None
+    providers = provider_groups.get("openai")
+    if not isinstance(providers, list):
+        return None
+    identities: set[str] = set()
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        if str(provider.get("baseUrl") or "").rstrip("/") != ALIBABA_TOKEN_PLAN_API_BASE:
+            continue
+        identity = alibaba_token_plan_subscription_identity(
+            provider.get("instanceCode")
+            if isinstance(provider.get("instanceCode"), str)
+            else ""
+        )
+        if identity is not None:
+            identities.add(identity)
+    if len(identities) != 1:
+        return None
+    return next(iter(identities))
+
+
+def resolve_alibaba_token_plan_subscription_identity() -> Optional[str]:
+    """Resolve the inference lane's subscription identity.
+
+    Precedence is the non-secret ``ALIBABA_TOKEN_PLAN_SUBSCRIPTION_ID``
+    instance code, then a single ``instanceCode`` on the Token Plan settings
+    entry. Credential env values are never hashed.
+    """
+
+    configured = os.getenv(ALIBABA_TOKEN_PLAN_SUBSCRIPTION_ID_ENV)
+    if isinstance(configured, str) and configured.strip():
+        return alibaba_token_plan_subscription_identity(configured)
+    return _subscription_identity_from_settings()
+
+
+def _candidate_subscription_identity(value: Any) -> Optional[str]:
+    """Accept only the contract hash. Empty and non-string values are unknown."""
+
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if not _is_alibaba_subscription_identity(normalized):
+        return None
+    return normalized
+
+
+def _candidate_instance_identity(value: Any) -> Optional[str]:
+    """Hash a candidate instance code. Empty and non-string values are unknown."""
+
+    if not isinstance(value, str):
+        return None
+    return alibaba_token_plan_subscription_identity(value)
+
+
+def subscription_identity_for_candidate(
+    candidate: Optional[Mapping[str, Any]],
+) -> Optional[str]:
+    """Return the lane identity, or None when it is missing or mismatched.
+
+    A present identity field that is empty, non-string, or not the contract
+    hash stays unknown. When both the hash and instance code are supplied,
+    they must name the same subscription. A candidate that supplies neither
+    field has no verified binding to the process-wide subscription, so it
+    stays unknown instead of inheriting that identity.
+    """
+
+    if not isinstance(candidate, Mapping):
+        return None
+    has_identity = "subscription_identity" in candidate
+    has_instance = "instance_code" in candidate
+    if not has_identity and not has_instance:
+        return None
+    identity = (
+        _candidate_subscription_identity(candidate.get("subscription_identity"))
+        if has_identity
+        else None
+    )
+    if has_identity and identity is None:
+        return None
+    instance_identity = (
+        _candidate_instance_identity(candidate.get("instance_code"))
+        if has_instance
+        else None
+    )
+    if has_instance and instance_identity is None:
+        return None
+    if (
+        identity is not None
+        and instance_identity is not None
+        and identity != instance_identity
+    ):
+        return None
+    return identity or instance_identity
 
 
 class AlibabaTokenPlanAuthenticationError(OpenAIError):

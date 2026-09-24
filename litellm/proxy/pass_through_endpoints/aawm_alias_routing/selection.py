@@ -24,6 +24,11 @@ from typing import AbstractSet, Any, Awaitable, Callable, Mapping, Optional, Seq
 from fastapi import HTTPException, Request
 
 from litellm._logging import verbose_proxy_logger
+from litellm.llms.alibaba_token_plan.chat.transformation import (
+    ALIBABA_TOKEN_PLAN_SUBSCRIPTION_IDENTITY_SOURCE as _ALIBABA_TOKEN_PLAN_SUBSCRIPTION_IDENTITY_SOURCE,
+    alibaba_token_plan_account_quota_cooldown_key,
+    subscription_identity_for_candidate,
+)
 from litellm.utils import get_model_info
 
 from . import admission as _admission
@@ -2033,8 +2038,13 @@ async def _apply_codex_auto_agent_alibaba_token_plan_account_cooldown(
     """Suppress every Alibaba Token Plan candidate during shared account cooling."""
     if candidate.get("provider") != _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER:
         return cooldown_seconds, cooldown_state_source, skip_reason
+    cooldown_key = alibaba_token_plan_account_quota_cooldown_key(
+        subscription_identity_for_candidate(candidate)
+    )
+    if cooldown_key is None:
+        return cooldown_seconds, cooldown_state_source, skip_reason
     account_seconds, account_source = await get_active_cooldown_state(
-        _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+        cooldown_key
     )
     if account_seconds > cooldown_seconds:
         cooldown_seconds = account_seconds
@@ -2092,6 +2102,18 @@ def _alibaba_token_plan_quota_observation_from_row(
         or evidence.get("telemetry_status") != "valid"
     ):
         return None
+    account_hash = str(values.get("account_hash") or "").strip()
+    stamped_identity = str(evidence.get("subscription_identity") or "").strip()
+    identity_source = evidence.get("subscription_identity_source")
+    if (
+        not account_hash
+        or (stamped_identity and stamped_identity != account_hash)
+        or (
+            identity_source not in (None, "")
+            and identity_source != _ALIBABA_TOKEN_PLAN_SUBSCRIPTION_IDENTITY_SOURCE
+        )
+    ):
+        return None
     evidence_window = str(evidence.get("window") or "")
     row_window = str(values.get("quota_period") or "")
     window = evidence_window
@@ -2123,7 +2145,8 @@ def _alibaba_token_plan_quota_observation_from_row(
     return {
         "provider": _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
         "model": values.get("model"),
-        "account_hash": values.get("account_hash"),
+        "account_hash": account_hash,
+        "subscription_identity": stamped_identity or account_hash,
         "environment": environment,
         "quota_key": values.get("quota_key"),
         "quota_period": window,
@@ -2302,12 +2325,29 @@ async def _hydrate_alibaba_token_plan_quota_observations() -> None:
     )
 
 
+def _alibaba_observation_matches_subscription(
+    observation: Mapping[str, Any],
+    subscription_identity: str,
+) -> bool:
+    """Keep one subscription. A blank or different identity never matches."""
+
+    account_hash = str(observation.get("account_hash") or "").strip()
+    if not subscription_identity or not account_hash or account_hash != subscription_identity:
+        return False
+    stamped = str(observation.get("subscription_identity") or "").strip()
+    return not stamped or stamped == subscription_identity
+
+
 def _alibaba_token_plan_quota_evidence(
     *,
     state_manager: Optional[Any] = None,
     now_epoch: Optional[float] = None,
+    subscription_identity: Optional[str] = None,
 ) -> tuple[Optional[dict[str, Any]], list[dict[str, Any]]]:
-    """Resolve exact Alibaba evidence, or unknown without side-effect blocks."""
+    """Resolve one subscription's evidence, or unknown without borrowing."""
+    identity = str(subscription_identity or "").strip()
+    if not identity:
+        return None, []
     state_manager = state_manager or alias_routing_state
     try:
         configured_environment = str(
@@ -2341,15 +2381,13 @@ def _alibaba_token_plan_quota_evidence(
                 f"{observation.get('quota_period')}:credits"
             )
             and isinstance(observation.get("exhausted"), bool)
+            and _alibaba_observation_matches_subscription(
+                observation,
+                identity,
+            )
         )
     ]
     if not fresh:
-        return None, []
-    account_hashes = {
-        str(observation.get("account_hash") or "").strip()
-        for observation in fresh
-    }
-    if len(account_hashes) != 1 or "" in account_hashes:
         return None, []
     confirmed_exhausted_windows = {
         str(observation.get("quota_period") or "")
@@ -2391,7 +2429,8 @@ def _alibaba_token_plan_quota_evidence(
         "source": _ALIBABA_TOKEN_PLAN_QUOTA_SOURCE,
         "parser_version": _ALIBABA_TOKEN_PLAN_QUOTA_PARSER_VERSION,
         "telemetry_status": "valid",
-        "account_hash": next(iter(account_hashes)),
+        "account_hash": identity,
+        "subscription_identity": identity,
         "observation_age_seconds": max(
             0.0,
             now - max(observation["observed_at"] for observation in windows),
@@ -2419,6 +2458,7 @@ def _attach_alibaba_token_plan_quota_state(
     observation, windows = _alibaba_token_plan_quota_evidence(
         state_manager=state_manager,
         now_epoch=now_epoch,
+        subscription_identity=subscription_identity_for_candidate(candidate),
     )
     if observation is None:
         if windows:
@@ -2458,6 +2498,15 @@ async def _clear_alibaba_token_plan_account_quota_cooldown(
         for window in windows
     ):
         return False
+    cooldown_key = alibaba_token_plan_account_quota_cooldown_key(
+        str(
+            evidence.get("subscription_identity")
+            or evidence.get("account_hash")
+            or ""
+        )
+    )
+    if cooldown_key is None:
+        return False
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_state import (
         clear_alias_family_cooldown_state,
     )
@@ -2465,9 +2514,7 @@ async def _clear_alibaba_token_plan_account_quota_cooldown(
     result = await clear_alias_family_cooldown_state(
         alias_family="codex",
         canonical_aliases=[_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY],
-        cooldown_keys=[
-            _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
-        ],
+        cooldown_keys=[cooldown_key],
         delete_durable=delete_durable,
     )
     return bool(result)
@@ -7154,8 +7201,25 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         for candidate in candidates
     ):
         await _hydrate_alibaba_token_plan_quota_observations()
-    alibaba_evidence, _alibaba_windows = _alibaba_token_plan_quota_evidence()
-    if alibaba_evidence is not None:
+    cleared_subscription_identities: set[str] = set()
+    for candidate in candidates:
+        if (
+            candidate.get("provider")
+            != _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
+        ):
+            continue
+        subscription_identity = subscription_identity_for_candidate(candidate)
+        if (
+            not subscription_identity
+            or subscription_identity in cleared_subscription_identities
+        ):
+            continue
+        cleared_subscription_identities.add(subscription_identity)
+        alibaba_evidence, _alibaba_windows = _alibaba_token_plan_quota_evidence(
+            subscription_identity=subscription_identity,
+        )
+        if alibaba_evidence is None:
+            continue
         windows = alibaba_evidence["windows"]
         now_epoch = time.time()
         valid_positive_windows = all(
@@ -8014,6 +8078,18 @@ def install(host_globals: dict) -> None:
         ),
         "_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY": (
             _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+        ),
+        "_ALIBABA_TOKEN_PLAN_SUBSCRIPTION_IDENTITY_SOURCE": (
+            _ALIBABA_TOKEN_PLAN_SUBSCRIPTION_IDENTITY_SOURCE
+        ),
+        "alibaba_token_plan_account_quota_cooldown_key": (
+            alibaba_token_plan_account_quota_cooldown_key
+        ),
+        "subscription_identity_for_candidate": (
+            subscription_identity_for_candidate
+        ),
+        "_alibaba_observation_matches_subscription": (
+            _alibaba_observation_matches_subscription
         ),
         "_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY": (
             _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY
