@@ -243,6 +243,16 @@ def _cohere_provider_status_code(original_exception: Any) -> Any:
     return status_code
 
 
+def _raise_cohere_provider_http_498(*, model: str) -> None:
+    """Map Cohere HTTP 498 to authentication without the provider body or key."""
+
+    raise AuthenticationError(
+        message="CohereException - invalid token",
+        llm_provider="cohere",
+        model=model,
+    )
+
+
 def _raise_cohere_provider_http_499(
     *,
     original_exception: BaseException,
@@ -383,6 +393,11 @@ def exception_type(  # type: ignore  # noqa: PLR0915
                     error_str=error_str,
                     model=model,
                 )
+            if (
+                custom_llm_provider == "cohere" or custom_llm_provider == "cohere_chat"
+            ) and _cohere_provider_status_code(original_exception) == 498:
+                exception_mapping_worked = True
+                _raise_cohere_provider_http_498(model=model)
 
             if (
                 "Request Timeout Error" in error_str
@@ -1625,10 +1640,7 @@ def exception_type(  # type: ignore  # noqa: PLR0915
                         response=getattr(original_exception, "response", None),
                     )
                 elif hasattr(original_exception, "status_code"):
-                    if (
-                        original_exception.status_code == 400
-                        or original_exception.status_code == 498
-                    ):
+                    if original_exception.status_code == 400:
                         exception_mapping_worked = True
                         raise BadRequestError(
                             message=f"CohereException - {original_exception.message}",
