@@ -9,32 +9,39 @@ aliases:
         model: alibaba_token_plan/qwen3.8-max
         route_family: codex_alibaba_token_plan_chat_completions_adapter
         priority: 100
+        # Wire: reasoning_effort=xhigh. max/high map to xhigh.
         reasoning_effort: max
 
       - provider: alibaba_token_plan
         model: alibaba_token_plan/qwen3.7-max
         route_family: codex_alibaba_token_plan_chat_completions_adapter
         priority: 90
+        # Wire: enable_thinking=true. reasoning_effort is unsupported.
         reasoning_effort: max
 
       - provider: alibaba_token_plan
         model: alibaba_token_plan/deepseek-v4-pro
         route_family: codex_alibaba_token_plan_chat_completions_adapter
         priority: 80
+        # Wire: reasoning_effort=max. Native values are high and max.
         reasoning_effort: max
 
       - provider: alibaba_token_plan
         model: alibaba_token_plan/glm-5.2
         route_family: codex_alibaba_token_plan_chat_completions_adapter
         priority: 70
+        # Wire: reasoning_effort=max. Native values are high and max.
         reasoning_effort: max
 
       - provider: alibaba_token_plan
         model: alibaba_token_plan/deepseek-v4.1-flash
         route_family: codex_alibaba_token_plan_chat_completions_adapter
         priority: 60
+        # No configured effort. Provider default is reasoning_effort=high.
 
       - provider: alibaba_token_plan
         model: alibaba_token_plan/qwen3.6-flash
         route_family: codex_alibaba_token_plan_chat_completions_adapter
         priority: 50
+        # No configured effort. reasoning_effort is unsupported;
+        # thinking stays at the provider default.

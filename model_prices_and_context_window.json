@@ -72,6 +72,11 @@
                         "verified_on": "2026-08-12"
                     },
                     "unpriced_reason": "public_per_token_rate_unavailable"
+                },
+                "reasoning_effort_wire": {
+                    "policy": "reject",
+                    "unsupported_field": "reasoning_effort",
+                    "source": "https://docs.qwencloud.com/api-reference/chat/openai-chat"
                 }
             }
         },
@@ -107,7 +112,13 @@
         "unsupported_input_item_types": [
             "custom_tool_call",
             "custom_tool_call_output"
-        ]
+        ],
+        "supports_minimal_reasoning_effort": false,
+        "supports_none_reasoning_effort": false,
+        "supports_low_reasoning_effort": false,
+        "supports_high_reasoning_effort": false,
+        "supports_xhigh_reasoning_effort": false,
+        "supports_max_reasoning_effort": false
     },
     "alibaba_token_plan/qwen3.8-max": {
         "comment": "Alibaba Token Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",
@@ -142,6 +153,25 @@
                         "verified_on": "2026-08-12"
                     },
                     "unpriced_reason": "public_per_token_rate_unavailable"
+                },
+                "reasoning_effort_wire": {
+                    "policy": "map_reasoning_effort",
+                    "wire_field": "reasoning_effort",
+                    "native_values": [
+                        "low",
+                        "medium",
+                        "xhigh"
+                    ],
+                    "value_map": {
+                        "minimal": "low",
+                        "low": "low",
+                        "medium": "medium",
+                        "high": "xhigh",
+                        "xhigh": "xhigh",
+                        "max": "xhigh"
+                    },
+                    "none_disables_thinking": true,
+                    "source": "https://docs.qwencloud.com/api-reference/chat/openai-chat"
                 }
             }
         },
@@ -177,7 +207,14 @@
         "unsupported_input_item_types": [
             "custom_tool_call",
             "custom_tool_call_output"
-        ]
+        ],
+        "supports_minimal_reasoning_effort": false,
+        "supports_none_reasoning_effort": false,
+        "supports_low_reasoning_effort": true,
+        "supports_high_reasoning_effort": false,
+        "supports_xhigh_reasoning_effort": true,
+        "supports_max_reasoning_effort": false,
+        "default_reasoning_effort": "xhigh"
     },
     "alibaba_token_plan/qwen3.7-plus": {
         "comment": "Alibaba Token Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",
@@ -215,6 +252,23 @@
                         "version": "2026-08-12",
                         "verified_on": "2026-08-12"
                     }
+                },
+                "reasoning_effort_wire": {
+                    "policy": "enable_thinking_only",
+                    "wire_field": "enable_thinking",
+                    "unsupported_field": "reasoning_effort",
+                    "accepted_efforts": [
+                        "none",
+                        "minimal",
+                        "low",
+                        "medium",
+                        "high",
+                        "xhigh",
+                        "max"
+                    ],
+                    "enabled_value": true,
+                    "disabled_value": false,
+                    "source": "https://docs.qwencloud.com/api-reference/chat/openai-chat"
                 }
             }
         },
@@ -250,7 +304,13 @@
         "unsupported_input_item_types": [
             "custom_tool_call",
             "custom_tool_call_output"
-        ]
+        ],
+        "supports_minimal_reasoning_effort": false,
+        "supports_none_reasoning_effort": false,
+        "supports_low_reasoning_effort": false,
+        "supports_high_reasoning_effort": false,
+        "supports_xhigh_reasoning_effort": false,
+        "supports_max_reasoning_effort": false
     },
     "alibaba_token_plan/qwen3.7-max": {
         "comment": "Alibaba Token Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",
@@ -288,6 +348,23 @@
                         "version": "2026-08-12",
                         "verified_on": "2026-08-12"
                     }
+                },
+                "reasoning_effort_wire": {
+                    "policy": "enable_thinking_only",
+                    "wire_field": "enable_thinking",
+                    "unsupported_field": "reasoning_effort",
+                    "accepted_efforts": [
+                        "none",
+                        "minimal",
+                        "low",
+                        "medium",
+                        "high",
+                        "xhigh",
+                        "max"
+                    ],
+                    "enabled_value": true,
+                    "disabled_value": false,
+                    "source": "https://docs.qwencloud.com/api-reference/chat/openai-chat"
                 }
             }
         },
@@ -323,7 +400,13 @@
         "unsupported_input_item_types": [
             "custom_tool_call",
             "custom_tool_call_output"
-        ]
+        ],
+        "supports_minimal_reasoning_effort": false,
+        "supports_none_reasoning_effort": false,
+        "supports_low_reasoning_effort": false,
+        "supports_high_reasoning_effort": false,
+        "supports_xhigh_reasoning_effort": false,
+        "supports_max_reasoning_effort": false
     },
     "alibaba_token_plan/qwen3.6-flash": {
         "comment": "Alibaba Token Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",
@@ -377,6 +460,23 @@
                         "version": "2026-08-12",
                         "verified_on": "2026-08-12"
                     }
+                },
+                "reasoning_effort_wire": {
+                    "policy": "enable_thinking_only",
+                    "wire_field": "enable_thinking",
+                    "unsupported_field": "reasoning_effort",
+                    "accepted_efforts": [
+                        "none",
+                        "minimal",
+                        "low",
+                        "medium",
+                        "high",
+                        "xhigh",
+                        "max"
+                    ],
+                    "enabled_value": true,
+                    "disabled_value": false,
+                    "source": "https://docs.qwencloud.com/api-reference/chat/openai-chat"
                 }
             }
         },
@@ -412,7 +512,13 @@
         "unsupported_input_item_types": [
             "custom_tool_call",
             "custom_tool_call_output"
-        ]
+        ],
+        "supports_minimal_reasoning_effort": false,
+        "supports_none_reasoning_effort": false,
+        "supports_low_reasoning_effort": false,
+        "supports_high_reasoning_effort": false,
+        "supports_xhigh_reasoning_effort": false,
+        "supports_max_reasoning_effort": false
     },
     "alibaba_token_plan/deepseek-v4-flash-0731": {
         "comment": "Alibaba Token Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",
@@ -447,6 +553,23 @@
                         "verified_on": "2026-08-16"
                     },
                     "unpriced_reason": "public_per_token_rate_unavailable"
+                },
+                "reasoning_effort_wire": {
+                    "policy": "map_reasoning_effort",
+                    "wire_field": "reasoning_effort",
+                    "native_values": [
+                        "low",
+                        "high",
+                        "max"
+                    ],
+                    "value_map": {
+                        "low": "low",
+                        "medium": "high",
+                        "high": "high",
+                        "xhigh": "high",
+                        "max": "max"
+                    },
+                    "source": "https://docs.qwencloud.com/api-reference/chat/openai-chat"
                 }
             }
         },
@@ -475,7 +598,14 @@
         "unsupported_input_item_types": [
             "custom_tool_call",
             "custom_tool_call_output"
-        ]
+        ],
+        "supports_minimal_reasoning_effort": false,
+        "supports_none_reasoning_effort": false,
+        "supports_low_reasoning_effort": true,
+        "supports_high_reasoning_effort": true,
+        "supports_xhigh_reasoning_effort": false,
+        "supports_max_reasoning_effort": true,
+        "default_reasoning_effort": "high"
     },
     "alibaba_token_plan/deepseek-v4.1-flash": {
         "comment": "Alibaba Token Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",
@@ -515,6 +645,25 @@
                         "version": "2026-09-14",
                         "verified_on": "2026-09-14"
                     }
+                },
+                "reasoning_effort_wire": {
+                    "policy": "map_reasoning_effort",
+                    "wire_field": "reasoning_effort",
+                    "native_values": [
+                        "low",
+                        "high",
+                        "max"
+                    ],
+                    "value_map": {
+                        "minimal": "low",
+                        "low": "low",
+                        "medium": "high",
+                        "high": "high",
+                        "xhigh": "high",
+                        "ultra": "max",
+                        "max": "max"
+                    },
+                    "source": "https://docs.qwencloud.com/api-reference/chat/openai-chat"
                 }
             }
         },
@@ -543,7 +692,14 @@
         "unsupported_input_item_types": [
             "custom_tool_call",
             "custom_tool_call_output"
-        ]
+        ],
+        "supports_minimal_reasoning_effort": false,
+        "supports_none_reasoning_effort": false,
+        "supports_low_reasoning_effort": true,
+        "supports_high_reasoning_effort": true,
+        "supports_xhigh_reasoning_effort": false,
+        "supports_max_reasoning_effort": true,
+        "default_reasoning_effort": "high"
     },
     "alibaba_token_plan/deepseek-v4-pro": {
         "comment": "Alibaba Token Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",
@@ -581,6 +737,22 @@
                         "version": "2026-08-12",
                         "verified_on": "2026-08-12"
                     }
+                },
+                "reasoning_effort_wire": {
+                    "policy": "map_reasoning_effort",
+                    "wire_field": "reasoning_effort",
+                    "native_values": [
+                        "high",
+                        "max"
+                    ],
+                    "value_map": {
+                        "low": "high",
+                        "medium": "high",
+                        "high": "high",
+                        "xhigh": "max",
+                        "max": "max"
+                    },
+                    "source": "https://docs.qwencloud.com/api-reference/chat/openai-chat"
                 }
             }
         },
@@ -609,7 +781,13 @@
         "unsupported_input_item_types": [
             "custom_tool_call",
             "custom_tool_call_output"
-        ]
+        ],
+        "supports_minimal_reasoning_effort": false,
+        "supports_none_reasoning_effort": false,
+        "supports_low_reasoning_effort": false,
+        "supports_high_reasoning_effort": true,
+        "supports_xhigh_reasoning_effort": false,
+        "supports_max_reasoning_effort": true
     },
     "alibaba_token_plan/glm-5.2": {
         "comment": "Alibaba Token Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",
@@ -643,7 +821,33 @@
         "unsupported_input_item_types": [
             "custom_tool_call",
             "custom_tool_call_output"
-        ]
+        ],
+        "supports_minimal_reasoning_effort": false,
+        "supports_none_reasoning_effort": false,
+        "supports_low_reasoning_effort": false,
+        "supports_high_reasoning_effort": true,
+        "supports_xhigh_reasoning_effort": false,
+        "supports_max_reasoning_effort": true,
+        "provider_specific_entry": {
+            "alibaba_token_plan": {
+                "reasoning_effort_wire": {
+                    "policy": "map_reasoning_effort",
+                    "wire_field": "reasoning_effort",
+                    "native_values": [
+                        "high",
+                        "max"
+                    ],
+                    "value_map": {
+                        "low": "high",
+                        "medium": "high",
+                        "high": "high",
+                        "xhigh": "max",
+                        "max": "max"
+                    },
+                    "source": "https://docs.qwencloud.com/api-reference/chat/openai-chat"
+                }
+            }
+        }
     },
     "zai_coding_plan/glm-5.3-flash": {
         "comment": "Z.AI Coding Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",

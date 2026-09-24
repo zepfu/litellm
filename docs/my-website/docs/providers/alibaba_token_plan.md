@@ -27,6 +27,26 @@ alias routes remain separate.
 The configured DeepSeek Flash model is `deepseek-v4.1-flash`; the provider
 receives that exact unprefixed ID.
 
+## Reasoning effort
+
+Each Token Plan model carries a `reasoning_effort_wire` contract in
+`model_prices_and_context_window.json`. The chat transformation reads that
+contract through `get_model_info` and writes the provider-bound body from it.
+Direct HTTP calls place these fields at the top level of the chat-completions
+body. Source: the QwenCloud OpenAI chat API reference.
+
+| Model | Configured effort | Serialized field |
+| --- | --- | --- |
+| `qwen3.8-max` | `max` | `reasoning_effort=xhigh` (`max` and `high` map to `xhigh`; `none` sets `enable_thinking=false`) |
+| `qwen3.7-max`, `qwen3.7-plus`, `qwen3.6-flash` | `max` when set | `enable_thinking=true`. `reasoning_effort` is not a supported wire field |
+| `deepseek-v4-pro`, `glm-5.2` | `max` | `reasoning_effort=max` (native `high` or `max`; `low`/`medium` map to `high`; `xhigh` maps to `max`) |
+| `deepseek-v4.1-flash` | omitted | no effort field; provider default is `high` |
+| `qwen3.8-max-preview` | — | reasoning effort is rejected |
+
+`qwen3.6-flash` has no configured effort, so the request omits both fields and
+leaves the provider thinking default in place. A caller-supplied effort on
+that model still serializes only `enable_thinking`.
+
 Other model IDs are rejected locally. The provider always resolves the public
 LiteLLM model identity to the unprefixed provider model before egress. A public
 AAWM alias such as `sota-alibaba` must never appear in an upstream request
