@@ -31,6 +31,10 @@ from litellm.llms.xai.route_descriptors import (
     XAI_NATIVE_GROK_CONTINUATION_RETRY_CAPABILITY,
     has_grok_native_route_capability,
 )
+from litellm.llms.zai_coding_plan.failure_classification import (
+    ZAICodingPlanFailureKind,
+    classify_zai_coding_plan_failure,
+)
 from litellm.llms.anthropic.experimental_pass_through.providers.grok import (
     side_channel as _grok_side_channel,
 )
@@ -68,6 +72,7 @@ from .policy import (
     CODEX_AUTO_AGENT_OPENROUTER_PROVIDER as _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
     CODEX_AUTO_AGENT_OPENCODE_PROVIDER as _CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
     CODEX_AUTO_AGENT_XAI_PROVIDER as _CODEX_AUTO_AGENT_XAI_PROVIDER,
+    CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER as _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER,
     nvidia_completion_adapter_upstream_model as _nvidia_completion_adapter_upstream_model,
 )
 from .interfaces import ProviderAttributedModelUnavailableMatch
@@ -1694,6 +1699,8 @@ def _get_codex_auto_agent_candidate_cooldown_scope(
         and _get_codex_auto_agent_xai_model_unavailable_suffix(candidate) is not None
     ):
         return "candidate"
+    if error_class == "provider_forbidden":
+        return "request_local"
     if error_class == "safety_policy_denied":
         return "request_local"
     if (
@@ -2828,6 +2835,66 @@ def _openrouter_credit_exhaustion_event(
     return extract_credit_exhaustion_event(exc, error_shape_runtime=_OPENROUTER_ERROR_SHAPE_RUNTIME)
 
 
+_ZAI_CODING_PLAN_ROUTE_FAMILY = "codex_zai_coding_plan_chat_completions_adapter"
+_ZAI_CODING_PLAN_PLAIN_AUTH_STATUS_CODES = frozenset({401, 403})
+
+
+def _exception_provider_returned(exc: Any) -> bool:
+    return (
+        getattr(exc, "_aawm_provider_returned", False) is True
+        or getattr(exc, "provider_returned", False) is True
+    )
+
+
+def _zai_coding_plan_plain_auth_failure(
+    exc: Any,
+    *,
+    candidate: Optional[dict[str, Any]],
+):
+    """Return the bounded forbidden classification for a codeless 401/403.
+
+    Recognized business codes stay on their own kinds. ``None`` means this is
+    not a plain Coding Plan 401/403. Callers must still require an attempted,
+    provider-returned call before treating the result as provider-attributed.
+    """
+
+    if not isinstance(candidate, dict):
+        return None
+    if candidate.get("provider") != _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER:
+        return None
+    if candidate.get("route_family") not in (None, _ZAI_CODING_PLAN_ROUTE_FAMILY):
+        return None
+    status_code = _extract_adapter_exception_status_code(exc)
+    if status_code not in _ZAI_CODING_PLAN_PLAIN_AUTH_STATUS_CODES:
+        return None
+    _error_type, error_code = _extract_codex_auto_agent_error_type_and_code(exc)
+    failure = classify_zai_coding_plan_failure(
+        status_code=status_code,
+        error_code=error_code,
+        upstream_id=candidate.get("model"),
+    )
+    if failure.kind != ZAICodingPlanFailureKind.FORBIDDEN:
+        return None
+    return failure
+
+
+def _zai_coding_plan_plain_auth_is_provider_attributed(
+    exc: Any,
+    *,
+    candidate: Optional[dict[str, Any]],
+    attempted_provider_call: bool,
+) -> bool:
+    return (
+        _zai_coding_plan_plain_auth_failure(
+            exc,
+            candidate=candidate,
+        )
+        is not None
+        and attempted_provider_call
+        and _exception_provider_returned(exc)
+    )
+
+
 def _is_openrouter_account_auth_failure(
     exc: Any,
     *,
@@ -2924,6 +2991,19 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         and candidate.get("provider") == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER
     ):
         return "usage_limit_reached"
+    plain_auth_failure = _zai_coding_plan_plain_auth_failure(
+        exc,
+        candidate=candidate,
+    )
+    if plain_auth_failure is not None:
+        if _zai_coding_plan_plain_auth_is_provider_attributed(
+            exc,
+            candidate=candidate,
+            attempted_provider_call=attempted_provider_call,
+        ):
+            setattr(exc, "_aawm_zai_coding_plan_safe_failure", "provider_forbidden")
+            return "provider_forbidden"
+        return None
     if "usage_limit_reached" in tokens:
         return "usage_limit_reached"
     openai_alpha_capacity_error_class = _classify_openai_alpha_capacity_error_code(
@@ -3246,6 +3326,13 @@ def _get_codex_auto_agent_cooldown_seconds(
     )
     if zen_failure is not None:
         return zen_failure.cooldown_seconds
+    if _zai_coding_plan_plain_auth_is_provider_attributed(
+        exc,
+        candidate=candidate,
+        attempted_provider_call=attempted_provider_call,
+    ):
+        setattr(exc, "_aawm_zai_coding_plan_safe_failure", "provider_forbidden")
+        return 0.0
     assert _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS is not None
     xai_header_wait = _parse_xai_rate_limit_header_wait_seconds(
         exc,
@@ -3266,6 +3353,8 @@ def _get_codex_auto_agent_cooldown_seconds(
         candidate=candidate,
         attempted_provider_call=attempted_provider_call,
     )
+    if error_class == "provider_forbidden":
+        return 0.0
     if error_class == _CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS:
         return 0.0
     if error_class in _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES:
@@ -3383,6 +3472,8 @@ def _get_codex_auto_agent_source_error_summary(
     failure = getattr(exc, "_aawm_zen_failure", None)
     if isinstance(failure, ZenFailure):
         return failure.public_detail
+    if getattr(exc, "_aawm_zai_coding_plan_safe_failure", None) == "provider_forbidden":
+        return "provider_forbidden"
     assert _get_passthrough_handled_http_error_summary is not None
     from fastapi import HTTPException
     from starlette import status as http_status
