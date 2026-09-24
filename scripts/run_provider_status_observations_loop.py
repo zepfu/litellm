@@ -408,6 +408,7 @@ ALIBABA_TOKEN_PLAN_RESET_CARD_CREDIT_TYPE = "manual_reset_card"
 ALIBABA_TOKEN_PLAN_RESET_CARD_SOURCE = "alibaba_token_plan_reset_card_list"
 ALIBABA_TOKEN_PLAN_RESET_CARD_PARSER_VERSION = "alibaba_token_plan_reset_card_v1"
 ALIBABA_QUOTA_RETRYABLE_HTTP_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+ALIBABA_QUOTA_HTTP_ERROR_BODY_MAX_BYTES = 65536
 ALIBABA_QUOTA_POLL_SLEEP_FN: Callable[[float], None] = time.sleep
 DEFAULT_CURSOR_AGENT_USAGE_POLL_ENABLED = False
 DEFAULT_CURSOR_AGENT_USAGE_POLL_INTERVAL_SECONDS = 600.0
@@ -12399,7 +12400,7 @@ def _handle_alibaba_quota_http_error(
 ) -> None:
     try:
         try:
-            exc.read()
+            exc.read(ALIBABA_QUOTA_HTTP_ERROR_BODY_MAX_BYTES)
         except Exception:
             pass
     finally:
