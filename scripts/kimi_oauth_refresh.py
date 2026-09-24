@@ -45,6 +45,8 @@ DEFAULT_KIMI_OAUTH_MAX_REFRESH_ATTEMPTS = 3
 DEFAULT_KIMI_OAUTH_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_KIMI_OAUTH_AUTH_FILE_MODE = 0o600
 DEFAULT_KIMI_OAUTH_ERROR_MESSAGE_LIMIT = 500
+DEFAULT_KIMI_OAUTH_HTTP_ERROR_BODY_LIMIT = 8192
+_HTTP_ERROR_SANITIZED_FIELDS = ("error", "error_description", "message")
 
 # Kimi Code 0.27.0 uses proper-lockfile with these retry/staleness settings.
 DEFAULT_KIMI_OAUTH_LOCK_RETRIES = 120
@@ -903,6 +905,7 @@ def _request_refresh_token(
         },
         method="POST",
     )
+    http_failure: Optional[BaseException] = None
     try:
         if on_token_endpoint_attempt is not None:
             on_token_endpoint_attempt()
@@ -910,10 +913,17 @@ def _request_refresh_token(
             status = int(getattr(response, "status", 200))
             payload = _read_response_payload(response.read())
     except urllib_error.HTTPError as exc:
-        payload = _read_http_error_payload(exc)
-        raise _classify_http_failure(exc.code, payload) from exc
+        try:
+            error_payload = _read_bounded_sanitized_http_error_payload(exc)
+            http_failure = _classify_http_failure(exc.code, error_payload)
+        except Exception as failure:
+            http_failure = _detach_owned_http_failure(failure)
+        finally:
+            _close_http_error_response(exc)
     except (urllib_error.URLError, TimeoutError, OSError) as exc:
         raise KimiOAuthTransportError(f"Kimi OAuth transport failure: {exc}") from exc
+    if http_failure is not None:
+        raise http_failure
     if status < 200 or status >= 300:
         raise _classify_http_failure(status, payload)
     return payload
@@ -929,11 +939,61 @@ def _read_response_payload(raw: bytes) -> Mapping[str, Any]:
     return payload
 
 
-def _read_http_error_payload(exc: urllib_error.HTTPError) -> Mapping[str, Any]:
+def _detach_owned_http_failure(failure: BaseException) -> BaseException:
+    """Drop implicit links back to the owned HTTPError response."""
+    failure.__context__ = None
+    failure.__cause__ = None
+    failure.__suppress_context__ = True
+    return failure
+
+
+def _close_http_error_response(response: object) -> None:
+    """Release one HTTP-error response. Callers own this and invoke it once."""
+    close = getattr(response, "close", None)
+    if not callable(close):
+        return
     try:
-        return _read_response_payload(exc.read())
-    except KimiOAuthError:
+        close()
+    except Exception:
+        return
+
+
+def _read_bounded_sanitized_http_error_payload(
+    exc: urllib_error.HTTPError,
+) -> Dict[str, Any]:
+    """Read a bounded error body and return only sanitized classification fields.
+
+    The raw body is not returned. Read failures and malformed JSON yield an
+    empty mapping so the caller can still classify and close the response.
+    """
+    try:
+        raw = exc.read(DEFAULT_KIMI_OAUTH_HTTP_ERROR_BODY_LIMIT)
+    except Exception:
         return {}
+    if isinstance(raw, str):
+        raw_bytes = raw.encode("utf-8")
+    elif isinstance(raw, (bytes, bytearray)):
+        raw_bytes = bytes(raw)
+    else:
+        return {}
+    raw_bytes = raw_bytes[:DEFAULT_KIMI_OAUTH_HTTP_ERROR_BODY_LIMIT]
+    try:
+        payload = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    sanitized: Dict[str, Any] = {}
+    for field in _HTTP_ERROR_SANITIZED_FIELDS:
+        value = payload.get(field)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        sanitized[field] = sanitize_credential_error_message(
+            value.strip(),
+            field_names=_SECRET_FIELD_NAMES,
+            limit=DEFAULT_KIMI_OAUTH_ERROR_MESSAGE_LIMIT,
+        )
+    return sanitized
 
 
 def _classify_http_failure(status: int, payload: Mapping[str, Any]) -> KimiOAuthError:
