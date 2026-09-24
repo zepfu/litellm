@@ -2457,14 +2457,11 @@ def _zai_coding_plan_control_remaining_pct(
     quota_remaining: Optional[float],
 ) -> Optional[float]:
     """Use absolute CREDIT_LIMIT remaining; keep other windows on their percent."""
-    if (
-        quota_type == "credits"
-        and quota_limit is not None
-        and quota_limit > 0.0
-        and quota_remaining is not None
-        and quota_remaining >= 0.0
-    ):
-        return max(0.0, min(100.0, quota_remaining / quota_limit * 100.0))
+    if quota_type == "credits" and quota_remaining is not None and quota_remaining >= 0.0:
+        if quota_remaining == 0.0:
+            return 0.0
+        if quota_limit is not None and quota_limit > 0.0:
+            return max(0.0, min(100.0, quota_remaining / quota_limit * 100.0))
     if remaining_pct is None or not 0.0 <= remaining_pct <= 100.0:
         return None
     return remaining_pct
