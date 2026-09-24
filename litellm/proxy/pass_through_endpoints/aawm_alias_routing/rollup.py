@@ -311,6 +311,12 @@ def _record_auto_agent_alias_route_status_rollup(  # noqa: PLR0915
     event: dict[str, Any],
 ) -> None:
     status = _auto_agent_alias_route_rollup_status(event)
+    suppress_recovered_route_status = (
+        event.get("route_rollup_status_suppressed") is True
+        and status == "Recovered"
+    )
+    if suppress_recovered_route_status:
+        status = None
     request_identity = _auto_agent_alias_event_request_identity(event)
     alias_model = _clean_codex_auth_value(event.get("alias_model"))
 
@@ -475,6 +481,10 @@ def _record_auto_agent_alias_route_status_rollup(  # noqa: PLR0915
             if candidate_event is event
             else _auto_agent_alias_route_rollup_status(candidate_event)
         )
+        if suppress_recovered_route_status and (
+            candidate_event is event or candidate_status == "Recovered"
+        ):
+            continue
         candidate_message = _auto_agent_alias_route_status_message(candidate_event)
         if (
             candidate_status is not None

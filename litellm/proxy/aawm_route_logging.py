@@ -3207,6 +3207,9 @@ def attach_aawm_route_rollup_context(
     metadata = _set_aawm_route_rollup_metadata(kwargs)
     if metadata is not None:
         metadata[_AAWM_ROUTE_ROLLUP_CONTEXT_METADATA_KEY] = context
+        request_state = getattr(request, "state", None)
+        if request_state is not None:
+            setattr(request_state, "_aawm_route_rollup_context", context)
         for key in ("client_ip", "client_ip_source", "host_name", "host_name_source"):
             value = context.get(key)
             if value:

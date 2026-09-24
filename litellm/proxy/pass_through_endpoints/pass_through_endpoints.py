@@ -2858,16 +2858,6 @@ def _is_direct_codex_usage_limit_error_for_rollup(exc: Exception) -> bool:
     return is_direct_codex_usage_limit_error(exc)
 
 
-def _is_direct_codex_token_invalidated_error_for_rollup(exc: Exception) -> bool:
-    """Classify trusted direct-account token invalidation as failover-bound."""
-
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
-        is_direct_codex_token_invalidated_error,
-    )
-
-    return is_direct_codex_token_invalidated_error(exc)
-
-
 def _get_passthrough_terminal_failure_kind(
     *,
     hidden_retry_failure_classification: Optional[Any],
@@ -10850,7 +10840,7 @@ async def pass_through_request(  # noqa: PLR0915
             e,
             status_code=status_code,
         )
-        suppress_direct_codex_account_failover_rollup = (
+        suppress_direct_codex_account_quota_rollup = (
             isinstance(
                 selected_openai_account_context := getattr(
                     getattr(request, "state", None),
@@ -10866,12 +10856,9 @@ async def pass_through_request(  # noqa: PLR0915
                 False,
             )
             is not True
-            and (
-                _is_direct_codex_usage_limit_error_for_rollup(e)
-                or _is_direct_codex_token_invalidated_error_for_rollup(e)
-            )
+            and _is_direct_codex_usage_limit_error_for_rollup(e)
         )
-        if not suppress_direct_codex_account_failover_rollup and not (
+        if not suppress_direct_codex_account_quota_rollup and not (
             _is_handled_session_owner_redispatch_required(
                 e,
                 status_code=status_code,

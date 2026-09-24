@@ -682,6 +682,17 @@ def note_direct_openai_managed_success(
     if attempt_record is None:
         return
     attempts = _direct_attempts(request)
+    prior_failover_attempts = [
+        attempt
+        for attempt in attempts
+        if attempt is not attempt_record
+        and isinstance(attempt, dict)
+        and attempt.get("request_outcome") == "pending_failover"
+    ]
+    suppress_recovered_route_status = bool(prior_failover_attempts) and all(
+        attempt.get("error_class") == "usage_limit_reached"
+        for attempt in prior_failover_attempts
+    )
     selected_account = getattr(
         request_state,
         "aawm_codex_oauth_selected_account",
@@ -702,6 +713,21 @@ def note_direct_openai_managed_success(
         if value is None and isinstance(candidate, dict):
             value = candidate.get(candidate_field)
         attempt_record[account_field] = value
+    rollup_context = getattr(
+        request_state,
+        "_aawm_route_rollup_context",
+        None,
+    )
+    if isinstance(rollup_context, dict) and attempt_record.get("account_hash"):
+        rollup_context.update(
+            {
+                "codex_auto_agent_selected_provider": "openai",
+                "codex_oauth_account_hash": attempt_record["account_hash"],
+                "codex_oauth_account_display": attempt_record.get(
+                    "account_display"
+                ),
+            }
+        )
     attempt_record["attempt_number"] = max(1, _provider_attempt_count(attempts))
     _apply_direct_attempt_trace(
         request,
@@ -756,6 +782,7 @@ def note_direct_openai_managed_success(
         attempts=_direct_attempts(request),
         attempt_record=attempt_record,
         add_alias_metadata_fn=_add_direct_openai_managed_metadata,
+        suppress_recovered_route_status=suppress_recovered_route_status,
     )
 
 

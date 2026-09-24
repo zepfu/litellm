@@ -1120,6 +1120,7 @@ def _record_auto_agent_alias_attempt_success(
     attempts: list[dict[str, Any]],
     attempt_record: dict[str, Any],
     add_alias_metadata_fn: Callable[..., dict[str, Any]],
+    suppress_recovered_route_status: bool = False,
 ) -> dict[str, Any]:
     """Record same-request alternate-account recovery without hiding prior failures."""
 
@@ -1190,6 +1191,8 @@ def _record_auto_agent_alias_attempt_success(
         "recovered" if recovered else "completed"
     )
     audit_event["request_outcome"] = "recovered" if recovered else "success"
+    if recovered and suppress_recovered_route_status:
+        audit_event["route_rollup_status_suppressed"] = True
     audit_event["attempts"] = copy.deepcopy(attempts)
     audit_event["attempt_count"] = _provider_attempt_count(attempts)
     _stamp_openrouter_inner_send_fields(audit_event, attempt_record)
