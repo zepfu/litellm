@@ -153,39 +153,38 @@ def subscription_identity_for_candidate(
 
     A present identity field that is empty, non-string, or not the contract
     hash stays unknown. When both the hash and instance code are supplied,
-    they must name the same subscription. The process-wide identity is used
-    only for an Alibaba Token Plan candidate that did not supply either field.
+    they must name the same subscription. A candidate that supplies neither
+    field has no verified binding to the process-wide subscription, so it
+    stays unknown instead of inheriting that identity.
     """
 
     if not isinstance(candidate, Mapping):
         return None
     has_identity = "subscription_identity" in candidate
     has_instance = "instance_code" in candidate
-    if has_identity or has_instance:
-        identity = (
-            _candidate_subscription_identity(candidate.get("subscription_identity"))
-            if has_identity
-            else None
-        )
-        if has_identity and identity is None:
-            return None
-        instance_identity = (
-            _candidate_instance_identity(candidate.get("instance_code"))
-            if has_instance
-            else None
-        )
-        if has_instance and instance_identity is None:
-            return None
-        if (
-            identity is not None
-            and instance_identity is not None
-            and identity != instance_identity
-        ):
-            return None
-        return identity or instance_identity
-    if candidate.get("provider") != ALIBABA_TOKEN_PLAN_PROVIDER_NAME:
+    if not has_identity and not has_instance:
         return None
-    return resolve_alibaba_token_plan_subscription_identity()
+    identity = (
+        _candidate_subscription_identity(candidate.get("subscription_identity"))
+        if has_identity
+        else None
+    )
+    if has_identity and identity is None:
+        return None
+    instance_identity = (
+        _candidate_instance_identity(candidate.get("instance_code"))
+        if has_instance
+        else None
+    )
+    if has_instance and instance_identity is None:
+        return None
+    if (
+        identity is not None
+        and instance_identity is not None
+        and identity != instance_identity
+    ):
+        return None
+    return identity or instance_identity
 
 
 class AlibabaTokenPlanAuthenticationError(OpenAIError):
