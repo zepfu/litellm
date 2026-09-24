@@ -326,10 +326,107 @@ def _copy_kimi_message_without_content(message: Any) -> Any:
     return updated_message
 
 
+_KIMI_EMPTY_CONTENT_PRESERVE_ROLES = frozenset(
+    {"system", "developer", "user", "tool"}
+)
+
+
+def _kimi_message_includes_content(message: Any) -> bool:
+    if isinstance(message, dict):
+        return "content" in message
+    return hasattr(message, "content")
+
+
+def _kimi_message_as_mapping(message: Any) -> Optional[dict[str, Any]]:
+    if isinstance(message, dict):
+        return message
+    model_dump = getattr(message, "model_dump", None)
+    if not callable(model_dump):
+        return None
+    dumped = model_dump()
+    if isinstance(dumped, dict):
+        return dumped
+    return None
+
+
+def _kimi_field_is_meaningful(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, dict, tuple, set)):
+        return len(value) > 0
+    return True
+
+
+def _is_exact_empty_assistant_list_artifact(message: Any) -> bool:
+    """Replay placeholder `{role: assistant, content: []}` with no other payload.
+
+    Continuation history can append this empty assistant list after a finished
+    tool exchange. Removal requires the whole message: empty `content`, no tool
+    call, and no other meaningful field such as `reasoning_content` or
+    `refusal`. Anything else stays in place or is rejected.
+    """
+
+    role = _get_kimi_message_field(message, "role")
+    content = _get_kimi_message_field(message, "content")
+    if role != "assistant" or _kimi_message_has_tool_call(message):
+        return False
+    if not isinstance(content, list) or len(content) != 0:
+        return False
+    fields = _kimi_message_as_mapping(message)
+    if fields is None:
+        return False
+    return not any(
+        key not in {"role", "content"} and _kimi_field_is_meaningful(value)
+        for key, value in fields.items()
+    )
+
+
+def _kimi_empty_content_action(
+    *,
+    message: Any,
+    role: Any,
+    content: Any,
+    has_tool_call: bool,
+    includes_content: bool,
+) -> str:
+    """Choose preserve, strip, remove, or reject for one history message.
+
+    Empty, whitespace, list, null, tool-call, and ordinary content resolve by
+    role:
+
+    - assistant + tool call + present empty content: strip `content`. Kimi
+      rejects an assistant tool-call message that still carries explicit empty
+      content (`text content is empty`).
+    - assistant + `content: []`, no tool call, and no other meaningful field:
+      remove that replay artifact.
+    - system, developer, user, tool, and every other assistant shape: preserve
+      the message, including empty content that still carries reasoning,
+      refusal, or another payload.
+    - any other role with empty content: reject. Do not drop it.
+    """
+
+    if (
+        role == "assistant"
+        and has_tool_call
+        and includes_content
+        and _is_kimi_empty_text_content(content)
+    ):
+        return "strip"
+    if _is_exact_empty_assistant_list_artifact(message):
+        return "remove"
+    if role in _KIMI_EMPTY_CONTENT_PRESERVE_ROLES or role == "assistant":
+        return "preserve"
+    if _is_kimi_empty_text_content(content):
+        return "reject"
+    return "preserve"
+
+
 def _sanitize_kimi_chat_messages(
     messages: list[Any],
 ) -> tuple[list[Any], dict[str, Any]]:
-    """Remove replay-only empty text without dropping valid tool history."""
+    """Drop only the proven empty assistant artifact; keep other role boundaries."""
 
     updated_messages: list[Any] = []
     removed_empty_message_count = 0
@@ -337,18 +434,29 @@ def _sanitize_kimi_chat_messages(
     for message in messages:
         role = _get_kimi_message_field(message, "role")
         content = _get_kimi_message_field(message, "content")
-        if role == "tool":
+        has_tool_call = _kimi_message_has_tool_call(message)
+        action = _kimi_empty_content_action(
+            message=message,
+            role=role,
+            content=content,
+            has_tool_call=has_tool_call,
+            includes_content=_kimi_message_includes_content(message),
+        )
+        if action == "strip":
+            message = _copy_kimi_message_without_content(message)
+            stripped_tool_call_content_count += 1
             updated_messages.append(message)
             continue
-        if _kimi_message_has_tool_call(message):
-            if _is_kimi_empty_text_content(content):
-                message = _copy_kimi_message_without_content(message)
-                stripped_tool_call_content_count += 1
-            updated_messages.append(message)
-            continue
-        if _is_kimi_empty_text_content(content):
+        if action == "remove":
             removed_empty_message_count += 1
             continue
+        if action == "reject":
+            raise ValueError(
+                "Kimi Code request history contains empty content for role "
+                f"{role!r}. Empty content is preserved for system, developer, "
+                "user, and tool messages, and removed only for the assistant "
+                "replay artifact with content []."
+            )
         updated_messages.append(message)
 
     if (
