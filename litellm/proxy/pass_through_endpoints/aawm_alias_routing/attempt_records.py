@@ -1645,6 +1645,27 @@ def note_alibaba_ciphertext_egress_started(*, ordinal: int) -> None:
             return
 
 
+def note_alibaba_ciphertext_transport_egress() -> None:
+    """Mark the in-flight generation only once provider transport send starts."""
+
+    attempt_record = _alibaba_attempt_record()
+    if attempt_record is None:
+        return
+    subattempts = attempt_record.get("subattempts")
+    if not isinstance(subattempts, list):
+        return
+    for subattempt in reversed(subattempts):
+        if (
+            isinstance(subattempt, dict)
+            and subattempt.get("kind") == "alibaba_ciphertext_generation"
+            and subattempt.get("outcome") == "in_flight"
+            and isinstance(subattempt.get("ordinal"), int)
+            and not isinstance(subattempt.get("ordinal"), bool)
+        ):
+            note_alibaba_ciphertext_egress_started(ordinal=subattempt["ordinal"])
+            return
+
+
 def finish_alibaba_ciphertext_subattempt(
     started_at: float,
     *,

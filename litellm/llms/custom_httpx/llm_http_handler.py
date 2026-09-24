@@ -380,6 +380,11 @@ class BaseLLMHTTPHandler:
         response: Optional[httpx.Response] = None
         for i in range(max(max_retry_on_unprocessable_entity_error, 1)):
             try:
+                from litellm.proxy.pass_through_endpoints.aawm_alias_routing.attempt_records import (
+                    note_alibaba_ciphertext_transport_egress,
+                )
+
+                note_alibaba_ciphertext_transport_egress()
                 response = await async_httpx_client.post(
                     url=api_base,
                     headers=headers,
