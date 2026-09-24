@@ -49,6 +49,9 @@ _OPENAI_FAULT_PLAN_DIRECT_SUCCESS_STATE_KEY = (
 _OPENAI_FAULT_PLAN_DIRECT_TERMINAL_STATE_KEY = (
     "aawm_openai_fault_plan_direct_terminal_recorded"
 )
+_OPENAI_FAULT_PLAN_DIRECT_NON_QUOTA_FAILURE_STATE_KEY = (
+    "aawm_openai_fault_plan_direct_non_quota_failure_recorded"
+)
 
 
 def _openai_fault_plan_control_enabled() -> bool:
@@ -689,9 +692,17 @@ def note_direct_openai_managed_success(
         and isinstance(attempt, dict)
         and attempt.get("request_outcome") == "pending_failover"
     ]
-    suppress_recovered_route_status = bool(prior_failover_attempts) and all(
-        attempt.get("error_class") == "usage_limit_reached"
-        for attempt in prior_failover_attempts
+    suppress_recovered_route_status = (
+        not getattr(
+            request_state,
+            _OPENAI_FAULT_PLAN_DIRECT_NON_QUOTA_FAILURE_STATE_KEY,
+            False,
+        )
+        and bool(prior_failover_attempts)
+        and all(
+            attempt.get("error_class") == "usage_limit_reached"
+            for attempt in prior_failover_attempts
+        )
     )
     selected_account = getattr(
         request_state,

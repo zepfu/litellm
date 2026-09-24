@@ -10840,6 +10840,9 @@ async def pass_through_request(  # noqa: PLR0915
             e,
             status_code=status_code,
         )
+        direct_codex_account_quota_failure = (
+            _is_direct_codex_usage_limit_error_for_rollup(e)
+        )
         suppress_direct_codex_account_quota_rollup = (
             isinstance(
                 selected_openai_account_context := getattr(
@@ -10856,7 +10859,7 @@ async def pass_through_request(  # noqa: PLR0915
                 False,
             )
             is not True
-            and _is_direct_codex_usage_limit_error_for_rollup(e)
+            and direct_codex_account_quota_failure
         )
         if not suppress_direct_codex_account_quota_rollup and not (
             _is_handled_session_owner_redispatch_required(
@@ -10864,10 +10867,26 @@ async def pass_through_request(  # noqa: PLR0915
                 status_code=status_code,
             )
         ):
-            record_aawm_route_rollup_failure(
+            route_failure_recorded = record_aawm_route_rollup_failure(
                 kwargs,
                 message=route_failure_summary,
             )
+            request_state = getattr(request, "state", None)
+            if (
+                route_failure_recorded
+                and not direct_codex_account_quota_failure
+                and getattr(
+                    request_state,
+                    "aawm_openai_fault_plan_direct_tracking",
+                    False,
+                )
+                is True
+            ):
+                setattr(
+                    request_state,
+                    "aawm_openai_fault_plan_direct_non_quota_failure_recorded",
+                    True,
+                )
         if suppress_retryable_failure_logging:
             verbose_proxy_logger.debug(
                 "Pass through endpoint received retryable upstream status=%s; deferring failure logging to adapter handling",
