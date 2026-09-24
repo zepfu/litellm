@@ -2305,6 +2305,34 @@ def install(
         ("_OPENCODE_GO_CREDENTIAL_FAMILY", _OPENCODE_GO_CREDENTIAL_FAMILY),
         ("_OPENCODE_GO_TARGET_FAMILY", _OPENCODE_GO_TARGET_FAMILY),
         ("_load_opencode_go_api_key", _load_opencode_go_api_key),
+        (
+            "_parse_encrypted_reasoning_arguments",
+            _parse_encrypted_reasoning_arguments,
+        ),
+        (
+            "_scan_encrypted_reasoning_argument_tree",
+            _scan_encrypted_reasoning_argument_tree,
+        ),
+        (
+            "_encrypted_reasoning_argument_finding",
+            _encrypted_reasoning_argument_finding,
+        ),
+        (
+            "_join_encrypted_reasoning_argument_path",
+            _join_encrypted_reasoning_argument_path,
+        ),
+        (
+            "_ENCRYPTED_REASONING_ARGUMENT_MAX_DEPTH",
+            _ENCRYPTED_REASONING_ARGUMENT_MAX_DEPTH,
+        ),
+        (
+            "_ENCRYPTED_REASONING_ARGUMENT_MAX_NODES",
+            _ENCRYPTED_REASONING_ARGUMENT_MAX_NODES,
+        ),
+        (
+            "_ENCRYPTED_REASONING_ARGUMENT_MAX_BYTES",
+            _ENCRYPTED_REASONING_ARGUMENT_MAX_BYTES,
+        ),
     ):
         host_globals.setdefault(_name, _value)
 
@@ -2526,6 +2554,12 @@ async def _abort_xai_responses_prefetch(
 _FERNET_TOKEN_PREFIX = "gAAAA"
 _FERNET_MIN_TOKEN_LENGTH = 64
 _ALIBABA_ENCRYPTED_REASONING_MAX_RETRIES = 1
+# Tool-argument walks stay bounded so nested ciphertext cannot hide past a
+# top-level key scan, and so a pathological document cannot exhaust the
+# process. Exceeding any bound fail-closes without copying argument text.
+_ENCRYPTED_REASONING_ARGUMENT_MAX_DEPTH = 16
+_ENCRYPTED_REASONING_ARGUMENT_MAX_NODES = 256
+_ENCRYPTED_REASONING_ARGUMENT_MAX_BYTES = 1_048_576
 
 
 def _is_fernet_encrypted_token(value: str) -> bool:
@@ -2542,18 +2576,167 @@ def _is_fernet_encrypted_token(value: str) -> bool:
     )
 
 
+def _encrypted_reasoning_argument_finding(
+    *,
+    name: str,
+    call_id: str,
+    argument_key: str,
+    bound: Optional[str] = None,
+) -> dict[str, Any]:
+    """Diagnostic for one leaked token or one exceeded walk bound.
+
+    The dict never carries argument text, so ciphertext cannot leave this
+    scanner through the finding itself.
+    """
+    finding: dict[str, Any] = {
+        "name": name,
+        "argument_key": argument_key,
+        "call_id": call_id,
+    }
+    if bound is not None:
+        finding["bound"] = bound
+    return finding
+
+
+def _join_encrypted_reasoning_argument_path(parent: str, segment: str) -> str:
+    if not parent:
+        return segment
+    if segment.startswith("["):
+        return f"{parent}{segment}"
+    return f"{parent}.{segment}"
+
+
+def _scan_encrypted_reasoning_argument_tree(
+    value: Any,
+    *,
+    name: str,
+    call_id: str,
+    path: str,
+    depth: int,
+    state: dict[str, int],
+    findings: list[dict[str, Any]],
+) -> bool:
+    """Walk one parsed argument node. Return True when the walk must stop.
+
+    Objects, arrays, and list roots are all visited. String leaves are
+    classified by the Fernet prefix only, so a long plaintext value stays
+    valid. Depth, node, and byte overruns append one bound finding and stop
+    without reading further argument text.
+    """
+    state["nodes"] += 1
+    if state["nodes"] > _ENCRYPTED_REASONING_ARGUMENT_MAX_NODES:
+        findings.append(
+            _encrypted_reasoning_argument_finding(
+                name=name,
+                call_id=call_id,
+                argument_key=path,
+                bound="nodes",
+            )
+        )
+        return True
+    if depth > _ENCRYPTED_REASONING_ARGUMENT_MAX_DEPTH:
+        findings.append(
+            _encrypted_reasoning_argument_finding(
+                name=name,
+                call_id=call_id,
+                argument_key=path,
+                bound="depth",
+            )
+        )
+        return True
+
+    if isinstance(value, str):
+        # Prefix classification does not depend on string length. A long
+        # plaintext value stays valid; only a Fernet token is a finding.
+        # Its bytes are not charged so a clean argument cannot trip the
+        # structural byte bound.
+        if _is_fernet_encrypted_token(value):
+            findings.append(
+                _encrypted_reasoning_argument_finding(
+                    name=name,
+                    call_id=call_id,
+                    argument_key=path or "$",
+                )
+            )
+        return False
+
+    if isinstance(value, dict):
+        for key, child in value.items():
+            key_text = key if isinstance(key, str) else str(key)
+            key_bytes = len(key_text.encode("utf-8"))
+            if state["bytes"] + key_bytes > _ENCRYPTED_REASONING_ARGUMENT_MAX_BYTES:
+                findings.append(
+                    _encrypted_reasoning_argument_finding(
+                        name=name,
+                        call_id=call_id,
+                        argument_key=path,
+                        bound="bytes",
+                    )
+                )
+                return True
+            state["bytes"] += key_bytes
+            if _scan_encrypted_reasoning_argument_tree(
+                child,
+                name=name,
+                call_id=call_id,
+                path=_join_encrypted_reasoning_argument_path(path, key_text),
+                depth=depth + 1,
+                state=state,
+                findings=findings,
+            ):
+                return True
+        return False
+
+    if isinstance(value, list):
+        for index, child in enumerate(value):
+            if _scan_encrypted_reasoning_argument_tree(
+                child,
+                name=name,
+                call_id=call_id,
+                path=_join_encrypted_reasoning_argument_path(path, f"[{index}]"),
+                depth=depth + 1,
+                state=state,
+                findings=findings,
+            ):
+                return True
+        return False
+
+    return False
+
+
+def _parse_encrypted_reasoning_arguments(arguments: Any) -> Any:
+    """Return a JSON object, array, or bare string ready for the walk.
+
+    List roots and nested containers stay structured. A non-JSON string is
+    scanned as itself so a bare Fernet token is not treated as absent.
+    Other scalars are ignored.
+    """
+    if isinstance(arguments, (dict, list)):
+        return arguments
+    if not isinstance(arguments, str) or not arguments:
+        return None
+    try:
+        parsed = json.loads(arguments)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return arguments
+    if isinstance(parsed, (dict, list, str)):
+        return parsed
+    return None
+
+
 def _responses_output_contains_encrypted_reasoning_arguments(
     responses_api_response: Any,
 ) -> list[dict[str, Any]]:
     """Detect Fernet-encrypted reasoning tokens in function_call arguments.
 
     Upstream chat-completion models may leak encrypted reasoning content
-    into tool call argument values.  Returns a list of diagnostic dicts
-    naming each affected tool call (by name and argument key) so the
-    caller can fail closed via the bounded malformed-tool-call path
-    instead of dispatching an encrypted/empty child assignment.
+    into tool call argument values, including nested objects, nested arrays,
+    and list-root argument documents.  Returns diagnostic dicts naming each
+    affected tool call so the caller can fail closed via the bounded
+    malformed-tool-call path instead of dispatching ciphertext.
 
-    Returns an empty list when no encrypted tokens are found.
+    Returns an empty list when no encrypted tokens are found and the
+    argument documents stay inside the depth, node, and byte bounds.
     """
     output = getattr(responses_api_response, "output", None)
     if not isinstance(output, list):
@@ -2563,26 +2746,22 @@ def _responses_output_contains_encrypted_reasoning_arguments(
     for item in output:
         if getattr(item, "type", None) != "function_call":
             continue
-        arguments = getattr(item, "arguments", None)
-        if not isinstance(arguments, str) or not arguments:
+        parsed = _parse_encrypted_reasoning_arguments(
+            getattr(item, "arguments", None)
+        )
+        if parsed is None:
             continue
-        try:
-            parsed = json.loads(arguments)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            continue
-        if not isinstance(parsed, dict):
-            continue
-
-        for key in list(parsed):
-            value = parsed[key]
-            if isinstance(value, str) and _is_fernet_encrypted_token(value):
-                findings.append(
-                    {
-                        "name": getattr(item, "name", None) or "",
-                        "argument_key": key,
-                        "call_id": getattr(item, "call_id", None) or "",
-                    }
-                )
+        name = getattr(item, "name", None) or ""
+        call_id = getattr(item, "call_id", None) or ""
+        _scan_encrypted_reasoning_argument_tree(
+            parsed,
+            name=name,
+            call_id=call_id,
+            path="",
+            depth=0,
+            state={"nodes": 0, "bytes": 0},
+            findings=findings,
+        )
 
     return findings
 
