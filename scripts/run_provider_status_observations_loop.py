@@ -10231,6 +10231,7 @@ def _fetch_kimi_usage_payload(
             method="GET",
         )
         response_body: Optional[str] = None
+        usage_http_failure: Optional[BaseException] = None
         try:
             with urllib_request.urlopen(
                 request,
@@ -10240,7 +10241,13 @@ def _fetch_kimi_usage_payload(
                 if 200 <= status_code < 300:
                     response_body = response.read().decode("utf-8")
         except urllib_error.HTTPError as exc:
-            status_code = exc.code
+            try:
+                kimi_oauth_refresh._read_bounded_sanitized_http_error_payload(exc)
+                status_code = exc.code
+            except Exception as failure:
+                usage_http_failure = kimi_oauth_refresh._detach_owned_http_failure(failure)
+            finally:
+                kimi_oauth_refresh._close_http_error_response(exc)
         except (urllib_error.URLError, TimeoutError, OSError) as exc:
             raise _kimi_usage_poll_error(
                 status_code=None,
@@ -10251,6 +10258,8 @@ def _fetch_kimi_usage_payload(
                 refresh_succeeded=refresh_succeeded,
                 message=("Kimi Code usage poll failed while contacting the native " "endpoint."),
             ) from exc
+        if usage_http_failure is not None:
+            raise usage_http_failure
 
         if status_code in {401, 403} and attempt_count == 1:
             refresh_attempted = True
