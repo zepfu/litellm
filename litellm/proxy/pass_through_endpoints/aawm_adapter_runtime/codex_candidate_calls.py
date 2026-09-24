@@ -9193,6 +9193,7 @@ async def _run_codex_alibaba_ciphertext_generations(  # noqa: PLR0915
                 ordinal=_ordinal,
                 outcome="failed",
                 retry_eligible=False,
+                error=exc,
                 error_class=type(exc).__name__,
             )
             raise
