@@ -1161,9 +1161,10 @@ def _apply_zen_account_cooldown_scope(
 
     Model and format failures keep the candidate key from the shared resolver.
     Account scope is taken only from the typed ``ZenFailure``. Message text is
-    not consulted. Durable keys are replaced only when that resolver already
-    published, so the evidence gate is not bypassed. The same sentinel is
-    excluded for the rest of this request so the other Zen model is not called.
+    not consulted. Each publication channel is retargeted only when that
+    channel already has keys, so a memory-only plan does not gain a durable
+    account cooldown. The same sentinel is excluded for the rest of this
+    request so the other Zen model is not called.
     """
 
     from .failure_vocabulary import ZenFailure
@@ -1191,8 +1192,8 @@ def _apply_zen_account_cooldown_scope(
     if not plan.memory_keys and not plan.durable_keys:
         return plan
     return CooldownPublicationPlan(
-        memory_keys=(cooldown_key,),
-        durable_keys=(cooldown_key,),
+        memory_keys=(cooldown_key,) if plan.memory_keys else (),
+        durable_keys=(cooldown_key,) if plan.durable_keys else (),
         duration_seconds=max(0.0, float(plan.duration_seconds)),
         applied_scope="account",
         grok_account_quota_exhausted=plan.grok_account_quota_exhausted,
