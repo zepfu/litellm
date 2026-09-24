@@ -681,6 +681,44 @@ def _handle_kimi_adapter_exception(
         ) from exc
 
 
+def _validated_kimi_responses_output_limit(value: Any) -> Optional[int]:
+    """Return a caller Responses output cap, or None when the caller set none.
+
+    Missing and JSON null are absent caps. A limit of one is preserved.
+    Every other value is rejected before conversion.
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(
+            "Kimi Code max_output_tokens must be an integer greater than or equal to 1."
+        )
+    return value
+
+
+def _capture_kimi_responses_output_limit(
+    request_body: dict[str, Any],
+) -> Optional[int]:
+    if "max_output_tokens" not in request_body:
+        return None
+    return _validated_kimi_responses_output_limit(request_body.get("max_output_tokens"))
+
+
+def _apply_kimi_responses_output_limit(
+    completion_kwargs: dict[str, Any],
+    output_limit: Optional[int],
+) -> None:
+    """Keep the current request cap and drop obsolete token-limit fields."""
+
+    completion_kwargs.pop("max_output_tokens", None)
+    completion_kwargs.pop("max_tokens", None)
+    if output_limit is None:
+        completion_kwargs.pop("max_completion_tokens", None)
+        return
+    completion_kwargs["max_completion_tokens"] = output_limit
+
+
 async def prepare_codex_kimi_chat_completions_adapter_route(
     *,
     request: object,
@@ -712,6 +750,7 @@ async def prepare_codex_kimi_chat_completions_adapter_route(
         task_payload_metadata["tags"] = tags
         task_payload_metadata.update(task_payload_changes)
         request_body["litellm_metadata"] = task_payload_metadata
+    output_limit = _capture_kimi_responses_output_limit(request_body)
     request_body.pop("max_output_tokens", None)
     request_input = request_body.get("input", "")
     responses_api_request = cast(
@@ -731,16 +770,13 @@ async def prepare_codex_kimi_chat_completions_adapter_route(
     completion_kwargs["metadata"] = litellm_metadata
     completion_kwargs["custom_llm_provider"] = "kimi_code"
     completion_kwargs["num_retries"] = 0
-    completion_kwargs.pop("max_output_tokens", None)
-    completion_kwargs.pop("max_tokens", None)
     previous_response_id = responses_api_request.get("previous_response_id")
     if isinstance(previous_response_id, str) and previous_response_id:
         completion_kwargs = await LiteLLMCompletionResponsesConfig.async_responses_api_session_handler(
             previous_response_id=previous_response_id,
             litellm_completion_request=completion_kwargs,
         )
-        completion_kwargs.pop("max_output_tokens", None)
-        completion_kwargs.pop("max_tokens", None)
+    _apply_kimi_responses_output_limit(completion_kwargs, output_limit)
     messages = completion_kwargs.get("messages")
     if not isinstance(messages, list):
         raise ValueError("Kimi Code request history must contain a messages list.")
