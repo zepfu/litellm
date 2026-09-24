@@ -55,6 +55,11 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_persist impor
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.attempt_records import (
     _persist_opencode_go_direct_rejection_audit,
+    alibaba_ciphertext_repair_prohibited,
+    begin_alibaba_ciphertext_subattempt,
+    finish_alibaba_ciphertext_subattempt,
+    mark_alibaba_downstream_response_committed,
+    note_alibaba_ciphertext_repair_blocked,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.opencode_go_preflight import (
     classify_opencode_go_credential_preflight_reason,
@@ -2100,6 +2105,7 @@ _HOST_FUNCTION_NAMES = (
     "_handle_codex_kimi_chat_completions_adapter_route",
     # Alibaba
     "_prepare_codex_alibaba_token_plan_adapter_route",
+    "_run_codex_alibaba_ciphertext_generations",
     "_perform_codex_alibaba_token_plan_adapter_call",
     "_handle_codex_alibaba_token_plan_adapter_route",
     # Z.AI Coding Plan
@@ -2186,6 +2192,12 @@ def install(
         "_raise_codex_alibaba_auto_review_validation_error",
         "_validate_codex_alibaba_auto_review_completion_or_raise",
         "_validate_codex_alibaba_auto_review_response_body_or_raise",
+        "_begin_alibaba_ciphertext_subattempt",
+        "_finish_alibaba_ciphertext_subattempt",
+        "_alibaba_ciphertext_repair_prohibited",
+        "_mark_alibaba_downstream_response_committed",
+        "_note_alibaba_ciphertext_repair_blocked",
+        "_alibaba_adapter_response_request_body",
     ):
         host_globals.setdefault(_name, _mod[_name])
     from litellm.llms.alibaba_token_plan.adapters import (
@@ -9074,6 +9086,37 @@ async def _handle_codex_kimi_chat_completions_adapter_route(
     return validated_response
 
 
+def _begin_alibaba_ciphertext_subattempt(*, ordinal: int) -> float:
+    return begin_alibaba_ciphertext_subattempt(ordinal=ordinal)
+
+
+def _finish_alibaba_ciphertext_subattempt(started_at: float, **payload: Any) -> None:
+    finish_alibaba_ciphertext_subattempt(started_at, **payload)
+
+
+def _alibaba_ciphertext_repair_prohibited(request: Any) -> bool:
+    return alibaba_ciphertext_repair_prohibited(request)
+
+
+def _mark_alibaba_downstream_response_committed(request: Any) -> None:
+    mark_alibaba_downstream_response_committed(request)
+
+
+def _note_alibaba_ciphertext_repair_blocked() -> None:
+    note_alibaba_ciphertext_repair_blocked()
+
+
+def _alibaba_adapter_response_request_body(
+    prepared_request_body: Any,
+    litellm_metadata: Any,
+) -> Optional[dict[str, Any]]:
+    if isinstance(prepared_request_body, dict):
+        return prepared_request_body
+    if isinstance(litellm_metadata, dict):
+        return {"litellm_metadata": litellm_metadata}
+    return None
+
+
 async def _prepare_codex_alibaba_token_plan_adapter_route(
     *,
     request: Request,
@@ -9106,6 +9149,158 @@ async def _prepare_codex_alibaba_token_plan_adapter_route(
         prepared_request_body=adapted_request_body,
         adapter_model=adapter_model,
         use_alias_candidate_probe=use_alias_candidate_probe,
+    )
+
+
+async def _run_codex_alibaba_ciphertext_generations(  # noqa: PLR0915
+    *,
+    request: Request,
+    prepared_request_body: Any,
+    adapter_model: str,
+    client_requested_stream: bool,
+    completion_kwargs: Payload,
+    request_input: Any,
+    responses_api_request: Any,
+    litellm_metadata: Any,
+    auto_review_schema: Optional[dict[str, Any]],
+    transform_config: Any,
+) -> Response:
+    """Run the initial generation and at most one ciphertext-repair generation.
+
+    Both generations stay on the current outer candidate. Repair does not
+    start after a downstream response is committed.
+    """
+    _call_kwargs = (
+        dict(completion_kwargs, stream=False)
+        if client_requested_stream
+        else completion_kwargs
+    )
+    _request_body = _alibaba_adapter_response_request_body(
+        prepared_request_body,
+        litellm_metadata,
+    )
+    responses_api_response = None
+    for _ordinal in range(1, _ALIBABA_ENCRYPTED_REASONING_MAX_RETRIES + 2):
+        if _ordinal > 1 and _alibaba_ciphertext_repair_prohibited(request):
+            _note_alibaba_ciphertext_repair_blocked()
+            break
+        _started = _begin_alibaba_ciphertext_subattempt(ordinal=_ordinal)
+        try:
+            completion_response = await litellm.acompletion(**_call_kwargs)
+        except Exception as exc:
+            _finish_alibaba_ciphertext_subattempt(
+                _started,
+                ordinal=_ordinal,
+                outcome="failed",
+                retry_eligible=False,
+                error_class=type(exc).__name__,
+            )
+            raise
+        try:
+            _validate_codex_alibaba_auto_review_completion_or_raise(
+                completion_response,
+                schema=auto_review_schema,
+            )
+            responses_api_response = transform_config.transform_chat_completion_response_to_responses_api_response(
+                chat_completion_response=completion_response,
+                request_input=request_input,
+                responses_api_request=responses_api_request,
+            )
+            _encrypted_findings = (
+                _responses_output_contains_encrypted_reasoning_arguments(
+                    responses_api_response
+                )
+            )
+        except Exception as exc:
+            _finish_alibaba_ciphertext_subattempt(
+                _started,
+                ordinal=_ordinal,
+                outcome="failed",
+                retry_eligible=False,
+                response=completion_response,
+                error_class=type(exc).__name__,
+            )
+            raise
+        if not _encrypted_findings:
+            response_body = json.loads(
+                _serialize_responses_adapter_response(responses_api_response)
+            )
+            try:
+                _validate_codex_alibaba_auto_review_response_body_or_raise(
+                    response_body,
+                    schema=auto_review_schema,
+                )
+            except Exception as exc:
+                _finish_alibaba_ciphertext_subattempt(
+                    _started,
+                    ordinal=_ordinal,
+                    outcome="failed",
+                    retry_eligible=False,
+                    response=completion_response,
+                    error_class=type(exc).__name__,
+                )
+                raise
+            _finish_alibaba_ciphertext_subattempt(
+                _started,
+                ordinal=_ordinal,
+                outcome="succeeded",
+                retry_eligible=False,
+                response=completion_response,
+            )
+            _mark_alibaba_downstream_response_committed(request)
+            if client_requested_stream:
+                return StreamingResponse(
+                    _responses_sse_from_repaired_response_body(
+                        response_body,
+                        request_body=_request_body,
+                    ),
+                    media_type="text/event-stream",
+                )
+            return _build_responses_response_from_adapter_response(
+                responses_api_response,
+                request_body=_request_body,
+            )
+        _repair_eligible = (
+            _ordinal <= _ALIBABA_ENCRYPTED_REASONING_MAX_RETRIES
+            and not _alibaba_ciphertext_repair_prohibited(request)
+        )
+        _finish_alibaba_ciphertext_subattempt(
+            _started,
+            ordinal=_ordinal,
+            outcome="ciphertext_detected",
+            retry_eligible=_repair_eligible,
+            response=completion_response,
+        )
+        if not _repair_eligible:
+            if _alibaba_ciphertext_repair_prohibited(request):
+                _note_alibaba_ciphertext_repair_blocked()
+            break
+    _response_body = json.loads(
+        _serialize_responses_adapter_response(responses_api_response)
+    )
+    _raise_codex_auto_agent_malformed_tool_call_text_payload(
+        response_body=_response_body,
+        adapter_model=adapter_model,
+        adapter="codex_alibaba_token_plan_chat_completions_adapter",
+        adapter_label="Alibaba Token Plan",
+        intake_context=_build_malformed_tool_call_intake_context(
+            request,
+            prepared_request_body,
+            adapter="codex_alibaba_token_plan_chat_completions_adapter",
+            provider="alibaba_token_plan",
+        ),
+    )
+    if client_requested_stream:
+        return StreamingResponse(
+            _responses_sse_from_repaired_response_body(
+                _response_body,
+                request_body=_request_body,
+            ),
+            media_type="text/event-stream",
+        )
+    return _build_responses_response_from_adapter_response(
+        responses_api_response,
+        request_body=_request_body,
     )
 
 
@@ -9161,172 +9356,19 @@ async def _perform_codex_alibaba_token_plan_adapter_call(
         },
         shared_session=_get_proxy_shared_aiohttp_session(),
     )
-    # CFG-004 streaming path: the client requested SSE, but we must inspect
-    # the full upstream response for encrypted reasoning tokens *before* any
-    # bytes reach the client.  Buffer the response as non-streaming, check
-    # for Fernet tokens in tool call arguments, retry once on the same
-    # Alibaba provider/model/route if found, and only then emit a valid
-    # Responses SSE stream from the confirmed-plaintext body.  If encrypted
-    # content persists after the bounded retry, fail closed without
-    # dispatching ciphertext.
-    if client_requested_stream:
-        _stream_acompletion_kwargs = dict(_acompletion_kwargs, stream=False)
-        _stream_completion_response = await litellm.acompletion(
-            **_stream_acompletion_kwargs
-        )
-        for _stream_attempt in range(_ALIBABA_ENCRYPTED_REASONING_MAX_RETRIES + 1):
-            _validate_codex_alibaba_auto_review_completion_or_raise(
-                _stream_completion_response,
-                schema=auto_review_schema,
-            )
-            _stream_responses_api_response = (
-                LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
-                    chat_completion_response=_stream_completion_response,
-                    request_input=request_input,
-                    responses_api_request=responses_api_request,
-                )
-            )
-            _stream_encrypted_findings = (
-                _responses_output_contains_encrypted_reasoning_arguments(
-                    _stream_responses_api_response
-                )
-            )
-            if not _stream_encrypted_findings:
-                _stream_response_body = json.loads(
-                    _serialize_responses_adapter_response(
-                        _stream_responses_api_response
-                    )
-                )
-                _validate_codex_alibaba_auto_review_response_body_or_raise(
-                    _stream_response_body,
-                    schema=auto_review_schema,
-                )
-                return StreamingResponse(
-                    _responses_sse_from_repaired_response_body(
-                        _stream_response_body,
-                        request_body=(
-                            prepared_request_body
-                            if isinstance(prepared_request_body, dict)
-                            else (
-                                {"litellm_metadata": litellm_metadata}
-                                if isinstance(litellm_metadata, dict)
-                                else None
-                            )
-                        ),
-                    ),
-                    media_type="text/event-stream",
-                )
-            if _stream_attempt < _ALIBABA_ENCRYPTED_REASONING_MAX_RETRIES:
-                _stream_completion_response = await litellm.acompletion(
-                    **_stream_acompletion_kwargs
-                )
-        _stream_response_body = json.loads(
-            _serialize_responses_adapter_response(_stream_responses_api_response)
-        )
-        _raise_codex_auto_agent_malformed_tool_call_text_payload(
-            response_body=_stream_response_body,
-            adapter_model=adapter_model,
-            adapter="codex_alibaba_token_plan_chat_completions_adapter",
-            adapter_label="Alibaba Token Plan",
-            intake_context=_build_malformed_tool_call_intake_context(
-                request,
-                prepared_request_body,
-                adapter="codex_alibaba_token_plan_chat_completions_adapter",
-                provider="alibaba_token_plan",
-            ),
-        )
-        # Unreachable: the raise helper always raises.
-        return StreamingResponse(
-            _responses_sse_from_repaired_response_body(
-                _stream_response_body,
-                request_body=(
-                    prepared_request_body
-                    if isinstance(prepared_request_body, dict)
-                    else (
-                        {"litellm_metadata": litellm_metadata}
-                        if isinstance(litellm_metadata, dict)
-                        else None
-                    )
-                ),
-            ),
-            media_type="text/event-stream",
-        )
-    completion_response = await litellm.acompletion(**_acompletion_kwargs)
-    # CFG-004: bounded retry when encrypted reasoning occupies tool arguments.
-    # The upstream model may non-deterministically leak a Fernet token into
-    # a tool call argument (e.g. spawn_agent.message) instead of plaintext.
-    # No plaintext exists to restore.  Retry the upstream call a bounded
-    # number of times on the same Alibaba provider/model/route; if the leak
-    # persists, fail closed via the malformed-tool-call path so the caller
-    # observes the Alibaba provider and can route accordingly.
-    _last_encrypted_findings: list[dict[str, Any]] = []
-    for _attempt in range(_ALIBABA_ENCRYPTED_REASONING_MAX_RETRIES + 1):
-        _validate_codex_alibaba_auto_review_completion_or_raise(
-            completion_response,
-            schema=auto_review_schema,
-        )
-        responses_api_response = (
-            LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
-                chat_completion_response=completion_response,
-                request_input=request_input,
-                responses_api_request=responses_api_request,
-            )
-        )
-        _encrypted_findings = (
-            _responses_output_contains_encrypted_reasoning_arguments(
-                responses_api_response
-            )
-        )
-        if not _encrypted_findings:
-            response_body = json.loads(
-                _serialize_responses_adapter_response(responses_api_response)
-            )
-            _validate_codex_alibaba_auto_review_response_body_or_raise(
-                response_body,
-                schema=auto_review_schema,
-            )
-            return _build_responses_response_from_adapter_response(
-                responses_api_response,
-                request_body=(
-                    prepared_request_body
-                    if isinstance(prepared_request_body, dict)
-                    else (
-                        {"litellm_metadata": litellm_metadata}
-                        if isinstance(litellm_metadata, dict)
-                        else None
-                    )
-                ),
-            )
-        _last_encrypted_findings = _encrypted_findings
-        if _attempt < _ALIBABA_ENCRYPTED_REASONING_MAX_RETRIES:
-            completion_response = await litellm.acompletion(**_acompletion_kwargs)
-
-    _response_body = json.loads(
-        _serialize_responses_adapter_response(responses_api_response)
-    )
-    _raise_codex_auto_agent_malformed_tool_call_text_payload(
-        response_body=_response_body,
+    # Each ciphertext-repair generation is its own quota-consuming subattempt
+    # on this outer candidate. Streaming still buffers each generation.
+    return await _run_codex_alibaba_ciphertext_generations(
+        request=request,
+        prepared_request_body=prepared_request_body,
         adapter_model=adapter_model,
-        adapter="codex_alibaba_token_plan_chat_completions_adapter",
-        adapter_label="Alibaba Token Plan",
-        intake_context=_build_malformed_tool_call_intake_context(
-            request,
-            prepared_request_body,
-            adapter="codex_alibaba_token_plan_chat_completions_adapter",
-            provider="alibaba_token_plan",
-        ),
-    )
-    return _build_responses_response_from_adapter_response(
-        responses_api_response,
-        request_body=(
-            prepared_request_body
-            if isinstance(prepared_request_body, dict)
-            else (
-                {"litellm_metadata": litellm_metadata}
-                if isinstance(litellm_metadata, dict)
-                else None
-            )
-        ),
+        client_requested_stream=client_requested_stream,
+        completion_kwargs=_acompletion_kwargs,
+        request_input=request_input,
+        responses_api_request=responses_api_request,
+        litellm_metadata=litellm_metadata,
+        auto_review_schema=auto_review_schema,
+        transform_config=LiteLLMCompletionResponsesConfig,
     )
 
 
