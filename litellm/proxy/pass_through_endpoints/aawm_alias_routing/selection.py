@@ -36,6 +36,8 @@ from .lane_keys import (
     openrouter_credit_lane_cooldown_key,
     resolve_cohere_credential_lane_sentinel,
     resolve_openrouter_credential_lane_key,
+    resolve_selected_zen_account_sentinel,
+    zen_account_cooldown_key,
     _codex_auto_agent_candidate_key,
     _resolve_anthropic_auto_agent_native_cooldown_lane_key,
     _resolve_codex_auto_agent_openai_cooldown_lane_key,
@@ -1916,6 +1918,41 @@ async def _apply_cohere_credential_lane_cooldown(
     if skip_reason is None:
         skip_reason = "cohere_credential_cooldown"
     return cooldown_seconds, cooldown_state_source, skip_reason, "credential"
+
+
+async def _apply_zen_account_lane_cooldown(
+    *,
+    request: Request,
+    candidate: dict[str, Any],
+    cooldown_seconds: float,
+    cooldown_state_source: Optional[str],
+    skip_reason: Optional[str],
+    get_active_cooldown_state: Callable[[str], Awaitable[tuple[float, str]]],
+) -> tuple[float, Optional[str], Optional[str], Optional[str]]:
+    """Suppress both Zen models that share the selected account sentinel.
+
+    OpenCode Go and other providers do not match the Zen cooldown key.
+    Model-specific cooldowns stay on the candidate key and are not read here.
+    """
+
+    if candidate.get("provider") != "opencode_zen":
+        return cooldown_seconds, cooldown_state_source, skip_reason, None
+    sentinel = await resolve_selected_zen_account_sentinel()
+    key = zen_account_cooldown_key(candidate, sentinel)
+    if key is None:
+        return cooldown_seconds, cooldown_state_source, skip_reason, None
+    request_local = key in _peek_codex_auto_agent_request_local_excluded_keys(request)
+    seconds, source = await get_active_cooldown_state(key)
+    if seconds <= 0 and not request_local:
+        return cooldown_seconds, cooldown_state_source, skip_reason, None
+    if seconds > cooldown_seconds:
+        cooldown_seconds = seconds
+        cooldown_state_source = source
+    elif request_local and cooldown_state_source is None:
+        cooldown_state_source = "zen_account_request_local"
+    if skip_reason is None:
+        skip_reason = "zen_account_cooldown"
+    return cooldown_seconds, cooldown_state_source, skip_reason, "account"
 
 
 async def _apply_kimi_code_managed_account_lane_cooldown(
@@ -3936,6 +3973,19 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         cooldown_seconds,
         cooldown_state_source,
         skip_reason,
+        zen_account_cooldown_scope,
+    ) = await _apply_zen_account_lane_cooldown(
+        request=request,
+        candidate=candidate,
+        cooldown_seconds=cooldown_seconds,
+        cooldown_state_source=cooldown_state_source,
+        skip_reason=skip_reason,
+        get_active_cooldown_state=active_cooldown_state,
+    )
+    (
+        cooldown_seconds,
+        cooldown_state_source,
+        skip_reason,
     ) = await _apply_codex_auto_agent_alibaba_token_plan_account_cooldown(
         candidate=candidate,
         cooldown_seconds=cooldown_seconds,
@@ -4060,6 +4110,8 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         state["cooldown_scope"] = openrouter_account_cooldown_scope
     if cohere_credential_cooldown_scope is not None:
         state["cooldown_scope"] = cohere_credential_cooldown_scope
+    if zen_account_cooldown_scope is not None:
+        state["cooldown_scope"] = zen_account_cooldown_scope
     if quota_state.get("cohere_quota_observations"):
         state["cohere_quota_observations"] = quota_state[
             "cohere_quota_observations"
@@ -4737,6 +4789,19 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
         cooldown_seconds,
         cooldown_state_source,
         skip_reason,
+        zen_account_cooldown_scope,
+    ) = await _apply_zen_account_lane_cooldown(
+        request=request,
+        candidate=candidate,
+        cooldown_seconds=cooldown_seconds,
+        cooldown_state_source=cooldown_state_source,
+        skip_reason=skip_reason,
+        get_active_cooldown_state=_get_anthropic_active_cooldown_state,
+    )
+    (
+        cooldown_seconds,
+        cooldown_state_source,
+        skip_reason,
         managed_account_cooldown_scope,
     ) = await _apply_kimi_code_managed_account_lane_cooldown(
         candidate=candidate,
@@ -4833,6 +4898,8 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
         state["cooldown_scope"] = managed_account_cooldown_scope
     if openrouter_account_cooldown_scope is not None:
         state["cooldown_scope"] = openrouter_account_cooldown_scope
+    if zen_account_cooldown_scope is not None:
+        state["cooldown_scope"] = zen_account_cooldown_scope
     return state
 
 
