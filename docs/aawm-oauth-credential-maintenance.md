@@ -691,6 +691,13 @@ configured.
 
 ## Kimi Code CLI credential ownership
 
+Refresh tombstones that shared file only after an explicit refresh-token
+revocation such as `invalid_grant`, and only when a bounded backoff and
+authoritative reread still show the same credential generation. A peer
+rotation wins and is left in place. Bare HTTP 401/403, `invalid_client`, and
+policy failures are degraded authentication: they preserve the credential
+bytes and do not publish a tombstone. Summaries redact token material.
+
 The shared Kimi Code CLI credential and native lock target are:
 
 ```text

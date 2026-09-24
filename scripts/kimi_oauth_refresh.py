@@ -45,6 +45,22 @@ DEFAULT_KIMI_OAUTH_MAX_REFRESH_ATTEMPTS = 3
 DEFAULT_KIMI_OAUTH_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_KIMI_OAUTH_AUTH_FILE_MODE = 0o600
 DEFAULT_KIMI_OAUTH_ERROR_MESSAGE_LIMIT = 500
+# One bounded wait so a peer can publish a replacement before revocation.
+_REVOCATION_GENERATION_REREAD_BACKOFF_SECONDS = 0.1
+
+# Tombstone only this explicit refresh-token revocation. Bare 401/403,
+# invalid_client, and policy denials leave the stored grant unchanged.
+_EXPLICIT_REFRESH_REVOCATION_ERROR_CODES = frozenset({"invalid_grant"})
+_POLICY_AUTHENTICATION_ERROR_CODES = frozenset(
+    {
+        "access_denied",
+        "consent_required",
+        "insufficient_scope",
+        "invalid_scope",
+        "policy_denied",
+        "unauthorized_client",
+    }
+)
 
 # Kimi Code 0.27.0 uses proper-lockfile with these retry/staleness settings.
 DEFAULT_KIMI_OAUTH_LOCK_RETRIES = 120
@@ -70,7 +86,11 @@ class KimiOAuthRetryableError(KimiOAuthError):
 
 
 class KimiOAuthAuthorizationError(KimiOAuthError):
-    """A rejected refresh token requiring the shared credential to be revoked."""
+    """Explicit refresh-token revocation, such as ``invalid_grant``."""
+
+
+class KimiOAuthDegradedAuthenticationError(KimiOAuthError):
+    """Authentication failed without revoking the stored refresh token."""
 
 
 class KimiOAuthLockError(KimiOAuthError):
@@ -414,13 +434,23 @@ def refresh_kimi_oauth_auth_file(
                     sleep=sleep,
                     on_token_endpoint_attempt=on_token_endpoint_attempt,
                 )
+            except KimiOAuthDegradedAuthenticationError as exc:
+                return _failed_summary(
+                    auth_path,
+                    active_scope,
+                    exc,
+                    attempted=True,
+                    auth_degraded=True,
+                )
             except KimiOAuthAuthorizationError as exc:
-                # A Kimi Code peer may have rotated the refresh token just
-                # before this rejected request reached the authorization server.
-                sleep(0.1)
+                # Bounded backoff, then reread the on-disk generation. A peer
+                # rotation wins; tombstone only an unchanged generation.
+                sleep(_REVOCATION_GENERATION_REREAD_BACKOFF_SECONDS)
                 lock.assert_owned()
                 peer_credential = _read_credential_payload(auth_path)
-                if _refresh_token_changed(credential, peer_credential):
+                if _credential_refresh_state(credential) != _credential_refresh_state(
+                    peer_credential
+                ):
                     threshold, threshold_source, threshold_degraded = (
                         _credential_refresh_threshold_metadata(peer_credential)
                     )
@@ -936,16 +966,40 @@ def _read_http_error_payload(exc: urllib_error.HTTPError) -> Mapping[str, Any]:
         return {}
 
 
+def _oauth_error_code(payload: Mapping[str, Any]) -> str:
+    error = payload.get("error")
+    if isinstance(error, str):
+        return error.strip().lower()
+    if isinstance(error, Mapping):
+        for key in ("code", "error", "type"):
+            nested = error.get(key)
+            if isinstance(nested, str) and nested.strip():
+                return nested.strip().lower()
+    return ""
+
+
+def _is_policy_authentication_failure(error_code: str) -> bool:
+    if error_code in _POLICY_AUTHENTICATION_ERROR_CODES:
+        return True
+    return "policy" in error_code
+
+
 def _classify_http_failure(status: int, payload: Mapping[str, Any]) -> KimiOAuthError:
-    error_code = str(payload.get("error") or "").strip().lower()
+    error_code = _oauth_error_code(payload)
     description = str(payload.get("error_description") or payload.get("message") or "").strip()
     detail = f"Kimi OAuth token request failed with HTTP {status}"
     if error_code:
         detail = f"{detail}: {error_code}"
     if description:
         detail = f"{detail}; {description}"
-    if status in {401, 403} or error_code == "invalid_grant":
+    if error_code in _EXPLICIT_REFRESH_REVOCATION_ERROR_CODES:
         return KimiOAuthAuthorizationError(detail)
+    if (
+        status in {401, 403}
+        or error_code == "invalid_client"
+        or _is_policy_authentication_failure(error_code)
+    ):
+        return KimiOAuthDegradedAuthenticationError(detail)
     if status in {408, 425, 429} or status >= 500:
         return KimiOAuthRetryableError(detail)
     return KimiOAuthError(detail)
@@ -1032,13 +1086,6 @@ def _credential_refresh_state(credential: Mapping[str, Any]) -> Tuple[Any, Any, 
         credential.get("expires_at"),
         credential.get("expires_in"),
     )
-
-
-def _refresh_token_changed(
-    credential: Mapping[str, Any],
-    peer_credential: Mapping[str, Any],
-) -> bool:
-    return credential.get("refresh_token") != peer_credential.get("refresh_token")
 
 
 def _credential_scope(credential: Mapping[str, Any], fallback_scope: str) -> str:
