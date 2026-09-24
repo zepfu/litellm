@@ -41,13 +41,21 @@ os.environ["ALIBABA_KEY"] = "..."
 ```
 
 The integration first reads `ALIBABA_KEY` from the existing environment
-reference. A managed deployment may instead set
+reference on every request. That value is not cached, so replacing it takes
+effect on the next request. A managed deployment may instead set
 `LITELLM_ALIBABA_TOKEN_PLAN_SETTINGS_FILE` to the canonical Qwen
 `settings.json`; LiteLLM resolves the one shared credential entry used by the
 approved Token Plan endpoint and model allowlist directly from that file.
-Caller-supplied API-key and base-URL overrides are ignored so requests cannot
-drift to another credential or endpoint. Deployment must mount the canonical
-file in place; do not copy, synthesize, refresh, or log the credential.
+Repeated requests reuse that parsed file credential for 60 seconds and do not
+read the file again while it is unchanged. After 60 seconds, the next request
+checks file identity and reads a replacement. Unchanged files are not parsed
+again. `LITELLM_ALIBABA_TOKEN_PLAN_SETTINGS_CACHE_TTL_SECONDS` may set a
+shorter positive window, and values above 300 seconds are ignored so a
+replaced file cannot stay cached indefinitely. The cache key is the settings
+path, never the credential. Caller-supplied API-key and base-URL overrides
+are ignored so requests cannot drift to another credential or endpoint.
+Deployment must mount the canonical file in place; do not copy, synthesize,
+refresh, or log the credential.
 
 ## Usage
 

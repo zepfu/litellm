@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
@@ -17,11 +21,20 @@ from ...openai.common_utils import OpenAIError
 ALIBABA_TOKEN_PLAN_API_BASE = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
 ALIBABA_TOKEN_PLAN_CHAT_COMPLETIONS_URL = f"{ALIBABA_TOKEN_PLAN_API_BASE}/chat/completions"
 ALIBABA_TOKEN_PLAN_API_KEY_ENV = "ALIBABA_KEY"
-ALIBABA_TOKEN_PLAN_SETTINGS_FILE_ENV = (
-    "LITELLM_ALIBABA_TOKEN_PLAN_SETTINGS_FILE"
-)
+ALIBABA_TOKEN_PLAN_SETTINGS_FILE_ENV = "LITELLM_ALIBABA_TOKEN_PLAN_SETTINGS_FILE"
 ALIBABA_TOKEN_PLAN_PROVIDER_NAME = "alibaba_token_plan"
 ALIBABA_TOKEN_PLAN_RAW_CHOICES_HIDDEN_PARAM = "_alibaba_token_plan_raw_choices"
+# Unchanged settings files are not re-read or re-parsed inside this window.
+# After it elapses, the next lookup stats the file: an unchanged generation
+# is reused, and replacement or credential rotation is read on that lookup.
+# The window cannot be disabled or extended past the maximum, so a stale
+# file credential cannot be retained indefinitely. ``ALIBABA_KEY`` is never
+# cached and still wins on every request.
+ALIBABA_TOKEN_PLAN_SETTINGS_CACHE_TTL_SECONDS = 60.0
+_ALIBABA_TOKEN_PLAN_SETTINGS_CACHE_TTL_ENV = "LITELLM_ALIBABA_TOKEN_PLAN_SETTINGS_CACHE_TTL_SECONDS"
+_ALIBABA_TOKEN_PLAN_SETTINGS_CACHE_MAX_TTL_SECONDS = 300.0
+_ALIBABA_TOKEN_PLAN_SETTINGS_CACHE_MAX_ENTRIES = 4
+_SettingsFileGeneration = tuple[int, int, int, int, int]
 # Catalog metadata only: credential discovery and model admission are
 # validated structurally, never against this static enumeration.
 ALIBABA_TOKEN_PLAN_MODEL_IDS = frozenset(
@@ -36,6 +49,93 @@ ALIBABA_TOKEN_PLAN_MODEL_IDS = frozenset(
         "glm-5.2",
     }
 )
+
+
+@dataclass
+class _SettingsFileCacheEntry:
+    """Parsed settings credential for one file generation.
+
+    The secret stays out of ``repr``, comparison, and the cache key. Eviction
+    drops this entry only; it does not close HTTP or SDK clients.
+    """
+
+    generation: Optional[_SettingsFileGeneration]
+    api_key: Optional[str] = field(default=None, repr=False, compare=False)
+    loaded_at: float = field(default_factory=time.monotonic)
+
+
+_settings_file_cache: "OrderedDict[str, _SettingsFileCacheEntry]" = OrderedDict()
+_settings_file_cache_lock = threading.Lock()
+
+
+def _settings_cache_ttl_seconds() -> float:
+    """Return the bounded settings-file cache window in seconds."""
+
+    raw = os.getenv(_ALIBABA_TOKEN_PLAN_SETTINGS_CACHE_TTL_ENV)
+    if not isinstance(raw, str) or not raw.strip():
+        return ALIBABA_TOKEN_PLAN_SETTINGS_CACHE_TTL_SECONDS
+    try:
+        configured = float(raw.strip())
+    except ValueError:
+        return ALIBABA_TOKEN_PLAN_SETTINGS_CACHE_TTL_SECONDS
+    if configured <= 0 or configured > _ALIBABA_TOKEN_PLAN_SETTINGS_CACHE_MAX_TTL_SECONDS:
+        return ALIBABA_TOKEN_PLAN_SETTINGS_CACHE_TTL_SECONDS
+    return configured
+
+
+def _settings_cache_key(settings_file: str) -> str:
+    """Cache by the configured path. The path is not a credential value."""
+
+    return os.path.normcase(os.path.abspath(settings_file))
+
+
+def _settings_file_generation(path: Path) -> Optional[_SettingsFileGeneration]:
+    """Return filesystem identity for the path ``read_text`` would follow."""
+
+    try:
+        stat_result = path.stat()
+    except OSError:
+        return None
+    return (
+        int(stat_result.st_dev),
+        int(stat_result.st_ino),
+        int(stat_result.st_mtime_ns),
+        int(stat_result.st_ctime_ns),
+        int(stat_result.st_size),
+    )
+
+
+def _remember_settings_file_cache(
+    cache_key: str,
+    generation: Optional[_SettingsFileGeneration],
+    api_key: Optional[str],
+) -> None:
+    """Store one generation. Drop the oldest path when the bound is exceeded."""
+
+    _settings_file_cache[cache_key] = _SettingsFileCacheEntry(
+        generation=generation,
+        api_key=api_key,
+    )
+    _settings_file_cache.move_to_end(cache_key)
+    while len(_settings_file_cache) > _ALIBABA_TOKEN_PLAN_SETTINGS_CACHE_MAX_ENTRIES:
+        _settings_file_cache.popitem(last=False)
+
+
+def _fresh_settings_api_key(
+    cache_key: str,
+    now: float,
+    ttl_seconds: float,
+) -> Optional[_SettingsFileCacheEntry]:
+    """Return a fresh entry without touching the filesystem."""
+
+    cached = _settings_file_cache.get(cache_key)
+    if cached is None:
+        return None
+    age = now - cached.loaded_at
+    if age < 0 or age >= ttl_seconds:
+        return None
+    _settings_file_cache.move_to_end(cache_key)
+    return cached
 
 
 class AlibabaTokenPlanAuthenticationError(OpenAIError):
@@ -134,20 +234,14 @@ class AlibabaTokenPlanChatConfig(DashScopeChatConfig):
         normalized = normalized.strip()
         if not normalized or "/" in normalized:
             raise ValueError(
-                f"Unsupported Alibaba Token Plan model {model!r}. "
-                "Token Plan routes require a nonempty model ID."
+                f"Unsupported Alibaba Token Plan model {model!r}. Token Plan routes require a nonempty model ID."
             )
         return normalized
 
     @staticmethod
-    def _get_qwen_settings_api_key() -> Optional[str]:
-        settings_file = os.getenv(ALIBABA_TOKEN_PLAN_SETTINGS_FILE_ENV)
-        if not isinstance(settings_file, str) or not settings_file.strip():
-            return None
+    def _parse_qwen_settings_api_key(settings_file: str) -> Optional[str]:
         try:
-            settings = json.loads(
-                Path(settings_file.strip()).read_text(encoding="utf-8")
-            )
+            settings = json.loads(Path(settings_file).read_text(encoding="utf-8"))
         except (OSError, TypeError, ValueError):
             return None
         if not isinstance(settings, dict):
@@ -168,8 +262,7 @@ class AlibabaTokenPlanChatConfig(DashScopeChatConfig):
             provider.get("envKey")
             for provider in providers
             if isinstance(provider, dict)
-            and str(provider.get("baseUrl") or "").rstrip("/")
-            == ALIBABA_TOKEN_PLAN_API_BASE
+            and str(provider.get("baseUrl") or "").rstrip("/") == ALIBABA_TOKEN_PLAN_API_BASE
             and isinstance(provider.get("id"), str)
             and provider["id"].strip()
             and isinstance(provider.get("envKey"), str)
@@ -185,6 +278,36 @@ class AlibabaTokenPlanChatConfig(DashScopeChatConfig):
         if not isinstance(api_key, str) or not api_key.strip():
             return None
         return api_key.strip()
+
+    @staticmethod
+    def _get_qwen_settings_api_key() -> Optional[str]:
+        settings_file = os.getenv(ALIBABA_TOKEN_PLAN_SETTINGS_FILE_ENV)
+        if not isinstance(settings_file, str) or not settings_file.strip():
+            return None
+        settings_path = Path(settings_file.strip())
+        cache_key = _settings_cache_key(settings_file.strip())
+        ttl_seconds = _settings_cache_ttl_seconds()
+        now = time.monotonic()
+        with _settings_file_cache_lock:
+            cached = _fresh_settings_api_key(cache_key, now, ttl_seconds)
+            if cached is not None:
+                return cached.api_key
+
+        generation = _settings_file_generation(settings_path)
+        with _settings_file_cache_lock:
+            cached = _settings_file_cache.get(cache_key)
+            if cached is not None and cached.generation == generation:
+                cached.loaded_at = time.monotonic()
+                _settings_file_cache.move_to_end(cache_key)
+                return cached.api_key
+
+        api_key = AlibabaTokenPlanChatConfig._parse_qwen_settings_api_key(settings_file.strip())
+        confirmed = _settings_file_generation(settings_path)
+        if confirmed != generation:
+            return api_key
+        with _settings_file_cache_lock:
+            _remember_settings_file_cache(cache_key, confirmed, api_key)
+        return api_key
 
     @classmethod
     def _get_canonical_api_key(cls) -> str:
