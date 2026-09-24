@@ -414,6 +414,111 @@ def cohere_credential_lane_cooldown_key(
     return "cohere:__credential__:" + sentinel
 
 
+_ZEN_ACCOUNT_DIGEST_RE = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
+_ZEN_ACCOUNT_SENTINEL_RE = re.compile(r"\Aopencode_zen:sha256:[0-9a-f]{64}\Z")
+_ZEN_ACCOUNT_SENTINEL_ATTR = "_aawm_zen_account_sentinel"
+_ZEN_CREDENTIAL_FAMILY = "opencode_zen"
+
+
+def zen_account_sentinel(digest: Optional[str]) -> Optional[str]:
+    """Account identity is the Zen credential family plus the selected digest.
+
+    Anything that is not the OC-016 ``sha256:`` digest returns None. The
+    sentinel never contains credential material, and it is not derived from
+    provider message text.
+    """
+
+    if not isinstance(digest, str) or _ZEN_ACCOUNT_DIGEST_RE.fullmatch(digest) is None:
+        return None
+    return _ZEN_CREDENTIAL_FAMILY + ":" + digest
+
+
+def stamp_zen_account_sentinel(exc: Any, sentinel: Optional[str]) -> None:
+    """Bind the digest captured for this attempt. A missing digest is not stored."""
+
+    if exc is None or not isinstance(sentinel, str):
+        return
+    if _ZEN_ACCOUNT_SENTINEL_RE.fullmatch(sentinel) is None:
+        return
+    try:
+        setattr(exc, _ZEN_ACCOUNT_SENTINEL_ATTR, sentinel)
+    except (AttributeError, TypeError):
+        return
+
+
+def read_zen_account_sentinel(exc: Any = None) -> Optional[str]:
+    """Return the sentinel stamped for this attempt, not a freshly loaded key."""
+
+    value = getattr(exc, _ZEN_ACCOUNT_SENTINEL_ATTR, None)
+    if isinstance(value, str) and _ZEN_ACCOUNT_SENTINEL_RE.fullmatch(value):
+        return value
+    return None
+
+
+def selected_zen_account_sentinel() -> Optional[str]:
+    """Read the digest the Zen loader stored for the current attempt."""
+
+    from ..providers.opencode_zen.runtime import (
+        _is_opencode_provider_account_digest,
+        _selected_zen_provider_account_hash,
+    )
+
+    digest = _selected_zen_provider_account_hash.get()
+    if not _is_opencode_provider_account_digest(digest):
+        return None
+    return zen_account_sentinel(digest)
+
+
+async def resolve_selected_zen_account_sentinel() -> Optional[str]:
+    """Resolve the current Zen account sentinel without reading Go credentials.
+
+    Prefer the digest already selected on this attempt. Otherwise hash the
+    Zen credential through the existing Zen loader. A missing key stays
+    unscoped so no shared cooldown is published.
+    """
+
+    current = selected_zen_account_sentinel()
+    if current is not None:
+        return current
+    from ..providers.opencode_zen.runtime import (
+        _constants,
+        _load_local_opencode_zen_api_key,
+        derive_opencode_provider_account_hash,
+    )
+
+    try:
+        api_key = await _load_local_opencode_zen_api_key()
+    except Exception:
+        return None
+    if not isinstance(api_key, str) or not api_key:
+        return None
+    try:
+        digest = derive_opencode_provider_account_hash(
+            api_key,
+            namespace=_constants._OPENCODE_ZEN_CREDENTIAL_FAMILY,
+        )
+    except ValueError:
+        return None
+    return zen_account_sentinel(digest)
+
+
+def zen_account_cooldown_key(
+    candidate: dict[str, Any],
+    sentinel: Optional[str],
+) -> Optional[str]:
+    """Shared Zen cooldown key for one account sentinel.
+
+    Only ``opencode_zen`` candidates match. OpenCode Go and every other
+    provider return None. An unscoped or non-digest sentinel cannot publish.
+    """
+
+    if candidate.get("provider") != _ZEN_CREDENTIAL_FAMILY or not isinstance(sentinel, str):
+        return None
+    if _ZEN_ACCOUNT_SENTINEL_RE.fullmatch(sentinel) is None:
+        return None
+    return "opencode_zen:__account__:" + sentinel
+
+
 def _resolve_codex_auto_agent_xai_lane_key(candidate: dict[str, Any]) -> str:
     route_family = str(candidate.get("route_family") or "")
     if route_family in {

@@ -2227,6 +2227,13 @@ def _opencode_zen_alias_failure(
         setattr(exc, "_aawm_zen_failure", failure)
     except (AttributeError, TypeError):
         pass
+    if failure.scope == "account":
+        from .lane_keys import (
+            selected_zen_account_sentinel,
+            stamp_zen_account_sentinel,
+        )
+
+        stamp_zen_account_sentinel(exc, selected_zen_account_sentinel())
     return failure
 
 
