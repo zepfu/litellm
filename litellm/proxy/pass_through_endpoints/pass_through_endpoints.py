@@ -2848,6 +2848,26 @@ def _is_passthrough_expected_provider_rate_limit(
     return status_code == status.HTTP_429_TOO_MANY_REQUESTS
 
 
+def _is_direct_codex_usage_limit_error_for_rollup(exc: Exception) -> bool:
+    """Classify a structured direct-account quota error as failover-bound."""
+
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
+        is_direct_codex_usage_limit_error,
+    )
+
+    return is_direct_codex_usage_limit_error(exc)
+
+
+def _is_direct_codex_token_invalidated_error_for_rollup(exc: Exception) -> bool:
+    """Classify trusted direct-account token invalidation as failover-bound."""
+
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
+        is_direct_codex_token_invalidated_error,
+    )
+
+    return is_direct_codex_token_invalidated_error(exc)
+
+
 def _get_passthrough_terminal_failure_kind(
     *,
     hidden_retry_failure_classification: Optional[Any],
@@ -10830,9 +10850,32 @@ async def pass_through_request(  # noqa: PLR0915
             e,
             status_code=status_code,
         )
-        if not _is_handled_session_owner_redispatch_required(
-            e,
-            status_code=status_code,
+        suppress_direct_codex_account_failover_rollup = (
+            isinstance(
+                selected_openai_account_context := getattr(
+                    getattr(request, "state", None),
+                    "aawm_codex_oauth_selected_account",
+                    None,
+                ),
+                Mapping,
+            )
+            and selected_openai_account_context.get("account_hash") is not None
+            and getattr(
+                getattr(request, "state", None),
+                "aawm_openai_fault_plan_direct_terminal_recorded",
+                False,
+            )
+            is not True
+            and (
+                _is_direct_codex_usage_limit_error_for_rollup(e)
+                or _is_direct_codex_token_invalidated_error_for_rollup(e)
+            )
+        )
+        if not suppress_direct_codex_account_failover_rollup and not (
+            _is_handled_session_owner_redispatch_required(
+                e,
+                status_code=status_code,
+            )
         ):
             record_aawm_route_rollup_failure(
                 kwargs,

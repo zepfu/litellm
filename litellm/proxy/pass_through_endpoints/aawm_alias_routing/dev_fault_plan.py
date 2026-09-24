@@ -682,6 +682,27 @@ def note_direct_openai_managed_success(
     if attempt_record is None:
         return
     attempts = _direct_attempts(request)
+    selected_account = getattr(
+        request_state,
+        "aawm_codex_oauth_selected_account",
+        None,
+    )
+    selected_account = (
+        selected_account
+        if isinstance(selected_account, dict)
+        else {}
+    )
+    candidate = _managed_openai_oauth_candidate(selection.get("candidate"))
+    for account_field, candidate_field in (
+        ("account_hash", "codex_oauth_account_hash"),
+        ("account_label", "codex_oauth_account_label"),
+        ("account_display", "codex_oauth_account_display"),
+    ):
+        value = selected_account.get(account_field)
+        if value is None and isinstance(candidate, dict):
+            value = candidate.get(candidate_field)
+        attempt_record[account_field] = value
+    attempt_record["attempt_number"] = max(1, _provider_attempt_count(attempts))
     _apply_direct_attempt_trace(
         request,
         request_body,
