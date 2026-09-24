@@ -2739,11 +2739,28 @@ _JSON_WS = " \t\r\n"
 _JSON_SIMPLE_ESCAPES = {'"', "\\", "/", "b", "f", "n", "r", "t"}
 
 
-def _skip_json_ws(text: str, index: int) -> int:
+def _charge_structural_byte(state: dict[str, Any], path: str) -> bool:
+    """Count one ASCII structural byte. Return False when the budget is spent."""
+    if state["bytes"] >= _ENCRYPTED_REASONING_ARGUMENT_MAX_BYTES:
+        state["bound_path"] = path
+        return False
+    state["bytes"] += 1
+    return True
+
+
+def _skip_json_ws(
+    text: str,
+    index: int,
+    state: dict[str, Any],
+    path: str,
+) -> tuple[int, Optional[str]]:
+    """Skip whitespace, charging each character against the structural budget."""
     length = len(text)
     while index < length and text[index] in _JSON_WS:
+        if not _charge_structural_byte(state, path):
+            return index, "bytes"
         index += 1
-    return index
+    return index, None
 
 
 def _read_json_hex_codepoint(text: str, index: int) -> tuple[Optional[int], int]:
@@ -2870,39 +2887,80 @@ def _match_json_literal(
     return index, None
 
 
+def _consume_numeric_literal(
+    text: str,
+    index: int,
+    literal: str,
+    state: dict[str, Any],
+    path: str,
+) -> tuple[int, Optional[str]]:
+    """Charge a decoder numeric literal and stop when the byte budget is spent."""
+    if not text.startswith(literal, index):
+        state["invalid"] = True
+        return index, None
+    for _char in literal:
+        if not _charge_structural_byte(state, path):
+            return index, "bytes"
+        index += 1
+    return index, None
+
+
 def _scan_json_number(
     text: str,
     index: int,
     state: dict[str, Any],
+    path: str,
 ) -> tuple[int, Optional[str]]:
+    """Charge a numeric lexeme. Stop at the first byte past the budget."""
     length = len(text)
-    start = index
-    if text[index] == "-":
+
+    def _take() -> Optional[str]:
+        nonlocal index
+        if not _charge_structural_byte(state, path):
+            return "bytes"
         index += 1
+        return None
+
+    if text[index] == "-":
+        bound = _take()
+        if bound is not None:
+            return index, bound
     digit_start = index
     while index < length and text[index].isdigit():
-        index += 1
+        bound = _take()
+        if bound is not None:
+            return index, bound
     if index == digit_start:
         state["invalid"] = True
-        return start, None
+        return index, None
     if index < length and text[index] == ".":
-        index += 1
+        bound = _take()
+        if bound is not None:
+            return index, bound
         fraction = index
         while index < length and text[index].isdigit():
-            index += 1
+            bound = _take()
+            if bound is not None:
+                return index, bound
         if index == fraction:
             state["invalid"] = True
-            return start, None
+            return index, None
     if index < length and text[index] in "eE":
-        index += 1
+        bound = _take()
+        if bound is not None:
+            return index, bound
         if index < length and text[index] in "+-":
-            index += 1
+            bound = _take()
+            if bound is not None:
+                return index, bound
         exponent = index
         while index < length and text[index].isdigit():
-            index += 1
+            bound = _take()
+            if bound is not None:
+                return index, bound
         if index == exponent:
             state["invalid"] = True
-            return start, None
+            return index, None
     return index, None
 
 
@@ -2914,7 +2972,9 @@ def _prescan_json_value(
     state: dict[str, Any],
 ) -> tuple[int, Optional[str]]:
     """Count one JSON value. Return a bound name without building it."""
-    index = _skip_json_ws(text, index)
+    index, bound = _skip_json_ws(text, index, state, path)
+    if bound is not None:
+        return index, bound
     if index >= len(text):
         state["invalid"] = True
         return index, None
@@ -2942,8 +3002,16 @@ def _prescan_json_value(
         return _match_json_literal(text, index, "false", state)
     if char == "n":
         return _match_json_literal(text, index, "null", state)
-    if char == "-" or char.isdigit():
-        return _scan_json_number(text, index, state)
+    if char == "N":
+        return _consume_numeric_literal(text, index, "NaN", state, path)
+    if char == "I":
+        return _consume_numeric_literal(text, index, "Infinity", state, path)
+    if char == "-":
+        if text.startswith("-Infinity", index):
+            return _consume_numeric_literal(text, index, "-Infinity", state, path)
+        return _scan_json_number(text, index, state, path)
+    if char.isdigit():
+        return _scan_json_number(text, index, state, path)
     state["invalid"] = True
     return index, None
 
@@ -2955,7 +3023,9 @@ def _prescan_json_object(
     path: str,
     state: dict[str, Any],
 ) -> tuple[int, Optional[str]]:
-    index = _skip_json_ws(text, index + 1)
+    index, bound = _skip_json_ws(text, index + 1, state, path)
+    if bound is not None:
+        return index, bound
     if index < len(text) and text[index] == "}":
         return index + 1, None
     while index < len(text):
@@ -2975,7 +3045,9 @@ def _prescan_json_object(
             state["invalid"] = True
             return end, None
         state["bytes"] += key_bytes
-        index = _skip_json_ws(text, end)
+        index, bound = _skip_json_ws(text, end, state, path)
+        if bound is not None:
+            return index, bound
         if index >= len(text) or text[index] != ":":
             state["invalid"] = True
             return index, None
@@ -2989,13 +3061,17 @@ def _prescan_json_object(
         )
         if bound is not None or state["invalid"]:
             return index, bound
-        index = _skip_json_ws(text, index)
+        index, bound = _skip_json_ws(text, index, state, path)
+        if bound is not None:
+            return index, bound
         if index < len(text) and text[index] == "}":
             return index + 1, None
         if index >= len(text) or text[index] != ",":
             state["invalid"] = True
             return index, None
-        index = _skip_json_ws(text, index + 1)
+        index, bound = _skip_json_ws(text, index + 1, state, path)
+        if bound is not None:
+            return index, bound
         if index < len(text) and text[index] == "}":
             state["invalid"] = True
             return index, None
@@ -3010,7 +3086,9 @@ def _prescan_json_array(
     path: str,
     state: dict[str, Any],
 ) -> tuple[int, Optional[str]]:
-    index = _skip_json_ws(text, index + 1)
+    index, bound = _skip_json_ws(text, index + 1, state, path)
+    if bound is not None:
+        return index, bound
     if index < len(text) and text[index] == "]":
         return index + 1, None
     element = 0
@@ -3026,13 +3104,17 @@ def _prescan_json_array(
         if bound is not None or state["invalid"]:
             return index, bound
         element += 1
-        index = _skip_json_ws(text, index)
+        index, bound = _skip_json_ws(text, index, state, path)
+        if bound is not None:
+            return index, bound
         if index < len(text) and text[index] == "]":
             return index + 1, None
         if index >= len(text) or text[index] != ",":
             state["invalid"] = True
             return index, None
-        index = _skip_json_ws(text, index + 1)
+        index, bound = _skip_json_ws(text, index + 1, state, path)
+        if bound is not None:
+            return index, bound
         if index < len(text) and text[index] == "]":
             state["invalid"] = True
             return index, None
@@ -3040,12 +3122,17 @@ def _prescan_json_array(
     return index, None
 
 
-def _prescan_encrypted_reasoning_json(text: str) -> Optional[tuple[str, str]]:
-    """Return ``(bound, path)`` when a JSON document exceeds a structural budget.
+_PRESCAN_INVALID = object()
 
-    The scan does not call ``json.loads`` and does not build containers or
-    decoded keys that are already over budget. None means the text is either
-    safe to parse or not JSON.
+
+def _prescan_encrypted_reasoning_json(
+    text: str,
+) -> Union[tuple[str, str], object, None]:
+    """Return a bound, an invalid sentinel, or None when the text may be decoded.
+
+    None is only a document that stayed inside the depth, node, and byte
+    budgets, including decoder ``NaN`` / ``Infinity`` literals. An invalid
+    scan is not None, so the caller must not pass it to ``json.loads``.
     """
     state: dict[str, Any] = {
         "nodes": 0,
@@ -3057,10 +3144,12 @@ def _prescan_encrypted_reasoning_json(text: str) -> Optional[tuple[str, str]]:
     if bound is not None:
         return bound, str(state.get("bound_path") or "")
     if state["invalid"]:
-        return None
-    end = _skip_json_ws(text, _index)
+        return _PRESCAN_INVALID
+    end, bound = _skip_json_ws(text, _index, state, "")
+    if bound is not None:
+        return bound, str(state.get("bound_path") or "")
     if end != len(text):
-        return None
+        return _PRESCAN_INVALID
     return None
 
 
@@ -3069,18 +3158,22 @@ def _parse_encrypted_reasoning_arguments(
 ) -> tuple[Any, Optional[str], str]:
     """Return a JSON object, array, or bare string ready for the walk.
 
-    Structural depth, node, and key-byte budgets are applied to JSON text
-    before ``json.loads``. An overrun returns ``(None, bound, path)`` and
-    does not materialize the document. List roots and nested containers stay
-    structured once they fit. A non-JSON string is scanned as itself so a
-    bare Fernet token is not treated as absent. Other scalars are ignored.
+    Structural depth, node, and byte budgets are applied to JSON text before
+    ``json.loads``. Numeric lexemes and structural whitespace count toward
+    the byte budget. An overrun returns ``(None, bound, path)`` and does not
+    materialize the document. A failed prescan is not treated as success, so
+    it is not decoded. List roots and nested containers stay structured once
+    they fit. A non-JSON string is scanned as itself so a bare Fernet token
+    is not treated as absent. Other scalars are ignored.
     """
     if isinstance(arguments, (dict, list)):
         return arguments, None, ""
     if not isinstance(arguments, str) or not arguments:
         return None, None, ""
     overrun = _prescan_encrypted_reasoning_json(arguments)
-    if overrun is not None:
+    if overrun is _PRESCAN_INVALID:
+        return arguments, None, ""
+    if isinstance(overrun, tuple):
         bound, path = overrun
         return None, bound, path
     try:
