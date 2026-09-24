@@ -2206,6 +2206,13 @@ Pending quota-failover diagnostics remain in the audit trail, not in logical
 request failure state, even when recovery crosses a rollup interval. Successful
 completion contributes its normal turn count in the completion interval; a
 zero-turn recovery status does not count as a completed turn.
+For direct Codex requests whose pending account failures were all quota
+exhaustion, successful recovery emits neither a zero-turn status row nor a
+`Request: [Recovered]` summary. The normal completed-turn row uses the final
+selected account; the attempt audit retains the exhausted account and recovery.
+Separate requests, including automatic title generation, keep their own caller
+groups. This quiet-recovery rule does not suppress terminal failures or
+recoveries involving other error classes.
 
 Successful streaming and non-streaming Codex auto-agent requests adapted to
 OpenCode Zen chat completions or OpenRouter chat completions also register
