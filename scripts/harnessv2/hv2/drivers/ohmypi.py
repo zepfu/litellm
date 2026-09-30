@@ -596,7 +596,7 @@ class OhmypiDriver:
             argv.extend(as_str_list(self.spec.get("argv_no_tools")))
         self.assert_no_print_flags(argv)
         prefix = str(self._tmux_cfg().get("harness_session_prefix") or "hv2-ohmypi")
-        safe_model = model.replace("/", "-").replace(" ", "-")
+        safe_model = model.replace("/", "-").replace(" ", "-").replace(".", "-")
         session = f"{prefix}-{safe_model}-{os.getpid()}"
         operator = self._default_session_name()
         if session == operator:
