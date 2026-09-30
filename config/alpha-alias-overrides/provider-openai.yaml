@@ -1,4 +1,4 @@
-# Alpha-only provider-pinned acceptance alias. Cheapest-first order.
+# Alpha/dev provider-pinned acceptance alias. Cheapest-first order.
 defaults: {}
 
 aliases:

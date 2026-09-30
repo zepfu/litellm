@@ -49,8 +49,8 @@ does not share candidate cooldown or affinity keys with `litellm-dev`.
   `:4001` config.
 - Source: `/app`, bind-mounted read-only from this repository
 - OpenAI alias override: `config/alpha-alias-overrides/provider-openai.yaml`
-  is mounted over alpha's shared `provider-openai.yaml`; dev and production
-  continue using the shared file
+  is mounted over alpha's and dev's shared `provider-openai.yaml`; production
+  continues using the shared file
 - Cursor GUI auth directory: `/home/zepfu/.config/cursor`, bind-mounted
   read-only at the same path; the directory mount keeps sidecar atomic
   auth-file replacement visible without recreating alpha

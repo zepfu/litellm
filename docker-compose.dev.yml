@@ -38,6 +38,8 @@ services:
       # credentials, identity, or state.
       - ./context-replacement:/app/context-replacement
       - ./litellm-dev-config.yaml:/app/litellm-dev-config.yaml
+      # GPT-6.1 acceptance alias shared with alpha, isolated from production.
+      - ./config/alpha-alias-overrides/provider-openai.yaml:/app/litellm/proxy/aawm_alias_config/provider-openai.yaml:ro
       # Repo-local error intake for managed LiteLLM runtime errors.
       - ./.analysis:/app/.analysis
       # Claude persisted-output files for local expansion
