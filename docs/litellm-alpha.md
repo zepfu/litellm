@@ -48,6 +48,9 @@ does not share candidate cooldown or affinity keys with `litellm-dev`.
   `litellm-dev-config.yaml` in the alpha process; that file remains the
   `:4001` config.
 - Source: `/app`, bind-mounted read-only from this repository
+- OpenAI alias override: `config/alpha-alias-overrides/provider-openai.yaml`
+  is mounted over alpha's shared `provider-openai.yaml`; dev and production
+  continue using the shared file
 - Cursor GUI auth directory: `/home/zepfu/.config/cursor`, bind-mounted
   read-only at the same path; the directory mount keeps sidecar atomic
   auth-file replacement visible without recreating alpha
@@ -147,7 +150,7 @@ next live test.
 
 ## Current Alpha Routing
 
-The current canonical alias YAML exposes these alpha test paths:
+The current alpha alias YAML exposes these test paths:
 
 - `basic` orders native Cohere `cohere/north-mini-code-1-0`, then OpenRouter
   Cohere `openrouter/cohere/north-mini-code:free`, then OpenCode Zen
@@ -162,6 +165,9 @@ The current canonical alias YAML exposes these alpha test paths:
 - `auto-review` references `auto-review-other`, then Luna and OpenRouter
   DeepSeek. `codex-auto-review` references that same public graph.
 - `sota-openai` uses OpenAI `gpt-6-astra`.
+- `provider-openai` includes `gpt-6.1-sol` after Luna and Terra, retaining
+  `gpt-6-sol` and Astra as later candidates. Codex can also select the
+  concrete `gpt-6.1-sol` model through alpha's Responses passthrough.
 - `sota-xai` orders native xAI/OIDC `xai/grok-4.7`, then managed
   xAI/OAuth `oa_xai/grok-4.7`. Cursor Agent
   `cursor_agent/cursor-grok-4.6-high` stays on `sota-cursor`.

@@ -66,6 +66,8 @@ services:
       # The checkout is authoritative. Keep it read-only to prevent candidate
       # runtime behavior from modifying source or configuration.
       - .:/app:ro
+      # Alpha-only OpenAI candidate set; dev and production use the shared file.
+      - ./config/alpha-alias-overrides/provider-openai.yaml:/app/litellm/proxy/aawm_alias_config/provider-openai.yaml:ro
       # Keep the packaged fallback synchronized with the canonical live map.
       - ./model_prices_and_context_window.json:/app/litellm/bundled_model_prices_and_context_window_fallback.json:ro
       # Runtime output surfaces remain writable.

@@ -1,0 +1,35 @@
+# Alpha-only provider-pinned acceptance alias. Cheapest-first order.
+defaults: {}
+
+aliases:
+  - name: provider-openai
+    candidates:
+      - provider: openai
+        model: gpt-6-luna
+        route_family: codex_responses
+        priority: 100
+        reasoning_effort: low
+
+      - provider: openai
+        model: gpt-5.6-terra
+        route_family: codex_responses
+        priority: 90
+        reasoning_effort: low
+
+      - provider: openai
+        model: gpt-6.1-sol
+        route_family: codex_responses
+        priority: 80
+        reasoning_effort: low
+
+      - provider: openai
+        model: gpt-6-sol
+        route_family: codex_responses
+        priority: 70
+        reasoning_effort: low
+
+      - provider: openai
+        model: gpt-6-astra
+        route_family: codex_responses
+        priority: 0
+        reasoning_effort: low
