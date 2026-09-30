@@ -8197,6 +8197,11 @@ def install(host_globals: dict) -> None:
         "_ZAI_CODING_PLAN_QUOTA_ACCOUNT_IDENTITY_SOURCE": (
             _ZAI_CODING_PLAN_QUOTA_ACCOUNT_IDENTITY_SOURCE
         ),
+        "_zai_coding_plan_quota_number": _zai_coding_plan_quota_number,
+        "_zai_coding_plan_control_remaining_pct": (
+            _zai_coding_plan_control_remaining_pct
+        ),
+        "_zai_coding_plan_quota_exhausted": _zai_coding_plan_quota_exhausted,
         "_zai_coding_plan_quota_observation_from_row": (
             _zai_coding_plan_quota_observation_from_row
         ),
