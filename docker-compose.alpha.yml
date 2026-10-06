@@ -64,8 +64,10 @@ services:
     volumes:
       # Application source, alpha configuration, alias override, and model map
       # are image-owned. These repository paths remain durable runtime data.
-      - ./.analysis:/app/.analysis
-      - ./captures:/tmp/captures
+      # Fixed root paths keep runtime data durable when alpha is built from a
+      # temporary implementation worktree.
+      - /home/zepfu/projects/litellm/.analysis:/app/.analysis
+      - /home/zepfu/projects/litellm/captures:/tmp/captures
       - /home/zepfu/.analysis:/home/zepfu/.analysis
       # Match the development proxy's read-only identity and credential inputs.
       - /home/zepfu/.claude/projects:/home/zepfu/.claude/projects:ro
