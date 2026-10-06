@@ -113,7 +113,7 @@ all consumers of that volume.
 ## Start
 
 Run Compose from `/home/zepfu/projects/litellm`, never a temporary worktree.
-Use the same environment preparation required by `litellm-dev`, including the
+Load the repository `.env` first, then the infrastructure env file for the
 two expected Codex OAuth account hashes. Confirm all bind sources exist with
 the expected file or directory types before activation. Live testing of the
 current temporary role aliases requires the credentials for the candidates
@@ -123,16 +123,19 @@ Live `auto-review` / `codex-auto-review` testing requires `ZAI_KEY` and
 when its container is created.
 
 ```bash
-docker compose --env-file /home/zepfu/projects/aawm-infrastructure/.env.thoth-litellm \
+docker compose --env-file .env \
+  --env-file /home/zepfu/projects/aawm-infrastructure/.env.thoth-litellm \
   -f docker-compose.alpha.yml config --quiet
-docker compose --env-file /home/zepfu/projects/aawm-infrastructure/.env.thoth-litellm \
+docker compose --env-file .env \
+  --env-file /home/zepfu/projects/aawm-infrastructure/.env.thoth-litellm \
   -f docker-compose.alpha.yml up -d --no-deps --build --force-recreate litellm-alpha
 ```
 
 ## Verify
 
 ```bash
-docker compose --env-file /home/zepfu/projects/aawm-infrastructure/.env.thoth-litellm \
+docker compose --env-file .env \
+  --env-file /home/zepfu/projects/aawm-infrastructure/.env.thoth-litellm \
   -f docker-compose.alpha.yml ps litellm-alpha
 docker logs --tail=100 litellm-alpha
 curl --fail http://127.0.0.1:4011/health/liveliness
@@ -191,7 +194,8 @@ durable provider-wide cooldown, and stateful requests preserve affinity.
 ## Rebuild
 
 ```bash
-docker compose --env-file /home/zepfu/projects/aawm-infrastructure/.env.thoth-litellm \
+docker compose --env-file .env \
+  --env-file /home/zepfu/projects/aawm-infrastructure/.env.thoth-litellm \
   -f docker-compose.alpha.yml up -d --no-deps --build --force-recreate litellm-alpha
 ```
 
@@ -204,9 +208,11 @@ Only the alpha service can be affected by this file, so `stop` and `down` here
 never touch `litellm-dev` or any other service.
 
 ```bash
-docker compose --env-file /home/zepfu/projects/aawm-infrastructure/.env.thoth-litellm \
+docker compose --env-file .env \
+  --env-file /home/zepfu/projects/aawm-infrastructure/.env.thoth-litellm \
   -f docker-compose.alpha.yml stop litellm-alpha
-docker compose --env-file /home/zepfu/projects/aawm-infrastructure/.env.thoth-litellm \
+docker compose --env-file .env \
+  --env-file /home/zepfu/projects/aawm-infrastructure/.env.thoth-litellm \
   -f docker-compose.alpha.yml rm -f litellm-alpha
 ```
 
@@ -367,7 +373,8 @@ rollback. Alpha-only:
 4. Rebuild and recreate **only** `litellm-alpha`:
 
    ```bash
-   docker compose --env-file /home/zepfu/projects/aawm-infrastructure/.env.thoth-litellm \
+   docker compose --env-file .env \
+     --env-file /home/zepfu/projects/aawm-infrastructure/.env.thoth-litellm \
      -f docker-compose.alpha.yml up -d --no-deps --build --force-recreate litellm-alpha
    ```
 
