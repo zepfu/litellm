@@ -94,6 +94,18 @@ filesystem state or unstated discovery requirements.
 - Preserve affected open-source/enterprise interfaces; inspect `enterprise/`
   when changing a shared contract.
 
+## Container Runtime Sources
+
+Never bind a running LiteLLM container to a temporary, agent-owned, or
+cleanup-eligible worktree, including for alpha. An implementation worktree may
+supply an image build, but it must never be a live bind source. Build
+application source and configuration into the image, or bind them from a
+designated persistent deployment checkout with an explicit owner and lifecycle.
+Bind runtime data only from persistent host paths.
+Before activation, verify every bind source exists with the expected file or
+directory type and will survive routine cleanup and reboot. Confirm the
+runtime revision, then verify startup and health after a restart or recreation.
+
 ## Dashboard Constraints
 
 - Reuse `ui/litellm-dashboard` common components. Do not introduce Tremor

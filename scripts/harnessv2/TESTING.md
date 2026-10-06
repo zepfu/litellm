@@ -74,7 +74,7 @@ is no `HV2_ALLOW_PROD` escape hatch.
 
 **Allowed:**
 
-- `litellm-alpha` (bind-mount `.:/app:ro`, watchfiles, Redis namespace
+- `litellm-alpha` (image-owned source/config, Redis namespace
   `aawm-routing-alpha-v1`)
 - if alpha needs a process recycle: `docker restart litellm-alpha`
   (never compose down)
@@ -623,8 +623,9 @@ Soft-fail signatures (warning, not `ok` flip) live under
 On halt:
 
 1. Stop remaining `--test model` / `--test orchestration`.
-2. Source-fix in the shared checkout (`litellm-alpha` bind-mounts it).
-3. Let watchfiles reload, or `docker restart litellm-alpha`.
+2. Fix the source and rebuild/recreate only `litellm-alpha` from the
+   repository root; it does not bind or watch a live checkout.
+3. Wait for alpha liveliness and readiness.
 4. Re-prove leftover uvicorn ACCESS = 0 except `/health*` on a
    harness-owned window (HTTP probes are enough for leftover ACCESS;
    do not resume Ohmypi TUI until that count is 0).
@@ -829,8 +830,8 @@ python scripts/harnessv2/run.py \
    baseline full-suite step. If you run it, leave dedicated
    `hv2-ohmypi-*` sessions open (one per compiled alias). On
    traceback / leftover uvicorn: halt, source-fix on the shared
-   checkout, `docker restart litellm-alpha` only if watchfiles did not
-   reload, resume the **same** row.
+   checkout, rebuild/recreate only `litellm-alpha` from the repository
+   root, then resume the **same** row after both health endpoints pass.
 8. Baseline next: `--test orchestration --orchestration-parent
    sota-openai` after leftover uvicorn is gone. Gate spawn on
    `child_evidence.ok` for the thirteen orchestration children (`basic`,
@@ -858,8 +859,8 @@ rerun a passed prefix or the full gate unless that evidence is
 invalidated or the operator explicitly requests it. At the next
 failure: stop, preserve the checkpoint, fix, and continue there.
 
-Alpha is testing-only. Uncommitted halt-fixes in the shared checkout
-are visible to the bind-mount immediately after watchfiles reload.
+Alpha is testing-only. Halt-fixes in the checkout become active only
+after an alpha image rebuild and container recreation.
 
 ---
 

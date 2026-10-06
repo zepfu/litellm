@@ -1,7 +1,7 @@
 # LiteLLM Alpha
 
-`litellm-alpha` is the testing-only LiteLLM proxy for candidate work in this
-checkout. It listens on port `4011`.
+`litellm-alpha` is the testing-only LiteLLM proxy for candidates built from
+this repository. It listens on port `4011`.
 
 Never route production traffic, persistent clients, scheduled jobs, or normal
 development traffic to this service. Do not use alpha results as production
@@ -43,14 +43,14 @@ does not share candidate cooldown or affinity keys with `litellm-dev`.
 - Compose file: `docker-compose.alpha.yml` (alpha only)
 - Local endpoint: `http://127.0.0.1:4011`
 - Tailscale endpoint: `http://100.109.19.233:4011`
-- Config: `/app/litellm-alpha-config.yaml`, bind-mounted from this
-  repository (`litellm-alpha-config.yaml`). Do not load
+- Config: `/app/litellm-alpha-config.yaml`, packaged in the image from
+  `litellm-alpha-config.yaml`. Do not load
   `litellm-dev-config.yaml` in the alpha process; that file remains the
   `:4001` config.
-- Source: `/app`, bind-mounted read-only from this repository
+- Source: `/app`, packaged in the image; no live source bind
 - OpenAI alias override: `config/alpha-alias-overrides/provider-openai.yaml`
-  is mounted over alpha's and dev's shared `provider-openai.yaml`; production
-  continues using the shared file
+  is packaged over alpha's shared `provider-openai.yaml`. Dev mounts that
+  override separately; production continues using the shared file
 - Cursor GUI auth directory: `/home/zepfu/.config/cursor`, bind-mounted
   read-only at the same path; the directory mount keeps sidecar atomic
   auth-file replacement visible without recreating alpha
@@ -77,29 +77,21 @@ directory. A fresh
 is supplied through Compose/environment; the auth JSON contents and raw API
 key are never placed there.
 
-The image contains the Python dependencies and an editable LiteLLM install.
-At runtime, the repository is mounted over `/app`, and `PYTHONPATH=/app`
-ensures imports resolve from the live checkout.
+The image contains the Python dependencies, application source, config,
+alpha alias override, and model map. Its editable LiteLLM install and
+`PYTHONPATH=/app` resolve imports from the image-owned `/app` tree, not a
+host checkout. No runtime bind source may come from a temporary worktree.
 
 Alpha never mounts or scans the development session-history spool at
 `/mnt/e/litellm/session_history`. Its durable queue fallback lives under the
 repository's ignored `.analysis/runtime/litellm-alpha/` tree, so alpha cannot
 claim, replay, quarantine, or delete `litellm-dev` spool records.
 
-`watchfiles` restarts the LiteLLM process when files change under:
-
-- `litellm/`
-- `enterprise/`
-- `litellm-alpha-config.yaml`
-- `model_prices_and_context_window.json`
-- `context-replacement/`
-
-Python and watched configuration changes therefore become active without
-rebuilding or recreating the container. The process briefly becomes
-unavailable on port `4011` while it restarts.
-
-Changes to dependencies, `Dockerfile.alpha`, `requirements.txt`, or packaging
-metadata require an image rebuild.
+Changes to application source, alpha configuration, alias overrides, model
+metadata, dependencies, or Docker packaging require an alpha image rebuild
+and container recreation. There is no file watcher or automatic source
+reload. The read-only credential directory mounts still expose atomic
+credential replacements to the running process.
 
 ## Routing Redis Persistence
 
@@ -120,33 +112,39 @@ all consumers of that volume.
 
 ## Start
 
+Run Compose from `/home/zepfu/projects/litellm`, never a temporary worktree.
 Use the same environment preparation required by `litellm-dev`, including the
-two expected Codex OAuth account hashes. Live testing of the current temporary
-role aliases requires the credentials for the candidates being exercised.
+two expected Codex OAuth account hashes. Confirm all bind sources exist with
+the expected file or directory types before activation. Live testing of the
+current temporary role aliases requires the credentials for the candidates
+being exercised.
 Live `auto-review` / `codex-auto-review` testing requires `ZAI_KEY` and
 `AAWM_OPENROUTER_API_KEY`; alpha receives only the provider credentials present
 when its container is created.
 
 ```bash
-docker compose -f docker-compose.alpha.yml build litellm-alpha
-docker compose -f docker-compose.alpha.yml up -d litellm-alpha
+docker compose --env-file /home/zepfu/projects/aawm-infrastructure/.env.thoth-litellm \
+  -f docker-compose.alpha.yml config --quiet
+docker compose --env-file /home/zepfu/projects/aawm-infrastructure/.env.thoth-litellm \
+  -f docker-compose.alpha.yml up -d --no-deps --build --force-recreate litellm-alpha
 ```
 
 ## Verify
 
 ```bash
-docker compose -f docker-compose.alpha.yml ps litellm-alpha
-docker compose -f docker-compose.alpha.yml logs --tail=100 litellm-alpha
+docker compose --env-file /home/zepfu/projects/aawm-infrastructure/.env.thoth-litellm \
+  -f docker-compose.alpha.yml ps litellm-alpha
+docker logs --tail=100 litellm-alpha
 curl --fail http://127.0.0.1:4011/health/liveliness
+curl --fail http://127.0.0.1:4011/health/readiness
 docker exec litellm-alpha python -c \
   'import litellm; print(litellm.__file__)'
 ```
 
-The import path must resolve under `/app/litellm`.
-
-When a watched file changes, the logs should show the existing LiteLLM process
-stop and a new process start. Wait for `/health/liveliness` before running the
-next live test.
+The import path must resolve under image-owned `/app/litellm`. Inspect the
+running container's mounts: none may point to a temporary worktree, and no
+mount may shadow `/app`, the alpha config, alias override, or model map.
+After a rebuild or restart, wait for both health endpoints before testing.
 
 ## Current Alpha Routing
 
@@ -178,7 +176,7 @@ The current alpha alias YAML exposes these test paths:
   `{}` send. AgentRunRequest field 12 is never sent, and the direct provider
   route remains available.
 
-These are alpha-only testing paths for the current checkout. A passing alpha
+These are alpha-only testing paths for the current alpha image. A passing alpha
 call is not `litellm-dev` or production acceptance, deployment evidence, or
 authorization to promote candidates or configuration to either environment.
 
@@ -193,12 +191,12 @@ durable provider-wide cooldown, and stateful requests preserve affinity.
 ## Rebuild
 
 ```bash
-docker compose -f docker-compose.alpha.yml build litellm-alpha
-docker compose -f docker-compose.alpha.yml up -d --force-recreate litellm-alpha
+docker compose --env-file /home/zepfu/projects/aawm-infrastructure/.env.thoth-litellm \
+  -f docker-compose.alpha.yml up -d --no-deps --build --force-recreate litellm-alpha
 ```
 
-Rebuild only when the image dependency layer or Dockerfile changed. Ordinary
-source and watched configuration edits do not require this.
+Rebuild for source, config, alias, model map, dependency, or Dockerfile edits.
+An environment-only Compose change needs recreation but not an image rebuild.
 
 ## Stop
 
@@ -206,15 +204,17 @@ Only the alpha service can be affected by this file, so `stop` and `down` here
 never touch `litellm-dev` or any other service.
 
 ```bash
-docker compose -f docker-compose.alpha.yml stop litellm-alpha
-docker compose -f docker-compose.alpha.yml rm -f litellm-alpha
+docker compose --env-file /home/zepfu/projects/aawm-infrastructure/.env.thoth-litellm \
+  -f docker-compose.alpha.yml stop litellm-alpha
+docker compose --env-file /home/zepfu/projects/aawm-infrastructure/.env.thoth-litellm \
+  -f docker-compose.alpha.yml rm -f litellm-alpha
 ```
 
 ## Testing Boundary
 
-Use alpha for short-lived live checks while candidate code is actively being
-edited. Keep each test attributable to the current checkout state and recheck
-health after every automatic restart.
+Use alpha for short-lived live checks after building candidate code into its
+image. Keep each test attributable to the running image revision and recheck
+health after each explicit restart or recreation.
 
 Alpha shares the development proxy's read-only provider credentials and
 development database connections for parity. Treat all calls as real provider
@@ -222,7 +222,7 @@ and development-data operations. It is isolated by port, container name,
 environment label, process application names, and alias-routing Redis
 namespace, but it is not a sandbox for destructive database or provider tests.
 The Cursor auth-file wiring is testing-only. Alpha results remain confined to
-the alpha service and current checkout; they do not promote candidates or
+the alpha service and running image; they do not promote candidates or
 configuration to `litellm-dev` or production.
 
 ## Muse Code (alpha only)
@@ -360,19 +360,20 @@ rollback. Alpha-only:
 2. Do not add Muse spark `model_list` rows to undo this route. If any
    were added to `litellm-alpha-config.yaml`, remove them there only.
    Do not edit `litellm-dev-config.yaml` to “undo” Muse.
-3. Recreate **only** `litellm-alpha`:
+3. If rolling back the source, reverse the Muse facade commit (router
+   include + `muse_code_gateway` module) before building. Alias YAML under
+   `litellm/proxy/aawm_alias_config/` must not have received Muse entries;
+   if it did, revert that as a defect.
+4. Rebuild and recreate **only** `litellm-alpha`:
 
    ```bash
-   docker compose -f docker-compose.alpha.yml up -d --force-recreate litellm-alpha
+   docker compose --env-file /home/zepfu/projects/aawm-infrastructure/.env.thoth-litellm \
+     -f docker-compose.alpha.yml up -d --no-deps --build --force-recreate litellm-alpha
    ```
 
-4. Confirm `curl -sS http://127.0.0.1:4011/muse-code/models` is 404
+5. Confirm `curl -sS http://127.0.0.1:4011/muse-code/models` is 404
    `{"detail":"Not Found"}` and that `:4000` / `:4001` were not
    restarted.
-5. Source rollback is the reverse of the Muse facade commit (router
-   include + `muse_code_gateway` module). Alias YAML under
-   `litellm/proxy/aawm_alias_config/` must not have received Muse
-   entries; if it did, revert that as a defect.
 
 Host `musela` can remain; it only pins alpha `endpoint_transport` in
 `~/.config/aawm-musela/`. Removing the launcher is optional and is not
