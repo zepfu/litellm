@@ -132,7 +132,7 @@ from litellm.secret_managers.xai_oauth_credentials import (
     resolve_xai_oauth_lock_path,
     resolve_xai_oauth_scope,
 )
-from litellm.llms.alibaba_token_plan.chat.transformation import (
+from litellm.secret_managers.alibaba_token_plan_subscription import (
     ALIBABA_TOKEN_PLAN_SUBSCRIPTION_IDENTITY_SOURCE,
     alibaba_token_plan_subscription_identity,
 )

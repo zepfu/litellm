@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
@@ -14,6 +13,10 @@ from pathlib import Path
 from typing import Any, List, Mapping, Optional, Tuple
 
 from litellm.llms.dashscope.chat.transformation import DashScopeChatConfig
+from litellm.secret_managers.alibaba_token_plan_subscription import (
+    ALIBABA_TOKEN_PLAN_SUBSCRIPTION_IDENTITY_SOURCE as ALIBABA_TOKEN_PLAN_SUBSCRIPTION_IDENTITY_SOURCE,
+    alibaba_token_plan_subscription_identity,
+)
 from litellm.secret_managers.main import get_secret_str
 from litellm.types.llms.openai import AllMessageValues
 from litellm.types.utils import ModelResponse
@@ -31,7 +34,6 @@ ALIBABA_TOKEN_PLAN_API_KEY_ENV = "ALIBABA_KEY"
 ALIBABA_TOKEN_PLAN_SETTINGS_FILE_ENV = "LITELLM_ALIBABA_TOKEN_PLAN_SETTINGS_FILE"
 ALIBABA_TOKEN_PLAN_PROVIDER_NAME = "alibaba_token_plan"
 ALIBABA_TOKEN_PLAN_SUBSCRIPTION_ID_ENV = "ALIBABA_TOKEN_PLAN_SUBSCRIPTION_ID"
-ALIBABA_TOKEN_PLAN_SUBSCRIPTION_IDENTITY_SOURCE = "instance_code_sha256"
 ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY_PREFIX = (
     "alibaba_token_plan:__account_quota__:alibaba_token_plan"
 )
@@ -67,22 +69,6 @@ def _is_alibaba_subscription_identity(value: str) -> bool:
     """True for the sha256 hex identity, never for a raw key or instance code."""
 
     return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
-
-
-def alibaba_token_plan_subscription_identity(instance_code: str) -> Optional[str]:
-    """Hash a non-secret Token Plan instance code.
-
-    The raw instance code is not returned. API keys, RAM secrets, and bearer
-    tokens are not accepted as identity material.
-    """
-
-    if not isinstance(instance_code, str):
-        return None
-    normalized = instance_code.strip()
-    if not normalized or any(ord(character) < 32 for character in normalized):
-        return None
-    material = f"alibaba-token-plan|instanceCode={normalized}".encode("utf-8")
-    return hashlib.sha256(material).hexdigest()
 
 
 def alibaba_token_plan_account_quota_cooldown_key(

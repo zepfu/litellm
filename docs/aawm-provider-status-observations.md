@@ -259,6 +259,10 @@ The Hermes Nous Portal OAuth dev Compose contract is exact:
 - `AAWM_NOUS_OAUTH_FORCE_REFRESH=0`
 - `AAWM_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS=30`
 
+The sidecar image packages the shared Hermes Nous auth resolver and the
+stdlib-only Alibaba subscription identity helper. It does not import the full
+Alibaba provider transformation.
+
 The sidecar is the sole automatic Hermes writer. Proxies mount
 `/home/zepfu/.hermes` read-only. Directory mounts, not file mounts, keep atomic
 credential replacement visible without restart. Hermes CLI auto-refresh must

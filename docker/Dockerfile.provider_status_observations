@@ -47,6 +47,8 @@ COPY litellm/secret_managers/credential_error_sanitizer.py /app/litellm/secret_m
 COPY litellm/secret_managers/credential_file_lock.py /app/litellm/secret_managers/credential_file_lock.py
 COPY litellm/secret_managers/credential_file_metadata.py /app/litellm/secret_managers/credential_file_metadata.py
 COPY litellm/secret_managers/credential_file_write.py /app/litellm/secret_managers/credential_file_write.py
+COPY litellm/secret_managers/hermes_nous_auth.py /app/litellm/secret_managers/hermes_nous_auth.py
+COPY litellm/secret_managers/alibaba_token_plan_subscription.py /app/litellm/secret_managers/alibaba_token_plan_subscription.py
 # Shared exact-scope xAI credential selector (pure-stdlib).
 COPY litellm/secret_managers/xai_oauth_credentials.py /app/litellm/secret_managers/xai_oauth_credentials.py
 # Grok native OIDC auth-path resolver (pure-stdlib).
