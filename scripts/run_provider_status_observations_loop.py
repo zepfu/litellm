@@ -393,7 +393,7 @@ ALIBABA_TOKEN_PLAN_PROVIDER = "alibaba_token_plan"
 ALIBABA_TOKEN_PLAN_MODEL = "qwen-token-plan"
 # Active alias Alibaba Token Plan candidates.  The plan quota is account-wide
 # (single consumed-percentage, no per-model dimension); all models share the
-# same 5h/7d Credit windows.  Rows are emitted for each exact model identity so
+# same reported Credit windows. Rows are emitted for each exact model identity so
 # the availability query can match alias candidates.
 ALIBABA_TOKEN_PLAN_ACTIVE_MODELS = (
     "alibaba_token_plan/qwen3.8-max",
@@ -407,6 +407,7 @@ ALIBABA_TOKEN_PLAN_SOURCE = "alibaba_token_plan_usage"
 ALIBABA_TOKEN_PLAN_PARSER_VERSION = "alibaba_token_plan_usage_v3"
 ALIBABA_TOKEN_PLAN_5H_QUOTA_KEY = "alibaba_token_plan_5h:credits"
 ALIBABA_TOKEN_PLAN_7D_QUOTA_KEY = "alibaba_token_plan_7d:credits"
+ALIBABA_TOKEN_PLAN_MONTHLY_QUOTA_KEY = "alibaba_token_plan_monthly:credits"
 ALIBABA_TOKEN_PLAN_RESET_CARD_CREDIT_FAMILY = "alibaba_token_plan_manual_quota_reset"
 ALIBABA_TOKEN_PLAN_RESET_CARD_CREDIT_TYPE = "manual_reset_card"
 ALIBABA_TOKEN_PLAN_RESET_CARD_SOURCE = "alibaba_token_plan_reset_card_list"
@@ -12858,12 +12859,18 @@ def _build_alibaba_quota_rate_limit_payloads(
             "per1WeekResetTime",
             ALIBABA_TOKEN_PLAN_7D_QUOTA_KEY,
         ),
+        (
+            "monthly",
+            "per1MonthPercentage",
+            "per1MonthResetTime",
+            ALIBABA_TOKEN_PLAN_MONTHLY_QUOTA_KEY,
+        ),
     )
     payloads: list[tuple[Any, ...]] = []
     for window, percentage_field, reset_field, quota_key in definitions:
         # A window is absent only when both its percentage and reset keys are
         # missing from the provider payload (the console omits unused windows,
-        # e.g. the 5-hour pair on a weekly-only account).  Wholly absent
+        # e.g. weekly fields on a monthly-only account). Wholly absent
         # windows are skipped; partial/malformed windows still fail closed.
         if percentage_field not in usage_payload and reset_field not in usage_payload:
             continue

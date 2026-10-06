@@ -153,7 +153,7 @@ _SHARED_ACCOUNT_QUOTA_LOOKUP_TIMEOUT_SECONDS = 0.5
 _ALIBABA_TOKEN_PLAN_QUOTA_CLIENT = "qwen-cloud-console"
 _ALIBABA_TOKEN_PLAN_QUOTA_SOURCE = "alibaba_token_plan_usage"
 _ALIBABA_TOKEN_PLAN_QUOTA_PARSER_VERSION = "alibaba_token_plan_usage_v3"
-_ALIBABA_TOKEN_PLAN_QUOTA_WINDOWS = frozenset({"5h", "7d"})
+_ALIBABA_TOKEN_PLAN_QUOTA_WINDOWS = frozenset({"5h", "7d", "monthly"})
 _ALIBABA_TOKEN_PLAN_QUOTA_CACHE_TTL_SECONDS = _SHARED_ACCOUNT_QUOTA_CACHE_TTL_SECONDS
 _ALIBABA_TOKEN_PLAN_QUOTA_FAILURE_RETRY_SECONDS = (
     _SHARED_ACCOUNT_QUOTA_FAILURE_RETRY_SECONDS
@@ -2427,7 +2427,7 @@ def _alibaba_token_plan_quota_evidence(
             or (not current_exhausted and observation["observed_at"] >= current["observed_at"])
         ):
             fresh_windows[window] = observation
-    if set(fresh_windows) != set(_ALIBABA_TOKEN_PLAN_QUOTA_WINDOWS):
+    if set(fresh_windows) not in ({"5h", "7d"}, {"monthly"}):
         return None, []
     windows = [fresh_windows[window] for window in sorted(fresh_windows)]
     evidence: dict[str, Any] = {

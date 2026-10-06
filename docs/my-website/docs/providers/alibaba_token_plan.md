@@ -161,20 +161,20 @@ and [context cache](https://www.alibabacloud.com/help/en/model-studio/context-ca
 ## Quota observability
 
 AAWM deployments may enable the provider-status sidecar's read-only
-ModelStudio quota poll. It records the Token Plan 5-hour and 7-day Credit
-windows without sending model traffic or using the plan-specific inference API
-key. The sidecar mints a console Bearer from RAM `ALIBABA_RAM_KEY` /
-`ALIBABA_RAM_SECRET` (optional `ALIBABA_RAM_PRINCIPAL`) and calls the
-Singapore CLI gateway `/cli/api.json`. See
+ModelStudio quota poll. It records reported Token Plan 5-hour, 7-day, or
+monthly Credit windows without sending model traffic or using the plan-specific
+inference API key. The sidecar mints a console Bearer from RAM
+`ALIBABA_RAM_KEY` / `ALIBABA_RAM_SECRET` (optional `ALIBABA_RAM_PRINCIPAL`)
+and calls the Singapore CLI gateway `/cli/api.json`. See
 `docs/aawm-provider-status-observations.md` for the RAM mint contract,
 polling cadence, stored quota keys, and degraded last-good behavior.
 
 The same RAM-minted Bearer also observes the manual weekly reset-card
 inventory through the console's read-only reset-card list contract. Manual
-cards are separate from the automatic rolling 5-hour and 7-day quota-window
-resets. The sidecar records sanitized card type and validity timestamps plus a
-hashed card identity and lifecycle state; it never stores the raw card number
-and never consumes or applies a reset (`/reset-card/use` is out of scope).
+cards are separate from the automatic quota-window resets. The sidecar records
+sanitized card type and validity timestamps plus a hashed card identity and
+lifecycle state; it never stores the raw card number and never consumes or
+applies a reset (`/reset-card/use` is out of scope).
 Available-card totals and per-card current state are exposed through the
 shared provider-credit observations.
 
@@ -182,8 +182,8 @@ LiteLLM does not invent a per-token price for this subscription. Consumers must
 not interpret a null invoice cost as a free request.
 
 Routing and recovery use only fresh, exact-environment, healthy Alibaba Token
-Plan observations for the single configured account and the relevant `5h` and
-`7d` windows. Missing, stale, unhealthy, malformed, mismatched, partial,
+Plan observations for the single configured account: either `5h` and `7d`, or
+monthly alone. Missing, stale, unhealthy, malformed, mismatched, partial,
 unavailable, or ambiguous evidence is unknown/fail-closed for recovery and
 cannot clear `alibaba_token_plan:__account_quota__:alibaba_token_plan`.
 
@@ -191,15 +191,15 @@ When an explicit Alibaba Token Plan five-hour or weekly exhaustion is detected
 in a response, LiteLLM publishes one shared account and lane cooldown covering
 `qwen3.8-max` and `qwen3.7-max`, including their last-resort use. Generic or
 ambiguous `429` responses do not trigger that cooldown. The cooldown lasts two
-hours plus up to one hour of jitter. Any fresh confirmed exhausted `5h` or `7d`
-window blocks all Alibaba candidates, even if its reset time has passed or the
-other window is missing. Early recovery clears only
+hours plus up to one hour of jitter. Any fresh confirmed exhausted quota window
+blocks all Alibaba candidates, even if its reset time has passed or another
+window is missing. Early recovery clears only
 `alibaba_token_plan:__account_quota__:alibaba_token_plan`, and only when fresh
-positive `5h` and `7d` evidence has finite reset times in the future and no
-fresh exhausted evidence exists. Newer unavailable evidence invalidates older
-positive cached observations; cross-account positive ambiguity neither blocks
-nor clears. Response-driven cooldown behavior continues to work without
-sidecar data.
+positive evidence for a complete window set (`5h` and `7d`, or monthly alone)
+has finite reset times in the future and no fresh exhausted evidence exists.
+Newer unavailable evidence invalidates older positive cached observations;
+cross-account positive ambiguity neither blocks nor clears. Response-driven
+cooldown behavior continues to work without sidecar data.
 
 ## Acceptance boundary
 

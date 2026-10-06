@@ -1065,38 +1065,40 @@ Relevant additional environment variables:
 
 The provider-status sidecar can poll the authenticated ModelStudio Token Plan
 console contract without sending inference traffic. It records the provider's
-5-hour and 7-day Credit usage windows as:
+reported 5-hour, 7-day, or monthly Credit usage windows as:
 
 - `alibaba_token_plan_5h:credits`
 - `alibaba_token_plan_7d:credits`
+- `alibaba_token_plan_monthly:credits`
 
 Alibaba reports each window as a consumed fraction. The sidecar converts that
 fraction to `remaining_pct`, preserves the provider reset timestamp, and leaves
 absolute limit/used/remaining columns null because this console response does
-not provide authoritative absolute Credit limits. It does not invent daily or
-monthly quota windows. Alibaba may omit a reset timestamp for a window whose
-consumed fraction is exactly zero. That unused window is persisted with
+not provide authoritative absolute Credit limits. It does not invent absent
+quota windows. Alibaba may omit a reset timestamp for a window whose consumed
+fraction is exactly zero. That unused window is persisted with
 `remaining_pct=100`, `expected_reset_at=NULL`, and explicit
 `reset_at_state=absent_unused_window` evidence. A missing reset for a consumed
 window remains malformed telemetry and is not persisted.
 
 LiteLLM admits Alibaba candidates using only fresh, exact-environment,
-healthy observations for the single configured account and the relevant `5h`
-and `7d` windows. Missing, stale, unhealthy, malformed, mismatched, partial,
-unavailable, or ambiguous evidence is unknown/fail-closed for recovery and
-cannot clear `alibaba_token_plan:__account_quota__:alibaba_token_plan`. A
-fresh confirmed exhausted window blocks all Alibaba candidates even when its
-reset has expired or the other window is unavailable. Early recovery clears
-only that cooldown key, and only for fresh positive `5h` plus `7d` evidence
-whose reset times are finite and in the future with no fresh exhausted
+healthy observations for the single configured account: either both `5h` and
+`7d`, or a monthly-only window. Missing, stale, unhealthy, malformed,
+mismatched, partial, unavailable, or ambiguous evidence is unknown/fail-closed
+for recovery and cannot clear
+`alibaba_token_plan:__account_quota__:alibaba_token_plan`. A fresh confirmed
+exhausted window blocks all Alibaba candidates even when its reset has expired
+or another window is unavailable. Early recovery clears only that cooldown
+key, and only for a complete positive window set (`5h` and `7d`, or monthly
+alone) whose reset times are finite and in the future with no fresh exhausted
 evidence. Newer unavailable evidence invalidates older positive cached
 observations; cross-account positive ambiguity neither blocks nor clears.
 
 The same scheduled poll separately reads the manual reset-card inventory from
 `zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/reset-card/list`. These cards
-are operator-consumable weekly quota resets, not the automatic rolling 5-hour
-or 7-day quota-window reset timestamps above. Observation is read-only: it
-lists cards but never consumes or applies a reset.
+are operator-consumable weekly quota resets, not the automatic quota-window
+reset timestamps above. Observation is read-only: it lists cards but never
+consumes or applies a reset.
 
 Manual reset-card rows reuse `public.provider_credit_observations` and
 `public.provider_credit_current` with
