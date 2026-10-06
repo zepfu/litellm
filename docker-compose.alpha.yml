@@ -16,8 +16,8 @@
 name: litellm-alpha
 
 # Explicit Codex OAuth inventory labels (non-secret operator mapping only):
-# - account1: sourced from Seshat ~/.codex/auth.json; owner rdkick+openai@pm.me
-# - account2: sourced from Thoth ~/.codex/auth.json; owner rdkick+openai2@pm.me
+# - account1: sourced from Thoth ~/.codex/auth.json; owner rdkick+openai@pm.me
+# - account2: originates on Seshat ~/.codex/auth.json; owner rdkick+openai2@pm.me
 # Deterministic primary/overflow order: account1 (priority 10), then account2
 # (priority 20).
 x-codex-oauth-inventory: &codex-oauth-inventory >-
@@ -47,13 +47,12 @@ services:
     command:
       - /usr/bin/env
       - LITELLM_KIMI_NATIVE_CONTRACT_PATH=/run/aawm/kimi-descriptor/native-contract.json
-      - watchfiles
-      - litellm --config /app/litellm-alpha-config.yaml --port 4011 --run_hypercorn
-      - /app/litellm
-      - /app/enterprise
+      - litellm
+      - --config
       - /app/litellm-alpha-config.yaml
-      - /app/model_prices_and_context_window.json
-      - /app/context-replacement
+      - --port
+      - "4011"
+      - --run_hypercorn
     logging:
       driver: json-file
       options:
@@ -63,14 +62,8 @@ services:
       - "127.0.0.1:4011:4011"
       - "100.109.19.233:4011:4011"
     volumes:
-      # The checkout is authoritative. Keep it read-only to prevent candidate
-      # runtime behavior from modifying source or configuration.
-      - .:/app:ro
-      # Alpha-only OpenAI candidate set; dev and production use the shared file.
-      - ./config/alpha-alias-overrides/provider-openai.yaml:/app/litellm/proxy/aawm_alias_config/provider-openai.yaml:ro
-      # Keep the packaged fallback synchronized with the canonical live map.
-      - ./model_prices_and_context_window.json:/app/litellm/bundled_model_prices_and_context_window_fallback.json:ro
-      # Runtime output surfaces remain writable.
+      # Application source, alpha configuration, alias override, and model map
+      # are image-owned. These repository paths remain durable runtime data.
       - ./.analysis:/app/.analysis
       - ./captures:/tmp/captures
       - /home/zepfu/.analysis:/home/zepfu/.analysis

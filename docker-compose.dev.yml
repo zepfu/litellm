@@ -1,6 +1,6 @@
 # Explicit Codex OAuth inventory labels (non-secret operator mapping only):
-# - account1: sourced from Seshat ~/.codex/auth.json; owner rdkick+openai@pm.me
-# - account2: sourced from Thoth ~/.codex/auth.json; owner rdkick+openai2@pm.me
+# - account1: sourced from Thoth ~/.codex/auth.json; owner rdkick+openai@pm.me
+# - account2: originates on Seshat ~/.codex/auth.json; owner rdkick+openai2@pm.me
 # Deterministic primary/overflow order: account1 (priority 10), then account2
 # (priority 20).
 x-codex-oauth-inventory: &codex-oauth-inventory >-
