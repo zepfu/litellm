@@ -1,7 +1,7 @@
 # LiteLLM Alpha
 
-`litellm-alpha` is the testing-only LiteLLM proxy for candidates built from
-this repository. It listens on port `4011`.
+`litellm-alpha` is the testing-only LiteLLM proxy for code in the persistent
+repository root, `/home/zepfu/projects/litellm`. It listens on port `4011`.
 
 Never route production traffic, persistent clients, scheduled jobs, or normal
 development traffic to this service. Do not use alpha results as production
@@ -43,13 +43,14 @@ does not share candidate cooldown or affinity keys with `litellm-dev`.
 - Compose file: `docker-compose.alpha.yml` (alpha only)
 - Local endpoint: `http://127.0.0.1:4011`
 - Tailscale endpoint: `http://100.109.19.233:4011`
-- Config: `/app/litellm-alpha-config.yaml`, packaged in the image from
+- Config: `/app/litellm-alpha-config.yaml`, mounted from repository-root
   `litellm-alpha-config.yaml`. Do not load
   `litellm-dev-config.yaml` in the alpha process; that file remains the
   `:4001` config.
-- Source: `/app`, packaged in the image; no live source bind
-- OpenAI alias override: `config/alpha-alias-overrides/provider-openai.yaml`
-  is packaged over alpha's shared `provider-openai.yaml`. Dev mounts that
+- Source: `/home/zepfu/projects/litellm`, mounted read-only at `/app`
+- OpenAI alias override: repository-root
+  `config/alpha-alias-overrides/provider-openai.yaml` is mounted read-only
+  over alpha's shared `provider-openai.yaml`. Dev mounts that
   override separately; production continues using the shared file
 - Cursor GUI auth directory: `/home/zepfu/.config/cursor`, bind-mounted
   read-only at the same path; the directory mount keeps sidecar atomic
@@ -77,21 +78,22 @@ directory. A fresh
 is supplied through Compose/environment; the auth JSON contents and raw API
 key are never placed there.
 
-The image contains the Python dependencies, application source, config,
-alpha alias override, and model map. Its editable LiteLLM install and
-`PYTHONPATH=/app` resolve imports from the image-owned `/app` tree, not a
-host checkout. No runtime bind source may come from a temporary worktree.
+The image supplies Python dependencies and an editable LiteLLM install.
+`PYTHONPATH=/app` resolves imports from the persistent repository-root mount.
+All source, configuration, alias and model-map mounts use absolute root paths;
+implementation worktrees never supply live runtime source.
 
 Alpha never mounts or scans the development session-history spool at
 `/mnt/e/litellm/session_history`. Its durable queue fallback lives under the
 repository's ignored `.analysis/runtime/litellm-alpha/` tree, so alpha cannot
 claim, replay, quarantine, or delete `litellm-dev` spool records.
 
-Changes to application source, alpha configuration, alias overrides, model
-metadata, dependencies, or Docker packaging require an alpha image rebuild
-and container recreation. There is no file watcher or automatic source
-reload. The read-only credential directory mounts still expose atomic
-credential replacements to the running process.
+`watchfiles` automatically restarts the alpha process when files change under
+`litellm/`, `enterprise/`, or `context-replacement/`, or when
+`litellm-alpha-config.yaml` or `model_prices_and_context_window.json` changes
+in repository root. Dependencies and Docker packaging require an image rebuild
+and container recreation. Credential directory mounts expose atomic credential
+replacements to the running process.
 
 ## Routing Redis Persistence
 
@@ -144,10 +146,10 @@ docker exec litellm-alpha python -c \
   'import litellm; print(litellm.__file__)'
 ```
 
-The import path must resolve under image-owned `/app/litellm`. Inspect the
-running container's mounts: none may point to a temporary worktree, and no
-mount may shadow `/app`, the alpha config, alias override, or model map.
-After a rebuild or restart, wait for both health endpoints before testing.
+The import path must resolve under `/app/litellm`, with `/app` mounted from
+`/home/zepfu/projects/litellm`. Inspect the running container's mounts: none
+may point to an implementation worktree. After a reload, rebuild or restart,
+wait for both health endpoints before testing.
 
 ## Current Alpha Routing
 
@@ -179,8 +181,8 @@ The current alpha alias YAML exposes these test paths:
   `{}` send. AgentRunRequest field 12 is never sent, and the direct provider
   route remains available.
 
-These are alpha-only testing paths for the current alpha image. A passing alpha
-call is not `litellm-dev` or production acceptance, deployment evidence, or
+These are alpha-only testing paths for the current alpha root checkout. A passing
+alpha call is not `litellm-dev` or production acceptance, deployment evidence, or
 authorization to promote candidates or configuration to either environment.
 
 For OpenRouter free candidates, the literal
@@ -199,7 +201,8 @@ docker compose --env-file .env \
   -f docker-compose.alpha.yml up -d --no-deps --build --force-recreate litellm-alpha
 ```
 
-Rebuild for source, config, alias, model map, dependency, or Dockerfile edits.
+Rebuild for dependency or Dockerfile edits. Repository-root source changes
+reload automatically.
 An environment-only Compose change needs recreation but not an image rebuild.
 
 ## Stop
@@ -218,9 +221,9 @@ docker compose --env-file .env \
 
 ## Testing Boundary
 
-Use alpha for short-lived live checks after building candidate code into its
-image. Keep each test attributable to the running image revision and recheck
-health after each explicit restart or recreation.
+Use alpha for short-lived live checks after integrating candidate code into
+repository root. Attribute each check to the root revision and recheck health
+after each reload, restart or recreation.
 
 Alpha shares the development proxy's read-only provider credentials and
 development database connections for parity. Treat all calls as real provider
@@ -228,7 +231,7 @@ and development-data operations. It is isolated by port, container name,
 environment label, process application names, and alias-routing Redis
 namespace, but it is not a sandbox for destructive database or provider tests.
 The Cursor auth-file wiring is testing-only. Alpha results remain confined to
-the alpha service and running image; they do not promote candidates or
+the alpha service and root revision; they do not promote candidates or
 configuration to `litellm-dev` or production.
 
 ## Muse Code (alpha only)

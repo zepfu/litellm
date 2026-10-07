@@ -47,12 +47,13 @@ services:
     command:
       - /usr/bin/env
       - LITELLM_KIMI_NATIVE_CONTRACT_PATH=/run/aawm/kimi-descriptor/native-contract.json
-      - litellm
-      - --config
+      - watchfiles
+      - litellm --config /app/litellm-alpha-config.yaml --port 4011 --run_hypercorn
+      - /app/litellm
+      - /app/enterprise
       - /app/litellm-alpha-config.yaml
-      - --port
-      - "4011"
-      - --run_hypercorn
+      - /app/model_prices_and_context_window.json
+      - /app/context-replacement
     logging:
       driver: json-file
       options:
@@ -62,10 +63,13 @@ services:
       - "127.0.0.1:4011:4011"
       - "100.109.19.233:4011:4011"
     volumes:
-      # Application source, alpha configuration, alias override, and model map
-      # are image-owned. These repository paths remain durable runtime data.
-      # Fixed root paths keep runtime data durable when alpha is built from a
-      # temporary implementation worktree.
+      # Reload only from the persistent repository root, even when this Compose
+      # file is inspected from an implementation worktree.
+      - /home/zepfu/projects/litellm:/app:ro
+      # Alpha-only OpenAI candidates and the canonical model-map fallback.
+      - /home/zepfu/projects/litellm/config/alpha-alias-overrides/provider-openai.yaml:/app/litellm/proxy/aawm_alias_config/provider-openai.yaml:ro
+      - /home/zepfu/projects/litellm/model_prices_and_context_window.json:/app/litellm/bundled_model_prices_and_context_window_fallback.json:ro
+      # Writable runtime data also stays in persistent root paths.
       - /home/zepfu/projects/litellm/.analysis:/app/.analysis
       - /home/zepfu/projects/litellm/captures:/tmp/captures
       - /home/zepfu/.analysis:/home/zepfu/.analysis

@@ -12,18 +12,14 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install the project and its alpha-owned runtime configuration into the image.
+# Install at the same path as the persistent repository-root runtime mount.
 COPY . .
 RUN pip install --no-cache-dir -e . \
-    && pip install --no-cache-dir asyncpg h2==4.3.0 hypercorn==0.15.0 langfuse
-
-# The alpha candidate set overrides the packaged shared alias for this image.
-COPY config/alpha-alias-overrides/provider-openai.yaml \
-    /app/litellm/proxy/aawm_alias_config/provider-openai.yaml
+    && pip install --no-cache-dir asyncpg h2==4.3.0 hypercorn==0.15.0 langfuse watchfiles==1.2.0
 
 ENV PYTHONPATH=/app \
     PYTHONDONTWRITEBYTECODE=1
 
 EXPOSE 4011
 
-CMD ["litellm", "--config", "/app/litellm-alpha-config.yaml", "--port", "4011", "--run_hypercorn"]
+CMD ["watchfiles", "litellm --config /app/litellm-alpha-config.yaml --port 4011 --run_hypercorn", "/app/litellm", "/app/enterprise", "/app/litellm-alpha-config.yaml", "/app/model_prices_and_context_window.json", "/app/context-replacement"]
