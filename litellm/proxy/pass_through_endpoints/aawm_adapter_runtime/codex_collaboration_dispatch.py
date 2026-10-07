@@ -766,6 +766,26 @@ def _normalize_tool_schemas_without_error_mapping(
 ) -> dict[str, Any]:
     normalized_body = body
     changed = False
+    # Stock Codex Responses Lite puts the current toolset in a leading
+    # developer item rather than tools[]. Materialize that declaration before
+    # the existing schema, alias, adapter and restoration paths inspect it.
+    input_items = body.get("input")
+    if isinstance(input_items, list) and input_items:
+        declaration = input_items[0]
+        if (
+            isinstance(declaration, dict)
+            and declaration.get("type") == "additional_tools"
+            and declaration.get("role") == "developer"
+        ):
+            tools = declaration.get("tools")
+            if not isinstance(tools, list) or body.get("tools") is not None:
+                raise CodexCollaborationDispatchError(
+                    "unsupported_collaboration_message_schema"
+                )
+            normalized_body = dict(body)
+            normalized_body["tools"] = tools
+            normalized_body["input"] = input_items[1:]
+            changed = True
     for key in ("tools", "functions"):
         normalized_tools, tools_changed = _normalize_tool_list(
             normalized_body.get(key),
