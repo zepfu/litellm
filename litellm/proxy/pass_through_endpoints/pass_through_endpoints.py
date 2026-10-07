@@ -7982,8 +7982,11 @@ async def pass_through_request(  # noqa: PLR0915
         ):
             from .aawm_adapter_runtime.codex_collaboration_dispatch import (
                 build_codex_collaboration_wire_aliases,
+                CodexCollaborationDispatchError,
                 collect_codex_collaboration_advertised_tool_names,
                 get_bound_codex_collaboration_tool_identities,
+                is_codex_collaboration_send_message_identity,
+                raise_codex_send_message_normalization_unreadable,
             )
 
             collaboration_aliases = build_codex_collaboration_wire_aliases(
@@ -8001,6 +8004,31 @@ async def pass_through_request(  # noqa: PLR0915
             )
             if responses_function_name_rewrite.changed:
                 provider_bound_body = responses_function_name_rewrite.body
+            send_message_upstream_names = frozenset(
+                upstream_name
+                for identity, upstream_name in (
+                    responses_function_name_rewrite.original_identity_to_upstream.items()
+                )
+                if is_codex_collaboration_send_message_identity(identity)
+            )
+            if send_message_upstream_names and isinstance(
+                provider_bound_body,
+                dict,
+            ):
+                from .aawm_adapter_runtime.openai_responses_body import (
+                    _canonicalize_codex_send_message_calls,
+                )
+
+                try:
+                    canonicalized_input = _canonicalize_codex_send_message_calls(
+                        provider_bound_body.get("input"),
+                        send_message_upstream_names,
+                    )
+                except CodexCollaborationDispatchError as exc:
+                    raise_codex_send_message_normalization_unreadable(exc.reason)
+                if canonicalized_input is not provider_bound_body.get("input"):
+                    provider_bound_body = dict(provider_bound_body)
+                    provider_bound_body["input"] = canonicalized_input
         local_prepare_completed_at = datetime.now()
         local_prepare_ms = _record_passthrough_duration(
             kwargs,

@@ -266,6 +266,17 @@ opaque assignments fail before provider egress with HTTP 409,
 never displayed as an assignment or recovered by guessing task content.
 Encrypted reasoning and function outputs retain their separate handling.
 
+For outbound generated `collaboration.send_message` calls, AAWM preserves a
+valid strict frame byte for byte and wraps plain readable text in that frame
+without trimming or rewriting it. The call must have exactly `message` and
+`target`; opaque, frame-shaped, or four-key values fail closed instead of
+guessing recipient semantics. This response-phase failure is identified as
+`codex_collaboration_send_message_normalization` and does not claim that no
+provider call was attempted. Captured history gets one bounded recovery only:
+if a MESSAGE item has actual matching author and recipient identity and its
+captured payload is readable, replay canonicalizes that payload; bare visible
+envelopes and unreadable payloads still fail closed.
+
 Managed `oa_xai` Responses preparation applies the existing catalog/model-
 metadata-driven `rewrite_input_item_types` continuation rewrite before xAI
 request sanitization. The rewrite runs only when model metadata requests those

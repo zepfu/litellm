@@ -31,6 +31,9 @@ COLLABORATION_MESSAGE_PROPERTY = "message"
 COLLABORATION_FRAME_VERSION = 1
 COLLABORATION_TEXT_ENCODING = "text"
 ASSIGNMENT_UNREADABLE_ERROR_CODE = "aawm_codex_assignment_unreadable"
+SEND_MESSAGE_NORMALIZATION_FAILURE_PHASE = (
+    "codex_collaboration_send_message_normalization"
+)
 CODEX_COLLABORATION_TOOL_IDENTITIES_STATE_FIELD = (
     "_aawm_codex_collaboration_tool_identities"
 )
@@ -268,6 +271,105 @@ def raise_codex_assignment_unreadable(
             "reason": reason,
             "attempted_provider_call": False,
             "failure_phase": failure_phase,
+            "non_resumable": True,
+            "regenerate_assignment_required": True,
+        },
+    )
+
+
+def is_codex_collaboration_send_message_identity(
+    identity: Any,
+) -> bool:
+    """Return whether an identity is the validated V2 send-message tool."""
+    return (
+        isinstance(identity, ResponsesFunctionIdentity)
+        and identity.name == "send_message"
+        and identity.namespace in _COLLABORATION_NAMESPACES
+    )
+
+
+def canonicalize_codex_send_message_argument(value: Any) -> str:
+    """Wrap readable generated text in the strict CFG-047 message frame.
+
+    A strict frame is returned unchanged. Plain readable text is preserved
+    exactly inside a newly allocated frame. Frame-looking values other than a
+    strict frame are rejected rather than guessed at; this deliberately covers
+    four-key near-frames until their recipient semantics are verified.
+    """
+    if not isinstance(value, str) or not value:
+        raise CodexCollaborationDispatchError("invalid_envelope")
+    if _is_opaque_representation(value):
+        raise CodexCollaborationDispatchError("opaque")
+    if _FRAME_PREFIX_PATTERN.match(value):
+        # A strict frame is already canonical; validate and preserve its exact
+        # serialized bytes instead of re-encoding it.
+        parse_codex_collaboration_text_frame(value)
+        return value
+    canonical = json.dumps(
+        {
+            "cfg047": COLLABORATION_FRAME_VERSION,
+            "encoding": COLLABORATION_TEXT_ENCODING,
+            "text": value,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    if len(canonical) > _MAX_FRAME_CHARS:
+        raise CodexCollaborationDispatchError("invalid_envelope")
+    if parse_codex_collaboration_text_frame(canonical) != value:
+        raise CodexCollaborationDispatchError("invalid_envelope")
+    return canonical
+
+
+def canonicalize_codex_send_message_call_arguments(value: Any) -> str:
+    """Canonicalize the serialized arguments of a V2 send-message call."""
+    if not isinstance(value, str) or not value:
+        raise CodexCollaborationDispatchError("invalid_envelope")
+    try:
+        decoded, remainder = json.JSONDecoder(
+            object_pairs_hook=_duplicate_rejecting_object,
+        ).raw_decode(value)
+    except CodexCollaborationDispatchError:
+        raise
+    except (RecursionError, TypeError, ValueError):
+        raise CodexCollaborationDispatchError("unknown_representation") from None
+    if remainder != len(value) or not isinstance(decoded, dict):
+        raise CodexCollaborationDispatchError("invalid_envelope")
+    if set(decoded) != {"message", "target"}:
+        raise CodexCollaborationDispatchError("unknown_representation")
+    target = decoded.get("target")
+    if not isinstance(target, str) or not target:
+        raise CodexCollaborationDispatchError("invalid_envelope")
+    return json.dumps(
+        {
+            "message": canonicalize_codex_send_message_argument(
+                decoded.get("message")
+            ),
+            "target": target,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def raise_codex_send_message_normalization_unreadable(
+    reason: str,
+) -> None:
+    """Reject response-derived malformed send-message calls before egress."""
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "error": {
+                "message": (
+                    "The generated Codex send-message assignment cannot be "
+                    "normalized safely. Regenerate the agent assignment."
+                ),
+                "type": "invalid_request_error",
+                "code": ASSIGNMENT_UNREADABLE_ERROR_CODE,
+                "reason": reason,
+            },
+            "reason": reason,
+            "failure_phase": SEND_MESSAGE_NORMALIZATION_FAILURE_PHASE,
             "non_resumable": True,
             "regenerate_assignment_required": True,
         },
@@ -854,13 +956,49 @@ def _validate_envelope_identity(
         raise CodexCollaborationDispatchError("invalid_envelope")
 
 
+def _replay_canonical_codex_message_payload(
+    item: Mapping[str, Any],
+    visible_text: str,
+    payload: Any,
+) -> Optional[str]:
+    """Return normalized exact MESSAGE text only from a captured history item.
+
+    Recovery requires actual matching author/recipient identity. Bare visible
+    envelopes therefore remain rejected, while malformed captured payload from
+    a real inter-agent MESSAGE can be repaired on replay without inventing
+    identity or accepting an opaque representation.
+    """
+    author = item.get("author")
+    recipient = item.get("recipient")
+    if (
+        not isinstance(author, str)
+        or not author
+        or not isinstance(recipient, str)
+        or not recipient
+    ):
+        return None
+    try:
+        return canonicalize_codex_send_message_argument(payload)
+    except CodexCollaborationDispatchError:
+        return None
+
+
 def _normalize_codex_message_payload(
     item: dict[str, Any],
     visible_part: dict[str, Any],
     visible_text: str,
     payload: Any,
 ) -> tuple[dict[str, Any], bool]:
-    assignment = parse_codex_collaboration_text_frame(payload)
+    normalized_payload = _replay_canonical_codex_message_payload(
+        item,
+        visible_text,
+        payload,
+    )
+    assignment = (
+        parse_codex_collaboration_text_frame(normalized_payload)
+        if normalized_payload is not None
+        else parse_codex_collaboration_text_frame(payload)
+    )
     normalized_item = _NormalizedCodexAgentMessage(item)
     normalized_item["content"] = [
         {
