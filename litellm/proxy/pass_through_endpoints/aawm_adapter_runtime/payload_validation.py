@@ -1746,6 +1746,7 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             normalize_codex_collaboration_dispatch_body(
                 dict(request_body),
                 identity_collector=identities,
+                request=request,  # noqa: F821
             )
             aliases = build_codex_collaboration_wire_aliases(
                 tuple(identities),
@@ -1767,12 +1768,43 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             if is_codex_collaboration_send_message_identity(alias.original)
         )
 
+    def _positive_send_message_upstream_names(output: Any) -> frozenset[str]:
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
+            is_codex_collaboration_send_message_identity,
+        )
+
+        if not isinstance(output, list):
+            return frozenset()
+        aliases = _mapping_or_attr_get(  # noqa: F821
+            response,
+            "_aawm_codex_collaboration_aliases",
+            None,
+        )
+        original_to_upstream = (
+            {
+                alias.original.rendered_name: alias.upstream_name
+                for alias in aliases
+                if is_codex_collaboration_send_message_identity(alias.original)
+            }
+            if aliases is not None
+            else {"send_message": "send_message"}
+        )
+        return frozenset(
+            original_to_upstream[item.get("name")]
+            for item in output
+            if isinstance(item, dict)
+            and item.get("type") == "function_call"
+            and item.get("name") in original_to_upstream
+        )
+
     def _gate_response_send_message_calls(response_body: Any) -> Any:
         if not isinstance(response_body, dict):
             return response_body
+        output = response_body.get("output")
         return gate_generated_codex_send_message_call_arguments(
-            response_body.get("output"),
-            _send_message_upstream_names(),
+            output,
+            _send_message_upstream_names()
+            | _positive_send_message_upstream_names(output),
         )
 
     def _gate_managed_responses_sse_event(payload: Any) -> Any:

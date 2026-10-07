@@ -317,9 +317,14 @@ _NESTED_ENCRYPTED_CONTENT_PART_TYPE = "encrypted_content"
 
 def restore_codex_agent_message_payloads_for_openai_egress(
     request_body: Mapping[str, Any] | dict[str, Any],
+    *,
+    request: Any = None,
 ) -> dict[str, Any]:
     """Compatibility wrapper for the CFG-047 shared dispatch normalizer."""
-    return normalize_codex_collaboration_dispatch_body(request_body)
+    return normalize_codex_collaboration_dispatch_body(
+        request_body,
+        request=request,
+    )
 
 
 
@@ -1486,7 +1491,6 @@ def guard_openai_encrypted_reasoning_egress(
     prepared, disposition = prepare_encrypted_reasoning_items_for_openai_egress(
         request_body if isinstance(request_body, dict) else dict(request_body or {}),
     )
-    prepared = normalize_codex_collaboration_dispatch_body(prepared)
     prepared, function_output_disposition = (
         prepare_encrypted_function_output_items_for_openai_egress(
             prepared,

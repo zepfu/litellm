@@ -442,6 +442,8 @@ def _restore_responses_sse_payload(
 
 def _responses_send_message_upstream_names(
     request_body: dict[str, Any],
+    *,
+    request: Any = None,
 ) -> frozenset[str]:
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
         collect_codex_collaboration_advertised_tool_names,
@@ -476,13 +478,18 @@ def _gate_responses_send_message_calls_in_body(
     rewrite: ResponsesFunctionNameRewrite,
 ) -> Any:
     """Gate generated send-message calls in a fully restored response body."""
-    if not isinstance(response_body, dict) or not isinstance(request_body, dict):
+    if not isinstance(response_body, dict):
         return response_body
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
         gate_generated_codex_send_message_call_arguments,
     )
 
-    upstream_names = _responses_send_message_upstream_names(request_body)
+    upstream_names = _positive_send_message_names(
+        rewrite,
+        response_body.get("output"),
+    )
+    if not upstream_names and isinstance(request_body, dict):
+        upstream_names = _responses_send_message_upstream_names(request_body)
     gated_output = gate_generated_codex_send_message_call_arguments(
         response_body.get("output"),
         upstream_names,
@@ -492,11 +499,194 @@ def _gate_responses_send_message_calls_in_body(
     return {**response_body, "output": gated_output}
 
 
+def _positive_send_message_names(
+    rewrite: ResponsesFunctionNameRewrite,
+    output: Any = None,
+) -> frozenset[str]:
+    """Return positive request/response evidence for send-message aliases."""
+    names = {
+        upstream
+        for upstream, original in rewrite.upstream_to_original.items()
+        if original == "send_message"
+    }
+    for upstream, identity in rewrite.upstream_to_original_identities.items():
+        if (
+            identity.name == "send_message"
+            and identity.namespace in {"collaboration", "functions.collaboration"}
+        ):
+            names.add(upstream)
+    if isinstance(output, list):
+        for item in output:
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "function_call"
+                and rewrite.restore_identity(item.get("name"), item.get("namespace"))[0]
+                == "send_message"
+            ):
+                names.add(item.get("name"))
+    return frozenset(name for name in names if isinstance(name, str))
+
+
+def _make_cfg072_sse_state() -> dict[str, dict[str, Any]]:
+    """Return request-local state for managed send-message stream gating."""
+    return {"items": {}, "arguments": {}}
+
+
+def _cfg072_call_key(item: Any, event: Any) -> Optional[str]:
+    for value in (
+        item.get("id") if isinstance(item, dict) else None,
+        item.get("call_id") if isinstance(item, dict) else None,
+        event.get("item_id") if isinstance(event, dict) else None,
+        event.get("call_id") if isinstance(event, dict) else None,
+    ):
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _gate_cfg072_sse_event(
+    payload: Any,
+    rewrite: ResponsesFunctionNameRewrite,
+    state: dict[str, dict[str, Any]],
+    *,
+    configured_names: frozenset[str],
+) -> Any:
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
+        canonicalize_generated_codex_send_message_call_arguments,
+        raise_codex_send_message_output_rejected,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
+        CodexCollaborationDispatchError,
+    )
+
+    if not isinstance(payload, dict):
+        return payload
+    event_type = payload.get("type")
+    item = payload.get("item")
+
+    if event_type == "response.output_item.added":
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            return payload
+        name = item.get("name")
+        original_name = rewrite.restore_identity(name, item.get("namespace"))[0]
+        targeted = name in configured_names or original_name == "send_message"
+        key = _cfg072_call_key(item, payload)
+        if key is not None:
+            if targeted:
+                state["items"][key] = {"name": name}
+            else:
+                state["items"].pop(key, None)
+        if not targeted:
+            return payload
+        if item.get("arguments"):
+            try:
+                canonical = canonicalize_generated_codex_send_message_call_arguments(
+                    item.get("arguments")
+                )
+            except CodexCollaborationDispatchError as exc:
+                raise_codex_send_message_output_rejected(exc.reason)
+            if key is not None:
+                state["arguments"][key] = canonical
+            return {**payload, "item": {**item, "arguments": canonical}}
+        return payload
+
+    if event_type == "response.function_call_arguments.delta":
+        key = _cfg072_call_key(None, payload)
+        targeted = key is not None and key in state["items"]
+        if not targeted:
+            name = payload.get("name")
+            targeted = name in configured_names
+        if not targeted:
+            return payload
+        if key is None:
+            raise RuntimeError("send-message stream call identity is required")
+        state["arguments"][key] = state["arguments"].get(key, "") + str(
+            payload.get("delta") or ""
+        )
+        return None
+
+    if event_type == "response.function_call_arguments.done":
+        key = _cfg072_call_key(item, payload)
+        name = payload.get("name")
+        if not isinstance(name, str) and isinstance(item, dict):
+            name = item.get("name")
+        original_name = rewrite.restore_identity(name, payload.get("namespace"))[0]
+        targeted = key in state["items"] or name in configured_names or (
+            isinstance(name, str) and original_name == "send_message"
+        )
+        if not targeted:
+            return payload
+        selected = (
+            state["items"][key].get("selected")
+            if key is not None and key in state["items"]
+            else None
+        )
+        arguments = selected or state["arguments"].get(key, payload.get("arguments"))
+        if key is not None:
+            selected_item = state["items"].get(key, {})
+            if not isinstance(selected, str) and isinstance(
+                selected_item.get("selected"), str
+            ):
+                arguments = selected_item["selected"]
+        try:
+            canonical = canonicalize_generated_codex_send_message_call_arguments(arguments)
+        except CodexCollaborationDispatchError as exc:
+            raise_codex_send_message_output_rejected(exc.reason)
+        if key is not None:
+            state["arguments"][key] = canonical
+            if isinstance(item, dict):
+                item_key = _cfg072_call_key(item, None)
+                if item_key is not None and item_key in state["items"]:
+                    state["items"][item_key]["selected"] = canonical
+        updated = dict(payload)
+        updated["arguments"] = canonical
+        if isinstance(item, dict):
+            updated["item"] = {**item, "arguments": canonical}
+        return updated
+
+    if event_type in {"response.completed", "response.done"}:
+        response = payload.get("response")
+        if not isinstance(response, dict):
+            return payload
+        output = response.get("output")
+        if not isinstance(output, list):
+            return payload
+        gated: list[Any] = []
+        changed = False
+        for entry in output:
+            if (
+                not isinstance(entry, dict)
+                or entry.get("type") != "function_call"
+                or entry.get("name") not in _positive_send_message_names(
+                    rewrite,
+                    [entry],
+                )
+                | configured_names
+            ):
+                gated.append(entry)
+                continue
+            key = _cfg072_call_key(entry, payload)
+            arguments = state["arguments"].get(key, entry.get("arguments"))
+            try:
+                canonical = canonicalize_generated_codex_send_message_call_arguments(
+                    arguments
+                )
+            except CodexCollaborationDispatchError as exc:
+                raise_codex_send_message_output_rejected(exc.reason)
+            if key is not None:
+                state["arguments"][key] = canonical
+            gated.append({**entry, "arguments": canonical})
+            changed = True
+        return {**payload, "response": {**response, "output": gated}} if changed else payload
+    return payload
+
+
 def _restore_responses_sse_frame(
     frame: bytes,
     rewrite: ResponsesFunctionNameRewrite,
     *,
     cfg072_request_body: Optional[dict[str, Any]] = None,
+    cfg072_state: Optional[dict[str, dict[str, Any]]] = None,
 ) -> bytes:
     data_lines: list[tuple[int, bytes, bytes, bytes]] = []
     saw_done = False
@@ -532,43 +722,23 @@ def _restore_responses_sse_frame(
         return frame
 
     restored = _restore_responses_sse_payload(payload, rewrite)
-    if cfg072_request_body is not None:
-        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
-            gate_generated_codex_send_message_call_arguments,
+    if cfg072_request_body is not None or cfg072_state is not None:
+        configured_names = (
+            _responses_send_message_upstream_names(cfg072_request_body or {})
+            if cfg072_request_body is not None
+            else frozenset()
         )
-
-        upstream_names = _responses_send_message_upstream_names(
-            cfg072_request_body
+        if cfg072_state is None:
+            cfg072_state = _make_cfg072_sse_state()
+        gated = _gate_cfg072_sse_event(
+            restored,
+            rewrite,
+            cfg072_state,
+            configured_names=configured_names,
         )
-        event_type = payload.get("type")
-        if event_type in {
-            "response.output_item.added",
-            "response.output_item.done",
-        }:
-            item = payload.get("item")
-            if isinstance(item, dict) and item.get("type") == "function_call":
-                gated_item = gate_generated_codex_send_message_call_arguments(
-                    [item],
-                    upstream_names,
-                )
-                if (
-                    isinstance(gated_item, list)
-                    and gated_item != [item]
-                    and gated_item
-                ):
-                    restored = {**restored, "item": gated_item[0]}
-        elif event_type == "response.completed":
-            response = payload.get("response")
-            if isinstance(response, dict):
-                gated_output = gate_generated_codex_send_message_call_arguments(
-                    response.get("output"),
-                    upstream_names,
-                )
-                if gated_output is not response.get("output"):
-                    restored = {
-                        **restored,
-                        "response": {**response, "output": gated_output},
-                    }
+        if gated is None:
+            return b""
+        restored = gated
     if restored is payload:
         return frame
 
@@ -608,6 +778,7 @@ async def _restore_responses_function_names_in_sse_chunks(
     cfg072_request_body: Optional[dict[str, Any]] = None,
 ) -> AsyncIterator[bytes]:
     buffer = b""
+    cfg072_state = _make_cfg072_sse_state()
     async for chunk in chunks:
         if isinstance(chunk, str):
             buffer += chunk.encode("utf-8")
@@ -625,13 +796,15 @@ async def _restore_responses_function_names_in_sse_chunks(
                 frame,
                 rewrite,
                 cfg072_request_body=cfg072_request_body,
+                cfg072_state=cfg072_state,
             )
 
     if buffer:
         yield _restore_responses_sse_frame(
             buffer,
             rewrite,
-            cfg072_request_body=cfg072_request_body,
+                cfg072_request_body=cfg072_request_body,
+                cfg072_state=cfg072_state,
         )
 
 

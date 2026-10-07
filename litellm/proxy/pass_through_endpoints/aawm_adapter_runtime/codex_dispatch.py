@@ -486,6 +486,7 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
         normalized_request_body = normalize_codex_collaboration_dispatch_body(
             prepared_request_body,
             identity_collector=codex_collaboration_identities,
+            request=request,
         )
     except Exception as exc:
         # Normalization is pre-egress and may fail before the route guard's

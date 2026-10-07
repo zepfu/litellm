@@ -531,6 +531,7 @@ class BaseOpenAIPassThroughHandler:
                     normalize_codex_collaboration_dispatch_body(
                         request_body,
                         identity_collector=codex_collaboration_identities,
+                        request=request,
                     )
                 )
                 if normalized_request_body is not request_body:
@@ -624,6 +625,7 @@ class BaseOpenAIPassThroughHandler:
                     normalize_codex_collaboration_dispatch_body(
                         prepared_request_body,
                         identity_collector=codex_collaboration_identities,
+                        request=request,
                     )
                 )
                 if normalized_request_body is not prepared_request_body:

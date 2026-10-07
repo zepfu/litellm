@@ -8264,7 +8264,8 @@ async def _perform_codex_auto_agent_native_openai_request(
     # Managed Codex Responses egress is always streamed and unpersisted,
     # including nested alias candidates that bypass direct-route shaping.
     request_body = normalize_codex_collaboration_dispatch_body(
-        dict(request_body)
+        dict(request_body),
+        request=request,
     )
     request_body, _encrypted_reasoning_disposition = (
         guard_openai_encrypted_reasoning_egress(
@@ -11553,7 +11554,8 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
 
         canonical_request_body = deepcopy(request_body)
         adapted_request_body = normalize_codex_collaboration_dispatch_body(
-            deepcopy(request_body)
+            deepcopy(request_body),
+            request=request,
         )
         input_items = adapted_request_body.get("input")
         if isinstance(input_items, list):

@@ -444,6 +444,7 @@ def compile_openai_responses_wire_body(
     body = normalize_codex_collaboration_dispatch_body(
         body,
         identity_collector=discovered_collaboration_identities,
+        request=request,
     )
     if request is not None:
         bind_codex_collaboration_tool_identities(

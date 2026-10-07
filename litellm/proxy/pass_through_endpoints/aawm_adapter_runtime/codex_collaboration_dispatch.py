@@ -1000,7 +1000,7 @@ def _normalize_codex_message_payload(
     assignment = (
         parse_codex_collaboration_text_frame(normalized_payload)
         if normalized_payload is not None
-        else parse_codex_collaboration_text_frame(payload)
+        else _parse_codex_collaboration_payload(payload)
     )
     normalized_item = _NormalizedCodexAgentMessage(item)
     normalized_item["content"] = [
@@ -1391,24 +1391,23 @@ def _replay_canonical_codex_message_payload(
         return None
     if not isinstance(payload, str):
         return None
-    try:
-        if canonicalize_codex_send_message_argument(payload) == payload:
-            return payload
-    except CodexCollaborationDispatchError:
-        pass
-    if _is_opaque_representation(payload):
-        return None
-    try:
-        decoded, remainder = _decode_complete_json(payload)
-    except CodexCollaborationDispatchError:
-        return None
-    if remainder != len(payload) or not isinstance(decoded, dict):
-        return None
-    task_name = decoded.get("task_name", recipient)
-    if not isinstance(task_name, str) or not task_name:
-        return None
-    assignment_text = decoded.get("text")
-    if not isinstance(assignment_text, str) or not assignment_text:
+    task_name = recipient
+    assignment_text = payload
+    if not _is_opaque_representation(payload):
+        try:
+            decoded, remainder = _decode_complete_json(payload)
+        except CodexCollaborationDispatchError:
+            return None
+        if decoded is not None:
+            if remainder != len(payload) or not isinstance(decoded, dict):
+                return None
+            task_name = decoded.get("task_name", recipient)
+            if not isinstance(task_name, str) or not task_name:
+                return None
+            assignment_text = decoded.get("text")
+            if not isinstance(assignment_text, str) or not assignment_text:
+                return None
+    else:
         return None
     return validate_codex_message_capture_evidence(
         capture_evidence,
@@ -1435,7 +1434,7 @@ def _normalize_codex_message_payload(
     assignment = (
         parse_codex_collaboration_text_frame(normalized_payload)
         if normalized_payload is not None
-        else parse_codex_collaboration_text_frame(payload)
+        else _parse_codex_collaboration_payload(payload)
     )
     normalized_item = _NormalizedCodexAgentMessage(item)
     normalized_item["content"] = [
