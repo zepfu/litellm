@@ -31,3 +31,20 @@ server-owned `litellm_metadata` namespace does not.
 
 Direct non-OpenAI egress retains route-identity cleanup at the request envelope
 and top-level `input`/`output` items without traversing nested user/tool data.
+
+## Session Continuity and Final Send Binding
+
+Managed OpenAI session compatibility follows the hosted provider and the
+compatible endpoint/state contract. The stored model is a last-used attribute;
+a model change within that contract does not require a new session identity.
+Direct and alias requests use the same rule, including tool-result
+continuations. Foreign reservations and incompatible provider or state
+contracts remain protected by the existing ownership checks.
+
+Session continuity does not relax the prepared request's binding. Immediately
+before each provider send, the serialized model must match the selected model,
+and the URL, selected account and protected authentication headers must match
+that attempt's server-loaded binding. Account-bound state remains on its
+account unless the existing validated portable transition authorizes a move;
+same-provider model mobility does not authorize an account change or replay of
+already delivered output or tool effects.
