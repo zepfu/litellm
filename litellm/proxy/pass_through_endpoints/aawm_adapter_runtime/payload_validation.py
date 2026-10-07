@@ -30,6 +30,9 @@ from litellm.proxy._types import ProxyException
 from litellm.proxy.aawm_runtime_error_logging import (
     schedule_persist_malformed_tool_call_detection,
 )
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
+    gate_generated_codex_send_message_call_arguments,
+)
 
 from typing import TYPE_CHECKING
 
@@ -1725,6 +1728,58 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
         state["reason"] = state.get("invalid_reason") or reason
         _set_stream_validation_state(target, state)
 
+    def _gate_response_send_message_calls(response_body: Any) -> Any:
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
+            collect_codex_collaboration_advertised_tool_names,
+        )
+
+        if not isinstance(response_body, dict) or not isinstance(
+            request_body,
+            dict,
+        ):
+            return response_body
+        aliases = _mapping_or_attr_get(  # noqa: F821
+            response, "_aawm_codex_collaboration_aliases", None
+        )
+        if aliases is None:
+            from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
+                build_codex_collaboration_wire_aliases,
+                normalize_codex_collaboration_dispatch_body,
+            )
+
+            identities: list = []
+            normalize_codex_collaboration_dispatch_body(
+                dict(request_body),
+                identity_collector=identities,
+            )
+            aliases = build_codex_collaboration_wire_aliases(
+                tuple(identities),
+                reserved_names=collect_codex_collaboration_advertised_tool_names(
+                    request_body
+                ),
+            )
+            try:
+                setattr(
+                    response,
+                    "_aawm_codex_collaboration_aliases",
+                    aliases,
+                )
+            except Exception:
+                pass
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
+            is_codex_collaboration_send_message_identity,
+        )
+
+        upstream_names = {
+            alias.upstream_name
+            for alias in aliases
+            if is_codex_collaboration_send_message_identity(alias.original)
+        }
+        return gate_generated_codex_send_message_call_arguments(
+            response_body.get("output"),
+            upstream_names,
+        )
+
     def _validated_stream_state() -> dict[str, Any]:
         return {
             "complete": False,
@@ -2462,6 +2517,11 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
         if restored_namespace_tool_count:
             response_body = restored_body
             response_changed = True
+        gated_output = _gate_response_send_message_calls(response_body)
+        if gated_output is not response_body.get("output"):
+            response_body = dict(response_body)
+            response_body["output"] = gated_output
+            response_changed = True
         if _is_codex_auto_agent_malformed_tool_call_text_output(
             response_body
         ) and not _anthropic_grok_composer_repair.response_body_has_structured_tool_calls(
@@ -2624,6 +2684,10 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             )
             if restored_namespace_tool_count:
                 response_body = restored_body
+            gated_output = _gate_response_send_message_calls(response_body)
+            if gated_output is not response_body.get("output"):
+                response_body = dict(response_body)
+                response_body["output"] = gated_output
             if _is_codex_auto_agent_malformed_tool_call_text_output(
                 response_body
             ) and not _anthropic_grok_composer_repair.response_body_has_structured_tool_calls(

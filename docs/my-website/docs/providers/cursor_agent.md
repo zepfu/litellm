@@ -260,12 +260,16 @@ retries or profile changes cannot repair an existing ciphertext blob. Other
 envelope shapes, encrypted reasoning, and provider-owned continuation state
 remain subject to the existing ownership guards.
 
-Generated `send_message` output is normalized at the route boundary: a strict
-frame is unchanged, plain readable text is wrapped in a strict frame with its
-exact text preserved, and opaque or unsupported frame shapes fail closed. A
-captured MESSAGE with verified author/recipient identity can be canonicalized
-on replay when its stored payload is readable; identity is never inferred and
-unreadable history remains rejected.
+Generated `send_message` output is normalized at the response boundary: a
+strict frame is unchanged, plain readable text is wrapped in a strict frame
+with its exact text preserved, and a four-key frame is projected only when its
+`task_name` exactly equals the call target and its other fields are valid.
+Other unsafe shapes carry a corrective marker rejected by Codex before
+delivery; a locally unrepresentable call raises
+`aawm_cfg072_send_message_output_rejected`. Request history is not rewritten.
+Replay recovery of a captured MESSAGE requires exact request-local capture
+evidence for its delivered bytes, author, recipient, and target resolution;
+supported prose and four-key payloads then project to the same strict frame.
 
 For native OpenAI Responses egress, reserved `collaboration.*` function names
 are replaced only for the recognized V2 identities with deterministic,

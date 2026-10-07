@@ -59,6 +59,7 @@ class OpenAIResponsesWireState(str, Enum):
 _KNOWN_POLICY_FAILURE_CODES = frozenset(
     {
         "aawm_repetitive_output_loop",
+        "aawm_cfg072_send_message_output_rejected",
         "aawm_watermark_output_rejected",
     }
 )

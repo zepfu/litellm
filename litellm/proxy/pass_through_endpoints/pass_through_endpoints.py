@@ -440,9 +440,63 @@ def _restore_responses_sse_payload(
     return updated
 
 
+def _responses_send_message_upstream_names(
+    request_body: dict[str, Any],
+) -> frozenset[str]:
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
+        collect_codex_collaboration_advertised_tool_names,
+        is_codex_collaboration_send_message_identity,
+        normalize_codex_collaboration_dispatch_body,
+        build_codex_collaboration_wire_aliases,
+    )
+
+    identities: list[Any] = []
+    normalize_codex_collaboration_dispatch_body(
+        dict(request_body),
+        identity_collector=identities,
+    )
+    aliases = build_codex_collaboration_wire_aliases(
+        tuple(identities),
+        reserved_names=collect_codex_collaboration_advertised_tool_names(
+            request_body
+        ),
+    )
+    upstream_names = {
+        alias.upstream_name
+        for alias in aliases
+        if is_codex_collaboration_send_message_identity(alias.original)
+    }
+    return frozenset(upstream_names)
+
+
+def _gate_responses_send_message_calls_in_body(
+    response_body: Any,
+    *,
+    request_body: Any,
+    rewrite: ResponsesFunctionNameRewrite,
+) -> Any:
+    """Gate generated send-message calls in a fully restored response body."""
+    if not isinstance(response_body, dict) or not isinstance(request_body, dict):
+        return response_body
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
+        gate_generated_codex_send_message_call_arguments,
+    )
+
+    upstream_names = _responses_send_message_upstream_names(request_body)
+    gated_output = gate_generated_codex_send_message_call_arguments(
+        response_body.get("output"),
+        upstream_names,
+    )
+    if gated_output is response_body.get("output"):
+        return response_body
+    return {**response_body, "output": gated_output}
+
+
 def _restore_responses_sse_frame(
     frame: bytes,
     rewrite: ResponsesFunctionNameRewrite,
+    *,
+    cfg072_request_body: Optional[dict[str, Any]] = None,
 ) -> bytes:
     data_lines: list[tuple[int, bytes, bytes, bytes]] = []
     saw_done = False
@@ -478,6 +532,43 @@ def _restore_responses_sse_frame(
         return frame
 
     restored = _restore_responses_sse_payload(payload, rewrite)
+    if cfg072_request_body is not None:
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
+            gate_generated_codex_send_message_call_arguments,
+        )
+
+        upstream_names = _responses_send_message_upstream_names(
+            cfg072_request_body
+        )
+        event_type = payload.get("type")
+        if event_type in {
+            "response.output_item.added",
+            "response.output_item.done",
+        }:
+            item = payload.get("item")
+            if isinstance(item, dict) and item.get("type") == "function_call":
+                gated_item = gate_generated_codex_send_message_call_arguments(
+                    [item],
+                    upstream_names,
+                )
+                if (
+                    isinstance(gated_item, list)
+                    and gated_item != [item]
+                    and gated_item
+                ):
+                    restored = {**restored, "item": gated_item[0]}
+        elif event_type == "response.completed":
+            response = payload.get("response")
+            if isinstance(response, dict):
+                gated_output = gate_generated_codex_send_message_call_arguments(
+                    response.get("output"),
+                    upstream_names,
+                )
+                if gated_output is not response.get("output"):
+                    restored = {
+                        **restored,
+                        "response": {**response, "output": gated_output},
+                    }
     if restored is payload:
         return frame
 
@@ -513,6 +604,8 @@ def _next_sse_frame_boundary(buffer: bytes) -> Optional[tuple[int, int]]:
 async def _restore_responses_function_names_in_sse_chunks(
     chunks: Any,
     rewrite: ResponsesFunctionNameRewrite,
+    *,
+    cfg072_request_body: Optional[dict[str, Any]] = None,
 ) -> AsyncIterator[bytes]:
     buffer = b""
     async for chunk in chunks:
@@ -528,10 +621,18 @@ async def _restore_responses_function_names_in_sse_chunks(
             complete_end = frame_end + delimiter_length
             frame = buffer[:complete_end]
             buffer = buffer[complete_end:]
-            yield _restore_responses_sse_frame(frame, rewrite)
+            yield _restore_responses_sse_frame(
+                frame,
+                rewrite,
+                cfg072_request_body=cfg072_request_body,
+            )
 
     if buffer:
-        yield _restore_responses_sse_frame(buffer, rewrite)
+        yield _restore_responses_sse_frame(
+            buffer,
+            rewrite,
+            cfg072_request_body=cfg072_request_body,
+        )
 
 
 # Global registry to track registered pass-through routes and prevent memory leaks
@@ -7982,11 +8083,8 @@ async def pass_through_request(  # noqa: PLR0915
         ):
             from .aawm_adapter_runtime.codex_collaboration_dispatch import (
                 build_codex_collaboration_wire_aliases,
-                CodexCollaborationDispatchError,
                 collect_codex_collaboration_advertised_tool_names,
                 get_bound_codex_collaboration_tool_identities,
-                is_codex_collaboration_send_message_identity,
-                raise_codex_send_message_normalization_unreadable,
             )
 
             collaboration_aliases = build_codex_collaboration_wire_aliases(
@@ -8004,31 +8102,6 @@ async def pass_through_request(  # noqa: PLR0915
             )
             if responses_function_name_rewrite.changed:
                 provider_bound_body = responses_function_name_rewrite.body
-            send_message_upstream_names = frozenset(
-                upstream_name
-                for identity, upstream_name in (
-                    responses_function_name_rewrite.original_identity_to_upstream.items()
-                )
-                if is_codex_collaboration_send_message_identity(identity)
-            )
-            if send_message_upstream_names and isinstance(
-                provider_bound_body,
-                dict,
-            ):
-                from .aawm_adapter_runtime.openai_responses_body import (
-                    _canonicalize_codex_send_message_calls,
-                )
-
-                try:
-                    canonicalized_input = _canonicalize_codex_send_message_calls(
-                        provider_bound_body.get("input"),
-                        send_message_upstream_names,
-                    )
-                except CodexCollaborationDispatchError as exc:
-                    raise_codex_send_message_normalization_unreadable(exc.reason)
-                if canonicalized_input is not provider_bound_body.get("input"):
-                    provider_bound_body = dict(provider_bound_body)
-                    provider_bound_body["input"] = canonicalized_input
         local_prepare_completed_at = datetime.now()
         local_prepare_ms = _record_passthrough_duration(
             kwargs,
@@ -9599,6 +9672,9 @@ async def pass_through_request(  # noqa: PLR0915
                 processed_chunks = _restore_responses_function_names_in_sse_chunks(
                     processed_chunks,
                     responses_function_name_rewrite,
+                    cfg072_request_body=(
+                        _parsed_body if isinstance(_parsed_body, dict) else None
+                    ),
                 )
             wrapper_cleanup_source = processed_chunks
             wrapper_setup_failure: Optional[BaseException] = None
@@ -10110,6 +10186,9 @@ async def pass_through_request(  # noqa: PLR0915
                 processed_chunks = _restore_responses_function_names_in_sse_chunks(
                     processed_chunks,
                     responses_function_name_rewrite,
+                    cfg072_request_body=(
+                        _parsed_body if isinstance(_parsed_body, dict) else None
+                    ),
                 )
             wrapper_cleanup_source = processed_chunks
             wrapper_setup_failure: Optional[BaseException] = None
@@ -10347,6 +10426,11 @@ async def pass_through_request(  # noqa: PLR0915
                 response_body,
                 responses_function_name_rewrite.upstream_to_original,
                 responses_function_name_rewrite.upstream_to_original_identities,
+            )
+            restored_response_body = _gate_responses_send_message_calls_in_body(
+                restored_response_body,
+                request_body=_parsed_body,
+                rewrite=responses_function_name_rewrite,
             )
             if restored_response_body is not response_body:
                 response_body = restored_response_body

@@ -36,14 +36,10 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.direct_openai_fun
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
     _NormalizedCodexAgentMessage,
     bind_codex_collaboration_tool_identities,
-    canonicalize_codex_send_message_call_arguments,
     build_codex_collaboration_wire_aliases,
-    CodexCollaborationDispatchError,
     collect_codex_collaboration_advertised_tool_names,
     get_bound_codex_collaboration_tool_identities,
-    is_codex_collaboration_send_message_identity,
     normalize_codex_collaboration_dispatch_body,
-    raise_codex_send_message_normalization_unreadable,
 )
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
     PROVENANCE_ITEM_FIELD,
@@ -98,32 +94,6 @@ def _raise_wire_body_immutable(*args: Any, **kwargs: Any) -> NoReturn:
     """Reject mutation of the exact provider-bound JSON payload."""
     _ = (args, kwargs)
     raise TypeError("OpenAI Responses wire body is immutable")
-
-
-def _canonicalize_codex_send_message_calls(
-    value: Any,
-    upstream_names: frozenset[str],
-) -> Any:
-    """Canonicalize response-derived send-message calls on known surfaces."""
-    if not upstream_names or not isinstance(value, list):
-        return value
-    changed = False
-    result = list(value)
-    for index, item in enumerate(result):
-        if not isinstance(item, dict) or item.get("type") != "function_call":
-            continue
-        if item.get("name") not in upstream_names:
-            continue
-        canonical_arguments = canonicalize_codex_send_message_call_arguments(
-            item.get("arguments")
-        )
-        if canonical_arguments == item.get("arguments"):
-            continue
-        updated_item = dict(item)
-        updated_item["arguments"] = canonical_arguments
-        result[index] = updated_item
-        changed = True
-    return result if changed else value
 
 
 class _FrozenWireDict(dict[str, Any]):
@@ -492,12 +462,6 @@ def compile_openai_responses_wire_body(
     forced_identity_rewrites = {
         alias.original: alias.upstream_name for alias in collaboration_aliases
     }
-    send_message_upstream_names = frozenset(
-        upstream_name
-        for identity, upstream_name in forced_identity_rewrites.items()
-        if is_codex_collaboration_send_message_identity(identity)
-    )
-
     # 1. Legacy function-history id normalization (direct + alias contract).
     body = normalize_direct_openai_legacy_function_call_history_ids(body)
 
@@ -522,18 +486,6 @@ def compile_openai_responses_wire_body(
     )
     if name_rewrite.changed and isinstance(name_rewrite.body, dict):
         body = name_rewrite.body
-    if send_message_upstream_names:
-        try:
-            canonicalized_input = _canonicalize_codex_send_message_calls(
-                body.get("input"),
-                send_message_upstream_names,
-            )
-        except CodexCollaborationDispatchError as exc:
-            raise_codex_send_message_normalization_unreadable(exc.reason)
-        if canonicalized_input is not body.get("input"):
-            body = dict(body)
-            body["input"] = canonicalized_input
-
     # 4. Watermark egress.
     body, watermark_audit = _apply_watermark_egress(
         body=body,

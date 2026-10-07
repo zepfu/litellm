@@ -268,14 +268,23 @@ Encrypted reasoning and function outputs retain their separate handling.
 
 For outbound generated `collaboration.send_message` calls, AAWM preserves a
 valid strict frame byte for byte and wraps plain readable text in that frame
-without trimming or rewriting it. The call must have exactly `message` and
-`target`; opaque, frame-shaped, or four-key values fail closed instead of
-guessing recipient semantics. This response-phase failure is identified as
-`codex_collaboration_send_message_normalization` and does not claim that no
-provider call was attempted. Captured history gets one bounded recovery only:
-if a MESSAGE item has actual matching author and recipient identity and its
-captured payload is readable, replay canonicalizes that payload; bare visible
-envelopes and unreadable payloads still fail closed.
+without trimming or rewriting it. A four-key CFG-047 frame is projected to the
+strict frame only when `task_name` is nonempty, exactly equals the call's
+`target`, and the remaining fields form a valid frame; other unsupported
+shapes are replaced by a corrective marker that the deployed Codex tool parser
+rejects, preserving the original `target` and string `message` values. A call
+that cannot be safely represented raises the response-phase wire failure
+`aawm_cfg072_send_message_output_rejected`; provider work is not described as
+unattempted. The gate applies to generated response output, including targeted
+SSE executable arguments and terminal response copies, and does not rewrite
+the original request history.
+
+Replaying an affected MESSAGE requires request-local capture evidence binding
+the exact delivered sender-message bytes to the native author, recipient, and
+target resolution. A strict frame is preserved, while a supported prose or
+four-key captured payload is projected to that exact strict frame. Identity
+alone, malformed JSON, opaque payload, and mismatched identity or target remain
+rejected.
 
 Managed `oa_xai` Responses preparation applies the existing catalog/model-
 metadata-driven `rewrite_input_item_types` continuation rewrite before xAI
