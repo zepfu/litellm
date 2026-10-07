@@ -2227,13 +2227,13 @@ def _strict_managed_openai_owner_comparison(
     owner_attributes: Mapping[str, Any],
     requested_attributes: Mapping[str, Any],
 ) -> tuple[bool, Optional[str]]:
-    """Compare a managed OpenAI owner without ordinary mobility exceptions.
+    """Compare managed OpenAI ownership while preserving model mobility.
 
-    The normal owner comparator intentionally permits model and account changes
-    for same-hosted-provider OpenAI routes. This separate mode is used only by
-    callers that have established an ordinary managed-OpenAI continuation.
-    Explicit portable transitions must leave this mode disabled and continue
-    through their existing transition validation.
+    The final send uses the same hosted-provider model-mobility contract as
+    selection. Account identity remains exact here; explicit portable account
+    transitions continue through their existing transition validation. The
+    prepared request's selected model and authentication binding are validated
+    separately before provider egress.
     """
 
     owner = _core_owner_attributes(owner_attributes)
@@ -2248,11 +2248,9 @@ def _strict_managed_openai_owner_comparison(
             "session_owner: strict managed OpenAI route contract mismatch",
         )
 
-    for key in ("provider", "model"):
-        owner_value = _clean_optional_str(owner.get(key))
-        requested_value = _clean_optional_str(requested.get(key))
-        if owner_value != requested_value:
-            return True, f"session_owner: strict {key} mismatch"
+    incomplete = incomplete_owner_attribute_reason(owner, for_promotion=False)
+    if incomplete is not None:
+        return True, incomplete
 
     for key in ("account_label", "account_hash", "account_lane"):
         owner_value = _clean_optional_str(owner.get(key))
