@@ -243,6 +243,23 @@ Codex 0.149 may advertise the same collaboration children as
 names as aliases of the catalog adapters so `spawn_agent` / `wait` stay
 function tools and are not dropped as an unsupported hosted `namespace`.
 
+Stock Codex V2 carries the collaboration tool's `message` string unchanged
+in an `agent_message` encrypted-content slot. AAWM advertises a plaintext
+CFG-047 frame for `spawn_agent`, `followup_task`, and `send_message`:
+`{"cfg047":1,"encoding":"text","text":"<exact assignment text>"}`.
+Native OpenAI egress uses nonreserved wire aliases, with the existing inverse
+restoring the client's tool identity and leaving arguments unchanged. Alias
+discovery survives repeated preparation of the normalized schema, including
+copies without the earlier request's local identity map.
+
+On recipient ingress, both `NEW_TASK` and `MESSAGE` encrypted-content slots
+must contain a complete valid frame. AAWM decodes its exact text and preserves
+the envelope's author, recipient, and task identity. Unknown, malformed, or
+opaque assignments fail before provider egress with HTTP 409,
+`aawm_codex_assignment_unreadable`, and `non_resumable: true`. Ciphertext is
+never displayed as an assignment or recovered by guessing task content.
+Encrypted reasoning and function outputs retain their separate handling.
+
 Managed `oa_xai` Responses preparation applies the existing catalog/model-
 metadata-driven `rewrite_input_item_types` continuation rewrite before xAI
 request sanitization. The rewrite runs only when model metadata requests those

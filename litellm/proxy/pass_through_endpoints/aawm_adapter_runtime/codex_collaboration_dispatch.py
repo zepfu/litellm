@@ -317,30 +317,29 @@ def parse_codex_collaboration_text_frame(value: Any) -> str:
     text = decoded.get("text")
     if not isinstance(text, str) or not text:
         raise CodexCollaborationDispatchError("invalid_envelope")
+    if _is_opaque_representation(text):
+        raise CodexCollaborationDispatchError("opaque")
     return text
 
 
 def _parse_codex_collaboration_payload(value: Any) -> str:
-    """Accept plaintext and materialize CFG-047 without rejecting opaque text.
-
-    Codex has shipped more than one assignment representation.  A payload
-    that starts like JSON may be a client-owned serialized assignment rather
-    than a complete CFG-047 frame, so an unknown frame shape must be preserved
-    byte-for-byte for the child route instead of becoming a pre-egress 409.
-    """
+    """Validate visible task text; encrypted slots require a complete frame."""
     if not isinstance(value, str) or not value or len(value) > _MAX_FRAME_CHARS:
         raise CodexCollaborationDispatchError("invalid_envelope")
+    if _is_opaque_representation(value):
+        raise CodexCollaborationDispatchError("opaque")
     if _FRAME_PREFIX_PATTERN.match(value):
-        try:
-            return parse_codex_collaboration_text_frame(value)
-        except CodexCollaborationDispatchError as exc:
-            if exc.reason != "unknown_representation":
-                raise
+        return parse_codex_collaboration_text_frame(value)
     return value
 
 
 def _is_opaque_representation(value: str) -> bool:
-    return any(value.startswith(prefix) for prefix in _OPAQUE_PREFIXES)
+    stripped = value.strip()
+    return any(stripped.startswith(prefix) for prefix in _OPAQUE_PREFIXES) or (
+        len(stripped) >= 64
+        and stripped.startswith("gAAAA")
+        and re.fullmatch(r"[A-Za-z0-9_=-]+", stripped) is not None
+    )
 
 
 def _schema_has_unsupported_composition(schema: Mapping[str, Any]) -> bool:
@@ -438,11 +437,16 @@ def _normalize_targeted_parameters(
         parameters,
         tool_name=tool_name,
     )
-    if message_schema.get("encrypted") is not True:
+    description = message_schema.get("description")
+    if (
+        "encrypted" not in message_schema
+        and isinstance(description, str)
+        and _MESSAGE_FRAME_INSTRUCTION in description
+    ):
         return parameters, False
 
     normalized_message = dict(message_schema)
-    normalized_message.pop("encrypted")
+    normalized_message.pop("encrypted", None)
     normalized_message["description"] = _append_frame_instruction(
         normalized_message.get("description")
     )
@@ -532,9 +536,19 @@ def _is_canonical_v2_tool_schema(
     *,
     tool_name: str,
 ) -> bool:
-    """Require the encrypted message contract before bare-name matching."""
+    """Recognize the stock schema and our already prepared plaintext schema."""
     if not _has_encrypted_message_marker(parameters):
-        return False
+        if not isinstance(parameters, dict):
+            return False
+        properties = parameters.get("properties")
+        message = properties.get("message") if isinstance(properties, dict) else None
+        if (
+            not isinstance(message, dict)
+            or "encrypted" in message
+            or not isinstance(message.get("description"), str)
+            or _MESSAGE_FRAME_INSTRUCTION not in message["description"]
+        ):
+            return False
     _message_schema(parameters, tool_name=tool_name)
     return True
 
@@ -625,8 +639,6 @@ def _normalize_function_tool(
         parameters,
         tool_name=target_name,
     )
-    if not changed:
-        return tool, False
     if identity_collector is not None:
         explicit_namespace = _tool_namespace(tool, function)
         (
@@ -647,6 +659,11 @@ def _normalize_function_tool(
                 original_namespace=original_namespace,
             )
         )
+
+    # Alias discovery must survive repeated preparation and copied requests;
+    # it is not a side effect of removing the encryption annotation.
+    if not changed:
+        return tool, False
 
     normalized_tool = dict(tool)
     if function is tool:
@@ -823,10 +840,7 @@ def _normalize_codex_message_payload(
     visible_text: str,
     payload: Any,
 ) -> tuple[dict[str, Any], bool]:
-    try:
-        assignment = parse_codex_collaboration_text_frame(payload)
-    except CodexCollaborationDispatchError:
-        return item, False
+    assignment = parse_codex_collaboration_text_frame(payload)
     normalized_item = _NormalizedCodexAgentMessage(item)
     normalized_item["content"] = [
         {
@@ -851,7 +865,7 @@ def _validate_visible_agent_message(
     message_type, task_name, sender, payload_offset = envelope
     _validate_envelope_identity(item, task_name=task_name, sender=sender)
     remainder = visible_text[payload_offset:]
-    if message_type != "NEW_TASK":
+    if message_type not in {"NEW_TASK", "MESSAGE"}:
         # A child result is content, even when its text happens to begin with
         # a representation-looking prefix. Never reinterpret it as a task.
         return None
@@ -918,7 +932,7 @@ def _normalize_agent_message_item(item: dict[str, Any]) -> tuple[dict[str, Any],
         payload = payload_part.get("encrypted_content")
         if not isinstance(payload, str) or not payload:
             raise CodexCollaborationDispatchError("invalid_envelope")
-        assignment = _parse_codex_collaboration_payload(payload)
+        assignment = parse_codex_collaboration_text_frame(payload)
         normalized_item = _NormalizedCodexAgentMessage(item)
         normalized_item["content"] = [
             {
