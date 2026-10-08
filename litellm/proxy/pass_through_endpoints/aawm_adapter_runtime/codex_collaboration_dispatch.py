@@ -957,47 +957,141 @@ def canonicalize_generated_codex_send_message_call_arguments(
     if not isinstance(value, str) or not value:
         raise CodexCollaborationDispatchError("invalid_envelope")
     try:
-        decoded, remainder = _decode_complete_json(value)
+        decoded = _decode_generated_codex_send_message_outer_arguments(value)
     except CodexCollaborationDispatchError:
         raise
-    if remainder != len(value) or not isinstance(decoded, dict):
+    if not isinstance(decoded, dict):
         raise CodexCollaborationDispatchError("invalid_envelope")
-    if set(decoded) != {"message", "target"}:
-        raise CodexCollaborationDispatchError("unknown_representation")
     if CFG072_REJECT_MARKER in decoded:
         raise CodexCollaborationDispatchError("marker_collision")
+    if not set(decoded).issubset({"message", "target"}):
+        raise CodexCollaborationDispatchError("unknown_representation")
+
     target = decoded.get("target")
     message = decoded.get("message")
-    if not isinstance(target, str) or not target:
-        raise CodexCollaborationDispatchError("invalid_envelope")
     if (
         isinstance(message, str)
         and message
         and not _is_opaque_representation(message)
-        and _FRAME_PREFIX_PATTERN.match(message)
     ):
-        projected = _project_generated_four_key_frame(message, target=target)
-        if projected is not None:
-            return json.dumps(
-                {"message": projected, "target": target},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
+        if _is_generated_codex_frame_like(message):
+            if (
+                isinstance(target, str)
+                and target
+                and _is_valid_generated_codex_strict_frame(message)
+            ):
+                return value
+            if isinstance(target, str) and target:
+                projected = _project_generated_four_key_frame(
+                    message,
+                    target=target,
+                )
+                if projected is not None:
+                    return json.dumps(
+                        {"message": projected, "target": target},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+            return _serialize_generated_codex_send_message_rejection(decoded)
+
+    if not isinstance(target, str) or not target or not isinstance(message, str):
+        return _serialize_generated_codex_send_message_rejection(decoded)
+
     try:
         canonical_message = canonicalize_codex_send_message_argument(message)
     except CodexCollaborationDispatchError:
-        rejected: dict[str, Any] = {CFG072_REJECT_MARKER: True}
-        if isinstance(message, str):
-            rejected["message"] = message
-        if isinstance(target, str):
-            rejected["target"] = target
-        return json.dumps(
-            rejected,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
+        return _serialize_generated_codex_send_message_rejection(decoded)
     return json.dumps(
         {"message": canonical_message, "target": target},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _decode_generated_codex_send_message_outer_arguments(
+    value: str,
+) -> Any:
+    try:
+        return json.loads(
+            value,
+            object_pairs_hook=_duplicate_rejecting_object,
+            parse_constant=_reject_generated_json_constant,
+        )
+    except CodexCollaborationDispatchError:
+        raise
+    except (RecursionError, TypeError, ValueError):
+        raise CodexCollaborationDispatchError("unknown_representation") from None
+
+
+def _reject_generated_json_constant(_value: str) -> Any:
+    raise CodexCollaborationDispatchError("invalid_envelope")
+
+
+def _is_generated_codex_frame_like(value: str) -> bool:
+    try:
+        decoded, remainder = _decode_complete_json(value)
+    except CodexCollaborationDispatchError:
+        return (
+            value.lstrip().startswith("{")
+            and re.search(r'"(?:cfg047|task_name)"\s*:', value) is not None
+        )
+    if remainder != len(value) or not isinstance(decoded, dict):
+        return (
+            value.lstrip().startswith("{")
+            and re.search(r'"(?:cfg047|task_name)"\s*:', value) is not None
+        )
+    return bool({"cfg047", "task_name"} & decoded.keys())
+
+
+def _is_valid_generated_codex_strict_frame(value: str) -> bool:
+    if not value or len(value) > _MAX_FRAME_CHARS:
+        return False
+    try:
+        decoded, remainder = _decode_complete_json(value)
+    except CodexCollaborationDispatchError:
+        return False
+    if (
+        remainder != len(value)
+        or not isinstance(decoded, dict)
+        or set(decoded) != {"cfg047", "encoding", "text"}
+    ):
+        return False
+    frame_version = decoded.get("cfg047")
+    text = decoded.get("text")
+    if (
+        not isinstance(frame_version, int)
+        or isinstance(frame_version, bool)
+        or frame_version != COLLABORATION_FRAME_VERSION
+        or decoded.get("encoding") != COLLABORATION_TEXT_ENCODING
+        or not isinstance(text, str)
+        or not text
+        or _is_opaque_representation(text)
+    ):
+        return False
+    canonical = json.dumps(
+        {
+            "cfg047": COLLABORATION_FRAME_VERSION,
+            "encoding": COLLABORATION_TEXT_ENCODING,
+            "text": text,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    try:
+        return parse_codex_collaboration_text_frame(canonical) == text
+    except CodexCollaborationDispatchError:
+        return False
+
+
+def _serialize_generated_codex_send_message_rejection(
+    arguments: Mapping[str, Any],
+) -> str:
+    rejected: dict[str, Any] = {CFG072_REJECT_MARKER: True}
+    for key in ("message", "target"):
+        if key in arguments:
+            rejected[key] = arguments[key]
+    return json.dumps(
+        rejected,
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -1194,8 +1288,7 @@ def _capture_session_matches(entry: Any, record: Any) -> bool:
     )
 
 
-def admit_codex_verified_capture_replay(
-    request: Any,
+def _validate_codex_verified_capture_pair_records(
     request_body: Mapping[str, Any],
     *,
     capture_manifest: Any,
@@ -1204,48 +1297,12 @@ def admit_codex_verified_capture_replay(
     sender_record: Any,
     receiver_session_record: Any,
     receiver_record: Any,
-) -> bool:
-    """Admit one operator-selected local capture pair onto this request only.
-
-    The caller supplies the untouched JSONL rows selected by the operator.
-    Request-body fields never establish trust, and no capture is retained
-    outside this request.
-    """
-    try:
-        evidence = _build_codex_verified_capture_evidence(
-            request_body,
-            capture_manifest=capture_manifest,
-            capture_name=capture_name,
-            sender_session_record=sender_session_record,
-            sender_record=sender_record,
-            receiver_session_record=receiver_session_record,
-            receiver_record=receiver_record,
-        )
-    except CodexCollaborationDispatchError:
-        return False
-
-    state = getattr(request, "state", None)
-    if state is None:
-        return False
-    if getattr(state, CODEX_CAPTURE_EVIDENCE_STATE_FIELD, None) is not None:
-        return False
-    try:
-        setattr(state, CODEX_CAPTURE_EVIDENCE_STATE_FIELD, evidence)
-    except Exception:
-        return False
-    return True
-
-
-def _build_codex_verified_capture_evidence(
-    request_body: Mapping[str, Any],
-    *,
-    capture_manifest: Any,
-    capture_name: str,
-    sender_session_record: Any,
-    sender_record: Any,
-    receiver_session_record: Any,
-    receiver_record: Any,
-) -> _CodexVerifiedCaptureEvidence:
+) -> tuple[
+    Mapping[str, Any],
+    Mapping[str, Any],
+    Mapping[str, Any],
+    Mapping[str, Any],
+]:
     if (
         not isinstance(capture_manifest, Mapping)
         or capture_manifest.get("schema") != "cfg072-verified-captures-v1"
@@ -1300,6 +1357,75 @@ def _build_codex_verified_capture_evidence(
         or receiver_record.get("timestamp") != receiver_entry.get("timestamp")
     ):
         raise CodexCollaborationDispatchError("capture_binding")
+    return sender_entry, receiver_entry, sender, receiver
+
+
+def admit_codex_verified_capture_replay(
+    request: Any,
+    request_body: Mapping[str, Any],
+    *,
+    capture_manifest: Any,
+    capture_name: str,
+    sender_session_record: Any,
+    sender_record: Any,
+    receiver_session_record: Any,
+    receiver_record: Any,
+) -> bool:
+    """Admit one operator-selected local capture pair onto this request only.
+
+    The caller supplies the untouched JSONL rows selected by the operator.
+    Request-body fields never establish trust, and no capture is retained
+    outside this request.
+    """
+    try:
+        evidence = _build_codex_verified_capture_evidence(
+            request_body,
+            capture_manifest=capture_manifest,
+            capture_name=capture_name,
+            sender_session_record=sender_session_record,
+            sender_record=sender_record,
+            receiver_session_record=receiver_session_record,
+            receiver_record=receiver_record,
+        )
+    except CodexCollaborationDispatchError:
+        return False
+
+    state = getattr(request, "state", None)
+    if state is None:
+        return False
+    if getattr(state, CODEX_CAPTURE_EVIDENCE_STATE_FIELD, None) is not None:
+        return False
+    try:
+        setattr(state, CODEX_CAPTURE_EVIDENCE_STATE_FIELD, evidence)
+    except Exception:
+        return False
+    return True
+
+
+def _build_codex_verified_capture_evidence(
+    request_body: Mapping[str, Any],
+    *,
+    capture_manifest: Any,
+    capture_name: str,
+    sender_session_record: Any,
+    sender_record: Any,
+    receiver_session_record: Any,
+    receiver_record: Any,
+) -> _CodexVerifiedCaptureEvidence:
+    (
+        sender_entry,
+        receiver_entry,
+        sender,
+        receiver,
+    ) = _validate_codex_verified_capture_pair_records(
+        request_body,
+        capture_manifest=capture_manifest,
+        capture_name=capture_name,
+        sender_session_record=sender_session_record,
+        sender_record=sender_record,
+        receiver_session_record=receiver_session_record,
+        receiver_record=receiver_record,
+    )
 
     sender_tool = sender_entry.get("tool")
     outer_arguments = sender_entry.get("outer_arguments")
