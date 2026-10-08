@@ -2375,6 +2375,9 @@ def _maybe_wrap_xai_passthrough_responses_stream(
 ) -> Response:
     """Live-forward CFG-025 wrap for xAI alias Responses SSE."""
     from fastapi.responses import StreamingResponse
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_generated_send_message_gate import (
+        CODEX_SEND_MESSAGE_OUTPUT_GATE_ATTR,
+    )
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.repetitive_output import (
         inherit_or_wrap_passthrough_streaming_response,
         maybe_wrap_passthrough_responses_stream,
@@ -2385,6 +2388,23 @@ def _maybe_wrap_xai_passthrough_responses_stream(
 
     if not isinstance(response, StreamingResponse):
         return response
+    output_gate = getattr(response, CODEX_SEND_MESSAGE_OUTPUT_GATE_ATTR, None)
+    output_gate_applied = getattr(
+        response,
+        f"{CODEX_SEND_MESSAGE_OUTPUT_GATE_ATTR}_applied",
+        False,
+    )
+
+    def _preserve_output_gate(target: Response) -> Response:
+        if output_gate is not None:
+            setattr(target, CODEX_SEND_MESSAGE_OUTPUT_GATE_ATTR, output_gate)
+            setattr(
+                target,
+                f"{CODEX_SEND_MESSAGE_OUTPUT_GATE_ATTR}_applied",
+                output_gate_applied,
+            )
+        return target
+
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.payload_validation import (
         prepare_responses_prefetch_lifecycle,
     )
@@ -2407,9 +2427,11 @@ def _maybe_wrap_xai_passthrough_responses_stream(
         request_context=request_context,
     )
     if wrapped_iter is response.body_iterator:
-        return inherit_or_wrap_passthrough_streaming_response(
-            response,
-            request_context=request_context,
+        return _preserve_output_gate(
+            inherit_or_wrap_passthrough_streaming_response(
+                response,
+                request_context=request_context,
+            )
         )
     reconstructed = StreamingResponse(
         wrapped_iter,
@@ -2417,10 +2439,12 @@ def _maybe_wrap_xai_passthrough_responses_stream(
         status_code=response.status_code,
         media_type=response.media_type or "text/event-stream",
     )
-    return inherit_or_wrap_passthrough_streaming_response(
-        reconstructed,
-        source_response=response,
-        request_context=request_context,
+    return _preserve_output_gate(
+        inherit_or_wrap_passthrough_streaming_response(
+            reconstructed,
+            source_response=response,
+            request_context=request_context,
+        )
     )
 
 
@@ -7625,6 +7649,7 @@ async def _handle_codex_cohere_chat_completions_adapter_route(
         adapter="codex_cohere_chat_completions_adapter",
         adapter_label="Cohere",
         intake_context=intake_context,
+        codex_request=request,
         request_body=prepared_request_body,
     )
     if isinstance(validated_response, StreamingResponse):
@@ -8103,6 +8128,7 @@ async def _handle_codex_nvidia_completion_adapter_route(
         adapter="codex_nvidia_completion_adapter",
         adapter_label="NVIDIA",
         intake_context=intake_context,
+        codex_request=request,
         request_body=prepared_request_body,
     )
     if isinstance(validated_response, StreamingResponse):
@@ -8172,6 +8198,7 @@ async def _perform_codex_auto_agent_muse_code_responses_request(
             upstream_url=MUSE_CODE_RESPONSES_UPSTREAM_URL,
             provider=MUSE_CODE_ROUTE_FAMILY,
         ),
+        codex_request=request,
         request_body=request_body,
     )
     if isinstance(response, StreamingResponse):
@@ -8476,6 +8503,7 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
             adapter="codex_auto_agent_grok_native_responses",
             adapter_label="Grok native",
             intake_context=grok_intake_context,
+            codex_request=request,
             request_body=canonical_request_body,
         )
         if isinstance(validated_response, StreamingResponse):
@@ -8628,6 +8656,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
             adapter="codex_auto_agent_xai_oauth_responses",
             adapter_label="xAI OAuth",
             intake_context=xai_intake_context,
+            codex_request=request,
             request_body=canonical_request_body,
         )
         if isinstance(validated_response, StreamingResponse):
@@ -9719,6 +9748,7 @@ async def _handle_codex_kimi_chat_completions_adapter_route(
         adapter="codex_kimi_chat_completions_adapter",
         adapter_label="Kimi Code",
         intake_context=intake_context,
+        codex_request=request,
         request_body=prepared_request_body,
     )
     if isinstance(validated_response, StreamingResponse):
@@ -10079,6 +10109,7 @@ async def _handle_codex_alibaba_token_plan_adapter_route(
             provider="alibaba_token_plan",
         ),
         request_body=prepared_request_body,
+        codex_request=request,
     )
     if isinstance(validated_response, StreamingResponse):
         validated_response = _bind_responses_wire_stream(
@@ -10291,6 +10322,7 @@ async def _handle_codex_zai_coding_plan_adapter_route(
         adapter="codex_zai_coding_plan_chat_completions_adapter",
         adapter_label="Z.AI Coding Plan",
         intake_context=intake_context,
+        codex_request=request,
         request_body=prepared_request_body,
     )
     if isinstance(validated_response, StreamingResponse):
@@ -11778,6 +11810,7 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
             adapter_label="OpenCode Go",
             intake_context=intake_context,
             request_body=canonical_request_body,
+            codex_request=request,
         )
         from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
             _stamp_encrypted_reasoning_in_sse_event,
@@ -12865,6 +12898,7 @@ async def _perform_codex_auto_agent_openrouter_completion_request(  # noqa: PLR0
             adapter="codex_auto_agent_openrouter_completion_adapter",
             adapter_label="OpenRouter chat-completions",
             intake_context=intake_context,
+            codex_request=request,
             request_body=canonical_request_body,
         )
         if isinstance(validated_response, StreamingResponse):
@@ -12911,6 +12945,7 @@ async def _perform_codex_auto_agent_openrouter_completion_request(  # noqa: PLR0
         adapter="codex_auto_agent_openrouter_completion_adapter",
         adapter_label="OpenRouter chat-completions",
         intake_context=intake_context,
+        codex_request=request,
         request_body=canonical_request_body,
     )
     _record_adapted_completed_route_rollup_turn(

@@ -44,6 +44,9 @@ CODEX_CAPTURE_EVIDENCE_STATE_FIELD = (
 CODEX_CAPTURE_EVIDENCE_CONTEXT_FIELD = (
     "_aawm_cfg072_verified_capture_context"
 )
+CODEX_CAPTURE_EVIDENCE_OWNER_FIELD = (
+    "_aawm_cfg072_verified_capture_owner"
+)
 CFG072_REJECT_MARKER = "__cfg072_reject_requires_exact_cfg047_text_frame"
 CFG072_SEND_MESSAGE_OUTPUT_REJECTED_CODE = (
     "aawm_cfg072_send_message_output_rejected"
@@ -1258,14 +1261,16 @@ def validate_codex_message_capture_evidence(
     task_name: str,
     sender: str,
 ) -> Optional[str]:
-    """Validate trusted request-local capture evidence and return target.
+    """Validate trusted request-local capture admission and project it.
 
-    The artifact must contain the original decoded sender message string,
-    the complete native targeted invocation target, and a nonempty path of
-    native delivery/resolution records. Literal target equality is accepted
+    The artifact must contain the complete sender message string, the
+    complete delivered bytes, the native targeted invocation target, and a
+    nonempty path of native delivery/resolution records. Admission first
+    proves that those strings are identical. Projection then wraps plain
+    prose in a strict frame, or projects an exact four-key frame through the
+    existing generated-frame projector. Literal target equality is accepted
     only for absolute targets; every other selector requires a record ending
-    at the exact recipient. Recovered messages project to the strict 3-key
-    frame; strict frames are returned unchanged.
+    at the exact recipient.
     """
     if (
         not isinstance(evidence, dict)
@@ -1276,7 +1281,16 @@ def validate_codex_message_capture_evidence(
         or not sender
     ):
         return None
-    if evidence.get("sender_message") != payload:
+    delivered = evidence.get("delivered_message")
+    original = evidence.get("sender_message")
+    if (
+        not isinstance(delivered, str)
+        or delivered != payload
+        or not isinstance(original, str)
+        or original != delivered
+    ):
+        return None
+    if _is_opaque_representation(payload):
         return None
     author = item.get("author")
     recipient = item.get("recipient")
@@ -1304,6 +1318,31 @@ def validate_codex_message_capture_evidence(
             return None
     elif target != recipient:
         return None
+    if _FRAME_PREFIX_PATTERN.match(payload):
+        decoded, remainder = _decode_complete_json(payload)
+        if (
+            remainder != len(payload)
+            or not isinstance(decoded, dict)
+            or set(decoded) != {
+                "cfg047",
+                "encoding",
+                "text",
+                "task_name",
+            }
+        ):
+            return None
+        frame_version = decoded.get("cfg047")
+        if (
+            not isinstance(frame_version, int)
+            or isinstance(frame_version, bool)
+            or frame_version != COLLABORATION_FRAME_VERSION
+            or decoded.get("encoding") != COLLABORATION_TEXT_ENCODING
+            or not isinstance(decoded.get("text"), str)
+            or not decoded["text"]
+            or _is_opaque_representation(decoded["text"])
+            or decoded.get("task_name") != task_name
+        ):
+            return None
     frame = {
         "cfg047": COLLABORATION_FRAME_VERSION,
         "encoding": COLLABORATION_TEXT_ENCODING,
@@ -1319,11 +1358,17 @@ def validate_codex_message_capture_evidence(
 
 def bind_codex_verified_capture(request: Any, evidence: Any) -> None:
     """Bind one trusted capture-evidence object to the current request."""
+    global _CODEX_CAPTURE_OWNER
     state = getattr(request, "state", None)
     if state is None:
         return
+    if not isinstance(evidence, dict):
+        evidence = {"sender_message": evidence}
     try:
         setattr(state, CODEX_CAPTURE_EVIDENCE_STATE_FIELD, evidence)
+        owner = f"state:{id(state)}"
+        setattr(state, CODEX_CAPTURE_EVIDENCE_OWNER_FIELD, owner)
+        _CODEX_CAPTURE_OWNER = owner
     except Exception:
         return
 
@@ -1339,16 +1384,22 @@ _CODEX_CAPTURE_CONTEXT = contextvars.ContextVar(
     CODEX_CAPTURE_EVIDENCE_CONTEXT_FIELD,
     default=None,
 )
+_CODEX_CAPTURE_OWNER: Optional[str] = None
 
 
 def set_codex_verified_capture_context(evidence: Any) -> Any:
     """Bind trusted capture evidence to the current execution context."""
-    return _CODEX_CAPTURE_CONTEXT.set(evidence)
+    return _CODEX_CAPTURE_CONTEXT.set({"evidence": evidence, "owner": None})
 
 
 def get_codex_verified_capture_from_context() -> Any:
-    """Return trusted capture evidence visible to the current request."""
-    return _CODEX_CAPTURE_CONTEXT.get()
+    """Return trusted capture evidence bound to the matching request owner."""
+    binding = _CODEX_CAPTURE_CONTEXT.get()
+    if not isinstance(binding, dict):
+        return None
+    if _CODEX_CAPTURE_OWNER is not None and binding.get("owner") != _CODEX_CAPTURE_OWNER:
+        return None
+    return binding.get("evidence")
 
 
 def _validate_envelope_identity(
@@ -1392,30 +1443,31 @@ def _replay_canonical_codex_message_payload(
     if not isinstance(payload, str):
         return None
     task_name = recipient
-    assignment_text = payload
-    if not _is_opaque_representation(payload):
+    if capture_evidence is None:
         try:
-            decoded, remainder = _decode_complete_json(payload)
+            return parse_codex_collaboration_text_frame(payload)
         except CodexCollaborationDispatchError:
             return None
-        if decoded is not None:
-            if remainder != len(payload) or not isinstance(decoded, dict):
-                return None
-            task_name = decoded.get("task_name", recipient)
-            if not isinstance(task_name, str) or not task_name:
-                return None
-            assignment_text = decoded.get("text")
-            if not isinstance(assignment_text, str) or not assignment_text:
-                return None
-    else:
-        return None
-    return validate_codex_message_capture_evidence(
+    try:
+        decoded, remainder = _decode_complete_json(payload)
+    except CodexCollaborationDispatchError:
+        decoded = None
+        remainder = 0
+    task_name = recipient
+    if decoded is not None:
+        if remainder != len(payload) or not isinstance(decoded, dict):
+            return None
+        task_name = decoded.get("task_name", recipient)
+        if not isinstance(task_name, str) or not task_name:
+            return None
+    recovered = validate_codex_message_capture_evidence(
         capture_evidence,
         item=item,
-        payload=assignment_text,
+        payload=payload,
         task_name=task_name,
         sender=author,
     )
+    return recovered
 
 
 def _normalize_codex_message_payload(
@@ -1434,7 +1486,7 @@ def _normalize_codex_message_payload(
     assignment = (
         parse_codex_collaboration_text_frame(normalized_payload)
         if normalized_payload is not None
-        else _parse_codex_collaboration_payload(payload)
+        else parse_codex_collaboration_text_frame(payload)
     )
     normalized_item = _NormalizedCodexAgentMessage(item)
     normalized_item["content"] = [
@@ -1606,8 +1658,18 @@ def normalize_codex_collaboration_dispatch_body(
     request: Any = None,
 ) -> dict[str, Any]:
     """Normalize schemas and assignments, failing closed before provider send."""
+    global _CODEX_CAPTURE_OWNER
     capture_evidence = get_codex_verified_capture(request) if request is not None else None
-    token = set_codex_verified_capture_context(capture_evidence)
+    owner = None
+    previous_owner = _CODEX_CAPTURE_OWNER
+    if request is not None:
+        state = getattr(request, "state", None)
+        owner = getattr(state, CODEX_CAPTURE_EVIDENCE_OWNER_FIELD, None)
+        if owner is not None:
+            _CODEX_CAPTURE_OWNER = owner
+    token = _CODEX_CAPTURE_CONTEXT.set(
+        {"evidence": capture_evidence, "owner": _CODEX_CAPTURE_OWNER}
+    )
     try:
         if not isinstance(request_body, dict):
             if isinstance(request_body, Mapping):
@@ -1623,6 +1685,7 @@ def normalize_codex_collaboration_dispatch_body(
         raise AssertionError("unreachable") from exc
     finally:
         _CODEX_CAPTURE_CONTEXT.reset(token)
+        _CODEX_CAPTURE_OWNER = previous_owner
 
 
 def restore_codex_agent_message_payloads_for_openai_egress(

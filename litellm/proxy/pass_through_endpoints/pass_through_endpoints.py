@@ -113,6 +113,10 @@ from litellm.proxy.aawm_runtime_error_logging import (
 from litellm.proxy.auth.auth_utils import get_end_user_id_from_request_body
 from litellm.proxy.litellm_pre_call_utils import clean_headers
 from litellm.proxy.utils import get_server_root_path, normalize_route_for_root_path
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_generated_send_message_gate import (
+    CODEX_SEND_MESSAGE_OUTPUT_GATE_ATTR,
+    build_codex_send_message_output_gate,
+)
 from litellm.responses.function_name_sanitization import (
     ResponsesFunctionNameRewrite,
     restore_function_names_in_responses_body,
@@ -440,256 +444,55 @@ def _restore_responses_sse_payload(
     return updated
 
 
-def _responses_send_message_upstream_names(
-    request_body: dict[str, Any],
-    *,
-    request: Any = None,
-) -> frozenset[str]:
-    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
-        collect_codex_collaboration_advertised_tool_names,
-        is_codex_collaboration_send_message_identity,
-        normalize_codex_collaboration_dispatch_body,
-        build_codex_collaboration_wire_aliases,
+def _build_cfg072_send_message_output_gate(
+    request: Any,
+    request_body: Any,
+    rewrite: ResponsesFunctionNameRewrite,
+) -> Any:
+    """Build the output gate from identities bound to this request."""
+    return build_codex_send_message_output_gate(
+        request,
+        request_body,
+        upstream_to_original_identities=rewrite.upstream_to_original_identities,
     )
-
-    identities: list[Any] = []
-    normalize_codex_collaboration_dispatch_body(
-        dict(request_body),
-        identity_collector=identities,
-    )
-    aliases = build_codex_collaboration_wire_aliases(
-        tuple(identities),
-        reserved_names=collect_codex_collaboration_advertised_tool_names(
-            request_body
-        ),
-    )
-    upstream_names = {
-        alias.upstream_name
-        for alias in aliases
-        if is_codex_collaboration_send_message_identity(alias.original)
-    }
-    return frozenset(upstream_names)
 
 
 def _gate_responses_send_message_calls_in_body(
     response_body: Any,
     *,
+    request: Any,
     request_body: Any,
     rewrite: ResponsesFunctionNameRewrite,
+    output_gate: Any = None,
 ) -> Any:
     """Gate generated send-message calls in a fully restored response body."""
     if not isinstance(response_body, dict):
         return response_body
-    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
-        gate_generated_codex_send_message_call_arguments,
-    )
-
-    upstream_names = _positive_send_message_names(
+    gate = output_gate or _build_cfg072_send_message_output_gate(
+        request,
+        request_body,
         rewrite,
-        response_body.get("output"),
     )
-    if not upstream_names and isinstance(request_body, dict):
-        upstream_names = _responses_send_message_upstream_names(request_body)
-    gated_output = gate_generated_codex_send_message_call_arguments(
-        response_body.get("output"),
-        upstream_names,
+    if gate is None:
+        return response_body
+    original_output = response_body.get("output")
+    gated_output = gate.gate_output(
+        original_output,
+        allow_selected_copies=True,
     )
-    if gated_output is response_body.get("output"):
+    if gated_output is original_output:
         return response_body
     return {**response_body, "output": gated_output}
 
 
-def _positive_send_message_names(
-    rewrite: ResponsesFunctionNameRewrite,
-    output: Any = None,
-) -> frozenset[str]:
-    """Return positive request/response evidence for send-message aliases."""
-    names = {
-        upstream
-        for upstream, original in rewrite.upstream_to_original.items()
-        if original == "send_message"
-    }
-    for upstream, identity in rewrite.upstream_to_original_identities.items():
-        if (
-            identity.name == "send_message"
-            and identity.namespace in {"collaboration", "functions.collaboration"}
-        ):
-            names.add(upstream)
-    if isinstance(output, list):
-        for item in output:
-            if (
-                isinstance(item, dict)
-                and item.get("type") == "function_call"
-                and rewrite.restore_identity(item.get("name"), item.get("namespace"))[0]
-                == "send_message"
-            ):
-                names.add(item.get("name"))
-    return frozenset(name for name in names if isinstance(name, str))
-
-
-def _make_cfg072_sse_state() -> dict[str, dict[str, Any]]:
-    """Return request-local state for managed send-message stream gating."""
-    return {"items": {}, "arguments": {}}
-
-
-def _cfg072_call_key(item: Any, event: Any) -> Optional[str]:
-    for value in (
-        item.get("id") if isinstance(item, dict) else None,
-        item.get("call_id") if isinstance(item, dict) else None,
-        event.get("item_id") if isinstance(event, dict) else None,
-        event.get("call_id") if isinstance(event, dict) else None,
-    ):
-        if isinstance(value, str) and value:
-            return value
-    return None
-
-
-def _gate_cfg072_sse_event(
-    payload: Any,
-    rewrite: ResponsesFunctionNameRewrite,
-    state: dict[str, dict[str, Any]],
-    *,
-    configured_names: frozenset[str],
-) -> Any:
-    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
-        canonicalize_generated_codex_send_message_call_arguments,
-        raise_codex_send_message_output_rejected,
-    )
-    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
-        CodexCollaborationDispatchError,
-    )
-
-    if not isinstance(payload, dict):
-        return payload
-    event_type = payload.get("type")
-    item = payload.get("item")
-
-    if event_type == "response.output_item.added":
-        if not isinstance(item, dict) or item.get("type") != "function_call":
-            return payload
-        name = item.get("name")
-        original_name = rewrite.restore_identity(name, item.get("namespace"))[0]
-        targeted = name in configured_names or original_name == "send_message"
-        key = _cfg072_call_key(item, payload)
-        if key is not None:
-            if targeted:
-                state["items"][key] = {"name": name}
-            else:
-                state["items"].pop(key, None)
-        if not targeted:
-            return payload
-        if item.get("arguments"):
-            try:
-                canonical = canonicalize_generated_codex_send_message_call_arguments(
-                    item.get("arguments")
-                )
-            except CodexCollaborationDispatchError as exc:
-                raise_codex_send_message_output_rejected(exc.reason)
-            if key is not None:
-                state["arguments"][key] = canonical
-            return {**payload, "item": {**item, "arguments": canonical}}
-        return payload
-
-    if event_type == "response.function_call_arguments.delta":
-        key = _cfg072_call_key(None, payload)
-        targeted = key is not None and key in state["items"]
-        if not targeted:
-            name = payload.get("name")
-            targeted = name in configured_names
-        if not targeted:
-            return payload
-        if key is None:
-            raise RuntimeError("send-message stream call identity is required")
-        state["arguments"][key] = state["arguments"].get(key, "") + str(
-            payload.get("delta") or ""
-        )
-        return None
-
-    if event_type == "response.function_call_arguments.done":
-        key = _cfg072_call_key(item, payload)
-        name = payload.get("name")
-        if not isinstance(name, str) and isinstance(item, dict):
-            name = item.get("name")
-        original_name = rewrite.restore_identity(name, payload.get("namespace"))[0]
-        targeted = key in state["items"] or name in configured_names or (
-            isinstance(name, str) and original_name == "send_message"
-        )
-        if not targeted:
-            return payload
-        selected = (
-            state["items"][key].get("selected")
-            if key is not None and key in state["items"]
-            else None
-        )
-        arguments = selected or state["arguments"].get(key, payload.get("arguments"))
-        if key is not None:
-            selected_item = state["items"].get(key, {})
-            if not isinstance(selected, str) and isinstance(
-                selected_item.get("selected"), str
-            ):
-                arguments = selected_item["selected"]
-        try:
-            canonical = canonicalize_generated_codex_send_message_call_arguments(arguments)
-        except CodexCollaborationDispatchError as exc:
-            raise_codex_send_message_output_rejected(exc.reason)
-        if key is not None:
-            state["arguments"][key] = canonical
-            if isinstance(item, dict):
-                item_key = _cfg072_call_key(item, None)
-                if item_key is not None and item_key in state["items"]:
-                    state["items"][item_key]["selected"] = canonical
-        updated = dict(payload)
-        updated["arguments"] = canonical
-        if isinstance(item, dict):
-            updated["item"] = {**item, "arguments": canonical}
-        return updated
-
-    if event_type in {"response.completed", "response.done"}:
-        response = payload.get("response")
-        if not isinstance(response, dict):
-            return payload
-        output = response.get("output")
-        if not isinstance(output, list):
-            return payload
-        gated: list[Any] = []
-        changed = False
-        for entry in output:
-            if (
-                not isinstance(entry, dict)
-                or entry.get("type") != "function_call"
-                or entry.get("name") not in _positive_send_message_names(
-                    rewrite,
-                    [entry],
-                )
-                | configured_names
-            ):
-                gated.append(entry)
-                continue
-            key = _cfg072_call_key(entry, payload)
-            arguments = state["arguments"].get(key, entry.get("arguments"))
-            try:
-                canonical = canonicalize_generated_codex_send_message_call_arguments(
-                    arguments
-                )
-            except CodexCollaborationDispatchError as exc:
-                raise_codex_send_message_output_rejected(exc.reason)
-            if key is not None:
-                state["arguments"][key] = canonical
-            gated.append({**entry, "arguments": canonical})
-            changed = True
-        return {**payload, "response": {**response, "output": gated}} if changed else payload
-    return payload
-
-
-def _restore_responses_sse_frame(
+def _replace_responses_sse_frame_payload(
     frame: bytes,
-    rewrite: ResponsesFunctionNameRewrite,
-    *,
-    cfg072_request_body: Optional[dict[str, Any]] = None,
-    cfg072_state: Optional[dict[str, dict[str, Any]]] = None,
+    payload: Any,
+    original_payload: Any,
 ) -> bytes:
+    if payload is None or payload is original_payload:
+        return frame
     data_lines: list[tuple[int, bytes, bytes, bytes]] = []
-    saw_done = False
     for index, line in enumerate(frame.splitlines(keepends=True)):
         line_ending = b""
         content = line
@@ -705,41 +508,10 @@ def _restore_responses_sse_frame(
         prefix = b"data: " if content.startswith(b"data: ") else b"data:"
         payload_bytes = content[len(prefix) :]
         if payload_bytes.strip() == b"[DONE]":
-            saw_done = True
-            continue
+            return frame
         data_lines.append((index, prefix, payload_bytes, line_ending))
 
-    if not data_lines or saw_done:
-        return frame
-
-    try:
-        payload = json.loads(
-            b"\n".join(payload_bytes for _, _, payload_bytes, _ in data_lines).decode(
-                "utf-8"
-            )
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return frame
-
-    restored = _restore_responses_sse_payload(payload, rewrite)
-    if cfg072_request_body is not None or cfg072_state is not None:
-        configured_names = (
-            _responses_send_message_upstream_names(cfg072_request_body or {})
-            if cfg072_request_body is not None
-            else frozenset()
-        )
-        if cfg072_state is None:
-            cfg072_state = _make_cfg072_sse_state()
-        gated = _gate_cfg072_sse_event(
-            restored,
-            rewrite,
-            cfg072_state,
-            configured_names=configured_names,
-        )
-        if gated is None:
-            return b""
-        restored = gated
-    if restored is payload:
+    if not data_lines:
         return frame
 
     first_data_index = data_lines[0][0]
@@ -747,7 +519,7 @@ def _restore_responses_sse_frame(
     first_prefix = data_lines[0][1]
     first_line_ending = data_lines[0][3]
     rendered_payload = json.dumps(
-        restored,
+        payload,
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -760,6 +532,70 @@ def _restore_responses_sse_frame(
                 first_prefix + rendered_payload + first_line_ending
             )
     return b"".join(updated_lines)
+
+
+def _restore_responses_sse_frame(
+    frame: bytes,
+    rewrite: ResponsesFunctionNameRewrite,
+    *,
+    output_gate: Any = None,
+) -> list[bytes]:
+    data_lines: list[bytes] = []
+    saw_done = False
+    for line in frame.splitlines(keepends=True):
+        content = line
+        if content.endswith(b"\r\n"):
+            content = content[:-2]
+        elif content.endswith(b"\n"):
+            content = content[:-1]
+        if not content.startswith(b"data:"):
+            continue
+        prefix = b"data: " if content.startswith(b"data: ") else b"data:"
+        payload_bytes = content[len(prefix) :]
+        if payload_bytes.strip() == b"[DONE]":
+            saw_done = True
+        data_lines.append(payload_bytes)
+
+    original_payload: Any = None
+    restored_payload: Any = None
+    if data_lines and not saw_done:
+        try:
+            original_payload = json.loads(
+                b"\n".join(data_lines).decode("utf-8")
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            pass
+        else:
+            restored_payload = _restore_responses_sse_payload(
+                original_payload,
+                rewrite,
+            )
+
+    if output_gate is None:
+        return [
+            _replace_responses_sse_frame_payload(
+                frame,
+                restored_payload,
+                original_payload,
+            )
+        ]
+
+    context = (frame, original_payload, restored_payload)
+    emitted = output_gate.process_event(restored_payload, context)
+    rendered: list[bytes] = []
+    for (
+        original_frame,
+        original_frame_payload,
+        _restored_frame_payload,
+    ), payload in emitted:
+        rendered.append(
+            _replace_responses_sse_frame_payload(
+                original_frame,
+                payload,
+                original_frame_payload,
+            )
+        )
+    return rendered
 
 
 def _next_sse_frame_boundary(buffer: bytes) -> Optional[tuple[int, int]]:
@@ -775,10 +611,9 @@ async def _restore_responses_function_names_in_sse_chunks(
     chunks: Any,
     rewrite: ResponsesFunctionNameRewrite,
     *,
-    cfg072_request_body: Optional[dict[str, Any]] = None,
+    output_gate: Any = None,
 ) -> AsyncIterator[bytes]:
     buffer = b""
-    cfg072_state = _make_cfg072_sse_state()
     async for chunk in chunks:
         if isinstance(chunk, str):
             buffer += chunk.encode("utf-8")
@@ -792,20 +627,22 @@ async def _restore_responses_function_names_in_sse_chunks(
             complete_end = frame_end + delimiter_length
             frame = buffer[:complete_end]
             buffer = buffer[complete_end:]
-            yield _restore_responses_sse_frame(
+            for rendered_frame in _restore_responses_sse_frame(
                 frame,
                 rewrite,
-                cfg072_request_body=cfg072_request_body,
-                cfg072_state=cfg072_state,
-            )
+                output_gate=output_gate,
+            ):
+                yield rendered_frame
 
     if buffer:
-        yield _restore_responses_sse_frame(
+        for rendered_frame in _restore_responses_sse_frame(
             buffer,
             rewrite,
-                cfg072_request_body=cfg072_request_body,
-                cfg072_state=cfg072_state,
-        )
+            output_gate=output_gate,
+        ):
+            yield rendered_frame
+    if output_gate is not None:
+        output_gate.finish()
 
 
 # Global registry to track registered pass-through routes and prevent memory leaks
@@ -9838,16 +9675,20 @@ async def pass_through_request(  # noqa: PLR0915
                 openai_wire_trace=wire_trace,
                 openai_stream_bookkeeping_state=stream_bookkeeping_state,
             )
-            if (
-                responses_function_name_rewrite is not None
-                and responses_function_name_rewrite.changed
-            ):
+            cfg072_output_gate = (
+                _build_cfg072_send_message_output_gate(
+                    request,
+                    _parsed_body,
+                    responses_function_name_rewrite,
+                )
+                if responses_function_name_rewrite is not None
+                else None
+            )
+            if responses_function_name_rewrite is not None:
                 processed_chunks = _restore_responses_function_names_in_sse_chunks(
                     processed_chunks,
                     responses_function_name_rewrite,
-                    cfg072_request_body=(
-                        _parsed_body if isinstance(_parsed_body, dict) else None
-                    ),
+                    output_gate=cfg072_output_gate,
                 )
             wrapper_cleanup_source = processed_chunks
             wrapper_setup_failure: Optional[BaseException] = None
@@ -10043,6 +9884,17 @@ async def pass_through_request(  # noqa: PLR0915
                     status_code=response.status_code,
                 )
             setattr(stream_response, "_aawm_upstream_response", response)
+            if cfg072_output_gate is not None:
+                setattr(
+                    stream_response,
+                    CODEX_SEND_MESSAGE_OUTPUT_GATE_ATTR,
+                    cfg072_output_gate,
+                )
+                setattr(
+                    stream_response,
+                    f"{CODEX_SEND_MESSAGE_OUTPUT_GATE_ATTR}_applied",
+                    True,
+                )
             _publish_openai_send_telemetry()
             return bind_output_guard_to_streaming_response(
                 bind_deferred_success_holder(
@@ -10352,16 +10204,20 @@ async def pass_through_request(  # noqa: PLR0915
                 openai_wire_trace=wire_trace,
                 openai_stream_bookkeeping_state=stream_bookkeeping_state,
             )
-            if (
-                responses_function_name_rewrite is not None
-                and responses_function_name_rewrite.changed
-            ):
+            cfg072_output_gate = (
+                _build_cfg072_send_message_output_gate(
+                    request,
+                    _parsed_body,
+                    responses_function_name_rewrite,
+                )
+                if responses_function_name_rewrite is not None
+                else None
+            )
+            if responses_function_name_rewrite is not None:
                 processed_chunks = _restore_responses_function_names_in_sse_chunks(
                     processed_chunks,
                     responses_function_name_rewrite,
-                    cfg072_request_body=(
-                        _parsed_body if isinstance(_parsed_body, dict) else None
-                    ),
+                    output_gate=cfg072_output_gate,
                 )
             wrapper_cleanup_source = processed_chunks
             wrapper_setup_failure: Optional[BaseException] = None
@@ -10557,6 +10413,17 @@ async def pass_through_request(  # noqa: PLR0915
                     status_code=response.status_code,
                 )
             setattr(stream_response, "_aawm_upstream_response", response)
+            if cfg072_output_gate is not None:
+                setattr(
+                    stream_response,
+                    CODEX_SEND_MESSAGE_OUTPUT_GATE_ATTR,
+                    cfg072_output_gate,
+                )
+                setattr(
+                    stream_response,
+                    f"{CODEX_SEND_MESSAGE_OUTPUT_GATE_ATTR}_applied",
+                    True,
+                )
             _publish_openai_send_telemetry()
             return bind_output_guard_to_streaming_response(
                 bind_deferred_success_holder(
@@ -10593,15 +10460,19 @@ async def pass_through_request(  # noqa: PLR0915
         if (
             response_body is not None
             and responses_function_name_rewrite is not None
-            and responses_function_name_rewrite.changed
         ):
-            restored_response_body = restore_function_names_in_responses_body(
-                response_body,
-                responses_function_name_rewrite.upstream_to_original,
-                responses_function_name_rewrite.upstream_to_original_identities,
+            restored_response_body = (
+                restore_function_names_in_responses_body(
+                    response_body,
+                    responses_function_name_rewrite.upstream_to_original,
+                    responses_function_name_rewrite.upstream_to_original_identities,
+                )
+                if responses_function_name_rewrite.changed
+                else response_body
             )
             restored_response_body = _gate_responses_send_message_calls_in_body(
                 restored_response_body,
+                request=request,
                 request_body=_parsed_body,
                 rewrite=responses_function_name_rewrite,
             )

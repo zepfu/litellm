@@ -30,9 +30,6 @@ from litellm.proxy._types import ProxyException
 from litellm.proxy.aawm_runtime_error_logging import (
     schedule_persist_malformed_tool_call_detection,
 )
-from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
-    gate_generated_codex_send_message_call_arguments,
-)
 
 from typing import TYPE_CHECKING
 
@@ -531,6 +528,7 @@ async def _validate_alias_candidate_responses_stream_if_needed(
             adapter_label=adapter_label,
             intake_context=intake_context,
             request_body=request_body,
+            codex_request=request,
         ),
     )
 
@@ -1666,6 +1664,7 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
     adapter_label: str,
     intake_context: Optional[dict[str, Any]] = None,
     request_body: Optional[dict[str, Any]] = None,
+    codex_request: Optional[Any] = None,
 ) -> Response:
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.repetitive_output import (
         inherit_or_wrap_passthrough_streaming_response,
@@ -1674,6 +1673,10 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.deferred_success import (
         finalize_deferred_failure,
         inherit_deferred_success_holder,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_generated_send_message_gate import (
+        CODEX_SEND_MESSAGE_OUTPUT_GATE_ATTR,
+        build_codex_send_message_output_gate,
     )
 
     def _set_stream_validation_state(
@@ -1728,186 +1731,118 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
         state["reason"] = state.get("invalid_reason") or reason
         _set_stream_validation_state(target, state)
 
-    def _send_message_upstream_names() -> frozenset[str]:
-        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
-            build_codex_collaboration_wire_aliases,
-            collect_codex_collaboration_advertised_tool_names,
-            is_codex_collaboration_send_message_identity,
-            normalize_codex_collaboration_dispatch_body,
-        )
+    response_aliases = getattr(response, "_aawm_codex_collaboration_aliases", None)
+    extra_upstream_identities: dict[str, Any] = {}
+    if isinstance(response_aliases, dict):
+        extra_upstream_identities.update(response_aliases)
+    elif isinstance(response_aliases, (tuple, list)):
+        for alias in response_aliases:
+            upstream_name = getattr(alias, "upstream_name", None)
+            original_identity = getattr(alias, "original", None)
+            if isinstance(upstream_name, str) and upstream_name:
+                extra_upstream_identities[upstream_name] = original_identity
 
-        if not isinstance(request_body, dict):
-            return frozenset()
-        aliases = _mapping_or_attr_get(  # noqa: F821
-            response, "_aawm_codex_collaboration_aliases", None
-        )
-        if aliases is None:
-            identities: list[Any] = []
-            normalize_codex_collaboration_dispatch_body(
-                dict(request_body),
-                identity_collector=identities,
-                request=request,  # noqa: F821
-            )
-            aliases = build_codex_collaboration_wire_aliases(
-                tuple(identities),
-                reserved_names=collect_codex_collaboration_advertised_tool_names(
-                    request_body
-                ),
-            )
-            try:
-                setattr(
-                    response,
-                    "_aawm_codex_collaboration_aliases",
-                    aliases,
-                )
-            except Exception:
-                pass
-        return frozenset(
-            alias.upstream_name
-            for alias in aliases
-            if is_codex_collaboration_send_message_identity(alias.original)
-        )
-
-    def _positive_send_message_upstream_names(output: Any) -> frozenset[str]:
-        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
-            is_codex_collaboration_send_message_identity,
-        )
-
-        if not isinstance(output, list):
-            return frozenset()
-        aliases = _mapping_or_attr_get(  # noqa: F821
-            response,
-            "_aawm_codex_collaboration_aliases",
+    send_message_gate = getattr(response, CODEX_SEND_MESSAGE_OUTPUT_GATE_ATTR, None)
+    if send_message_gate is None:
+        upstream_response = getattr(response, "_aawm_upstream_response", None)
+        send_message_gate = getattr(
+            upstream_response,
+            CODEX_SEND_MESSAGE_OUTPUT_GATE_ATTR,
             None,
         )
-        original_to_upstream = (
-            {
-                alias.original.rendered_name: alias.upstream_name
-                for alias in aliases
-                if is_codex_collaboration_send_message_identity(alias.original)
-            }
-            if aliases is not None
-            else {"send_message": "send_message"}
-        )
-        return frozenset(
-            original_to_upstream[item.get("name")]
-            for item in output
-            if isinstance(item, dict)
-            and item.get("type") == "function_call"
-            and item.get("name") in original_to_upstream
+    if send_message_gate is None:
+        send_message_gate = build_codex_send_message_output_gate(
+            codex_request,
+            request_body,
+            extra_upstream_to_original_identities=extra_upstream_identities,
         )
 
     def _gate_response_send_message_calls(response_body: Any) -> Any:
-        if not isinstance(response_body, dict):
-            return response_body
-        output = response_body.get("output")
-        return gate_generated_codex_send_message_call_arguments(
-            output,
-            _send_message_upstream_names()
-            | _positive_send_message_upstream_names(output),
+        if not isinstance(response_body, dict) or send_message_gate is None:
+            return response_body.get("output") if isinstance(response_body, dict) else response_body
+        return send_message_gate.gate_output(
+            response_body.get("output"),
+            allow_selected_copies=True,
         )
 
-    def _gate_managed_responses_sse_event(payload: Any) -> Any:
-        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
-            canonicalize_generated_codex_send_message_call_arguments,
-        )
+    def _gate_managed_responses_sse_stream(
+        chunks: Any,
+        output_gate: Any,
+    ) -> Any:
+        if output_gate is None:
+            return chunks
 
-        if not isinstance(payload, dict):
-            return payload
-        event_type = payload.get("type")
-        if event_type in {
-            "response.output_item.added",
-            "response.output_item.done",
-        }:
-            item = payload.get("item")
-            if not isinstance(item, dict) or item.get("name") not in names:
-                return payload
-            gated = gate_generated_codex_send_message_call_arguments(
-                [item],
-                names,
-            )
-            if gated is [item] or gated == [item]:
-                return payload
-            return {**payload, "item": gated[0]}
-        if event_type == "response.function_call_arguments.done":
-            name = payload.get("name")
-            item = payload.get("item")
-            if (
-                (not isinstance(name, str) or name not in names)
-                and not (
-                    isinstance(item, dict)
-                    and item.get("name") in names
-                )
-            ):
-                return payload
-            arguments = payload.get("arguments")
-            canonical = canonicalize_generated_codex_send_message_call_arguments(
-                arguments
-            )
-            updated = dict(payload)
-            updated["arguments"] = canonical
-            if isinstance(item, dict):
-                gated_item = dict(item)
-                gated_item["arguments"] = canonical
-                updated["item"] = gated_item
-            return updated
-        if event_type in {"response.completed", "response.done"}:
-            response_payload = payload.get("response")
-            if not isinstance(response_payload, dict):
-                return payload
-            gated = gate_generated_codex_send_message_call_arguments(
-                response_payload.get("output"),
-                names,
-            )
-            if gated is response_payload.get("output"):
-                return payload
-            return {
-                **payload,
-                "response": {**response_payload, "output": gated},
-            }
-        return payload
-
-    def _gate_managed_responses_sse_stream(chunks: Any) -> Any:
-        buffer = ""
-        line_ending = "\n"
-
-        def render_event(event: str) -> str:
-            data_indexes = [
-                index
-                for index, line in enumerate(event.splitlines())
-                if line.startswith("data:")
+        def _next_event_boundary(value: str) -> Optional[tuple[int, int]]:
+            boundaries = [
+                (index, length)
+                for delimiter in ("\r\n\r\n", "\n\n")
+                if (index := value.find(delimiter)) >= 0
+                for length in (len(delimiter),)
             ]
-            if not data_indexes:
-                return event
-            raw_data = "\n".join(
-                event.splitlines()[index].partition(":")[2].lstrip()
-                for index in data_indexes
-            )
-            if not raw_data or raw_data.strip() == "[DONE]":
-                return event
-            try:
-                decoded = json.loads(raw_data)
-            except (json.JSONDecodeError, TypeError, ValueError):
-                return event
-            gated = _gate_managed_responses_sse_event(decoded)
-            if gated is decoded:
+            return min(boundaries) if boundaries else None
+
+        def _render_event(
+            event: str,
+            payload: Any,
+            original_payload: Any,
+        ) -> str:
+            if payload is None or payload is original_payload:
                 return event
             lines = event.splitlines(keepends=True)
+            data_indexes: list[int] = []
+            for index, line in enumerate(lines):
+                content = line.rstrip("\r\n")
+                if content.startswith("data:"):
+                    data_indexes.append(index)
+            if not data_indexes:
+                return event
             first = data_indexes[0]
+            first_line = lines[first]
+            content = first_line.rstrip("\r\n")
+            line_ending = first_line[len(content) :]
+            prefix = "data: " if content.startswith("data: ") else "data:"
             lines[first] = (
-                lines[first].partition(":")[0]
-                + ": "
-                + json.dumps(gated, ensure_ascii=False, separators=(",", ":"))
+                prefix
+                + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
                 + line_ending
             )
+            discarded = set(data_indexes[1:])
             return "".join(
-                line
-                for index, line in enumerate(lines)
-                if index not in set(data_indexes[1:])
+                line for index, line in enumerate(lines) if index not in discarded
             )
 
+        def _gate_event(event: str, delimiter: str) -> list[str]:
+            original_payload: Any = None
+            data_lines: list[str] = []
+            saw_done = False
+            for line in event.splitlines():
+                if not line.startswith("data:"):
+                    continue
+                data = line.partition(":")[2].lstrip()
+                data_lines.append(data)
+                if data.strip() == "[DONE]":
+                    saw_done = True
+            if data_lines and not saw_done:
+                try:
+                    decoded = json.loads("\n".join(data_lines))
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    decoded = None
+                if isinstance(decoded, dict):
+                    original_payload = decoded
+            context = (event, delimiter, original_payload)
+            emitted = output_gate.process_event(original_payload, context)
+            return [
+                _render_event(original_event, payload, original)
+                + original_delimiter
+                for (
+                    original_event,
+                    original_delimiter,
+                    original,
+                ), payload in emitted
+            ]
+
         async def iterator() -> Any:
-            nonlocal buffer
+            buffer = ""
             async for chunk in chunks:
                 text = (
                     chunk.decode("utf-8")
@@ -1915,11 +1850,17 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                     else str(chunk)
                 )
                 buffer += text
-                while "\n\n" in buffer:
-                    event, buffer = buffer.split("\n\n", 1)
-                    yield render_event(event) + "\n\n"
+                while (boundary := _next_event_boundary(buffer)) is not None:
+                    event_end, delimiter_length = boundary
+                    delimiter = buffer[event_end : event_end + delimiter_length]
+                    event = buffer[:event_end]
+                    buffer = buffer[event_end + delimiter_length :]
+                    for rendered in _gate_event(event, delimiter):
+                        yield rendered
             if buffer:
-                yield render_event(buffer)
+                for rendered in _gate_event(buffer, ""):
+                    yield rendered
+            output_gate.finish()
 
         return iterator()
 
@@ -2474,6 +2415,24 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
 
     if isinstance(response, StreamingResponse):
         event_summaries: list[dict[str, Any]] = []
+        if (
+            send_message_gate is not None
+            and not getattr(
+                response,
+                f"{CODEX_SEND_MESSAGE_OUTPUT_GATE_ATTR}_applied",
+                False,
+            )
+        ):
+            response.body_iterator = _gate_managed_responses_sse_stream(
+                response.body_iterator,
+                send_message_gate,
+            )
+            setattr(response, CODEX_SEND_MESSAGE_OUTPUT_GATE_ATTR, send_message_gate)
+            setattr(
+                response,
+                f"{CODEX_SEND_MESSAGE_OUTPUT_GATE_ATTR}_applied",
+                True,
+            )
         try:
             peek = await _aawm_alias_streaming.peek_streaming_response(  # noqa: F821
                 response,
@@ -2499,15 +2458,6 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             await _close_peeked_stream(response)
             raise
         peek = await _collect_pending_grok_marker_stream(peek)
-        names = _send_message_upstream_names()
-        if (
-            names
-            and peek.stop_reason == "pending_stream"
-            and isinstance(peek.response, StreamingResponse)
-        ):
-            peek.response.body_iterator = _gate_managed_responses_sse_stream(
-                peek.response.body_iterator
-            )
         if not peek.exhausted:
             correlation = intake_context or {}
             model_alias = correlation.get("model_alias")
@@ -2837,7 +2787,10 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             if restored_namespace_tool_count:
                 response_body = restored_body
             gated_output = _gate_response_send_message_calls(response_body)
-            if gated_output is not response_body.get("output"):
+            send_message_output_changed = (
+                gated_output is not response_body.get("output")
+            )
+            if send_message_output_changed:
                 response_body = dict(response_body)
                 response_body["output"] = gated_output
             if _is_codex_auto_agent_malformed_tool_call_text_output(
@@ -2869,6 +2822,7 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                 or isinstance(repaired_body, dict)
                 or restored_custom_tool_count
                 or restored_namespace_tool_count
+                or send_message_output_changed
             ):
                 repaired_response = Response(
                     content=json.dumps(response_body),
