@@ -1678,6 +1678,9 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
         CODEX_SEND_MESSAGE_OUTPUT_GATE_ATTR,
         build_codex_send_message_output_gate,
     )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.tool_call_restore import (
+        _advertised_namespace_tool_function_adapter_map,
+    )
 
     def _set_stream_validation_state(
         target: Any,
@@ -1751,9 +1754,16 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             None,
         )
     if send_message_gate is None:
+        adapted_namespace_by_name = (
+            _advertised_namespace_tool_function_adapter_map(
+                request_body if isinstance(request_body, dict) else None,
+                adapter_model=adapter_model,
+            )
+        )
         send_message_gate = build_codex_send_message_output_gate(
             codex_request,
             request_body,
+            adapted_namespace_by_name=adapted_namespace_by_name,
             extra_upstream_to_original_identities=extra_upstream_identities,
         )
 
@@ -1843,13 +1853,14 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
 
         async def iterator() -> Any:
             buffer = ""
+            decoder = codecs.getincrementaldecoder("utf-8")()
             async for chunk in chunks:
-                text = (
-                    chunk.decode("utf-8")
-                    if isinstance(chunk, (bytes, bytearray))
-                    else str(chunk)
+                raw_chunk = (
+                    bytes(chunk)
+                    if isinstance(chunk, (bytes, bytearray, memoryview))
+                    else str(chunk).encode("utf-8")
                 )
-                buffer += text
+                buffer += decoder.decode(raw_chunk)
                 while (boundary := _next_event_boundary(buffer)) is not None:
                     event_end, delimiter_length = boundary
                     delimiter = buffer[event_end : event_end + delimiter_length]
@@ -1857,6 +1868,7 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                     buffer = buffer[event_end + delimiter_length :]
                     for rendered in _gate_event(event, delimiter):
                         yield rendered
+            buffer += decoder.decode(b"", final=True)
             if buffer:
                 for rendered in _gate_event(buffer, ""):
                     yield rendered
