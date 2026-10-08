@@ -1775,7 +1775,7 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             allow_selected_copies=True,
         )
 
-    def _gate_managed_responses_sse_stream(
+    def _gate_managed_responses_sse_stream(  # noqa: PLR0915
         chunks: Any,
         output_gate: Any,
     ) -> Any:
