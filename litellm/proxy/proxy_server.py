@@ -1617,6 +1617,10 @@ app.add_middleware(
 app.add_middleware(PrometheusAuthMiddleware)
 app.add_middleware(InFlightRequestsMiddleware)
 app.add_middleware(CursorAgentCliInboundMiddleware)
+# Outermost admission hook includes inbound normalization and auth/body waits.
+from litellm.integrations.aawm_session_history.waits import SessionHistoryWaitMiddleware
+
+app.add_middleware(SessionHistoryWaitMiddleware)
 
 
 def mount_swagger_ui():

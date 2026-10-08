@@ -49,6 +49,7 @@ from typing_extensions import TypeGuard  # noqa: F401 - Wave 6F facade host bind
 globals()["status"] = fastapi_status
 
 import litellm
+from litellm.integrations.aawm_session_history.waits import wait_for
 from litellm import get_llm_provider
 from litellm._logging import verbose_proxy_logger
 from litellm.constants import (
@@ -4735,7 +4736,10 @@ _ANTHROPIC_AUTO_AGENT_ROUTE_RUNTIME = (
             _perform_anthropic_auto_agent_alias_candidate_request(*args, **kwargs)
         ),
         select_candidate=lambda *args, **kwargs: (
-            _select_anthropic_auto_agent_candidate(*args, **kwargs)
+            wait_for(
+                "candidate_selection",
+                _select_anthropic_auto_agent_candidate(*args, **kwargs),
+            )
         ),
         publish_cooldown_memory=lambda *args, **kwargs: (
             _publish_anthropic_cooldown_memory(*args, **kwargs)
@@ -6735,7 +6739,10 @@ _CODEX_AUTO_AGENT_ROUTE_RUNTIME = (
             _perform_codex_auto_agent_alias_candidate_request(*args, **kwargs)
         ),
         select_candidate_fn=lambda *args, **kwargs: (
-            _select_codex_auto_agent_candidate(*args, **kwargs)
+            wait_for(
+                "candidate_selection",
+                _select_codex_auto_agent_candidate(*args, **kwargs),
+            )
         ),
         resolve_cooldown_publication_fn=lambda *args, **kwargs: (
             _resolve_auto_agent_cooldown_publication_plan(*args, **kwargs)

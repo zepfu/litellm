@@ -7,6 +7,8 @@ depends on the pass-through header prefix constant).
 
 from __future__ import annotations
 
+from litellm.integrations.aawm_session_history.waits import track_wait
+
 import ast
 import asyncio
 import base64
@@ -479,6 +481,7 @@ def _load_locked_codex_oauth_headers_for_record_sync(
         return _load_codex_oauth_headers_for_record_sync(request, record)
 
 
+@track_wait("credential_resolution")
 async def _load_local_codex_auth_selection(
     request: Request,
     *,
@@ -494,6 +497,7 @@ async def _load_local_codex_auth_selection(
     return await _load_codex_oauth_headers_for_record(request, record)
 
 
+@track_wait("credential_resolution")
 async def _load_bound_codex_oauth_auth(
     request: Request,
 ) -> CodexOAuthRequestAuth:
@@ -653,6 +657,7 @@ def _record_codex_oauth_dispatched_auth(
     )
 
 
+@track_wait("credential_reload")
 async def reload_codex_oauth_credential_after_token_invalidated(
     request: Request,
     *,

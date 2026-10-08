@@ -22,6 +22,8 @@ from uuid import uuid4
 
 from starlette.requests import Request
 
+from litellm.integrations.aawm_session_history.waits import track_wait, wait_for
+
 from .durable import get_aawm_alias_routing_state_namespace
 from .retry import (
     OpenAIAlphaCapacityRetryBudget,
@@ -78,7 +80,10 @@ async def await_with_client_disconnect(
         operation_task: asyncio.Future[Any] = asyncio.ensure_future(operation())
     except BaseException:
         disconnect_task.cancel()
-        await asyncio.gather(disconnect_task, return_exceptions=True)
+        await wait_for(
+            "cancellation_cleanup",
+            asyncio.gather(disconnect_task, return_exceptions=True),
+        )
         raise
 
     try:
@@ -90,7 +95,10 @@ async def await_with_client_disconnect(
             disconnect_task.result()
             if not operation_task.done():
                 operation_task.cancel()
-            await asyncio.gather(operation_task, return_exceptions=True)
+            await wait_for(
+                "cancellation_cleanup",
+                asyncio.gather(operation_task, return_exceptions=True),
+            )
             raise ClientDisconnectedCancellation("client disconnected")
         return operation_task.result()
     finally:
@@ -98,10 +106,13 @@ async def await_with_client_disconnect(
             operation_task.cancel()
         if not disconnect_task.done():
             disconnect_task.cancel()
-        await asyncio.gather(
-            operation_task,
-            disconnect_task,
-            return_exceptions=True,
+        await wait_for(
+            "cancellation_cleanup",
+            asyncio.gather(
+                operation_task,
+                disconnect_task,
+                return_exceptions=True,
+            ),
         )
 
 
@@ -622,6 +633,7 @@ class OpenAIAlphaCapacityRetryCoordinator:
         """Signal a successful connection to wake waiting requests."""
         await _signal_openai_capacity_success(self._target_identity, self._namespace)
 
+    @track_wait("retry_backoff")
     async def sleep_with_wakeup(
         self,
         wait_seconds: float,

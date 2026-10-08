@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Optional
 
+from litellm.integrations.aawm_session_history.waits import (
+    enrich_request_waits,
+    track_wait,
+)
+
 from litellm.proxy.aawm_session_transfer.identity import extract_transfer_identity
 from litellm.proxy.aawm_session_transfer.registry import (
     safe_finalize,
@@ -36,14 +41,17 @@ def build_transfer_identity(
     )
 
 
+@track_wait("transfer_registry")
 async def publish_transfer_phase(
     identity: Mapping[str, Any],
     phase: str,
     extra: Optional[Mapping[str, Any]] = None,
 ) -> None:
+    enrich_request_waits(identity)
     await safe_mark_phase(identity, phase, extra)
 
 
+@track_wait("transfer_registry")
 async def publish_transfer_chunks(
     identity: Mapping[str, Any],
     **kwargs: Any,
@@ -51,6 +59,7 @@ async def publish_transfer_chunks(
     await safe_record_chunks(identity, **kwargs)
 
 
+@track_wait("transfer_registry")
 async def publish_transfer_terminal(
     identity: Mapping[str, Any],
     phase: str,
@@ -59,6 +68,7 @@ async def publish_transfer_terminal(
     await safe_finalize(identity, phase, extra)
 
 
+@track_wait("transfer_registry")
 async def publish_adapter_transfer_event(
     *,
     request: Any = None,
@@ -89,4 +99,5 @@ async def publish_adapter_transfer_event(
     )
     if extra:
         await safe_upsert(identity, extra, force=True)
+    enrich_request_waits(identity)
     return await safe_mark_phase(identity, phase, extra)

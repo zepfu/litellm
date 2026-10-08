@@ -21,6 +21,11 @@ from fastapi import HTTPException, Request, status
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import litellm
+from litellm.integrations.aawm_session_history.waits import (
+    claim_request_call_id,
+    wait_for,
+    enrich_request_waits,
+)
 from litellm._logging import verbose_proxy_logger
 from litellm._uuid import uuid
 from litellm.constants import (
@@ -170,7 +175,7 @@ async def create_response(
             generator = await generator
 
         # Now get the first chunk from the actual generator
-        first_chunk_value = await generator.__anext__()
+        first_chunk_value = await wait_for("adapter_first_chunk", generator.__anext__())
 
         if first_chunk_value is not None:
             try:
@@ -834,8 +839,15 @@ class ProxyBaseLLMRequestProcessing:
         ):
             self.data["model"] = user_api_key_dict.aliases[self.data["model"]]
 
-        self.data["litellm_call_id"] = request.headers.get(
-            "x-litellm-call-id", str(uuid.uuid4())
+        self.data["litellm_call_id"] = claim_request_call_id(
+            request.headers.get("x-litellm-call-id", str(uuid.uuid4()))
+        )
+        from litellm.proxy.aawm_session_transfer.identity import (
+            extract_transfer_identity,
+        )
+
+        enrich_request_waits(
+            extract_transfer_identity(request=request, request_body=self.data)
         )
         DDSpanTagger.tag_call_id(self.data.get("litellm_call_id"))
         DDSpanTagger.tag_request(
@@ -871,8 +883,11 @@ class ProxyBaseLLMRequestProcessing:
 
         self.data["litellm_logging_obj"] = logging_obj
 
-        self.data = await proxy_logging_obj.pre_call_hook(  # type: ignore
-            user_api_key_dict=user_api_key_dict, data=self.data, call_type=route_type  # type: ignore
+        self.data = await wait_for(
+            "request_hooks",
+            proxy_logging_obj.pre_call_hook(  # type: ignore
+                user_api_key_dict=user_api_key_dict, data=self.data, call_type=route_type  # type: ignore
+            ),
         )
 
         # Apply hierarchical router_settings (Key > Team)
@@ -1133,11 +1148,14 @@ class ProxyBaseLLMRequestProcessing:
             )
 
             # Call response headers hook for streaming success
-            callback_headers = await proxy_logging_obj.post_call_response_headers_hook(
-                data=self.data,
-                user_api_key_dict=user_api_key_dict,
-                response=response,
-                request_headers=dict(request.headers),
+            callback_headers = await wait_for(
+                "request_hooks",
+                proxy_logging_obj.post_call_response_headers_hook(
+                    data=self.data,
+                    user_api_key_dict=user_api_key_dict,
+                    response=response,
+                    request_headers=dict(request.headers),
+                ),
             )
             if callback_headers:
                 custom_headers.update(callback_headers)
@@ -1205,8 +1223,11 @@ class ProxyBaseLLMRequestProcessing:
                 )
 
         ### CALL HOOKS ### - modify outgoing data
-        response = await proxy_logging_obj.post_call_success_hook(
-            data=self.data, user_api_key_dict=user_api_key_dict, response=response
+        response = await wait_for(
+            "request_hooks",
+            proxy_logging_obj.post_call_success_hook(
+                data=self.data, user_api_key_dict=user_api_key_dict, response=response
+            ),
         )
         if route_type == "arerank":
             capture_rerank_shape(
@@ -1253,11 +1274,14 @@ class ProxyBaseLLMRequestProcessing:
         )
 
         # Call response headers hook for non-streaming success
-        callback_headers = await proxy_logging_obj.post_call_response_headers_hook(
-            data=self.data,
-            user_api_key_dict=user_api_key_dict,
-            response=response,
-            request_headers=dict(request.headers),
+        callback_headers = await wait_for(
+            "request_hooks",
+            proxy_logging_obj.post_call_response_headers_hook(
+                data=self.data,
+                user_api_key_dict=user_api_key_dict,
+                response=response,
+                request_headers=dict(request.headers),
+            ),
         )
         if callback_headers:
             fastapi_response.headers.update(callback_headers)
@@ -1381,10 +1405,13 @@ class ProxyBaseLLMRequestProcessing:
                 exc_info=(type(e), e, e.__traceback__),
             )
         # Allow callbacks to transform the error response
-        transformed_exception = await proxy_logging_obj.post_call_failure_hook(
-            user_api_key_dict=user_api_key_dict,
-            original_exception=e,
-            request_data=self.data,
+        transformed_exception = await wait_for(
+            "request_hooks",
+            proxy_logging_obj.post_call_failure_hook(
+                user_api_key_dict=user_api_key_dict,
+                original_exception=e,
+                request_data=self.data,
+            ),
         )
         # Use transformed exception if callback returned one, otherwise use original
         if transformed_exception is not None:
@@ -1435,12 +1462,15 @@ class ProxyBaseLLMRequestProcessing:
 
         # Call response headers hook for failure
         try:
-            callback_headers = await proxy_logging_obj.post_call_response_headers_hook(
-                data=self.data,
-                user_api_key_dict=user_api_key_dict,
-                response=None,
-                request_headers=(self.data.get("proxy_server_request") or {}).get(
-                    "headers", {}
+            callback_headers = await wait_for(
+                "request_hooks",
+                proxy_logging_obj.post_call_response_headers_hook(
+                    data=self.data,
+                    user_api_key_dict=user_api_key_dict,
+                    response=None,
+                    request_headers=(self.data.get("proxy_server_request") or {}).get(
+                        "headers", {}
+                    ),
                 ),
             )
             if callback_headers:
@@ -1540,11 +1570,14 @@ class ProxyBaseLLMRequestProcessing:
                 verbose_proxy_logger.debug(
                     "async_data_generator: received streaming chunk - {}".format(chunk)
                 )
-                chunk = await proxy_logging_obj.async_post_call_streaming_hook(
-                    user_api_key_dict=user_api_key_dict,
-                    response=chunk,
-                    data=request_data,
-                    str_so_far=str_so_far,
+                chunk = await wait_for(
+                    "request_hooks",
+                    proxy_logging_obj.async_post_call_streaming_hook(
+                        user_api_key_dict=user_api_key_dict,
+                        response=chunk,
+                        data=request_data,
+                        str_so_far=str_so_far,
+                    ),
                 )
 
                 if isinstance(chunk, (ModelResponse, ModelResponseStream)):
@@ -1573,10 +1606,13 @@ class ProxyBaseLLMRequestProcessing:
                     str(e)
                 )
             )
-            transformed_exception = await proxy_logging_obj.post_call_failure_hook(
-                user_api_key_dict=user_api_key_dict,
-                original_exception=e,
-                request_data=request_data,
+            transformed_exception = await wait_for(
+                "request_hooks",
+                proxy_logging_obj.post_call_failure_hook(
+                    user_api_key_dict=user_api_key_dict,
+                    original_exception=e,
+                    request_data=request_data,
+                ),
             )
             if transformed_exception is not None:
                 e = transformed_exception

@@ -13,6 +13,11 @@ from urllib.parse import urlparse
 import httpx
 
 import litellm
+from litellm.integrations.aawm_session_history.waits import (
+    wait_for,
+    wait_iterator,
+    enrich_request_waits,
+)
 from litellm._logging import verbose_proxy_logger
 from litellm.integrations.aawm_passthrough_shape_capture import (
     capture_passthrough_stream_shape,
@@ -1208,7 +1213,9 @@ class PassThroughStreamingHandler:
             iterator = response.aiter_bytes()
             while True:
                 try:
-                    chunk = await iterator.__anext__()
+                    chunk = await wait_for(
+                        "upstream_precommit_read", iterator.__anext__()
+                    )
                 except StopAsyncIteration:
                     iterator = None
                     break
@@ -1822,7 +1829,9 @@ class PassThroughStreamingHandler:
                 if extra:
                     metadata["aawm_deferred_transfer_extra"] = dict(extra)
                 return
-            await safe_finalize(identity, phase, extra=extra)
+            await wait_for(
+                "transfer_registry", safe_finalize(identity, phase, extra=extra)
+            )
 
         try:
             raw_bytes: List[bytes] = []
@@ -1901,9 +1910,14 @@ class PassThroughStreamingHandler:
                 custom_llm_provider=custom_llm_provider,
                 stream_path="pass_through",
             )
-            await safe_mark_phase(transfer_identity, "awaiting_upstream")
+            await wait_for(
+                "transfer_registry",
+                safe_mark_phase(transfer_identity, "awaiting_upstream"),
+            )
             downstream_chunk_count = 0
             downstream_byte_count = 0
+
+            enrich_request_waits(transfer_identity)
 
             async def _publish_transfer_chunks(
                 *,
@@ -1913,14 +1927,17 @@ class PassThroughStreamingHandler:
             ) -> None:
                 if not force and chunk_count > 1 and chunk_count % 8 != 0:
                     return
-                await safe_record_chunks(
-                    transfer_identity,
-                    upstream_chunks=chunk_count,
-                    upstream_bytes=total_stream_bytes,
-                    downstream_chunks=downstream_chunk_count,
-                    downstream_bytes=downstream_byte_count,
-                    first_upstream=first_upstream,
-                    first_downstream=first_downstream,
+                await wait_for(
+                    "transfer_registry",
+                    safe_record_chunks(
+                        transfer_identity,
+                        upstream_chunks=chunk_count,
+                        upstream_bytes=total_stream_bytes,
+                        downstream_chunks=downstream_chunk_count,
+                        downstream_bytes=downstream_byte_count,
+                        first_upstream=first_upstream,
+                        first_downstream=first_downstream,
+                    ),
                 )
 
             def _mark_first_emitted_chunk() -> None:
@@ -2103,16 +2120,19 @@ class PassThroughStreamingHandler:
                         ),
                     },
                 )
-                await safe_mark_phase(
-                    transfer_identity,
-                    "finalizing",
-                    extra={
-                        "delivered_disposition": delivered_disposition,
-                        "upstream_chunk_count": chunk_count,
-                        "upstream_byte_count": total_stream_bytes,
-                        "downstream_chunk_count": downstream_chunk_count,
-                        "downstream_byte_count": downstream_byte_count,
-                    },
+                await wait_for(
+                    "transfer_registry",
+                    safe_mark_phase(
+                        transfer_identity,
+                        "finalizing",
+                        extra={
+                            "delivered_disposition": delivered_disposition,
+                            "upstream_chunk_count": chunk_count,
+                            "upstream_byte_count": total_stream_bytes,
+                            "downstream_chunk_count": downstream_chunk_count,
+                            "downstream_byte_count": downstream_byte_count,
+                        },
+                    ),
                 )
                 transfer_phase = {
                     "completed": "completed",
@@ -2125,16 +2145,19 @@ class PassThroughStreamingHandler:
                     "failed",
                 )
                 async def _finalize_stream_delivery() -> None:
-                    await safe_finalize(
-                        transfer_identity,
-                        transfer_phase,
-                        extra={
-                            "delivered_disposition": delivered_disposition,
-                            "upstream_chunk_count": chunk_count,
-                            "upstream_byte_count": total_stream_bytes,
-                            "downstream_chunk_count": downstream_chunk_count,
-                            "downstream_byte_count": downstream_byte_count,
-                        },
+                    await wait_for(
+                        "transfer_registry",
+                        safe_finalize(
+                            transfer_identity,
+                            transfer_phase,
+                            extra={
+                                "delivered_disposition": delivered_disposition,
+                                "upstream_chunk_count": chunk_count,
+                                "upstream_byte_count": total_stream_bytes,
+                                "downstream_chunk_count": downstream_chunk_count,
+                                "downstream_byte_count": downstream_byte_count,
+                            },
+                        ),
                     )
 
                     precomputed_lines: Optional[List[str]] = None
@@ -2184,7 +2207,10 @@ class PassThroughStreamingHandler:
                 async def _run_post_delivery_bookkeeping(
                     delivered_snapshot: Dict[str, Any],
                 ) -> None:
-                    await _finalize_completed_stream(delivered_snapshot)
+                    await wait_for(
+                        "terminal_bookkeeping",
+                        _finalize_completed_stream(delivered_snapshot),
+                    )
 
                 if openai_stream_bookkeeping_state is not None:
                     openai_stream_bookkeeping_state[
@@ -2200,7 +2226,9 @@ class PassThroughStreamingHandler:
                 if isinstance(extensions, dict):
                     extensions["aawm_openai_responses_terminal_pending"] = True
 
-            async for chunk in response.aiter_bytes():
+            async for chunk in wait_iterator(
+                "upstream_stream_read", response.aiter_bytes()
+            ):
                 current_chunk_at = datetime.now()
                 chunk_count += 1
                 total_stream_bytes += len(chunk)
@@ -2480,7 +2508,7 @@ class PassThroughStreamingHandler:
                 )
                 yield trailing_partial
 
-            await _finalize_completed_stream()
+            await wait_for("terminal_bookkeeping", _finalize_completed_stream())
         except asyncio.CancelledError:
             local_identity = (
                 transfer_identity if "transfer_identity" in locals() else {}
@@ -2489,7 +2517,9 @@ class PassThroughStreamingHandler:
                 getattr(response, "url", None)
             ):
                 try:
-                    await aclose_upstream_response_once(response)
+                    await wait_for(
+                        "resource_cleanup", aclose_upstream_response_once(response)
+                    )
                 except Exception:
                     pass
             await _finalize_transfer_if_needed(
@@ -2526,7 +2556,7 @@ class PassThroughStreamingHandler:
                 and locals().get("responses_terminal_seen") is True
             ):
                 metadata["aawm_responses_terminal_close_finalized"] = True
-                await _finalize_completed_stream()
+                await wait_for("terminal_bookkeeping", _finalize_completed_stream())
                 raise
             local_identity = (
                 transfer_identity if "transfer_identity" in locals() else {}
@@ -2535,7 +2565,9 @@ class PassThroughStreamingHandler:
                 getattr(response, "url", None)
             ):
                 try:
-                    await aclose_upstream_response_once(response)
+                    await wait_for(
+                        "resource_cleanup", aclose_upstream_response_once(response)
+                    )
                 except Exception:
                     pass
             await _finalize_transfer_if_needed(
@@ -2716,10 +2748,13 @@ class PassThroughStreamingHandler:
             "downstream_chunk_count": 0,
             "downstream_byte_count": 0,
         }
-        await safe_mark_phase(
-            transfer_identity,
-            "finalizing",
-            extra=transfer_extra,
+        await wait_for(
+            "transfer_registry",
+            safe_mark_phase(
+                transfer_identity,
+                "finalizing",
+                extra=transfer_extra,
+            ),
         )
         transfer_phase = {
             "completed": "completed",
@@ -2728,10 +2763,13 @@ class PassThroughStreamingHandler:
             "cancelled": "cancelled",
             "disconnected": "disconnected",
         }.get(delivered_disposition, "failed")
-        await safe_finalize(
-            transfer_identity,
-            transfer_phase,
-            extra=transfer_extra,
+        await wait_for(
+            "transfer_registry",
+            safe_finalize(
+                transfer_identity,
+                transfer_phase,
+                extra=transfer_extra,
+            ),
         )
         await PassThroughStreamingHandler._route_streaming_logging_to_handler(
             litellm_logging_obj=litellm_logging_obj,

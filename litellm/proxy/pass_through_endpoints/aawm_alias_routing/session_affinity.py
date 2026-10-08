@@ -33,6 +33,8 @@ structured ``redispatch_required`` (never ignored).
 
 from __future__ import annotations
 
+from litellm.integrations.aawm_session_history.waits import track_wait
+
 import asyncio
 import hashlib
 import json
@@ -2550,6 +2552,7 @@ def _decode_redis_value(raw: Any, *, redis_cache: Any) -> Optional[Payload]:
     return cast(Payload, parsed)
 
 
+@track_wait("session_owner_lookup")
 async def _read_session_owner_record(
     *,
     redis_cache: Any,
@@ -2658,6 +2661,7 @@ def _normalize_reservation_wait_poll(poll_seconds: Optional[float]) -> float:
     return max(0.001, min(_MAX_RESERVATION_WAIT_POLL_SECONDS, poll))
 
 
+@track_wait("session_owner_reservation")
 async def _wait_for_foreign_reserved_session_owner(
     *,
     redis_cache: Any,
@@ -2829,6 +2833,7 @@ async def _cleanup_unpublished_session_owner_reservation(
         return None
 
 
+@track_wait("session_owner_acquisition")
 async def _acquire_session_owner_reservation(
     *,
     operation: Awaitable[Any],
@@ -3585,6 +3590,7 @@ def _session_owner_lease_is_renewable(
     )
 
 
+@track_wait("session_owner_renewal_barrier")
 async def _barrier_session_owner_lease_renewal(
     lease: SessionOwnerLease,
 ) -> None:
@@ -3639,6 +3645,7 @@ def _normalize_reservation_renewal_interval(
     return max(0.001, min(ttl / 2.0, interval))
 
 
+@track_wait("session_owner_renewal")
 async def _renew_session_owner_lease_once(
     lease: SessionOwnerLease,
     *,
@@ -3713,6 +3720,7 @@ async def _session_owner_lease_renewal_loop(
             )
 
 
+@track_wait("cancellation_cleanup")
 async def _cancel_and_await_tasks(*tasks: Any) -> None:
     active_tasks = [
         task
@@ -3898,6 +3906,7 @@ async def run_with_session_owner_lease_renewal(
                     lease.renewal_task = None
 
 
+@track_wait("session_owner_promotion")
 async def promote_session_owner_reservation(  # noqa: PLR0911
     *,
     session_identity: Optional[str],
@@ -4092,6 +4101,7 @@ async def promote_session_owner_reservation(  # noqa: PLR0911
     )
 
 
+@track_wait("session_owner_rebind")
 async def rebind_session_owner_for_portable_failover(  # noqa: PLR0911
     *,
     session_identity: Optional[str],
@@ -4431,6 +4441,7 @@ async def rebind_session_owner_for_portable_failover(  # noqa: PLR0911
     )
 
 
+@track_wait("session_owner_release")
 async def release_session_owner_reservation(
     *,
     session_identity: Optional[str],
@@ -4512,6 +4523,7 @@ async def release_session_owner_reservation(
     )
 
 
+@track_wait("session_owner_refresh")
 async def refresh_session_owner_mutable_attributes(
     *,
     session_identity: Optional[str],
@@ -5571,6 +5583,7 @@ def retained_session_is_closed(session: Any) -> bool:
     return closed is True
 
 
+@track_wait("resource_cleanup")
 async def close_retained_session_once(session: Any) -> None:
     """Close a retained session exactly once on the async path.
 
@@ -6119,6 +6132,7 @@ async def finalize_session_owner_lease_on_wire_disposition(
     return await finalize_session_owner_lease_on_failure(lease, request=request)
 
 
+@track_wait("session_owner_finalization")
 async def finalize_request_session_owner_lease(
     request: Any = None,
     response: Any = None,

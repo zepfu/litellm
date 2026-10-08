@@ -932,7 +932,11 @@ ON CONFLICT (litellm_call_id) DO UPDATE SET
     tenant_id = COALESCE(NULLIF(EXCLUDED.tenant_id, ''), session_history.tenant_id),
     call_type = COALESCE(NULLIF(EXCLUDED.call_type, ''), session_history.call_type),
     created_at = LEAST(session_history.created_at, EXCLUDED.created_at),
-    start_time = COALESCE(session_history.start_time, EXCLUDED.start_time),
+    start_time = CASE
+        WHEN session_history.call_type IS NULL AND session_history.metadata ? 'wait_accounting'
+            THEN COALESCE(EXCLUDED.start_time, session_history.start_time)
+        ELSE COALESCE(session_history.start_time, EXCLUDED.start_time)
+    END,
     end_time = COALESCE(EXCLUDED.end_time, session_history.end_time),
     input_tokens = GREATEST(session_history.input_tokens, EXCLUDED.input_tokens),
     output_tokens = GREATEST(session_history.output_tokens, EXCLUDED.output_tokens),
@@ -1375,7 +1379,8 @@ ON CONFLICT (litellm_call_id) DO UPDATE SET
         EXCLUDED.previous_response_to_current_request_ms,
         session_history.previous_response_to_current_request_ms
     ),
-    metadata = COALESCE(session_history.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
+    metadata = COALESCE(session_history.metadata, '{}'::jsonb)
+        || (COALESCE(EXCLUDED.metadata, '{}'::jsonb) - 'wait_accounting')
 """
 _AAWM_CLAUDE_AUTO_REVIEW_PARENT_IDENTITY_SQL = """
 SELECT
@@ -1422,6 +1427,7 @@ affected AS (
         SELECT sh.id
         FROM public.session_history sh
         WHERE sh.session_id = inserted.session_id
+          AND NOT (sh.call_type IS NULL AND sh.metadata ? 'wait_accounting')
           AND (COALESCE(sh.start_time, sh.created_at), sh.id)
               > (inserted.current_started_at, inserted.id)
         ORDER BY COALESCE(sh.start_time, sh.created_at) ASC, sh.id ASC
@@ -1450,6 +1456,7 @@ derived AS (
         SELECT sh.end_time
         FROM public.session_history sh
         WHERE sh.session_id = target.session_id
+          AND NOT (sh.call_type IS NULL AND sh.metadata ? 'wait_accounting')
           AND (COALESCE(sh.start_time, sh.created_at), sh.id)
               < (target.current_started_at, target.id)
         ORDER BY COALESCE(sh.start_time, sh.created_at) DESC, sh.id DESC
@@ -2374,3 +2381,20 @@ _AAWM_COHERE_ACCEPTED_CALLS_TABLE_SQL = _AAWM_LOCALLY_COUNTED_ACCEPTED_CALLS_TAB
 _AAWM_COHERE_ACCEPTED_CALLS_INDEX_STATEMENTS = (
     _AAWM_LOCALLY_COUNTED_ACCEPTED_CALLS_INDEX_STATEMENTS
 )
+
+# Checkpoints own only additive wait metadata and initial identity enrichment.
+_AAWM_SESSION_HISTORY_WAIT_CHECKPOINT_SQL = """
+INSERT INTO public.session_history (
+    litellm_call_id, session_id, model, provider, start_time, metadata
+) VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+ON CONFLICT (litellm_call_id) DO UPDATE SET
+    session_id = CASE WHEN session_history.session_id = 'request:' || EXCLUDED.litellm_call_id
+        THEN EXCLUDED.session_id ELSE session_history.session_id END,
+    model = CASE WHEN session_history.model = 'unknown'
+        THEN EXCLUDED.model ELSE session_history.model END,
+    provider = COALESCE(session_history.provider, EXCLUDED.provider),
+    metadata = COALESCE(session_history.metadata, '{}'::jsonb)
+        || jsonb_build_object('wait_accounting', EXCLUDED.metadata->'wait_accounting')
+WHERE COALESCE((session_history.metadata->'wait_accounting'->>'sequence')::bigint, -1)
+    < (EXCLUDED.metadata->'wait_accounting'->>'sequence')::bigint
+"""

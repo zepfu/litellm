@@ -61,6 +61,74 @@ This fork stores AAWM-specific routing and observability details in
 maintainer diagnostics and downstream reporting surfaces. They should not be
 treated as public LiteLLM API guarantees.
 
+## Durable request waits
+
+Inference HTTP requests persist `metadata.wait_accounting` through the existing
+session-history queue, batch writer, and degraded-mode spool. No new table,
+timer, or storage service is required. Checkpoints start at server admission,
+update at wait boundaries, and finish when the ASGI request exits. The first
+logging call shares the admission call ID; subsequent provider attempts retain
+separate token/cost rows. Request-wide waits remain on the first row, even when
+a later attempt succeeds.
+
+The object contains `version`, increasing `sequence`, `status`, UTC
+`started_at`/`updated_at`, `current_waits` (`type` and UTC `started_at`), cumulative
+closed `durations_ms`, and invocation `counts`. Status is `running`, `completed`,
+`failed`, `cancelled`, or `disconnected`; `completed` means the ASGI response
+finished, not that provider content succeeded. A running row with an open wait after
+process loss records the last persisted state; it does not prove the process is
+still alive. For each open wait, calculate elapsed time from its start to the
+observation time and add it to that type's closed duration. Multiple waits can
+be active concurrently, and nested spans overlap: do not sum type durations as
+total request latency. An empty `current_waits` means no instrumented await was
+active at the last checkpoint.
+
+Measured boundaries:
+
+- `request_body`: ASGI receive until the body completes; excludes the subsequent
+  disconnect watcher.
+- `authentication`: the proxy authentication builder after body parsing.
+- `credential_resolution` / `credential_reload`: LiteLLM's Codex credential
+  selection/loading and invalidated-token reload.
+- `request_hooks`: native and shared proxy hooks and guardrails.
+- `candidate_selection`: shared alias candidate selection, including quota
+  hydration, routing locks, and credential discovery.
+- `session_owner_lookup`, `session_owner_reservation`,
+  `session_owner_acquisition`, `session_owner_renewal`,
+  `session_owner_renewal_barrier`, `session_owner_promotion`,
+  `session_owner_rebind`, `session_owner_release`, `session_owner_refresh`,
+  `session_owner_finalization`: the corresponding ownership operations. The
+  reservation span includes polling and its lookups; renewal excludes the
+  background renewal loop's sleep.
+- `retry_backoff`: actual native hidden-retry/capacity-coordinator waiting,
+  including shortened or cancelled waits; excludes failed-attempt execution.
+- `upstream_response`: native HTTP send through its return (headers for streamed
+  sends; complete response for buffered sends).
+- `upstream_precommit_read`, `upstream_stream_read`, `upstream_body_read`: native
+  precommit byte reads, subsequent stream reads, and buffered body reads.
+- `adapter_response`, `adapter_first_chunk`, `adapter_stream_read`: shared
+  SDK call, shared first-chunk, and SDK stream-reader awaits. SDK processing
+  and callbacks inside those awaited operations are included.
+- `downstream_send`: the ASGI send await, including client backpressure.
+- `transfer_registry`: publishing live transfer-registry phases/chunks.
+- `terminal_bookkeeping`: native completed-stream finalization.
+- `cancellation_cleanup` / `resource_cleanup`: settling cancelled tasks and
+  closing native responses or retained sessions.
+
+Checkpoints are cumulative and coalesced per call within each writer batch.
+Older queued/spooled snapshots cannot replace a newer sequence. Checkpoints do
+not update terminal payloads, costs, tokens, tools, latency fields, or previous
+response gaps; checkpoint-only rows are excluded from previous-gap lookups.
+Normal history writes preserve the reserved wait object. Until
+identity becomes available, the row uses session `request:<call-id>` and model
+`unknown`. Normal callbacks populate the same row with full attribution.
+
+Persistence has the existing writer's flush delay and outage behavior. A hard
+exit before a checkpoint flush/spool can lose that checkpoint. Client-side
+credential, network, or scheduling waits before LiteLLM admission are outside
+this measurement. Existing latency columns and retry `Elapsed Wait` retain their
+meanings; these checkpoints supplement them for unfinished requests.
+
 ## OpenAI passthrough text-watermark audits
 
 When `general_settings.openai_passthrough_text_watermark.mode` is not `off`,

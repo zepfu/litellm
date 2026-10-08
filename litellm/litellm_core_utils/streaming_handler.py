@@ -24,6 +24,7 @@ import httpx
 from pydantic import BaseModel
 
 import litellm
+from litellm.integrations.aawm_session_history.waits import track_wait
 from litellm import verbose_logger
 from litellm._uuid import uuid
 from litellm.llms.cohere.cancellation import (
@@ -2008,6 +2009,7 @@ class CustomStreamWrapper:
 
         return self.completion_stream
 
+    @track_wait("adapter_stream_read")
     async def __anext__(self) -> "ModelResponseStream":  # noqa: PLR0915
         cache_hit = False
         if (

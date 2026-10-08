@@ -1436,6 +1436,11 @@ def post_call_processing(
 
 
 def client(original_function):  # noqa: PLR0915
+    from litellm.integrations.aawm_session_history.waits import (
+        claim_request_call_id,
+        track_wait,
+    )
+
     Rules = getattr(sys.modules[__name__], "Rules")
     rules_obj = Rules()
 
@@ -1498,7 +1503,7 @@ def client(original_function):  # noqa: PLR0915
 
         # only set litellm_call_id if its not in kwargs
         if "litellm_call_id" not in kwargs:
-            kwargs["litellm_call_id"] = str(uuid.uuid4())
+            kwargs["litellm_call_id"] = claim_request_call_id(str(uuid.uuid4()))
 
         try:
             if logging_obj is None:
@@ -1815,6 +1820,7 @@ def client(original_function):  # noqa: PLR0915
             raise e
 
     @wraps(original_function)
+    @track_wait("adapter_response")
     async def wrapper_async(*args, **kwargs):  # noqa: PLR0915
         call_type = original_function.__name__
         model: Optional[str] = args[0] if len(args) > 0 else kwargs.get("model", None)
@@ -1840,7 +1846,7 @@ def client(original_function):  # noqa: PLR0915
         )
         # only set litellm_call_id if its not in kwargs
         if "litellm_call_id" not in kwargs:
-            kwargs["litellm_call_id"] = str(uuid.uuid4())
+            kwargs["litellm_call_id"] = claim_request_call_id(str(uuid.uuid4()))
 
         is_completion_with_fallbacks = kwargs.get("fallbacks") is not None
 

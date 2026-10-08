@@ -51,6 +51,10 @@ from websockets.exceptions import (
 )
 
 import litellm
+from litellm.integrations.aawm_session_history.waits import (
+    claim_request_call_id,
+    wait_for,
+)
 from litellm._logging import (
     _redact_string,
     emit_aawm_error_intake_only,
@@ -2467,7 +2471,7 @@ def _record_grok_billing_passthrough_request_contract(
 
 
 async def _passthrough_hidden_retry_sleep(seconds: float) -> None:
-    await asyncio.sleep(seconds)
+    await wait_for("retry_backoff", asyncio.sleep(seconds))
 
 
 async def _await_passthrough_pre_first_byte_operation(
@@ -2504,7 +2508,10 @@ async def _await_passthrough_pre_first_byte_operation(
             )
             if operation_task not in done:
                 operation_task.cancel()
-                await asyncio.gather(operation_task, return_exceptions=True)
+                await wait_for(
+                    "cancellation_cleanup",
+                    asyncio.gather(operation_task, return_exceptions=True),
+                )
                 raise _PassthroughHiddenRetryBudgetTimeout(
                     f"Pass-through {operation_name} hidden retry budget exhausted"
                 )
@@ -2512,7 +2519,10 @@ async def _await_passthrough_pre_first_byte_operation(
         finally:
             if not operation_task.done():
                 operation_task.cancel()
-            await asyncio.gather(operation_task, return_exceptions=True)
+            await wait_for(
+                "cancellation_cleanup",
+                asyncio.gather(operation_task, return_exceptions=True),
+            )
 
     if request is None:
         return await _run_operation()
@@ -4988,8 +4998,13 @@ async def chat_completion_pass_through_endpoint(  # noqa: PLR0915
             data["model"] = user_api_key_dict.aliases[data["model"]]
 
         ### CALL HOOKS ### - modify incoming data before calling the model
-        data = await proxy_logging_obj.pre_call_hook(  # type: ignore
-            user_api_key_dict=user_api_key_dict, data=data, call_type="text_completion"
+        data = await wait_for(
+            "request_hooks",
+            proxy_logging_obj.pre_call_hook(  # type: ignore
+                user_api_key_dict=user_api_key_dict,
+                data=data,
+                call_type="text_completion",
+            ),
         )
 
         ### ROUTE THE REQUESTs ###
@@ -5759,7 +5774,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             if not is_openai_redirect:
                 return
             try:
-                await response.aclose()
+                await wait_for("resource_cleanup", response.aclose())
             except Exception:  # noqa: BLE001
                 verbose_proxy_logger.debug(
                     "Failed to close rejected OpenAI redirect response",
@@ -5779,7 +5794,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             )
             return
         try:
-            await response.aclose()
+            await wait_for("resource_cleanup", response.aclose())
         except Exception:  # noqa: BLE001
             verbose_proxy_logger.debug(
                 "Failed to close rejected managed xAI redirect response",
@@ -5986,7 +6001,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                     send_kwargs: dict[str, Any] = {"stream": False}
                     if follow_redirects is not None:
                         send_kwargs["follow_redirects"] = follow_redirects
-                    response = await async_client.send(req, **send_kwargs)
+                    response = await wait_for(
+                        "upstream_response", async_client.send(req, **send_kwargs)
+                    )
                 else:
                     request_kwargs: dict[str, Any] = {
                         "method": request.method,
@@ -5996,7 +6013,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                     }
                     if follow_redirects is not None:
                         request_kwargs["follow_redirects"] = follow_redirects
-                    response = await async_client.request(**request_kwargs)
+                    response = await wait_for(
+                        "upstream_response", async_client.request(**request_kwargs)
+                    )
         else:
             json_headers, _removed_content_type = _headers_for_json_passthrough_egress(
                 headers
@@ -6023,7 +6042,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                     send_kwargs = {"stream": False}
                     if follow_redirects is not None:
                         send_kwargs["follow_redirects"] = follow_redirects
-                    response = await async_client.send(req, **send_kwargs)
+                    response = await wait_for(
+                        "upstream_response", async_client.send(req, **send_kwargs)
+                    )
                 else:
                     request_kwargs = {
                         "method": request.method,
@@ -6034,7 +6055,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                     }
                     if follow_redirects is not None:
                         request_kwargs["follow_redirects"] = follow_redirects
-                    response = await async_client.request(**request_kwargs)
+                    response = await wait_for(
+                        "upstream_response", async_client.request(**request_kwargs)
+                    )
         return response
 
     @staticmethod
@@ -6083,7 +6106,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                     send_kwargs: dict[str, Any] = {"stream": False}
                     if follow_redirects is not None:
                         send_kwargs["follow_redirects"] = follow_redirects
-                    response = await async_client.send(req, **send_kwargs)
+                    response = await wait_for(
+                        "upstream_response", async_client.send(req, **send_kwargs)
+                    )
                 else:
                     request_kwargs: dict[str, Any] = {
                         "method": request.method,
@@ -6093,7 +6118,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                     }
                     if follow_redirects is not None:
                         request_kwargs["follow_redirects"] = follow_redirects
-                    response = await async_client.request(**request_kwargs)
+                    response = await wait_for(
+                        "upstream_response", async_client.request(**request_kwargs)
+                    )
         elif raw_body is not None:
             if send_request_fn is not None:
                 req = async_client.build_request(
@@ -6120,7 +6147,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 send_kwargs: dict[str, Any] = {"stream": True}
                 if follow_redirects is not None:
                     send_kwargs["follow_redirects"] = follow_redirects
-                response = await async_client.send(req, **send_kwargs)
+                response = await wait_for(
+                    "upstream_response", async_client.send(req, **send_kwargs)
+                )
             else:
                 if validate_request_fn is not None:
                     req = async_client.build_request(
@@ -6134,7 +6163,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                     send_kwargs = {"stream": False}
                     if follow_redirects is not None:
                         send_kwargs["follow_redirects"] = follow_redirects
-                    response = await async_client.send(req, **send_kwargs)
+                    response = await wait_for(
+                        "upstream_response", async_client.send(req, **send_kwargs)
+                    )
                 else:
                     request_kwargs = {
                         "method": request.method,
@@ -6145,7 +6176,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                     }
                     if follow_redirects is not None:
                         request_kwargs["follow_redirects"] = follow_redirects
-                    response = await async_client.request(**request_kwargs)
+                    response = await wait_for(
+                        "upstream_response", async_client.request(**request_kwargs)
+                    )
         elif (
             HttpPassThroughEndpointHelpers.is_multipart(request) is True
             and not _parsed_body
@@ -6193,7 +6226,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 send_kwargs = {"stream": True}
                 if follow_redirects is not None:
                     send_kwargs["follow_redirects"] = follow_redirects
-                response = await async_client.send(req, **send_kwargs)
+                response = await wait_for(
+                    "upstream_response", async_client.send(req, **send_kwargs)
+                )
             else:
                 if validate_request_fn is not None:
                     req = async_client.build_request(
@@ -6207,7 +6242,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                     send_kwargs = {"stream": False}
                     if follow_redirects is not None:
                         send_kwargs["follow_redirects"] = follow_redirects
-                    response = await async_client.send(req, **send_kwargs)
+                    response = await wait_for(
+                        "upstream_response", async_client.send(req, **send_kwargs)
+                    )
                 else:
                     request_kwargs = {
                         "method": request.method,
@@ -6218,7 +6255,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                     }
                     if follow_redirects is not None:
                         request_kwargs["follow_redirects"] = follow_redirects
-                    response = await async_client.request(**request_kwargs)
+                    response = await wait_for(
+                        "upstream_response", async_client.request(**request_kwargs)
+                    )
         return response
 
     @staticmethod
@@ -6300,7 +6339,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             send_kwargs: dict[str, Any] = {"stream": True}
             if follow_redirects is not None:
                 send_kwargs["follow_redirects"] = follow_redirects
-            return await async_client.send(req, **send_kwargs)
+            return await wait_for(
+                "upstream_response", async_client.send(req, **send_kwargs)
+            )
 
         if validate_request_fn is not None:
             req = async_client.build_request(
@@ -6315,7 +6356,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             send_kwargs = {"stream": False}
             if follow_redirects is not None:
                 send_kwargs["follow_redirects"] = follow_redirects
-            response = await async_client.send(req, **send_kwargs)
+            response = await wait_for(
+                "upstream_response", async_client.send(req, **send_kwargs)
+            )
         else:
             request_kwargs: dict[str, Any] = {
                 "method": request.method,
@@ -6327,7 +6370,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             }
             if follow_redirects is not None:
                 request_kwargs["follow_redirects"] = follow_redirects
-            response = await async_client.request(**request_kwargs)
+            response = await wait_for(
+                "upstream_response", async_client.request(**request_kwargs)
+            )
         return response
 
     @staticmethod
@@ -7607,7 +7652,7 @@ async def pass_through_request(  # noqa: PLR0915
     #########################################################
     # Initialize variables
     #########################################################
-    litellm_call_id = str(uuid.uuid4())
+    litellm_call_id = claim_request_call_id(str(uuid.uuid4()))
     url: Optional[httpx.URL] = None
 
     # parsed request body
@@ -7945,10 +7990,13 @@ async def pass_through_request(  # noqa: PLR0915
         _parsed_body["litellm_logging_obj"] = logging_obj
 
         ### CALL HOOKS ### - modify incoming data / reject request before calling the model
-        _parsed_body = await proxy_logging_obj.pre_call_hook(
-            user_api_key_dict=user_api_key_dict,
-            data=_parsed_body,
-            call_type="pass_through_endpoint",
+        _parsed_body = await wait_for(
+            "request_hooks",
+            proxy_logging_obj.pre_call_hook(
+                user_api_key_dict=user_api_key_dict,
+                data=_parsed_body,
+                call_type="pass_through_endpoint",
+            ),
         )
         # Second normalize pass only when pre_call_hook rewrote the tools object
         # (RR-056 #9). In-place first-pass fixes are already complete; skip when
@@ -8343,7 +8391,7 @@ async def pass_through_request(  # noqa: PLR0915
                 return True
             closed = True
             try:
-                await response.aclose()
+                await wait_for("resource_cleanup", response.aclose())
             except BaseException:
                 closed = False
                 verbose_proxy_logger.debug(
@@ -9313,10 +9361,13 @@ async def pass_through_request(  # noqa: PLR0915
                                 or egress_credential_family
                             ),
                         )
-                    response = await async_client.send(
-                        prepared_request,
-                        stream=send_stream,
-                        follow_redirects=False,
+                    response = await wait_for(
+                        "upstream_response",
+                        async_client.send(
+                            prepared_request,
+                            stream=send_stream,
+                            follow_redirects=False,
+                        ),
                     )
                     _record_openai_final_send_binding_observation(
                         request=request,
@@ -9385,10 +9436,13 @@ async def pass_through_request(  # noqa: PLR0915
                         expected_target_family or egress_credential_family
                     ),
                 )
-                response = await async_client.send(
-                    prepared_request,
-                    stream=send_stream,
-                    follow_redirects=False,
+                response = await wait_for(
+                    "upstream_response",
+                    async_client.send(
+                        prepared_request,
+                        stream=send_stream,
+                        follow_redirects=False,
+                    ),
                 )
                 await HttpPassThroughEndpointHelpers.reject_managed_xai_redirect_response(
                     response=response,
@@ -9515,7 +9569,9 @@ async def pass_through_request(  # noqa: PLR0915
                         send_kwargs: dict[str, Any] = {"stream": stream}
                         if managed_xai_oauth_egress or openai_bound_egress:
                             send_kwargs["follow_redirects"] = False
-                        response = await async_client.send(req, **send_kwargs)
+                        response = await wait_for(
+                            "upstream_response", async_client.send(req, **send_kwargs)
+                        )
                     raw_response = response
                     await HttpPassThroughEndpointHelpers.reject_managed_xai_redirect_response(
                         response=response,
@@ -9527,8 +9583,10 @@ async def pass_through_request(  # noqa: PLR0915
                     try:
                         response.raise_for_status()
                     except httpx.HTTPStatusError as e:
-                        error_content = await e.response.aread()
-                        await e.response.aclose()
+                        error_content = await wait_for(
+                            "upstream_body_read", e.response.aread()
+                        )
+                        await wait_for("resource_cleanup", e.response.aclose())
                         clear_active_upstream_response(request, response=e.response)
                         raw_response = None
                         _capture_passthrough_error_shape(
@@ -10012,8 +10070,10 @@ async def pass_through_request(  # noqa: PLR0915
                     try:
                         response.raise_for_status()
                     except httpx.HTTPStatusError as e:
-                        error_content = await e.response.aread()
-                        await e.response.aclose()
+                        error_content = await wait_for(
+                            "upstream_body_read", e.response.aread()
+                        )
+                        await wait_for("resource_cleanup", e.response.aclose())
                         clear_active_upstream_response(request, response=e.response)
                         raw_response = None
                         _capture_passthrough_error_shape(
@@ -10074,8 +10134,10 @@ async def pass_through_request(  # noqa: PLR0915
                 except httpx.HTTPStatusError as e:
                     # prefer_stream_for_unknown_content uses stream=True for non-GET,
                     # so non-SSE error bodies must be drained with aread() (RR-056 #6).
-                    error_content = await e.response.aread()
-                    await e.response.aclose()
+                    error_content = await wait_for(
+                        "upstream_body_read", e.response.aread()
+                    )
+                    await wait_for("resource_cleanup", e.response.aclose())
                     clear_active_upstream_response(request, response=e.response)
                     raw_response = None
                     try:
@@ -10110,7 +10172,7 @@ async def pass_through_request(  # noqa: PLR0915
                     and capacity_retry_coordinator is not None
                     and is_native_openai_responses_route
                 ):
-                    await response.aread()
+                    await wait_for("upstream_body_read", response.aread())
                     pre_commit_failure = (
                         _classify_json_responses_precommit_failure(
                             get_response_body(response)
@@ -10435,7 +10497,7 @@ async def pass_through_request(  # noqa: PLR0915
 
         if response.status_code >= 300:
             # Streamed non-SSE responses need aread() before .text (RR-056 #6).
-            error_body = await response.aread()
+            error_body = await wait_for("upstream_body_read", response.aread())
             try:
                 error_detail = error_body.decode("utf-8", errors="replace")
             except Exception:
@@ -10453,7 +10515,7 @@ async def pass_through_request(  # noqa: PLR0915
             raise provider_exception
 
         finalize_started_at = datetime.now()
-        content = await response.aread()
+        content = await wait_for("upstream_body_read", response.aread())
 
         ## LOG SUCCESS
         response_body: Optional[dict] = get_response_body(response)
@@ -11932,10 +11994,13 @@ async def websocket_passthrough_request(  # noqa: PLR0915
 
     ### CALL HOOKS ### - modify incoming data / reject request before calling the model
     websocket_data: dict[str, Any] = {}
-    websocket_data = await proxy_logging_obj.pre_call_hook(
-        user_api_key_dict=user_api_key_dict,
-        data=websocket_data,
-        call_type="pass_through_endpoint",
+    websocket_data = await wait_for(
+        "request_hooks",
+        proxy_logging_obj.pre_call_hook(
+            user_api_key_dict=user_api_key_dict,
+            data=websocket_data,
+            call_type="pass_through_endpoint",
+        ),
     )
 
     try:

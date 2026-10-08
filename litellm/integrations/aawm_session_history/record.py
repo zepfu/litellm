@@ -2517,6 +2517,14 @@ async def _persist_session_history_record(record: Dict[str, Any]) -> None:
     async with pool.acquire() as conn:
         await _ensure_session_history_schema(conn)
 
+        if record.get("_wait_checkpoint"):
+            from litellm.integrations.aawm_session_history.waits import (
+                persist_wait_checkpoints,
+            )
+
+            await persist_wait_checkpoints(conn, [_strip_postgres_nul_bytes(record)])
+            return
+
         history_records = [] if record.get("_skip_session_history") else [record]
         if history_records:
             # Primary session_history + tool_activity are one unit of work.
@@ -2553,6 +2561,19 @@ async def _persist_session_history_records(records: List[Dict[str, Any]]) -> Non
     pool = await _get_aawm_session_history_pool()
     async with pool.acquire() as conn:
         await _ensure_session_history_schema(conn)
+
+        checkpoints = [record for record in records if record.get("_wait_checkpoint")]
+        records = [record for record in records if not record.get("_wait_checkpoint")]
+        if checkpoints:
+            from litellm.integrations.aawm_session_history.waits import (
+                persist_wait_checkpoints,
+            )
+
+            await persist_wait_checkpoints(
+                conn, [_strip_postgres_nul_bytes(record) for record in checkpoints]
+            )
+        if not records:
+            return
 
         history_records = [
             record for record in records if not record.get("_skip_session_history")

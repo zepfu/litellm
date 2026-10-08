@@ -18,6 +18,10 @@ from fastapi import HTTPException, Request, WebSocket, status
 from fastapi.security.api_key import APIKeyHeader
 
 import litellm
+from litellm.integrations.aawm_session_history.waits import (
+    wait_for,
+    enrich_request_waits,
+)
 from litellm._logging import verbose_logger, verbose_proxy_logger
 from litellm._service_logger import ServiceLogging
 from litellm.caching import DualCache
@@ -1554,15 +1558,24 @@ async def user_api_key_auth(
     route: str = get_request_route(request=request)
     ## CHECK IF ROUTE IS ALLOWED
 
-    user_api_key_auth_obj = await _user_api_key_auth_builder(
-        request=request,
-        api_key=api_key,
-        azure_api_key_header=azure_api_key_header,
-        anthropic_api_key_header=anthropic_api_key_header,
-        google_ai_studio_api_key_header=google_ai_studio_api_key_header,
-        azure_apim_header=azure_apim_header,
-        request_data=request_data,
-        custom_litellm_key_header=custom_litellm_key_header,
+    user_api_key_auth_obj = await wait_for(
+        "authentication",
+        _user_api_key_auth_builder(
+            request=request,
+            api_key=api_key,
+            azure_api_key_header=azure_api_key_header,
+            anthropic_api_key_header=anthropic_api_key_header,
+            google_ai_studio_api_key_header=google_ai_studio_api_key_header,
+            azure_apim_header=azure_apim_header,
+            request_data=request_data,
+            custom_litellm_key_header=custom_litellm_key_header,
+        ),
+    )
+
+    from litellm.proxy.aawm_session_transfer.identity import extract_transfer_identity
+
+    enrich_request_waits(
+        extract_transfer_identity(request=request, request_body=request_data)
     )
 
     ## ENSURE DISABLE ROUTE WORKS ACROSS ALL USER AUTH FLOWS ##
