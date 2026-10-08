@@ -17,7 +17,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import contextvars
 from dataclasses import dataclass
 from typing import Any, Mapping, MutableSequence, Optional
 
@@ -40,12 +39,6 @@ CODEX_COLLABORATION_TOOL_IDENTITIES_STATE_FIELD = (
 )
 CODEX_CAPTURE_EVIDENCE_STATE_FIELD = (
     "_aawm_cfg072_verified_capture"
-)
-CODEX_CAPTURE_EVIDENCE_CONTEXT_FIELD = (
-    "_aawm_cfg072_verified_capture_context"
-)
-CODEX_CAPTURE_EVIDENCE_OWNER_FIELD = (
-    "_aawm_cfg072_verified_capture_owner"
 )
 CFG072_REJECT_MARKER = "__cfg072_reject_requires_exact_cfg047_text_frame"
 CFG072_SEND_MESSAGE_OUTPUT_REJECTED_CODE = (
@@ -115,6 +108,22 @@ class CodexCollaborationDispatchError(ValueError):
     def __init__(self, reason: str):
         super().__init__(f"unsupported Codex collaboration assignment: {reason}")
         self.reason = reason
+
+
+@dataclass(frozen=True)
+class _CodexVerifiedCaptureEvidence:
+    sender_message: str
+    sender_message_sha256: str
+    sender_session_id: str
+    sender_call_id: str
+    sender_agent_path: str
+    target: str
+    receiver_session_id: str
+    receiver_item_id: str
+    author: str
+    recipient: str
+    header_task_name: str
+    capture_name: str
 
 
 class _NormalizedCodexAgentMessage(dict[str, Any]):
@@ -941,201 +950,6 @@ def _parse_collaboration_envelope(text: str) -> Optional[tuple[str, str, str, in
     )
 
 
-def _validate_envelope_identity(
-    item: Mapping[str, Any],
-    *,
-    task_name: str,
-    sender: str,
-) -> None:
-    author = item.get("author")
-    recipient = item.get("recipient")
-    if author is None and recipient is None:
-        return
-    if (
-        not isinstance(author, str)
-        or not author
-        or not isinstance(recipient, str)
-        or not recipient
-        or task_name != recipient
-        or sender != author
-    ):
-        raise CodexCollaborationDispatchError("invalid_envelope")
-
-
-def _replay_canonical_codex_message_payload(
-    item: Mapping[str, Any],
-    visible_text: str,
-    payload: Any,
-) -> Optional[str]:
-    """Return normalized exact MESSAGE text only from a captured history item.
-
-    Recovery requires actual matching author/recipient identity. Bare visible
-    envelopes therefore remain rejected, while malformed captured payload from
-    a real inter-agent MESSAGE can be repaired on replay without inventing
-    identity or accepting an opaque representation.
-    """
-    author = item.get("author")
-    recipient = item.get("recipient")
-    if (
-        not isinstance(author, str)
-        or not author
-        or not isinstance(recipient, str)
-        or not recipient
-    ):
-        return None
-    try:
-        return canonicalize_codex_send_message_argument(payload)
-    except CodexCollaborationDispatchError:
-        return None
-
-
-def _normalize_codex_message_payload(
-    item: dict[str, Any],
-    visible_part: dict[str, Any],
-    visible_text: str,
-    payload: Any,
-) -> tuple[dict[str, Any], bool]:
-    normalized_payload = _replay_canonical_codex_message_payload(
-        item,
-        visible_text,
-        payload,
-    )
-    assignment = (
-        parse_codex_collaboration_text_frame(normalized_payload)
-        if normalized_payload is not None
-        else _parse_codex_collaboration_payload(payload)
-    )
-    normalized_item = _NormalizedCodexAgentMessage(item)
-    normalized_item["content"] = [
-        {
-            "type": visible_part["type"],
-            "text": f"{visible_text}{assignment}",
-        }
-    ]
-    return normalized_item, True
-
-
-def _validate_visible_agent_message(
-    item: dict[str, Any],
-    visible_part: dict[str, Any],
-) -> Optional[dict[str, Any]]:
-    visible_text = visible_part.get("text")
-    if not isinstance(visible_text, str):
-        raise CodexCollaborationDispatchError("invalid_envelope")
-    envelope = _parse_collaboration_envelope(visible_text)
-    if envelope is None:
-        return None
-
-    message_type, task_name, sender, payload_offset = envelope
-    _validate_envelope_identity(item, task_name=task_name, sender=sender)
-    remainder = visible_text[payload_offset:]
-    if message_type not in {"NEW_TASK", "MESSAGE"}:
-        # A child result is content, even when its text happens to begin with
-        # a representation-looking prefix. Never reinterpret it as a task.
-        return None
-    if not remainder:
-        raise CodexCollaborationDispatchError("invalid_envelope")
-    if remainder:
-        assignment = _parse_codex_collaboration_payload(remainder)
-        normalized_item = _NormalizedCodexAgentMessage(item)
-        normalized_item["content"] = [
-            {
-                "type": visible_part["type"],
-                "text": f"{visible_text[:payload_offset]}{assignment}",
-            }
-        ]
-        return normalized_item
-    return None
-
-
-def _normalize_agent_message_item(item: dict[str, Any]) -> tuple[dict[str, Any], bool]:
-    if isinstance(item, _NormalizedCodexAgentMessage):
-        return item, False
-
-    content = item.get("content")
-    if not isinstance(content, list):
-        return item, False
-
-    encrypted_parts = [
-        part
-        for part in content
-        if isinstance(part, dict) and part.get("type") == "encrypted_content"
-    ]
-    if encrypted_parts:
-        if len(content) != 2 or len(encrypted_parts) != 1:
-            raise CodexCollaborationDispatchError("invalid_envelope")
-        visible_part, payload_part = content
-        if (
-            not isinstance(visible_part, dict)
-            or set(visible_part) != {"type", "text"}
-            or visible_part.get("type") not in {"input_text", "text"}
-            or not isinstance(payload_part, dict)
-            or set(payload_part) != {"type", "encrypted_content"}
-            or payload_part.get("type") != "encrypted_content"
-        ):
-            raise CodexCollaborationDispatchError("invalid_envelope")
-        visible_text = visible_part.get("text")
-        if not isinstance(visible_text, str):
-            raise CodexCollaborationDispatchError("invalid_envelope")
-        envelope = _parse_collaboration_envelope(visible_text)
-        if envelope is None:
-            raise CodexCollaborationDispatchError("invalid_envelope")
-        message_type, task_name, sender, payload_offset = envelope
-        if payload_offset != len(visible_text):
-            raise CodexCollaborationDispatchError("invalid_envelope")
-        _validate_envelope_identity(item, task_name=task_name, sender=sender)
-        if message_type == "MESSAGE":
-            return _normalize_codex_message_payload(
-                item,
-                visible_part,
-                visible_text,
-                payload_part.get("encrypted_content"),
-            )
-        if message_type != "NEW_TASK":
-            return item, False
-        payload = payload_part.get("encrypted_content")
-        if not isinstance(payload, str) or not payload:
-            raise CodexCollaborationDispatchError("invalid_envelope")
-        assignment = parse_codex_collaboration_text_frame(payload)
-        normalized_item = _NormalizedCodexAgentMessage(item)
-        normalized_item["content"] = [
-            {
-                "type": visible_part["type"],
-                "text": f"{visible_text}{assignment}",
-            }
-        ]
-        return normalized_item, True
-
-    if len(content) != 1:
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            text = part.get("text")
-            if not isinstance(text, str) or not text.startswith("Message Type: "):
-                continue
-            if part.get("type") not in {"input_text", "text"}:
-                raise CodexCollaborationDispatchError("invalid_envelope")
-            raise CodexCollaborationDispatchError("invalid_envelope")
-
-    if len(content) == 1 and isinstance(content[0], dict):
-        visible_part = content[0]
-        visible_text = visible_part.get("text")
-        if isinstance(visible_text, str) and visible_text.startswith("Message Type: "):
-            if visible_part.get("type") not in {"input_text", "text"}:
-                raise CodexCollaborationDispatchError("invalid_envelope")
-        if visible_part.get("type") in {"input_text", "text"}:
-            if set(visible_part) != {"type", "text"}:
-                raise CodexCollaborationDispatchError("invalid_envelope")
-            if isinstance(visible_text, str) and _is_opaque_representation(
-                visible_text
-            ):
-                raise CodexCollaborationDispatchError("opaque")
-            normalized_item = _validate_visible_agent_message(item, visible_part)
-            if normalized_item is not None:
-                return normalized_item, True
-    return item, False
-
-
 def canonicalize_generated_codex_send_message_call_arguments(
     value: Any,
 ) -> str:
@@ -1261,19 +1075,9 @@ def validate_codex_message_capture_evidence(
     task_name: str,
     sender: str,
 ) -> Optional[str]:
-    """Validate trusted request-local capture admission and project it.
-
-    The artifact must contain the complete sender message string, the
-    complete delivered bytes, the native targeted invocation target, and a
-    nonempty path of native delivery/resolution records. Admission first
-    proves that those strings are identical. Projection then wraps plain
-    prose in a strict frame, or projects an exact four-key frame through the
-    existing generated-frame projector. Literal target equality is accepted
-    only for absolute targets; every other selector requires a record ending
-    at the exact recipient.
-    """
+    """Validate the complete captured slot before projecting its contents."""
     if (
-        not isinstance(evidence, dict)
+        not isinstance(evidence, _CodexVerifiedCaptureEvidence)
         or not isinstance(item, Mapping)
         or not isinstance(payload, str)
         or not payload
@@ -1281,125 +1085,354 @@ def validate_codex_message_capture_evidence(
         or not sender
     ):
         return None
-    delivered = evidence.get("delivered_message")
-    original = evidence.get("sender_message")
     if (
-        not isinstance(delivered, str)
-        or delivered != payload
-        or not isinstance(original, str)
-        or original != delivered
+        evidence.sender_message != payload
+        or evidence.sender_message_sha256
+        != hashlib.sha256(payload.encode("utf-8")).hexdigest()
     ):
-        return None
-    if _is_opaque_representation(payload):
         return None
     author = item.get("author")
     recipient = item.get("recipient")
-    header_task = evidence.get("header_task_name")
     if (
         not isinstance(author, str)
         or not author
         or not isinstance(recipient, str)
         or not recipient
-        or evidence.get("author") != author
-        or evidence.get("recipient") != recipient
-        or header_task != recipient
+        or item.get("id") != evidence.receiver_item_id
+        or author != evidence.author
+        or author != evidence.sender_agent_path
+        or recipient != evidence.recipient
+        or recipient != evidence.target
+        or evidence.header_task_name != recipient
         or task_name != recipient
+        or sender != author
     ):
         return None
-    target = evidence.get("target")
-    resolution = evidence.get("resolution")
-    if not isinstance(target, str) or not target or not isinstance(resolution, list) or not resolution:
+    return _project_captured_codex_message_payload(
+        payload,
+        target=evidence.target,
+    )
+
+
+def _project_captured_codex_message_payload(
+    payload: str,
+    *,
+    target: str,
+) -> Optional[str]:
+    """Project bound prose or a target-matched four-key frame to CFG-047."""
+    if (
+        not payload
+        or len(payload) > _MAX_FRAME_CHARS
+        or _is_opaque_representation(payload)
+    ):
         return None
-    for record in resolution:
-        if not isinstance(record, dict):
-            return None
-    if not target.startswith("/"):
-        if resolution[-1].get("resolved_target") != recipient:
-            return None
-    elif target != recipient:
-        return None
-    if _FRAME_PREFIX_PATTERN.match(payload):
+
+    try:
         decoded, remainder = _decode_complete_json(payload)
-        if (
-            remainder != len(payload)
-            or not isinstance(decoded, dict)
-            or set(decoded) != {
-                "cfg047",
-                "encoding",
-                "text",
-                "task_name",
-            }
+    except CodexCollaborationDispatchError:
+        if payload.lstrip().startswith("{") and re.search(
+            r'"(?:cfg047|encoding|task_name)"\s*:',
+            payload,
         ):
             return None
-        frame_version = decoded.get("cfg047")
-        if (
-            not isinstance(frame_version, int)
-            or isinstance(frame_version, bool)
-            or frame_version != COLLABORATION_FRAME_VERSION
-            or decoded.get("encoding") != COLLABORATION_TEXT_ENCODING
-            or not isinstance(decoded.get("text"), str)
-            or not decoded["text"]
-            or _is_opaque_representation(decoded["text"])
-            or decoded.get("task_name") != task_name
-        ):
+        try:
+            return canonicalize_codex_send_message_argument(payload)
+        except CodexCollaborationDispatchError:
             return None
-    frame = {
-        "cfg047": COLLABORATION_FRAME_VERSION,
-        "encoding": COLLABORATION_TEXT_ENCODING,
-        "text": payload,
-    }
-    canonical = json.dumps(frame, ensure_ascii=False, separators=(",", ":"))
-    if len(canonical) > _MAX_FRAME_CHARS:
+
+    if remainder != len(payload):
         return None
-    if parse_codex_collaboration_text_frame(canonical) != payload:
+    if isinstance(decoded, dict):
+        keys = set(decoded)
+        if keys == {"cfg047", "encoding", "text"}:
+            try:
+                parse_codex_collaboration_text_frame(payload)
+            except CodexCollaborationDispatchError:
+                return None
+            return payload
+        if keys == {"cfg047", "encoding", "text", "task_name"}:
+            return _project_generated_four_key_frame(payload, target=target)
+        if keys.intersection({"cfg047", "encoding", "task_name"}):
+            return None
+
+    try:
+        return canonicalize_codex_send_message_argument(payload)
+    except CodexCollaborationDispatchError:
         return None
-    return canonical
 
 
-def bind_codex_verified_capture(request: Any, evidence: Any) -> None:
-    """Bind one trusted capture-evidence object to the current request."""
-    global _CODEX_CAPTURE_OWNER
+def _capture_row_payload(
+    record: Any,
+    *,
+    expected_type: str,
+) -> Optional[Mapping[str, Any]]:
+    if (
+        not isinstance(record, Mapping)
+        or record.get("type") != "response_item"
+        or not isinstance(record.get("payload"), Mapping)
+        or record["payload"].get("type") != expected_type
+    ):
+        return None
+    return record["payload"]
+
+
+def _capture_session_matches(entry: Any, record: Any) -> bool:
+    if (
+        not isinstance(entry, Mapping)
+        or not isinstance(record, Mapping)
+        or record.get("type") != "session_meta"
+        or not isinstance(record.get("payload"), Mapping)
+    ):
+        return False
+    metadata = record["payload"]
+    return (
+        entry.get("id") == entry.get("session_id") == metadata.get("id")
+        and entry.get("thread_source") == metadata.get("thread_source")
+        and entry.get("parent_thread_id") == metadata.get("parent_thread_id")
+        and entry.get("agent_path") == metadata.get("agent_path")
+        and entry.get("agent_role") == metadata.get("agent_role")
+    )
+
+
+def admit_codex_verified_capture_replay(
+    request: Any,
+    request_body: Mapping[str, Any],
+    *,
+    capture_manifest: Any,
+    capture_name: str,
+    sender_session_record: Any,
+    sender_record: Any,
+    receiver_session_record: Any,
+    receiver_record: Any,
+) -> bool:
+    """Admit one operator-selected local capture pair onto this request only.
+
+    The caller supplies the untouched JSONL rows selected by the operator.
+    Request-body fields never establish trust, and no capture is retained
+    outside this request.
+    """
+    try:
+        evidence = _build_codex_verified_capture_evidence(
+            request_body,
+            capture_manifest=capture_manifest,
+            capture_name=capture_name,
+            sender_session_record=sender_session_record,
+            sender_record=sender_record,
+            receiver_session_record=receiver_session_record,
+            receiver_record=receiver_record,
+        )
+    except CodexCollaborationDispatchError:
+        return False
+
     state = getattr(request, "state", None)
     if state is None:
-        return
-    if not isinstance(evidence, dict):
-        evidence = {"sender_message": evidence}
+        return False
+    if getattr(state, CODEX_CAPTURE_EVIDENCE_STATE_FIELD, None) is not None:
+        return False
     try:
         setattr(state, CODEX_CAPTURE_EVIDENCE_STATE_FIELD, evidence)
-        owner = f"state:{id(state)}"
-        setattr(state, CODEX_CAPTURE_EVIDENCE_OWNER_FIELD, owner)
-        _CODEX_CAPTURE_OWNER = owner
     except Exception:
-        return
+        return False
+    return True
 
 
-def get_codex_verified_capture(request: Any) -> Any:
-    """Return the current request's trusted capture evidence, if bound."""
+def _build_codex_verified_capture_evidence(
+    request_body: Mapping[str, Any],
+    *,
+    capture_manifest: Any,
+    capture_name: str,
+    sender_session_record: Any,
+    sender_record: Any,
+    receiver_session_record: Any,
+    receiver_record: Any,
+) -> _CodexVerifiedCaptureEvidence:
+    if (
+        not isinstance(capture_manifest, Mapping)
+        or capture_manifest.get("schema") != "cfg072-verified-captures-v1"
+        or capture_manifest.get("raw_message_contents_included") is not False
+        or not isinstance(capture_name, str)
+        or not capture_name
+        or not isinstance(request_body, Mapping)
+    ):
+        raise CodexCollaborationDispatchError("capture_binding")
+
+    pairs = capture_manifest.get("pairs")
+    if not isinstance(pairs, list):
+        raise CodexCollaborationDispatchError("capture_binding")
+    matching_pairs = [
+        pair
+        for pair in pairs
+        if isinstance(pair, Mapping) and pair.get("name") == capture_name
+    ]
+    if len(matching_pairs) != 1:
+        raise CodexCollaborationDispatchError("capture_binding")
+    pair = matching_pairs[0]
+    capture_origin = pair.get("capture_origin")
+    if (
+        not isinstance(capture_origin, Mapping)
+        or capture_origin.get("method")
+        != "local session JSONL physical-line extraction"
+        or capture_origin.get("source_contents_trusted_for_local_replay_only")
+        is not True
+    ):
+        raise CodexCollaborationDispatchError("capture_binding")
+
+    sender_entry = pair.get("sender")
+    receiver_entry = pair.get("receiver")
+    if not isinstance(sender_entry, Mapping) or not isinstance(
+        receiver_entry, Mapping
+    ):
+        raise CodexCollaborationDispatchError("capture_binding")
+    if not _capture_session_matches(sender_entry, sender_session_record):
+        raise CodexCollaborationDispatchError("capture_binding")
+    if not _capture_session_matches(receiver_entry, receiver_session_record):
+        raise CodexCollaborationDispatchError("capture_binding")
+
+    sender = _capture_row_payload(sender_record, expected_type="function_call")
+    receiver = _capture_row_payload(
+        receiver_record,
+        expected_type="agent_message",
+    )
+    if sender is None or receiver is None:
+        raise CodexCollaborationDispatchError("capture_binding")
+    if (
+        sender_record.get("timestamp") != sender_entry.get("timestamp")
+        or receiver_record.get("timestamp") != receiver_entry.get("timestamp")
+    ):
+        raise CodexCollaborationDispatchError("capture_binding")
+
+    sender_tool = sender_entry.get("tool")
+    outer_arguments = sender_entry.get("outer_arguments")
+    if (
+        not isinstance(sender_tool, Mapping)
+        or sender_tool.get("name") != "send_message"
+        or not isinstance(sender_tool.get("call_id"), str)
+        or not sender_tool.get("call_id")
+        or not isinstance(outer_arguments, Mapping)
+        or outer_arguments.get("additional_outer_keys") != []
+        or outer_arguments.get("message_type") != "string"
+        or outer_arguments.get("target_type") != "string"
+        or sender.get("name") != "send_message"
+        or sender.get("namespace") not in _COLLABORATION_NAMESPACES
+        or sender.get("call_id") != sender_tool.get("call_id")
+    ):
+        raise CodexCollaborationDispatchError("capture_binding")
+
+    arguments_value = sender.get("arguments")
+    if not isinstance(arguments_value, str):
+        raise CodexCollaborationDispatchError("capture_binding")
+    arguments, remainder = _decode_complete_json(arguments_value)
+    if (
+        remainder != len(arguments_value)
+        or not isinstance(arguments, dict)
+        or set(arguments) != {"message", "target"}
+        or not isinstance(arguments.get("message"), str)
+        or not arguments["message"]
+        or not isinstance(arguments.get("target"), str)
+        or not arguments["target"].startswith("/")
+    ):
+        raise CodexCollaborationDispatchError("capture_binding")
+    sender_message = arguments["message"]
+    target = arguments["target"]
+    sender_path = sender_entry.get("agent_path")
+    receiver_author = receiver.get("author")
+    recipient = receiver.get("recipient")
+    message_hash = hashlib.sha256(sender_message.encode("utf-8")).hexdigest()
+    delivered_slot = receiver_entry.get("delivered_slot")
+    if (
+        not isinstance(sender_path, str)
+        or not sender_path
+        or sender_path != sender_session_record["payload"].get("agent_path")
+        or receiver_author != sender_path
+        or not isinstance(recipient, str)
+        or recipient != target
+        or target != outer_arguments.get("target")
+        or outer_arguments.get("message_length") != len(sender_message)
+        or outer_arguments.get("message_sha256") != message_hash
+        or not isinstance(delivered_slot, Mapping)
+        or delivered_slot.get("type") != "encrypted_content"
+        or delivered_slot.get("length") != len(sender_message)
+        or delivered_slot.get("sha256") != message_hash
+    ):
+        raise CodexCollaborationDispatchError("capture_binding")
+
+    content = receiver.get("content")
+    if (
+        not isinstance(content, list)
+        or len(content) != 2
+        or not isinstance(content[0], Mapping)
+        or set(content[0]) != {"type", "text"}
+        or content[0].get("type") not in {"input_text", "text"}
+        or not isinstance(content[0].get("text"), str)
+        or not isinstance(content[1], Mapping)
+        or set(content[1]) != {"type", "encrypted_content"}
+        or content[1].get("type") != "encrypted_content"
+        or content[1].get("encrypted_content") != sender_message
+    ):
+        raise CodexCollaborationDispatchError("capture_binding")
+    envelope = _parse_collaboration_envelope(content[0]["text"])
+    if (
+        envelope is None
+        or envelope[0] != "MESSAGE"
+        or envelope[1] != recipient
+        or envelope[2] != receiver_author
+        or envelope[3] != len(content[0]["text"])
+    ):
+        raise CodexCollaborationDispatchError("capture_binding")
+
+    receiver_item_id = receiver_entry.get("item_id")
+    receiver_session_id = receiver_entry.get("session_id")
+    sender_session_id = sender_entry.get("session_id")
+    if (
+        not isinstance(receiver_item_id, str)
+        or not receiver_item_id
+        or receiver.get("id") != receiver_item_id
+        or not isinstance(receiver_session_id, str)
+        or not receiver_session_id
+        or not isinstance(sender_session_id, str)
+        or not sender_session_id
+    ):
+        raise CodexCollaborationDispatchError("capture_binding")
+
+    input_items = request_body.get("input")
+    if not isinstance(input_items, list):
+        raise CodexCollaborationDispatchError("capture_binding")
+    matching_items = [
+        item
+        for item in input_items
+        if isinstance(item, Mapping) and item.get("id") == receiver_item_id
+    ]
+    if len(matching_items) != 1 or matching_items[0] != receiver:
+        raise CodexCollaborationDispatchError("capture_binding")
+
+    return _CodexVerifiedCaptureEvidence(
+        sender_message=sender_message,
+        sender_message_sha256=message_hash,
+        sender_session_id=sender_session_id,
+        sender_call_id=sender_tool["call_id"],
+        sender_agent_path=sender_path,
+        target=target,
+        receiver_session_id=receiver_session_id,
+        receiver_item_id=receiver_item_id,
+        author=receiver_author,
+        recipient=recipient,
+        header_task_name=envelope[1],
+        capture_name=capture_name,
+    )
+
+
+def _take_codex_verified_capture(
+    request: Any,
+) -> Optional[_CodexVerifiedCaptureEvidence]:
     state = getattr(request, "state", None)
     evidence = getattr(state, CODEX_CAPTURE_EVIDENCE_STATE_FIELD, None)
-    return evidence if isinstance(evidence, dict) else None
-
-
-_CODEX_CAPTURE_CONTEXT = contextvars.ContextVar(
-    CODEX_CAPTURE_EVIDENCE_CONTEXT_FIELD,
-    default=None,
-)
-_CODEX_CAPTURE_OWNER: Optional[str] = None
-
-
-def set_codex_verified_capture_context(evidence: Any) -> Any:
-    """Bind trusted capture evidence to the current execution context."""
-    return _CODEX_CAPTURE_CONTEXT.set({"evidence": evidence, "owner": None})
-
-
-def get_codex_verified_capture_from_context() -> Any:
-    """Return trusted capture evidence bound to the matching request owner."""
-    binding = _CODEX_CAPTURE_CONTEXT.get()
-    if not isinstance(binding, dict):
-        return None
-    if _CODEX_CAPTURE_OWNER is not None and binding.get("owner") != _CODEX_CAPTURE_OWNER:
-        return None
-    return binding.get("evidence")
+    if state is not None and isinstance(evidence, _CodexVerifiedCaptureEvidence):
+        try:
+            setattr(state, CODEX_CAPTURE_EVIDENCE_STATE_FIELD, None)
+        except Exception:
+            return None
+        return evidence
+    return None
 
 
 def _validate_envelope_identity(
@@ -1431,43 +1464,18 @@ def _replay_canonical_codex_message_payload(
     capture_evidence: Any = None,
 ) -> Optional[str]:
     """Return a strict frame only for evidence-bound captured history."""
-    author = item.get("author")
-    recipient = item.get("recipient")
-    if (
-        not isinstance(author, str)
-        or not author
-        or not isinstance(recipient, str)
-        or not recipient
-    ):
-        return None
     if not isinstance(payload, str):
         return None
-    task_name = recipient
-    if capture_evidence is None:
-        try:
-            return parse_codex_collaboration_text_frame(payload)
-        except CodexCollaborationDispatchError:
-            return None
-    try:
-        decoded, remainder = _decode_complete_json(payload)
-    except CodexCollaborationDispatchError:
-        decoded = None
-        remainder = 0
-    task_name = recipient
-    if decoded is not None:
-        if remainder != len(payload) or not isinstance(decoded, dict):
-            return None
-        task_name = decoded.get("task_name", recipient)
-        if not isinstance(task_name, str) or not task_name:
-            return None
-    recovered = validate_codex_message_capture_evidence(
+    envelope = _parse_collaboration_envelope(visible_text)
+    if envelope is None:
+        return None
+    return validate_codex_message_capture_evidence(
         capture_evidence,
         item=item,
         payload=payload,
-        task_name=task_name,
-        sender=author,
+        task_name=envelope[1],
+        sender=envelope[2],
     )
-    return recovered
 
 
 def _normalize_codex_message_payload(
@@ -1475,8 +1483,9 @@ def _normalize_codex_message_payload(
     visible_part: dict[str, Any],
     visible_text: str,
     payload: Any,
+    *,
+    capture_evidence: Any = None,
 ) -> tuple[dict[str, Any], bool]:
-    capture_evidence = get_codex_verified_capture_from_context()
     normalized_payload = _replay_canonical_codex_message_payload(
         item,
         visible_text,
@@ -1531,7 +1540,11 @@ def _validate_visible_agent_message(
     return None
 
 
-def _normalize_agent_message_item(item: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+def _normalize_agent_message_item(
+    item: dict[str, Any],
+    *,
+    capture_evidence: Any = None,
+) -> tuple[dict[str, Any], bool]:
     if isinstance(item, _NormalizedCodexAgentMessage):
         return item, False
 
@@ -1573,6 +1586,7 @@ def _normalize_agent_message_item(item: dict[str, Any]) -> tuple[dict[str, Any],
                 visible_part,
                 visible_text,
                 payload_part.get("encrypted_content"),
+                capture_evidence=capture_evidence,
             )
         if message_type != "NEW_TASK":
             return item, False
@@ -1619,7 +1633,11 @@ def _normalize_agent_message_item(item: dict[str, Any]) -> tuple[dict[str, Any],
     return item, False
 
 
-def _normalize_input_without_error_mapping(body: dict[str, Any]) -> dict[str, Any]:
+def _normalize_input_without_error_mapping(
+    body: dict[str, Any],
+    *,
+    capture_evidence: Any = None,
+) -> dict[str, Any]:
     input_items = body.get("input")
     if not isinstance(input_items, list):
         return body
@@ -1629,7 +1647,10 @@ def _normalize_input_without_error_mapping(body: dict[str, Any]) -> dict[str, An
     for index, item in enumerate(input_items):
         if not isinstance(item, dict) or item.get("type") != "agent_message":
             continue
-        normalized_item, item_changed = _normalize_agent_message_item(item)
+        normalized_item, item_changed = _normalize_agent_message_item(
+            item,
+            capture_evidence=capture_evidence,
+        )
         if item_changed:
             normalized_items[index] = normalized_item
             changed = True
@@ -1658,18 +1679,7 @@ def normalize_codex_collaboration_dispatch_body(
     request: Any = None,
 ) -> dict[str, Any]:
     """Normalize schemas and assignments, failing closed before provider send."""
-    global _CODEX_CAPTURE_OWNER
-    capture_evidence = get_codex_verified_capture(request) if request is not None else None
-    owner = None
-    previous_owner = _CODEX_CAPTURE_OWNER
-    if request is not None:
-        state = getattr(request, "state", None)
-        owner = getattr(state, CODEX_CAPTURE_EVIDENCE_OWNER_FIELD, None)
-        if owner is not None:
-            _CODEX_CAPTURE_OWNER = owner
-    token = _CODEX_CAPTURE_CONTEXT.set(
-        {"evidence": capture_evidence, "owner": _CODEX_CAPTURE_OWNER}
-    )
+    capture_evidence = _take_codex_verified_capture(request)
     try:
         if not isinstance(request_body, dict):
             if isinstance(request_body, Mapping):
@@ -1679,13 +1689,13 @@ def normalize_codex_collaboration_dispatch_body(
             request_body,
             identity_collector=identity_collector,
         )
-        return _normalize_input_without_error_mapping(body)
+        return _normalize_input_without_error_mapping(
+            body,
+            capture_evidence=capture_evidence,
+        )
     except CodexCollaborationDispatchError as exc:
         raise_codex_assignment_unreadable(reason=exc.reason)
         raise AssertionError("unreachable") from exc
-    finally:
-        _CODEX_CAPTURE_CONTEXT.reset(token)
-        _CODEX_CAPTURE_OWNER = previous_owner
 
 
 def restore_codex_agent_message_payloads_for_openai_egress(
