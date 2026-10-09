@@ -2928,15 +2928,19 @@ def _classify_codex_auto_agent_retryable_exhaustion(
     attempted_provider_call: bool = True,
     openai_alpha_capacity_retry_enabled: bool = False,
 ) -> Optional[str]:
-    # A normalized pre-commit HTTP exception no longer carries the provider
-    # payload verbatim. The narrowed marker is set only when converting the
-    # typed failure, so recovery must not rediscover a broader 503 class.
+    # A normalized protection failure no longer carries the provider payload
+    # verbatim. The narrowed marker is set only for that ordinary class, so
+    # other typed failures can still receive provider/auth/continuation
+    # classifications from their preserved payloads.
     typed_precommit_error_class = getattr(
         exc,
         "_aawm_typed_precommit_error_class",
         None,
     )
-    if typed_precommit_error_class:
+    if (
+        typed_precommit_error_class
+        == "openai_response_protection_unavailable"
+    ):
         return str(typed_precommit_error_class)
     if _is_codex_auto_agent_continuation_state_unavailable(
         exc,
@@ -3124,9 +3128,6 @@ _RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES = frozenset(
         "upstream_overloaded",
         "capacity_exhausted",
         "upstream_transient_internal",
-        # Shared pre-commit retry accounting includes the ordinary (non-capacity)
-        # protection failure so candidate attempts follow the same two-send cap.
-        "openai_response_protection_unavailable",
     }
 )
 _RESPONSES_PRE_COMMIT_ORDINARY_RETRY_CLASSES = frozenset(
