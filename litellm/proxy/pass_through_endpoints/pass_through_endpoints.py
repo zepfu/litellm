@@ -3605,6 +3605,12 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     isinstance(remaining_ordinary_sends, int)
                     and not isinstance(remaining_ordinary_sends, bool)
                     and remaining_ordinary_sends > 0
+                    and (
+                        exc.error_class
+                        != "openai_response_protection_unavailable"
+                        or attempt_number
+                        < RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS
+                    )
                 ):
                     should_retry = True
                     wait_seconds = float(exc.retry_after_seconds or 10.0)
