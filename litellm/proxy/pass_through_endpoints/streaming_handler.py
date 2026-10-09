@@ -204,7 +204,7 @@ class ResponsesStreamPreCommitFailure(Exception):
         headers = None
         if self.retryable or self.pre_commit_retry_exhausted:
             retry_after = self.retry_after_seconds
-            if retry_after is None:
+            if retry_after is None or retry_after <= 0:
                 retry_after = RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS
             if retry_after == int(retry_after):
                 retry_after_header = str(int(retry_after))
