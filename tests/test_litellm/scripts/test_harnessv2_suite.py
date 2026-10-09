@@ -31,7 +31,7 @@ def _load() -> Any:
     from hv2.suite.timing import consume_wait_checkpoints, reconcile
     from hv2.suite.verdict import classify_infrastructure, evaluate_case
     from hv2.suite.execute import execute_suite
-    from hv2.suite.live import _evidence_from_step, _run_case
+    from hv2.suite import live as suite_live
     from hv2.suite.matrix import selection_from_args
 
     return SimpleNamespace(
@@ -46,8 +46,8 @@ def _load() -> Any:
         reconcile=reconcile,
         classify_infrastructure=classify_infrastructure,
         evaluate_case=evaluate_case,
-        evidence_from_step=_evidence_from_step,
-        run_case=_run_case,
+        evidence_from_step=suite_live._evidence_from_step,
+        run_case=suite_live._run_case,
         execute_suite=execute_suite,
         selection_from_args=selection_from_args,
     )
@@ -438,7 +438,9 @@ def _stock_case(kind: str, case_id: str, alias: str) -> dict[str, Any]:
 
 
 def _assert_one(hv2: Any, case: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
-    evidence = hv2.evidence_from_step(case, step)
+    from hv2.suite.live import _evidence_from_step
+
+    evidence = _evidence_from_step(case, step)
     rows = hv2.evaluate_case(case, evidence)
     assert len(rows) == 1
     return rows[0]
