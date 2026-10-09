@@ -201,7 +201,8 @@ OpenAI `gpt-6-luna` (priority 0, `reasoning_effort: low`).
 
 `basic-other` orders Z.AI Coding Plan `zai_coding_plan/glm-5.3-flash`
 (priority 170, admitted only from `23:00-09:00 UTC+8`), Cohere (160),
-Nous (150), NVIDIA (140), OpenRouter (130), OpenCode Go `omen-alpha` (120),
+Nous Solar Mini 4 (150), NVIDIA (140), OpenRouter (130),
+OpenCode Go `omen-alpha` (120),
 OpenCode Go `muse-spark-1.3-contributor` (110), then Alibaba Token Plan
 `alibaba_token_plan/deepseek-v4.1-flash` (100, `22:00-08:00 UTC+8`).
 These candidates have no configured reasoning-effort override.
@@ -318,13 +319,18 @@ These Codex aliases select a native provider first, then OpenAI
 | `openrouter_basic` | `openrouter/nvidia/nemotron-3-ultra-550b-a55b:free` |
 | `nvidia_basic` | `nvidia/moonshotai/kimi-k3` |
 | `cohere_basic` | `cohere/north-mini-code-1-0` |
-| `nous_basic` | `nous/meituan/longcat-2.0:free` |
+| `nous_basic` | `nous/upstage/solar-mini4:free` |
 | `opencode_basic` | OpenCode Go `muse-spark-1.3-contributor`, then `omen-alpha` |
 
 Native candidates have no configured reasoning-effort override. Provider
 capability and admission checks still apply; configuring an alias does not
 establish upstream availability or tool support. Native acceptance requires
 the actual provider/model and tool results, not a successful Luna fallback.
+
+Both `basic-other` and `nous_basic` use the free Nous Solar Mini 4 route.
+The retired free LongCat candidate is no longer selected; its historical
+catalog and pricing evidence remains. Free-route unavailability preserves the
+eligible fallback chain and does not select a paid Solar or LongCat variant.
 
 OpenCode Go selects its native Responses endpoint for models whose catalog
 mode is `responses`; chat-mode candidates retain the existing chat endpoint.
