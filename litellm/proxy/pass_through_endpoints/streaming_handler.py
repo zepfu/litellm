@@ -123,6 +123,11 @@ _RESPONSES_TRANSIENT_CAPACITY_CLASSES = frozenset(
         "upstream_transient_internal",
     }
 )
+_RESPONSES_ORDINARY_RETRY_CLASSES = frozenset(
+    {
+        "openai_response_protection_unavailable",
+    }
+)
 _RESPONSES_TRANSIENT_STREAM_CLASSES = frozenset(
     {
         "stream_interrupted",
@@ -132,6 +137,9 @@ _RESPONSES_ACCOUNT_EXHAUSTION_CLASSES = frozenset(
     {
         "usage_limit_reached",
     }
+)
+_OPENAI_RESPONSE_PROTECTION_UNAVAILABLE_ERROR = (
+    "response protection is unavailable"
 )
 _RESPONSES_STREAM_REDISPATCH_CLASSES = frozenset(
     {
@@ -873,6 +881,34 @@ class PassThroughStreamingHandler:
         )
 
     @staticmethod
+    def _is_openai_response_protection_unavailable_payload(
+        error_payload: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Match the observed OpenAI protection-unavailable provider shape."""
+        if not isinstance(error_payload, dict):
+            return False
+        direct_error = error_payload.get("error")
+        candidates: list[Any] = [error_payload]
+        if isinstance(direct_error, dict):
+            candidates.append(direct_error)
+        nested_response = error_payload.get("response")
+        if isinstance(nested_response, dict):
+            nested_error = nested_response.get("error")
+            if isinstance(nested_error, dict):
+                candidates.append(nested_error)
+        for candidate in candidates:
+            message = candidate.get("message")
+            if (
+                isinstance(message, str)
+                and message.strip().lower()
+                == _OPENAI_RESPONSE_PROTECTION_UNAVAILABLE_ERROR
+                and candidate.get("type") == "internal_error"
+                and candidate.get("code") == "error"
+            ):
+                return True
+        return False
+
+    @staticmethod
     def _classify_responses_pre_commit_error(
         error_payload: Optional[Dict[str, Any]],
         *,
@@ -883,6 +919,14 @@ class PassThroughStreamingHandler:
                 error_payload
             )
         )
+        if PassThroughStreamingHandler._is_openai_response_protection_unavailable_payload(
+            error_payload
+        ):
+            return (
+                "openai_response_protection_unavailable",
+                "transient_upstream",
+                True,
+            )
         if error_code == "token_invalidated":
             return "token_invalidated", "token_invalidated", False
         if PassThroughStreamingHandler._is_responses_unpersisted_item_not_found_payload(

@@ -135,6 +135,10 @@ one-use authorization and preserves its logical ordinal; it does not change the
 ordinary call cap. Without that authorization, ledger exhaustion is raised
 before another send and is terminal: it does not trigger candidate cooldown,
 account failover, or another hidden retry.
+The exact OpenAI provider signature `internal_error` / `error` /
+`response protection is unavailable` remains ordinary-retry eligible but is
+never classified as capacity overload, so it cannot receive that additional
+authorization.
 
 Reservation closes any previously active upstream response first and disables
 opaque redirects for ledger-owned sends. Observable connection failures are

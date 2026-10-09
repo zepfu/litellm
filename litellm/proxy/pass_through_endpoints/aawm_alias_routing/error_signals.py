@@ -3116,6 +3116,11 @@ _RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES = frozenset(
         "upstream_transient_internal",
     }
 )
+_RESPONSES_PRE_COMMIT_ORDINARY_RETRY_CLASSES = frozenset(
+    {
+        "openai_response_protection_unavailable",
+    }
+)
 _RESPONSES_PRE_COMMIT_ACCOUNT_EXHAUSTION_CLASSES = frozenset(
     {
         OPENROUTER_CREDIT_EXHAUSTED,
@@ -3174,6 +3179,29 @@ def plan_responses_pre_commit_retry(
     (usage exhaustion, terminal, etc.) are excluded immediately.
     """
     normalized = str(error_class or "")
+    if normalized in _RESPONSES_PRE_COMMIT_ORDINARY_RETRY_CLASSES:
+        if (
+            same_account_transient_attempts
+            < RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS
+        ):
+            return {
+                "action": "retry_same_account",
+                "retry_same_account": True,
+                "apply_account_exhaustion_cooldown": False,
+                "wait_seconds": RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS,
+                "http_status": 503,
+                "retryable": True,
+                "error_class": normalized,
+            }
+        return {
+            "action": "pre_stream_unavailable",
+            "retry_same_account": False,
+            "apply_account_exhaustion_cooldown": False,
+            "wait_seconds": RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS,
+            "http_status": 503,
+            "retryable": True,
+            "error_class": normalized,
+        }
     if normalized in _RESPONSES_PRE_COMMIT_ACCOUNT_EXHAUSTION_CLASSES:
         return {
             "action": "rotate_account",

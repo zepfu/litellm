@@ -49,7 +49,9 @@ sent for non-streaming Responses.
 
 Exit telemetry retains logical provider-call counts, transport connection
 failure counts, and hidden retry counts alongside the wire-enriched send-ledger
-snapshot.
+snapshot. The exact OpenAI provider signature `internal_error` / `error` /
+`response protection is unavailable` follows the ordinary retry budget and
+cannot receive the additional OpenAI capacity-retry authorization.
 
 The internal callback contract is
 `on_disposition(disposition, trace)`. Consumers should read a copy from

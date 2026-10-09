@@ -209,6 +209,7 @@ from .streaming_handler import (
     RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS,
     PassThroughStreamingHandler,
     ResponsesStreamPreCommitFailure,
+    _RESPONSES_ORDINARY_RETRY_CLASSES,
     _RESPONSES_TRANSIENT_CAPACITY_CLASSES,
     _RESPONSES_TRANSIENT_STREAM_CLASSES,
 )
@@ -2732,6 +2733,17 @@ def _classify_passthrough_raw_http_error(
 
     if not payload.get("message") and error_text.strip():
         payload = {**payload, "message": error_text}
+    if PassThroughStreamingHandler._is_openai_response_protection_unavailable_payload(
+        payload
+    ):
+        return _finish(
+            (
+                "openai_response_protection_unavailable",
+                "transient_upstream",
+                True,
+            ),
+            reason="openai_response_protection_unavailable",
+        )
     classified = PassThroughStreamingHandler._classify_responses_pre_commit_error(
         payload,
         openai_alpha_capacity_retry_enabled=provider_returned_429,
@@ -3509,7 +3521,10 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
             )
             ordinary_stream_retry = bool(
                 isinstance(exc, ResponsesStreamPreCommitFailure)
-                and exc.error_class in _RESPONSES_TRANSIENT_STREAM_CLASSES
+                and (
+                    exc.error_class in _RESPONSES_TRANSIENT_STREAM_CLASSES
+                    or exc.error_class in _RESPONSES_ORDINARY_RETRY_CLASSES
+                )
                 and exc.retryable
                 and not exc.pre_commit_retry_exhausted
                 and not getattr(exc, "aawm_call_ledger_exhausted", False)
