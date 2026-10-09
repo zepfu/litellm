@@ -55,9 +55,59 @@ def build_parser() -> argparse.ArgumentParser:
         help="Same as --instance",
     )
     parser.add_argument(
+        "--suite",
+        action="store_true",
+        help=(
+            "Resolve a multi-TUI suite matrix instead of one --test kind. "
+            "Dry-run does not inspect Docker or launch a TUI."
+        ),
+    )
+    parser.add_argument(
+        "--suite-tui",
+        action="append",
+        default=None,
+        help="Suite TUI name (repeatable / comma-separated)",
+    )
+    parser.add_argument(
+        "--suite-kind",
+        action="append",
+        default=None,
+        help="Suite kind (repeatable / comma-separated)",
+    )
+    parser.add_argument(
+        "--suite-model",
+        action="append",
+        default=None,
+        help="Suite model id or group (repeatable / comma-separated)",
+    )
+    parser.add_argument(
+        "--suite-parent",
+        action="append",
+        default=None,
+        help="Suite orchestration parent alias or group (repeatable / comma-separated)",
+    )
+    parser.add_argument(
+        "--suite-children",
+        default=None,
+        help="Suite orchestration children aliases or group",
+    )
+    parser.add_argument(
+        "--suite-shared",
+        dest="suite_shared",
+        action="store_true",
+        default=True,
+        help="Include shared platform checks (default)",
+    )
+    parser.add_argument(
+        "--no-suite-shared",
+        dest="suite_shared",
+        action="store_false",
+        help="Omit shared platform checks from the suite matrix",
+    )
+    parser.add_argument(
         "--test",
         dest="test",
-        required=True,
+        default=None,
         help="Kind name from kinds.yaml (platform, catalog, model, orchestration)",
     )
     parser.add_argument(
@@ -96,7 +146,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    return build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.suite and not args.test:
+        parser.error("--test is required unless --suite is set")
+    return args
 
 
 def split_csv(values: Sequence[str] | None) -> list[str]:
