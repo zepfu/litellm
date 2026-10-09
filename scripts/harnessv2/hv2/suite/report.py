@@ -38,12 +38,14 @@ def exit_from_result(result: Mapping[str, Any]) -> tuple[str, int]:
     assertions = result.get("assertions") if isinstance(result.get("assertions"), list) else []
     required_failed = any(_required_suite_failed(row) for row in assertions)
     failures = result.get("failures") if isinstance(result.get("failures"), list) else []
+    checks_failed = result.get("suite_checks_failed") is True or _failed_shared_checks(result)
     if (
         int(counts.get("failed") or 0)
         or int(counts.get("errored") or 0)
         or int(counts.get("blocked") or 0)
         or failures
         or required_failed
+        or checks_failed
     ):
         return "validation", EXIT_VALIDATION
     planned = int(counts.get("planned") or 0)
@@ -59,6 +61,26 @@ def exit_from_result(result: Mapping[str, Any]) -> tuple[str, int]:
     if planned > 0 and passed == planned and not _non_pass_residue(counts):
         return "success", EXIT_SUCCESS
     return "incomplete", EXIT_INCOMPLETE
+
+
+def _failed_shared_checks(result: Mapping[str, Any]) -> bool:
+    """A failed required shared check is not a case assertion and not exit 0.
+
+    Live and fixture rows stay skipped or recorded. Docker findings are not
+    invented here; only a classified finding whose ok is false counts.
+    """
+
+    findings = result.get("infrastructure_findings")
+    if isinstance(findings, list) and any(
+        isinstance(item, Mapping) and item.get("ok") is False for item in findings
+    ):
+        return True
+    shared = result.get("shared_checks")
+    if isinstance(shared, list) and any(
+        isinstance(row, Mapping) and row.get("status") == "failed" for row in shared
+    ):
+        return True
+    return False
 
 
 def _required_suite_failed(row: Any) -> bool:
@@ -113,6 +135,9 @@ def project(result: Mapping[str, Any]) -> dict[str, Any]:
         _failure_row(case) for case in cases if case.get("status") in _FAILURE_STATUSES
     ]
     body["infrastructure_findings"] = _infrastructure(body.get("infrastructure_findings"))
+    body["suite_checks_failed"] = body.get("suite_checks_failed") is True or _failed_shared_checks(
+        body
+    )
     exit_class, exit_code = exit_from_result(body)
     body["exit_class"] = exit_class
     body["exit_code"] = exit_code

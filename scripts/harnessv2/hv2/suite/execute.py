@@ -191,6 +191,22 @@ def _reuse_passed(
     return reused
 
 
+def _positive_seconds(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    seconds = float(value)
+    if seconds <= 0:
+        return None
+    return seconds
+
+
+def _suite_deadline(policy: Mapping[str, Any]) -> float | None:
+    seconds = _positive_seconds(policy.get("deadline_seconds"))
+    if seconds is None:
+        return None
+    return time.monotonic() + seconds
+
+
 def _guard_case(
     case: dict[str, Any],
     *,
@@ -200,32 +216,35 @@ def _guard_case(
     phases: list[dict[str, Any]],
     launches: dict[str, int],
     policy: Mapping[str, Any],
-) -> tuple[str | None, str | None]:
-    """Run one case. Returns (halt_token, controller_error)."""
+) -> tuple[str | None, str | None, bool]:
+    """Run one case. Returns (halt_token, controller_error, case_deadline)."""
 
+    started = time.monotonic()
     try:
-        return (
-            _run_case(
-                case,
-                live=live,
-                runner=runner,
-                evidence_map=evidence_map,
-                phases=phases,
-                launches=launches,
-                policy=policy,
-            ),
-            None,
+        stop = _run_case(
+            case,
+            live=live,
+            runner=runner,
+            evidence_map=evidence_map,
+            phases=phases,
+            launches=launches,
+            policy=policy,
         )
     except _SuiteSetupError:
         raise
     except HarnessError as exc:
         detail = str(exc)
         _mark_incomplete(case, "controller", detail)
-        return "controller", detail
+        return "controller", detail, False
     except Exception as exc:
         detail = str(exc)
         _mark_incomplete(case, "controller", detail)
-        return "controller", detail
+        return "controller", detail, False
+    limit = _positive_seconds(policy.get("case_timeout_seconds"))
+    if limit is not None and (time.monotonic() - started) > limit:
+        _mark_incomplete(case, "deadline", "case_timeout_seconds exceeded")
+        return "deadline", None, True
+    return stop, None, False
 
 
 def _finish_suite(
@@ -277,6 +296,9 @@ def _finish_suite(
     result["launches"] = {"attempts": launches["attempts"], "ready": launches["ready"]}
     result["halted"] = halted
     result["runner_error"] = runner_error
+    result["suite_checks_failed"] = _suite_checks_failed(
+        result["shared_checks"], result["infrastructure_findings"]
+    )
     result["timing"] = reconcile(
         suite_start_mono=started_mono,
         suite_end_mono=time.monotonic(),
@@ -354,6 +376,17 @@ def _run_case(
     return None
 
 
+def _suite_checks_failed(
+    shared_rows: list[Mapping[str, Any]],
+    findings: list[Mapping[str, Any]],
+) -> bool:
+    """Required shared checks are suite-level. They do not invent a case cause."""
+
+    if any(item.get("ok") is False for item in findings):
+        return True
+    return any(row.get("status") == "failed" for row in shared_rows)
+
+
 def _prepare_running(case: dict[str, Any]) -> None:
     case["status"] = "running"
     case["attempts"] = [
@@ -379,12 +412,18 @@ def _walk_cases(
     launches: dict[str, int],
     policy: Mapping[str, Any],
     progress: ProgressFn | None,
+    cancelled: bool = False,
 ) -> tuple[list[dict[str, Any]], bool, str | None]:
     cases_out: list[dict[str, Any]] = []
     halted = False
     halt_reason = "halted_before_start"
     halt_detail: str | None = None
     runner_error: str | None = None
+    deadline = _suite_deadline(policy)
+    if cancelled:
+        result["cancelled"] = True
+        halted = True
+        halt_reason = "cancelled"
     for case in selected:
         case_id = str(case["case_id"])
         reused = _reuse_passed(case_id, prior_cases)
@@ -409,6 +448,22 @@ def _walk_cases(
                 progress,
                 {"event": "case", "case_id": case_id, "status": "incomplete"},
             )
+            if halt_reason in {"deadline", "cancelled"}:
+                _persist(state_file, _state_snapshot(contract, cases_out))
+            continue
+        if deadline is not None and time.monotonic() >= deadline:
+            result["deadline"] = True
+            halted = True
+            halt_reason = "deadline"
+            halt_detail = "deadline_seconds exceeded"
+            _mark_incomplete(case, halt_reason, halt_detail)
+            cases_out.append(case)
+            _publish(
+                result,
+                progress,
+                {"event": "case", "case_id": case_id, "status": "incomplete"},
+            )
+            _persist(state_file, _state_snapshot(contract, cases_out))
             continue
         _prepare_running(case)
         _persist(state_file, _state_snapshot(contract, cases_out, case))
@@ -421,7 +476,7 @@ def _walk_cases(
                 "attempt_id": case["attempt_id"],
             },
         )
-        stop, controller_error = _guard_case(
+        stop, controller_error, case_deadline = _guard_case(
             case,
             live=live,
             runner=runner,
@@ -435,6 +490,11 @@ def _walk_cases(
             halted = True
             halt_reason = "halted_before_start"
             halt_detail = controller_error
+        elif case_deadline:
+            result["deadline"] = True
+            halted = True
+            halt_reason = "deadline"
+            halt_detail = "case_timeout_seconds exceeded"
         cases_out.append(case)
         _publish(
             result,
@@ -494,6 +554,7 @@ def execute_suite(
     report_path: Path | None = None,
     infrastructure: list[Mapping[str, Any]] | None = None,
     runner: RunnerFn | None = None,
+    cancelled: bool = False,
 ) -> dict[str, Any]:
     """Run or dry-run the resolved matrix and return one projected result."""
 
@@ -551,6 +612,7 @@ def execute_suite(
         launches=launches,
         policy=policy,
         progress=progress,
+        cancelled=cancelled,
     )
     _finish_suite(
         result,

@@ -274,10 +274,12 @@ before execution. Resume reuses a passed case only while the frozen
 configuration and source contract match.
 
 Exit codes: `0` complete success, `1` validation failure, `2` runner or
-setup failure, `3` incomplete execution. Success cannot hide a skipped
-required case, missing terminal evidence, or a failed required suite
-check. Finished means passed plus failed. Errored, blocked, skipped,
-running, and incomplete stay out of that total.
+setup failure, `3` incomplete execution. A suite deadline or
+cancellation leaves every unfinished selected case incomplete (exit 3),
+and a failed shared infrastructure check prevents exit 0. Success cannot
+hide a skipped required case, missing terminal evidence, or a failed
+required suite check. Finished means passed plus failed. Errored,
+blocked, skipped, running, and incomplete stay out of that total.
 
 Client evidence inventory (frozen contracts; OpenCode has none):
 
