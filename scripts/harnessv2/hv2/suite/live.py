@@ -203,7 +203,7 @@ def _bound(case: Mapping[str, Any], session: Any) -> dict[str, Any]:
 
 
 def _apply_model_fields(evidence: dict[str, Any], turn: Mapping[str, Any]) -> None:
-    tool_contract = str(turn.get("pass_mode") or "") == "tool_command" or turn.get("tool_pass") is True
+    tool_contract = str(turn.get("pass_mode") or "") == "tool_command"
     if tool_contract:
         evidence["contract"] = "tool_command"
         command = turn.get("tool_command") if isinstance(turn.get("tool_command"), str) else None
@@ -219,34 +219,133 @@ def _apply_model_fields(evidence: dict[str, Any], turn: Mapping[str, Any]) -> No
     if "exact_pong" in turn and turn.get("exact_pong") is True and not tool_contract:
         evidence["response_value"] = "PONG"
     if "provider_404" in turn and turn.get("provider_404") is True:
-        evidence["provider_error"] = {"status": 404}
+        expected = turn.get("expect_provider_status")
+        if expected == 404:
+            evidence["expect_error"] = {"status": 404}
+            evidence["provider_error"] = {
+                "status": 404,
+                "attributed": True,
+                "source": "pane_after_prompt",
+            }
+        else:
+            evidence["provider_error"] = {"status": 404, "attributed": True}
     if "completed" in turn:
         evidence["completed"] = bool(turn.get("completed"))
 
 
 def _apply_orchestration_fields(evidence: dict[str, Any], turn: Mapping[str, Any]) -> None:
-    if "child_evidence" in turn and isinstance(turn.get("child_evidence"), Mapping):
-        evidence["children"] = _child_rows(turn["child_evidence"])
-    if "tool_pass" in turn:
-        evidence["tool"] = {"recorded": True, "ok": bool(turn.get("tool_pass"))}
+    recorded = turn.get("child_evidence")
+    if isinstance(recorded, Mapping):
+        children = _child_rows(recorded)
+        if children is not None:
+            evidence["children"] = children
+        failures = recorded.get("failures")
+        evidence["spawn_ok"] = recorded.get("ok") is True and (
+            not isinstance(failures, list) or not failures
+        )
+        if isinstance(failures, list):
+            evidence["spawn_failures"] = list(failures)
+    command = turn.get("tool_command") if isinstance(turn.get("tool_command"), str) else None
+    stdout = turn.get("tool_stdout") if isinstance(turn.get("tool_stdout"), str) else None
+    exit_status = turn.get("tool_exit_status")
+    if command or stdout or exit_status is not None:
+        evidence["tool"] = {
+            "command": command,
+            "stdout": stdout,
+            "exit_status": exit_status,
+        }
     if "completed" in turn:
         evidence["parent_completed"] = bool(turn.get("completed"))
 
 
-def _child_rows(recorded: Mapping[str, Any]) -> list[dict[str, Any]] | None:
-    """Copy child rows only when the step recorded per-child evidence."""
+def _producer_text(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
 
+
+def _ohmypi_child_rows(recorded: Mapping[str, Any]) -> list[dict[str, Any]] | None:
+    names = recorded.get("children")
+    routes = recorded.get("routes")
+    if not isinstance(names, list) or not names or not all(isinstance(item, str) for item in names):
+        return None
+    if not isinstance(routes, Mapping):
+        return None
+    successful = {
+        str(item) for item in (recorded.get("successful_agents") or []) if str(item).strip()
+    }
+    rows: list[dict[str, Any]] = []
+    for alias in names:
+        route = routes.get(alias) if isinstance(routes.get(alias), Mapping) else {}
+        disposition = route.get("terminal_disposition")
+        provider = _producer_text(route.get("selected_provider"))
+        completed = alias in successful and disposition == "completed" and bool(provider)
+        created = alias in successful or (
+            isinstance(disposition, str) and disposition not in {"", "missing"}
+        )
+        rows.append(
+            {
+                "alias": alias,
+                "created": created,
+                "completed": completed,
+                "producer": provider,
+            }
+        )
+    return rows or None
+
+
+def _codex_child_rows(items: list[Any]) -> list[dict[str, Any]] | None:
+    rows: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, Mapping) or "target" not in item:
+            continue
+        alias = str(item.get("target") or "")
+        if not alias:
+            continue
+        failures = item.get("failures")
+        empty_failures = not isinstance(failures, list) or not failures
+        completed = item.get("ok") is True and empty_failures
+        provider = None
+        providers = item.get("providers")
+        if isinstance(providers, list):
+            provider = next(
+                (text for text in (_producer_text(value) for value in providers) if text),
+                None,
+            )
+        if provider is None:
+            provider = _producer_text(item.get("selected_provider"))
+        thread_id = item.get("thread_id")
+        created = item.get("ok") is True or (
+            isinstance(thread_id, str) and bool(thread_id.strip())
+        )
+        rows.append(
+            {
+                "alias": alias,
+                "created": created,
+                "completed": completed,
+                "producer": provider,
+            }
+        )
+    return rows or None
+
+
+def _child_rows(recorded: Mapping[str, Any]) -> list[dict[str, Any]] | None:
+    """Translate stock child evidence into alias rows. Absence stays unset."""
+
+    nested = recorded.get("child_evidence")
+    if isinstance(nested, list):
+        return _codex_child_rows(nested)
+    ohmypi = _ohmypi_child_rows(recorded)
+    if ohmypi is not None:
+        return ohmypi
     raw = recorded.get("child_rows")
     if isinstance(raw, list):
-        rows = [dict(item) for item in raw if isinstance(item, Mapping)]
+        rows = [
+            dict(item)
+            for item in raw
+            if isinstance(item, Mapping) and item.get("alias")
+        ]
         return rows or None
-    children = recorded.get("children")
-    if (
-        isinstance(children, list)
-        and children
-        and all(isinstance(item, Mapping) for item in children)
-    ):
-        return [dict(item) for item in children]
     return None
 
 

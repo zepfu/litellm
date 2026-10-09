@@ -438,7 +438,7 @@ def _model_turn_settings(
     default_tools: bool,
     default_pass_mode: str,
     default_reply_needles: list[str],
-) -> tuple[str, bool, str, list[str]]:
+) -> tuple[str, bool, str, list[str], int | None]:
     """Apply a per-alias model override without changing the TUI default."""
 
     raw = select.get("model_overrides")
@@ -449,6 +449,7 @@ def _model_turn_settings(
             default_tools,
             default_prompt,
             list(default_reply_needles),
+            None,
         )
     pass_mode = str(override.get("pass_mode") or default_pass_mode)
     tools = (
@@ -469,7 +470,11 @@ def _model_turn_settings(
         parsed = as_str_list(override.get("reply_needles"))
         if parsed:
             reply = parsed
-    return pass_mode, tools, prompt, reply
+    expect_status = override.get("expect_provider_status")
+    expect_provider_status = (
+        int(expect_status) if isinstance(expect_status, int) and not isinstance(expect_status, bool) else None
+    )
+    return pass_mode, tools, prompt, reply, expect_provider_status
 
 
 def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915
@@ -494,16 +499,20 @@ def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915
     )
     send_text = ""
     for model in plan.models:
-        model_pass_mode, model_tools, model_prompt, model_reply_needles = (
-            _model_turn_settings(
-                plan,
-                select,
-                model,
-                default_prompt=prompt,
-                default_tools=tools,
-                default_pass_mode=pass_mode,
-                default_reply_needles=reply_needles,
-            )
+        (
+            model_pass_mode,
+            model_tools,
+            model_prompt,
+            model_reply_needles,
+            expect_provider_status,
+        ) = _model_turn_settings(
+            plan,
+            select,
+            model,
+            default_prompt=prompt,
+            default_tools=tools,
+            default_pass_mode=pass_mode,
+            default_reply_needles=reply_needles,
         )
         argv = driver.launch_argv(model)
         driver.assert_no_print_flags(argv)
@@ -520,6 +529,7 @@ def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915
             "session": launched.get("session"),
             "launch_ok": launched.get("ok"),
             "selected": launched.get("selected"),
+            "expect_provider_status": expect_provider_status,
         }
         if not launched.get("ok"):
             failures.append(

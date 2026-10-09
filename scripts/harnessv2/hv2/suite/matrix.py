@@ -200,15 +200,25 @@ def _capability(tui: str, config: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def shared_check_ids(config: Mapping[str, Any]) -> list[dict[str, Any]]:
-    kinds = config.get("kinds") if isinstance(config.get("kinds"), dict) else {}
-    platform = kinds.get("platform") if isinstance(kinds.get("platform"), dict) else {}
-    steps = platform.get("steps") if isinstance(platform.get("steps"), list) else []
-    rows = []
-    for index, step in enumerate(steps):
-        if not isinstance(step, dict):
-            continue
-        step_type = str(step.get("type") or f"shared-{index}")
+_PLATFORM_ONLY_SHARED = ("health", "http_suite", "error_jsonl", "redis_scan", "docker_logs")
+_CATALOG_ONLY_SHARED = ("catalog_http", "tui_catalog")
+
+
+def shared_check_ids(
+    config: Mapping[str, Any], *, kinds: Sequence[str] | None = None
+) -> list[dict[str, Any]]:
+    """Platform steps plus catalog-only steps. Never a headline case."""
+
+    selected = set(kinds or [])
+    include_platform = bool(selected - {"catalog"})
+    include_catalog = "catalog" in selected
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def _add(step_type: str) -> None:
+        if step_type in seen:
+            return
+        seen.add(step_type)
         rows.append(
             {
                 "check_id": f"shared:{step_type}",
@@ -217,6 +227,13 @@ def shared_check_ids(config: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "counts_as_case": False,
             }
         )
+
+    if include_platform:
+        for step_type in _PLATFORM_ONLY_SHARED:
+            _add(step_type)
+    if include_catalog:
+        for step_type in _CATALOG_ONLY_SHARED:
+            _add(step_type)
     return rows
 
 
@@ -320,26 +337,12 @@ def resolve_matrix(
                         }
                     )
             elif kind == "catalog":
-                case_id = _stable_id(run_id, tui, kind, "catalog")
-                cases.append(
-                    {
-                        "case_id": case_id,
-                        "run_id": run_id,
-                        "tui": tui,
-                        "kind": kind,
-                        "scenario": "catalog",
-                        "model": None,
-                        "parent": None,
-                        "children": [],
-                        "alias": None,
-                        "attempt_id": f"{case_id}:1",
-                        "attempt": 1,
-                        "prompt_hash": _prompt_hash(config, tui, kind, []),
-                        "counts_as_case": True,
-                        "status": "planned",
-                    }
-                )
-    shared = shared_check_ids(config) if selection.get("include_shared", True) else []
+                continue
+    shared = (
+        shared_check_ids(config, kinds=kinds)
+        if selection.get("include_shared", True)
+        else []
+    )
     return {
         "schema": SCHEMA_VERSION,
         "run_id": run_id,

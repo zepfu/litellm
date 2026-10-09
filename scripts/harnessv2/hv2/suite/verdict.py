@@ -65,6 +65,28 @@ def attribute_error(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _assertion_correlation(
+    case: Mapping[str, Any], evidence: Mapping[str, Any] | None
+) -> dict[str, Any] | None:
+    """Copy a recorded correlation, else identity from the case and bound session."""
+
+    if isinstance(evidence, Mapping):
+        recorded = evidence.get("correlation")
+        if isinstance(recorded, Mapping):
+            return dict(recorded)
+    case_id = case.get("case_id")
+    alias = case.get("alias")
+    if not evidence:
+        if case_id is None and alias is None:
+            return None
+        return {"case_id": case_id, "alias": alias}
+    bound = evidence.get("bound") if isinstance(evidence, Mapping) else None
+    row: dict[str, Any] = {"case_id": case_id, "alias": alias}
+    if isinstance(bound, Mapping) and bound.get("session_id"):
+        row["session_id"] = bound.get("session_id")
+    return row
+
+
 def evaluate_case(
     case: Mapping[str, Any],
     evidence: Mapping[str, Any] | None,
@@ -72,6 +94,7 @@ def evaluate_case(
     """Return assertions for one executed case. Never promotes missing evidence."""
 
     case_id = str(case.get("case_id") or "")
+    correlation = _assertion_correlation(case, evidence)
     if not evidence:
         return [
             assertion(
@@ -81,6 +104,7 @@ def evaluate_case(
                 status="inconclusive",
                 case_id=case_id,
                 required=True,
+                correlation=correlation,
             )
         ]
     refs = _refs(evidence)
@@ -100,6 +124,7 @@ def evaluate_case(
                 status="inconclusive",
                 evidence_refs=refs,
                 case_id=case_id,
+                correlation=correlation,
             )
         ]
     if evidence.get("acknowledgement_only"):
@@ -112,6 +137,7 @@ def evaluate_case(
                 evidence_refs=refs,
                 case_id=case_id,
                 detail="recap, echo, selector, idle glyph, or spawn acknowledgement",
+                correlation=correlation,
             )
         ]
     if not _bound_ok(case, evidence):
@@ -123,6 +149,7 @@ def evaluate_case(
                 status="inconclusive",
                 evidence_refs=refs,
                 case_id=case_id,
+                correlation=correlation,
             )
         ]
 
@@ -144,6 +171,7 @@ def evaluate_case(
                 status="pass" if ok else "fail",
                 evidence_refs=refs,
                 case_id=case_id,
+                correlation=correlation,
             )
         )
         return assertions
@@ -157,15 +185,16 @@ def evaluate_case(
                 status="fail",
                 evidence_refs=refs,
                 case_id=case_id,
+                correlation=correlation,
             )
         )
         return assertions
 
     kind = str(case.get("kind") or "")
     if kind == "model":
-        assertions.extend(_model_assertions(case, evidence, refs))
+        assertions.extend(_model_assertions(case, evidence, refs, correlation))
     elif kind == "orchestration":
-        assertions.extend(_child_assertions(case, evidence, refs))
+        assertions.extend(_child_assertions(case, evidence, refs, correlation))
     elif kind == "catalog":
         observed = evidence.get("catalog_ids")
         expected = evidence.get("expected_catalog_ids")
@@ -178,6 +207,7 @@ def evaluate_case(
                 status="pass" if ok else "inconclusive" if observed is None else "fail",
                 evidence_refs=refs,
                 case_id=case_id,
+                correlation=correlation,
             )
         )
     else:
@@ -188,6 +218,7 @@ def evaluate_case(
                 observed=kind,
                 status="inconclusive",
                 case_id=case_id,
+                correlation=correlation,
             )
         )
     return assertions
@@ -197,6 +228,7 @@ def _model_assertions(
     case: Mapping[str, Any],
     evidence: Mapping[str, Any],
     refs: Sequence[Mapping[str, Any]],
+    correlation: Mapping[str, Any] | None,
 ) -> list[dict[str, Any]]:
     case_id = str(case.get("case_id") or "")
     contract = str(evidence.get("contract") or "response")
@@ -222,6 +254,7 @@ def _model_assertions(
                 status=status,
                 evidence_refs=list(refs),
                 case_id=case_id,
+                correlation=correlation,
             )
         ]
     expected = evidence.get("expected_response", "PONG")
@@ -240,14 +273,31 @@ def _model_assertions(
             status=status,
             evidence_refs=list(refs),
             case_id=case_id,
+            correlation=correlation,
         )
     ]
+
+
+def _parent_tool_ok(tool: Mapping[str, Any] | None) -> bool:
+    if not isinstance(tool, Mapping):
+        return False
+    command = tool.get("command")
+    stdout = str(tool.get("stdout") or "").strip()
+    return bool(command) and tool.get("exit_status") == 0 and bool(stdout)
+
+
+def _spawn_ok(evidence: Mapping[str, Any]) -> bool:
+    if evidence.get("spawn_ok") is not True:
+        return False
+    failures = evidence.get("spawn_failures")
+    return not isinstance(failures, list) or not failures
 
 
 def _child_assertions(
     case: Mapping[str, Any],
     evidence: Mapping[str, Any],
     refs: Sequence[Mapping[str, Any]],
+    correlation: Mapping[str, Any] | None,
 ) -> list[dict[str, Any]]:
     case_id = str(case.get("case_id") or "")
     wanted = [str(item) for item in (case.get("children") or [])]
@@ -261,6 +311,7 @@ def _child_assertions(
                 status="inconclusive",
                 evidence_refs=list(refs),
                 case_id=case_id,
+                correlation=correlation,
             )
         ]
     by_alias = {
@@ -271,7 +322,9 @@ def _child_assertions(
     assertions: list[dict[str, Any]] = []
     if not wanted:
         tool = evidence.get("tool") if isinstance(evidence.get("tool"), Mapping) else None
-        parent_ok = bool(evidence.get("parent_completed")) or bool(tool)
+        parent_ok = evidence.get("parent_completed") is True and (
+            _spawn_ok(evidence) or _parent_tool_ok(tool)
+        )
         assertions.append(
             assertion(
                 code="orchestration.parent",
@@ -280,6 +333,7 @@ def _child_assertions(
                 status="pass" if parent_ok else "inconclusive",
                 evidence_refs=list(refs),
                 case_id=case_id,
+                correlation=correlation,
             )
         )
         return assertions
@@ -294,6 +348,7 @@ def _child_assertions(
                     status="fail",
                     evidence_refs=list(refs),
                     case_id=case_id,
+                    correlation=correlation,
                 )
             )
             continue
@@ -314,6 +369,7 @@ def _child_assertions(
                 status=status,
                 evidence_refs=list(refs),
                 case_id=case_id,
+                correlation=correlation,
             )
         )
     return assertions

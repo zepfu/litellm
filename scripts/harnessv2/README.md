@@ -251,8 +251,9 @@ checkpoint, fix, and continue there.
 `--suite` selects an explicit matrix beside `--test`. One case is one
 TUI plus one scenario plus one model or one orchestration parent. Shared
 platform checks and child or tool assertions have their own counts and
-do not increase the headline planned or passed totals. Retries add
-attempts on the same case.
+do not increase the headline planned or passed totals. Catalog is a
+shared check, not a headline case. Retries add attempts on the same
+case.
 
 ```text
 python scripts/harnessv2/run.py \
@@ -288,8 +289,9 @@ Client evidence inventory (frozen contracts; OpenCode has none):
 | Muse | dedicated `hv2-muse-*` via `musela` | `muse_spawn_tool_evidence`; a child token alone is not a pass |
 
 Recap, echoed prompts, selector text, idle glyphs, and spawn
-acknowledgements are not success. A provider 404 passes only a case
-that expects that error and its attribution. Missing, stale, or
+acknowledgements are not success. A provider 404 passes a suite case
+only when that model's override sets `expect_provider_status: 404`.
+Missing, stale, or
 cross-session evidence stays inconclusive. Docker log and error-JSONL
 findings are suite infrastructure and are not the cause of a case
 unless a machine correlation names that case.

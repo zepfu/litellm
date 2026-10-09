@@ -115,6 +115,7 @@ def assertion(
     required: bool = True,
     case_id: str | None = None,
     detail: str | None = None,
+    correlation: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if status not in {"pass", "fail", "inconclusive"}:
         raise ValueError(f"assertion status {status!r} is not pass/fail/inconclusive")
@@ -125,6 +126,7 @@ def assertion(
         "status": status,
         "required": required,
         "evidence_refs": list(evidence_refs or []),
+        "correlation": dict(correlation) if isinstance(correlation, Mapping) else None,
     }
     if case_id:
         row["case_id"] = case_id
