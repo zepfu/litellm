@@ -4558,6 +4558,11 @@ def _headers_for_json_passthrough_egress(
     removed_content_type: Optional[str] = None
     has_json_content_type = False
     for header_name in list(json_headers.keys()):
+        if str(header_name).lower() in {"content-encoding", "content-length"}:
+            # httpx serializes parsed JSON again; inbound framing describes
+            # different bytes (including compressed Grok Build requests).
+            json_headers.pop(header_name)
+            continue
         if str(header_name).lower() == "content-type":
             content_type = _clean_passthrough_error_context_value(
                 json_headers[header_name]

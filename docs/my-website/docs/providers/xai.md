@@ -73,6 +73,23 @@ response = completion(
 
 **Pricing:** See [xAI's pricing page](https://docs.x.ai/docs/models) for current rates.
 
+## Grok Build compressed requests
+
+The proxy accepts Grok Build JSON requests with `Content-Encoding: zstd`,
+including `/grok/v1/responses`. It decodes the body before routing and session
+ownership checks, preserving the requested model, input and tools. Install the
+`proxy` extra or the proxy requirements to include the `zstandard` decoder.
+
+Decoded bodies are limited to 16 MiB. Invalid or truncated zstd frames return
+HTTP 400; frames advertising a larger decoded body return HTTP 413. Invalid
+JSON or UTF-8 also returns HTTP 400 instead of a missing-model session-owner
+conflict. These errors occur before provider egress.
+
+When forwarding parsed JSON, the proxy removes the inbound `Content-Encoding`
+and `Content-Length`; the HTTP client serializes JSON and calculates its length.
+Intentional raw passthrough keeps its original bytes and encoding headers.
+Plain JSON requests and session ownership protections retain their contracts.
+
 ## API Key
 ```python
 # env variable

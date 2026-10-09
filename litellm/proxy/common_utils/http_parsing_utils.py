@@ -3,6 +3,7 @@ import re
 from typing import Any, Collection, Dict, List, Optional
 
 import orjson
+import zstandard
 from fastapi import Request, UploadFile, status
 from starlette.requests import ClientDisconnect
 
@@ -12,6 +13,33 @@ from litellm.proxy.common_utils.callback_utils import (
     get_metadata_variable_name_from_kwargs,
 )
 from litellm.types.router import Deployment
+
+
+_MAX_ZSTD_REQUEST_BODY_BYTES = 16 * 1024 * 1024
+
+
+def _decode_zstd_request_body(body: bytes) -> bytes:
+    """Decode one JSON request frame without unbounded expansion."""
+    try:
+        if zstandard.frame_content_size(body) > _MAX_ZSTD_REQUEST_BODY_BYTES:
+            raise ProxyException(
+                message="Decoded zstd request body exceeds 16 MiB",
+                type="invalid_request_error",
+                param="request_body",
+                code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            )
+        return zstandard.ZstdDecompressor().decompress(
+            body,
+            max_output_size=_MAX_ZSTD_REQUEST_BODY_BYTES,
+            allow_extra_data=False,
+        )
+    except zstandard.ZstdError as exc:
+        raise ProxyException(
+            message="Invalid zstd request body",
+            type="invalid_request_error",
+            param="request_body",
+            code=status.HTTP_400_BAD_REQUEST,
+        ) from exc
 
 
 async def _read_request_body(request: Optional[Request]) -> Dict:
@@ -45,6 +73,8 @@ async def _read_request_body(request: Optional[Request]) -> Dict:
         else:
             # Read the request body
             body = await request.body()
+            if _request_headers.get("content-encoding", "").strip().lower() == "zstd":
+                body = _decode_zstd_request_body(body)
 
             # Return empty dict if body is empty or None
             if not body:
@@ -55,7 +85,15 @@ async def _read_request_body(request: Optional[Request]) -> Dict:
                 except orjson.JSONDecodeError as e:
                     # First try the standard json module which is more forgiving
                     # First decode bytes to string if needed
-                    body_str = body.decode("utf-8") if isinstance(body, bytes) else body
+                    try:
+                        body_str = body.decode("utf-8") if isinstance(body, bytes) else body
+                    except UnicodeDecodeError as exc:
+                        raise ProxyException(
+                            message="Invalid JSON payload: body is not UTF-8",
+                            type="invalid_request_error",
+                            param="request_body",
+                            code=status.HTTP_400_BAD_REQUEST,
+                        ) from exc
 
                     # Replace invalid surrogate pairs
                     # This regex finds incomplete surrogate pairs
