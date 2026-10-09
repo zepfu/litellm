@@ -438,9 +438,9 @@ def _stock_case(kind: str, case_id: str, alias: str) -> dict[str, Any]:
 
 
 def _assert_one(hv2: Any, case: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
-    from hv2.suite.live import _evidence_from_step
+    from hv2.suite import live as suite_live
 
-    evidence = _evidence_from_step(case, step)
+    evidence = suite_live._evidence_from_step(case, step)
     rows = hv2.evaluate_case(case, evidence)
     assert len(rows) == 1
     return rows[0]
@@ -766,7 +766,9 @@ def _assert_recorded(
         "children": children or [],
         "instance_token": "litellm-alpha",
     }
-    result = hv2.run_case(hv2.load_config(), case)
+    from hv2.suite import live as suite_live
+
+    result = suite_live._run_case(hv2.load_config(), case)
     assert result["ready"] is True, result
     rows = hv2.evaluate_case(case, result["evidence"])
     assert len(rows) == 1
