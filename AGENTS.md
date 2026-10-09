@@ -69,6 +69,12 @@ exclusions or an operator prohibition on investigation artifacts.
 
 ## Discovery and Evaluation
 
+For session stalls and request failures, start with the affected traffic and
+matching LiteLLM source/runtime revision. Use retained session history,
+Langfuse, Garage, and Codex logs to investigate the likely failing layer before
+broad product-documentation searches. Propose new instrumentation only for a
+specific evidence gap in existing capture.
+
 For broad delegated alias or investigation discovery, include the inventory
 contract in the prompt: list commands/sources and matching candidates, mark
 each inspected/omitted/unavailable, explain omissions, classify relevance, and
