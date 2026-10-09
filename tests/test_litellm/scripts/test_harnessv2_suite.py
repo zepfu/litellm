@@ -612,6 +612,29 @@ def test_evidence_from_step_maps_stock_model_and_spawn_records(hv2: Any) -> None
     assert muse_pass["code"] == "orchestration.spawn"
     assert muse_pass["status"] == "pass"
 
+    muse_recorded = _assert_one(
+        hv2,
+        muse,
+        {
+            "parents": [
+                {
+                    "session": "hv2-muse-parent",
+                    "tool_pass": True,
+                    "child_evidence": {
+                        "kind": "muse_spawn_tool",
+                        "ok": True,
+                        "failures": [],
+                        "spawn_chrome": True,
+                        "child_completed": True,
+                    },
+                }
+            ]
+        },
+    )
+    assert muse_recorded["code"] == "orchestration.spawn"
+    assert muse_recorded["status"] == "pass"
+    assert muse_recorded["observed"]["parent_completed"] is True
+
     muse_open = _assert_one(
         hv2,
         muse,
