@@ -166,11 +166,9 @@ def _policy(config: Mapping[str, Any]) -> dict[str, Any]:
         "ordering": str(policy.get("ordering") or "selection"),
         "concurrency": int(policy.get("concurrency") or 1),
         "deadline_seconds": policy.get("deadline_seconds"),
-        "case_timeout_seconds": int(
-            policy.get("case_timeout_seconds")
-            or (config.get("timeouts") or {}).get("tui_seconds")
-            or 420
-        ),
+        # Unset means the driver reply wait is the case budget. A positive
+        # suite.policy.case_timeout_seconds is an explicit extra halt.
+        "case_timeout_seconds": policy.get("case_timeout_seconds"),
         "retry_budget": int(policy.get("retry_budget") or 0),
         "fail_fast": bool(policy.get("fail_fast") or False),
         "resume_eligible_statuses": list(
