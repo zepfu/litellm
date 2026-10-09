@@ -18,8 +18,32 @@ from hv2.kinds.runner import run_plan  # noqa: E402
 from hv2.load_config import load_config  # noqa: E402
 from hv2.plan import build_plan  # noqa: E402
 from hv2.suite.execute import execute_suite  # noqa: E402
+from hv2.suite.live import interactive_runner  # noqa: E402
 from hv2.suite.matrix import selection_from_args  # noqa: E402
 from hv2.suite.report import dumps  # noqa: E402
+
+
+def _progress(event: Any) -> None:
+    if not isinstance(event, dict):
+        return
+    name = event.get("event")
+    case_id = event.get("case_id")
+    status = event.get("status")
+    if name is None or case_id is None or status is None:
+        return
+    sys.stderr.write(f"progress {name} {case_id} {status}\n")
+
+
+def _load_suite_evidence(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise HarnessError(f"suite evidence must be a JSON object: {path}")
+    evidence: dict[str, Any] = {}
+    for key, value in payload.items():
+        if not isinstance(value, dict):
+            raise HarnessError(f"suite evidence for {key!r} must be a JSON object")
+        evidence[str(key)] = value
+    return evidence
 
 
 def _run_suite(args: Any, config: dict) -> int:
@@ -31,19 +55,34 @@ def _run_suite(args: Any, config: dict) -> int:
         children=split_csv([args.suite_children]) if args.suite_children else None,
         include_shared=bool(args.suite_shared),
     )
+    evidence_path = getattr(args, "suite_evidence", None)
+    if args.dry_run:
+        kwargs: dict[str, Any] = {"dry_run": True}
+    elif evidence_path is not None:
+        kwargs = {
+            "dry_run": False,
+            "live": False,
+            "evidence_by_case": _load_suite_evidence(evidence_path),
+        }
+    else:
+        kwargs = {
+            "dry_run": False,
+            "live": True,
+            "runner": interactive_runner(config),
+        }
     result = execute_suite(
         config,
         selection,
         instance_token=args.instance,
-        dry_run=True,
+        write_path=args.write_artifact,
+        report_path=args.suite_report,
+        state_dir=args.suite_state_dir,
+        resume=bool(args.suite_resume),
+        progress=_progress,
+        **kwargs,
     )
     sys.stdout.write(dumps(result))
-    if result.get("dry_run"):
-        planned = int((result.get("counts") or {}).get("planned") or 0)
-        launches = result.get("launches") if isinstance(result.get("launches"), dict) else {}
-        if planned > 0 and int(launches.get("attempts") or 0) == 0 and not result.get("runner_error"):
-            return 0
-    return int(result.get("exit_code") or 0)
+    return int(result["exit_code"])
 
 
 def main(argv: list[str] | None = None) -> int:

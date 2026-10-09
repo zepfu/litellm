@@ -105,6 +105,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="Omit shared platform checks from the suite matrix",
     )
     parser.add_argument(
+        "--suite-evidence",
+        type=Path,
+        default=None,
+        help=(
+            "JSON object map of case evidence. Executes the suite without "
+            "a TUI (not a live run)."
+        ),
+    )
+    parser.add_argument(
+        "--suite-report",
+        type=Path,
+        default=None,
+        help="Write the readable suite report to this path",
+    )
+    parser.add_argument(
+        "--suite-state-dir",
+        type=Path,
+        default=None,
+        help="Directory for suite resume state",
+    )
+    parser.add_argument(
+        "--suite-resume",
+        action="store_true",
+        help="Reuse a previously passed case when the suite contract matches",
+    )
+    parser.add_argument(
         "--test",
         dest="test",
         default=None,
