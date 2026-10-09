@@ -1154,6 +1154,8 @@ class PassThroughStreamingHandler:
             status_code = 400
             error_type = "invalid_request_error"
             error_code = error_code or "invalid_request_error"
+        elif error_class == "openai_response_protection_unavailable":
+            status_code = 503
         elif error_class == "server_overloaded" and (
             error_code in {
                 "rate_limit_exceeded",

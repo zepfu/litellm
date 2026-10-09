@@ -3631,6 +3631,7 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
             ):
                 should_retry = False
                 exc.pre_commit_retry_exhausted = True
+                exc.retry_after_seconds = 0.0
             if not should_retry or (
                 openai_capacity_coordinator is None
                 and attempt_number >= max_attempts

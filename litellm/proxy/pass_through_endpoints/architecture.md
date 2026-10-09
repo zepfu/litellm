@@ -137,7 +137,8 @@ before another send and is terminal: it does not trigger candidate cooldown,
 account failover, or another hidden retry.
 The exact OpenAI provider signature `internal_error` / `error` /
 `response protection is unavailable` remains ordinary-retry eligible but is
-never classified as capacity overload, so it cannot receive that additional
+never classified as capacity overload; after its bounded retries it normalizes
+to HTTP 503 with `Retry-After: 0` and cannot receive that additional
 authorization.
 
 Reservation closes any previously active upstream response first and disables
