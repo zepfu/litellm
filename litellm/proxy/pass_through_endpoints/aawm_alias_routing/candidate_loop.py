@@ -2561,6 +2561,13 @@ async def handle_alias_route(  # noqa: PLR0915
             request=request,
         )
         terminal_exc: Optional[HTTPException] = None
+        if getattr(exc, "aawm_cleanup_timeout", False):
+            # Local cleanup is terminal for this logical request, not capacity.
+            raise HTTPException(
+                status_code=503,
+                detail=getattr(exc, "detail", str(exc)),
+                headers={"Retry-After": "1"},
+            ) from exc
         if isinstance(exc, ProviderCallReplayBlocked) or getattr(
             exc,
             "aawm_openai_wire_replay_blocked",
@@ -4592,6 +4599,9 @@ async def handle_alias_route(  # noqa: PLR0915
                             request=request,
                         )
 
+                    if getattr(probe_failure_exc, "aawm_cleanup_timeout", False):
+                        _raise_terminal_alias_failure(probe_failure_exc)
+
                     if probe_failure_exc is not None and (
                         isinstance(probe_failure_exc, ProviderCallReplayBlocked)
                         or getattr(
@@ -5116,6 +5126,8 @@ async def handle_alias_route(  # noqa: PLR0915
                 # --- failure handling (post-release) ---------------------------
                 failure_exc = probe_failure_exc
                 assert failure_exc is not None
+                if getattr(failure_exc, "aawm_cleanup_timeout", False):
+                    _raise_terminal_alias_failure(failure_exc)
                 if (
                     _classify_codex_cohere_candidate_failure(
                         failure_exc,

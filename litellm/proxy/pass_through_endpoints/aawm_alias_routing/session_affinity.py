@@ -34,6 +34,7 @@ structured ``redispatch_required`` (never ignored).
 from __future__ import annotations
 
 from litellm.integrations.aawm_session_history.waits import track_wait
+from .pre_commit_cleanup import retain_precommit_task
 
 import asyncio
 import hashlib
@@ -173,6 +174,7 @@ class SessionOwnerLease:
         compare=False,
     )
     finalizing: bool = False
+    cleanup_tasks: set[Any] = field(default_factory=set, repr=False, compare=False)
     # Native OpenAI Responses ownership cannot be promoted from HTTP 2xx. The
     # lease remains renewable until the final wire coordinator reports a
     # terminal disposition.
@@ -3892,7 +3894,7 @@ async def run_with_session_owner_lease_renewal(
             and not lease.released
             and lease.renewal_task is renewal_task
         )
-        if preserve_deferred_wire_renewal:
+        if preserve_deferred_wire_renewal or lease.cleanup_tasks:
             # A nested pass-through may defer this lease after returning a
             # streaming response. Keep the existing renewer alive until the
             # final wire disposition releases or promotes the lease.
@@ -5712,6 +5714,10 @@ async def _release_session_owner_lease_on_terminal(
         )
         return None
 
+    if lease.cleanup_tasks:
+        # Cancellation cleanup still owns provider resources and this reservation.
+        return None
+
     release_only = force_release_only or session_owner_lease_is_release_only(lease)
     invariant = _session_owner_lease_release_invariant(
         lease,
@@ -6067,6 +6073,43 @@ async def finalize_session_owner_lease_on_failure(
     )
 
 
+def defer_session_owner_lease_until_cleanup(request: Any, task: Any) -> None:
+    """Transfer unfinished precommit cleanup to the existing lease lifecycle."""
+    state = getattr(request, "state", None)
+    if state is None:
+        return
+    pending = getattr(state, "aawm_precommit_cleanup_tasks", None)
+    if not isinstance(pending, set):
+        pending = set()
+        state.aawm_precommit_cleanup_tasks = pending
+    if task in pending:
+        return
+    pending.add(task)
+    lease = get_request_session_owner_lease(request)
+    if lease is not None:
+        lease.cleanup_tasks.add(task)
+        start_session_owner_lease_renewal(lease)
+
+    def settled(completed: Any) -> None:
+        pending.discard(completed)
+        if lease is None:
+            return
+        lease.cleanup_tasks.discard(completed)
+        if not lease.cleanup_tasks:
+            # The task has retired its response before this failure finalizer.
+            retain_precommit_task(
+                asyncio.create_task(
+                    finalize_request_session_owner_lease(
+                        request,
+                        lease=lease,
+                        exc=RuntimeError("precommit_cleanup_settled"),
+                    )
+                )
+            )
+
+    task.add_done_callback(settled)
+
+
 def defer_session_owner_lease_until_wire_terminal(request: Any) -> bool:
     """Keep a held lease reserved until its actual accepted wire terminal."""
 
@@ -6152,6 +6195,8 @@ async def finalize_request_session_owner_lease(
     """
 
     active = lease if lease is not None else get_request_session_owner_lease(request)
+    if active is not None and active.cleanup_tasks:
+        return None
     if active is None:
         record_session_owner_continuity_receipt(
             request, phase="owner_finalize", source="request_lease", outcome="no_session"

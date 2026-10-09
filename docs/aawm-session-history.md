@@ -129,6 +129,41 @@ credential, network, or scheduling waits before LiteLLM admission are outside
 this measurement. Existing latency columns and retry `Elapsed Wait` retain their
 meanings; these checkpoints supplement them for unfinished requests.
 
+### Native Responses cancellation cleanup
+
+The disconnect watcher checks pending asyncio cancellation after each
+Starlette disconnect poll. This covers the AnyIO CancelScope collision that
+can swallow a concurrent cancellation and leave the watcher polling.
+Successful precommit output remains usable; watcher cancellation does not
+require another inference.
+
+Both precommit task joins use `asyncio.wait` with a one-second cleanup
+deadline, separate from the existing capacity/backoff budget. A controlled
+check allows 250 ms of scheduling margin per join. Disconnect detection may
+also take one 250 ms polling interval. A timeout around `gather` that waits for
+cancellation acknowledgement does not provide this bound.
+
+Unfinished tasks remain referenced and their eventual exceptions are consumed.
+Cancelled native sends are fenced before egress and when a response returns;
+late responses are retired by the operation that owns them. An unsettled
+provider cleanup keeps its held session-owner reservation renewable and defers
+failure finalization until cleanup settles. It cannot authorize another
+internal send, account fallback, or postcommit replay. Shared HTTP clients
+remain open.
+
+An unsettled precommit operation returns local HTTP 503 with
+`aawm_cleanup_timeout` and `Retry-After: 1` through the existing error path.
+Unmodified Codex can retry this pre-header failure within its normal retry
+limits. Caller and disconnect cancellation retain their cancellation outcomes.
+The existing ASGI wait tracker closes `cancellation_cleanup` and records the
+request's terminal status; background retirement remains task/lease-owned.
+These durations measure the request's wait, not background lifetime after the
+HTTP request has ended.
+
+Existing disconnect regressions mock the poll. Bounded reproductions using
+the deployed Starlette/AnyIO versions are needed to check the CancelScope
+collision; passing the mocked checks alone does not cover that race.
+
 ## OpenAI passthrough text-watermark audits
 
 When `general_settings.openai_passthrough_text_watermark.mode` is not `off`,

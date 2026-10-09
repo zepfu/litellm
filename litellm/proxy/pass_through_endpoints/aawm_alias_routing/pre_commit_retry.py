@@ -22,9 +22,15 @@ from uuid import uuid4
 
 from starlette.requests import Request
 
-from litellm.integrations.aawm_session_history.waits import track_wait, wait_for
+from litellm.integrations.aawm_session_history.waits import track_wait
 
 from .durable import get_aawm_alias_routing_state_namespace
+from .pre_commit_cleanup import (
+    PrecommitFence,
+    cancel_and_drain_precommit,
+    ensure_precommit_send_active,
+    run_fenced_precommit,
+)
 from .retry import (
     OpenAIAlphaCapacityRetryBudget,
     openai_alpha_capacity_retry_wait_seconds,
@@ -52,7 +58,11 @@ class ClientDisconnectedCancellation(asyncio.CancelledError):
 
 async def _wait_for_client_disconnect(request: Request) -> None:
     while True:
-        if await request.is_disconnected():
+        disconnected = await request.is_disconnected()
+        # Starlette's self-cancelled AnyIO scope can consume an external cancel.
+        # Honour the still-pending asyncio cancellation before polling again.
+        ensure_precommit_send_active()
+        if disconnected:
             return
         await asyncio.sleep(_CLIENT_DISCONNECT_POLL_SECONDS)
 
@@ -67,23 +77,31 @@ async def await_with_client_disconnect(
     ``operation`` is an unstarted factory so an already-disconnected request
     cannot begin another egress. The request body must be parsed before this
     helper is called; it only polls ``Request.is_disconnected()``. On
-    disconnect, the operation is canceled and awaited before
+    disconnect, the operation is canceled and drained for at most one second before
     ``ClientDisconnectedCancellation`` is propagated. Caller cancellation
     remains a normal ``asyncio.CancelledError``. The watcher is canceled and
-    awaited on every other exit path as well.
+    drained on every other exit path as well. Unfinished work remains owned;
+    successful provider output is preserved even if watcher cleanup is delayed.
     """
-    if await request.is_disconnected():
+    disconnected = await request.is_disconnected()
+    ensure_precommit_send_active()
+    if disconnected:
         raise ClientDisconnectedCancellation("client disconnected")
 
-    disconnect_task = asyncio.create_task(_wait_for_client_disconnect(request))
-    try:
-        operation_task: asyncio.Future[Any] = asyncio.ensure_future(operation())
-    except BaseException:
-        disconnect_task.cancel()
-        await wait_for(
-            "cancellation_cleanup",
-            asyncio.gather(disconnect_task, return_exceptions=True),
+    watcher_fence = PrecommitFence()
+    disconnect_task = asyncio.create_task(
+        run_fenced_precommit(
+            lambda: _wait_for_client_disconnect(request), watcher_fence
         )
+    )
+    fence = PrecommitFence()
+    try:
+        operation_task: asyncio.Future[Any] = asyncio.ensure_future(
+            run_fenced_precommit(operation, fence)
+        )
+    except BaseException:
+        watcher_fence.stopped = True
+        await cancel_and_drain_precommit(disconnect_task)
         raise
 
     try:
@@ -93,26 +111,17 @@ async def await_with_client_disconnect(
         )
         if disconnect_task in done:
             disconnect_task.result()
-            if not operation_task.done():
-                operation_task.cancel()
-            await wait_for(
-                "cancellation_cleanup",
-                asyncio.gather(operation_task, return_exceptions=True),
-            )
             raise ClientDisconnectedCancellation("client disconnected")
         return operation_task.result()
     finally:
+        watcher_fence.stopped = True
         if not operation_task.done():
-            operation_task.cancel()
-        if not disconnect_task.done():
-            disconnect_task.cancel()
-        await wait_for(
-            "cancellation_cleanup",
-            asyncio.gather(
-                operation_task,
-                disconnect_task,
-                return_exceptions=True,
-            ),
+            fence.stopped = True
+        await cancel_and_drain_precommit(
+            operation_task,
+            disconnect_task,
+            request=request,
+            operation_task=operation_task,
         )
 
 

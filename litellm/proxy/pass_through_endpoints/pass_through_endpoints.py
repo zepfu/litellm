@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import traceback
 from base64 import b64encode
 from collections import deque
@@ -217,6 +218,14 @@ from .aawm_alias_routing.pre_commit_retry import (
     _build_openai_capacity_target_identity,
     await_with_client_disconnect,
     get_or_create_openai_alpha_capacity_retry_coordinator,
+)
+from .aawm_alias_routing.pre_commit_cleanup import (
+    PrecommitCleanupTimeout,
+    PrecommitFence,
+    cancel_and_drain_precommit,
+    ensure_precommit_send_active,
+    run_fenced_precommit,
+    run_with_precommit_cleanup_owner,
 )
 from litellm.llms.xai.managed_send_counter import (
     record_managed_xai_actual_send,
@@ -2490,15 +2499,13 @@ async def _await_passthrough_pre_first_byte_operation(
         if timeout_seconds is None:
             return await operation()
 
-        operation_coroutine = operation()
+        fence = PrecommitFence()
+        operation_coroutine = run_fenced_precommit(operation, fence)
         try:
-            operation_task = asyncio.create_task(
-                operation_coroutine,
-                eager_start=True,
-            )
+            operation_task = asyncio.create_task(operation_coroutine, eager_start=True)
         except TypeError:
             operation_coroutine.close()
-            operation_task = asyncio.create_task(operation())
+            operation_task = asyncio.create_task(run_fenced_precommit(operation, fence))
         try:
             if operation_task.done():
                 return operation_task.result()
@@ -2507,22 +2514,23 @@ async def _await_passthrough_pre_first_byte_operation(
                 timeout=timeout_seconds,
             )
             if operation_task not in done:
-                operation_task.cancel()
-                await wait_for(
-                    "cancellation_cleanup",
-                    asyncio.gather(operation_task, return_exceptions=True),
-                )
                 raise _PassthroughHiddenRetryBudgetTimeout(
                     f"Pass-through {operation_name} hidden retry budget exhausted"
                 )
             return operation_task.result()
         finally:
             if not operation_task.done():
-                operation_task.cancel()
-            await wait_for(
-                "cancellation_cleanup",
-                asyncio.gather(operation_task, return_exceptions=True),
+                fence.stopped = True
+            pending = await cancel_and_drain_precommit(
+                operation_task,
+                request=request,
+                operation_task=operation_task,
             )
+            if pending:
+                # Never enter hidden retries while the old operation is unsettled.
+                # Preserve caller cancellation; timeout failures use the local 503.
+                if not isinstance(sys.exc_info()[1], asyncio.CancelledError):
+                    raise PrecommitCleanupTimeout()
 
     if request is None:
         return await _run_operation()
@@ -3367,6 +3375,13 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                 )
             return result
         except Exception as exc:
+            if getattr(exc, "aawm_cleanup_timeout", False):
+                if openai_capacity_coordinator is not None:
+                    openai_capacity_coordinator.record_terminal(
+                        "cleanup_timeout", error_class="aawm_cleanup_timeout",
+                        status_code=503,
+                    )
+                raise
             retry_progress["failed_attempt_seconds"] = float(
                 retry_progress.get("failed_attempt_seconds") or 0.0
             ) + max(0.0, time.monotonic() - operation_started)
@@ -7514,11 +7529,13 @@ async def _aawm_run_with_session_owner_lease_renewal(
     lease = sa.get_request_session_owner_lease(request)
     renewal_runner = getattr(sa, "run_with_session_owner_lease_renewal", None)
     if renewal_runner is None:
-        return await operation()
+        return await run_with_precommit_cleanup_owner(request, operation)
 
     renewal_error_type = getattr(sa, "SessionOwnerLeaseRenewalError", None)
     try:
-        return await renewal_runner(lease, operation)
+        return await renewal_runner(
+            lease, lambda: run_with_precommit_cleanup_owner(request, operation)
+        )
     except Exception as exc:  # noqa: BLE001
         if renewal_error_type is None or not isinstance(exc, renewal_error_type):
             raise
@@ -9075,7 +9092,7 @@ async def pass_through_request(  # noqa: PLR0915
                 )
                 raise AssertionError("unreachable")
 
-            async def _send_prepared_openai_request(
+            async def _send_prepared_openai_request(  # noqa: PLR0915
                 prepared_request: httpx.Request,
                 send_stream: bool,
             ) -> httpx.Response:
@@ -9361,6 +9378,7 @@ async def pass_through_request(  # noqa: PLR0915
                                 or egress_credential_family
                             ),
                         )
+                    ensure_precommit_send_active()
                     response = await wait_for(
                         "upstream_response",
                         async_client.send(
@@ -9369,6 +9387,11 @@ async def pass_through_request(  # noqa: PLR0915
                             follow_redirects=False,
                         ),
                     )
+                    try:
+                        ensure_precommit_send_active()
+                    except asyncio.CancelledError:
+                        await wait_for("resource_cleanup", response.aclose())
+                        raise
                     _record_openai_final_send_binding_observation(
                         request=request,
                         metadata=passthrough_metadata,
@@ -9643,6 +9666,7 @@ async def pass_through_request(  # noqa: PLR0915
                                     retired_response,
                                 )
                             raise pre_commit_failure
+                    ensure_precommit_send_active()
                     return response, req
                 except BaseException:
                     if raw_response is not None:
@@ -10127,6 +10151,7 @@ async def pass_through_request(  # noqa: PLR0915
                                     retired_response,
                                 )
                             raise pre_commit_failure
+                    ensure_precommit_send_active()
                     return response
 
                 try:
@@ -10190,6 +10215,7 @@ async def pass_through_request(  # noqa: PLR0915
                                 retired_response,
                             )
                         raise pre_commit_failure
+                ensure_precommit_send_active()
                 return response
             except BaseException:
                 if raw_response is not None:
@@ -10897,7 +10923,9 @@ async def pass_through_request(  # noqa: PLR0915
         _publish_openai_send_telemetry()
         replay_blocked = getattr(e, "aawm_openai_wire_replay_blocked", False)
         if not replay_blocked:
-            await close_active_upstream_response(request)
+            pending_cleanup = getattr(request.state, "aawm_precommit_cleanup_tasks", None)
+            if not isinstance(pending_cleanup, set) or not pending_cleanup:
+                await close_active_upstream_response(request)
             try:
                 await _aawm_session_owner_on_upstream_result(
                     request=request,
@@ -11442,6 +11470,14 @@ async def pass_through_request(  # noqa: PLR0915
             setattr(proxy_exc, "attempted_provider_call", False)
             setattr(proxy_exc, "wire_commitment", getattr(e, "wire_commitment", None))
             setattr(proxy_exc, "ledger_snapshot", getattr(e, "ledger_snapshot", None))
+            raise proxy_exc
+        if getattr(e, "aawm_cleanup_timeout", False):
+            proxy_exc = ProxyException(
+                message=e.message, type="server_error", param=None, code=503,
+                headers={**(custom_headers or {}), "Retry-After": "1"},
+            )
+            setattr(proxy_exc, "detail", e.detail)
+            setattr(proxy_exc, "aawm_cleanup_timeout", True)
             raise proxy_exc
         if isinstance(e, ProviderCallLedgerExhausted):
             proxy_exc = ProxyException(
