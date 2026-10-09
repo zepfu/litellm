@@ -217,6 +217,17 @@ def test_reconcile_wall_nested_and_wait_checkpoints(hv2: Any) -> None:
     assert nested == pytest.approx(13.0)
     assert nested != wall
     assert timing["wall_excludes_nested_spans"] is True
+    empty = hv2.reconcile(
+        suite_start_mono=0.0,
+        suite_end_mono=1.0,
+        suite_started_at="2026-10-09T00:00:00+00:00",
+        suite_finished_at="2026-10-09T00:00:01+00:00",
+        phases=[],
+        nested_spans=[],
+        shared_overhead_seconds=0.0,
+    )
+    assert empty["nested_span_sum_seconds"] is None
+    assert "nested_span_sum_seconds" in empty["unavailable"]
     assert "phase.launch_readiness" in timing["unavailable"]
     assert "phase.prompt_delivery" in timing["unavailable"]
     assert "phase.response_execution" in timing["unavailable"]

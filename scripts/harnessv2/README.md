@@ -282,7 +282,7 @@ Client evidence inventory (frozen contracts; OpenCode has none):
 
 | TUI | Launch | Terminal evidence |
 |---|---|---|
-| Codex | dedicated `hv2-codex-*` tmux, never `codex exec` | `codex_spawn_tool_evidence` or exact `PONG` where the model override says so |
+| Codex | dedicated `hv2-codex-*` tmux, never `codex exec` | `codex_spawn_tool_evidence` or exact `PONG` where the model override says so. The suite projection stays inconclusive until the step records the tool command, exit status, and stdout; a pane token alone is not a suite pass |
 | Ohmypi | dedicated `hv2-ohmypi-*` tmux, never `-p` | exact `PONG` or an expected provider 404; orchestration uses `child_spawn_evidence` |
 | Grok | dedicated `hv2-grok-*` via `grokla` | `grok_spawn_tool_evidence` |
 | Muse | dedicated `hv2-muse-*` via `musela` | `muse_spawn_tool_evidence`; a child token alone is not a pass |

@@ -155,6 +155,8 @@ def _nested_spans(
             continue
         nested_sum += duration
         nested_known = True
+    if not nested_known:
+        unavailable.append("nested_span_sum_seconds")
     return nested, nested_sum if nested_known else None, unavailable
 
 
