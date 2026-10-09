@@ -26719,6 +26719,7 @@
         "input_cost_per_token": 0,
         "litellm_provider": "nous",
         "mode": "chat",
+        "output_cost_per_token": 0,
         "namespace_tool_function_adapters": {
             "collaboration": [
                 "followup_task",
@@ -26736,7 +26737,6 @@
                 "wait_agent"
             ]
         },
-        "output_cost_per_token": 0,
         "supports_function_calling": true,
         "supports_native_streaming": true,
         "supports_tool_choice": true,
@@ -26753,6 +26753,15 @@
         "litellm_provider": "nous",
         "mode": "chat",
         "output_cost_per_token": 0
+    },
+    "nous/upstage/solar-mini4:free": {
+        "input_cost_per_token": 0,
+        "litellm_provider": "nous",
+        "mode": "chat",
+        "output_cost_per_token": 0,
+        "supports_function_calling": true,
+        "supports_native_streaming": true,
+        "supports_tool_choice": true
     },
     "nous/poolside/laguna-s-2.1:free": {
         "input_cost_per_token": 0,

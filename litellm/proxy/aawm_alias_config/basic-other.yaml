@@ -19,7 +19,7 @@ aliases:
         priority: 160
 
       - provider: nous
-        model: nous/meituan/longcat-2.0:free
+        model: nous/upstage/solar-mini4:free
         route_family: codex_nous_chat_completions_adapter
         priority: 150
 
