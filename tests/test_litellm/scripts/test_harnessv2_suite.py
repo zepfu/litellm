@@ -31,7 +31,7 @@ def _load() -> Any:
     from hv2.suite.timing import consume_wait_checkpoints, reconcile
     from hv2.suite.verdict import classify_infrastructure, evaluate_case
     from hv2.suite.execute import execute_suite
-    from hv2.suite.live import _evidence_from_step, _run_case
+    from hv2.suite import live as suite_live
     from hv2.suite.matrix import selection_from_args
 
     return SimpleNamespace(
@@ -46,8 +46,8 @@ def _load() -> Any:
         reconcile=reconcile,
         classify_infrastructure=classify_infrastructure,
         evaluate_case=evaluate_case,
-        evidence_from_step=_evidence_from_step,
-        run_case=_run_case,
+        evidence_from_step=suite_live._evidence_from_step,
+        run_case=suite_live._run_case,
         execute_suite=execute_suite,
         selection_from_args=selection_from_args,
     )
@@ -438,7 +438,9 @@ def _stock_case(kind: str, case_id: str, alias: str) -> dict[str, Any]:
 
 
 def _assert_one(hv2: Any, case: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
-    evidence = hv2.evidence_from_step(case, step)
+    from hv2.suite import live as suite_live
+
+    evidence = suite_live._evidence_from_step(case, step)
     rows = hv2.evaluate_case(case, evidence)
     assert len(rows) == 1
     return rows[0]
@@ -612,6 +614,29 @@ def test_evidence_from_step_maps_stock_model_and_spawn_records(hv2: Any) -> None
     assert muse_pass["code"] == "orchestration.spawn"
     assert muse_pass["status"] == "pass"
 
+    muse_recorded = _assert_one(
+        hv2,
+        muse,
+        {
+            "parents": [
+                {
+                    "session": "hv2-muse-parent",
+                    "tool_pass": True,
+                    "child_evidence": {
+                        "kind": "muse_spawn_tool",
+                        "ok": True,
+                        "failures": [],
+                        "spawn_chrome": True,
+                        "child_completed": True,
+                    },
+                }
+            ]
+        },
+    )
+    assert muse_recorded["code"] == "orchestration.spawn"
+    assert muse_recorded["status"] == "pass"
+    assert muse_recorded["observed"]["parent_completed"] is True
+
     muse_open = _assert_one(
         hv2,
         muse,
@@ -741,7 +766,9 @@ def _assert_recorded(
         "children": children or [],
         "instance_token": "litellm-alpha",
     }
-    result = hv2.run_case(hv2.load_config(), case)
+    from hv2.suite import live as suite_live
+
+    result = suite_live._run_case(hv2.load_config(), case)
     assert result["ready"] is True, result
     rows = hv2.evaluate_case(case, result["evidence"])
     assert len(rows) == 1
