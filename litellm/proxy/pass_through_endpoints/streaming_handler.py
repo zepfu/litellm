@@ -204,7 +204,7 @@ class ResponsesStreamPreCommitFailure(Exception):
         headers = None
         if self.retryable or self.pre_commit_retry_exhausted:
             retry_after = self.retry_after_seconds
-            if retry_after is None or retry_after <= 0:
+            if retry_after is None:
                 retry_after = RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS
             if retry_after == int(retry_after):
                 retry_after_header = str(int(retry_after))
@@ -217,6 +217,11 @@ class ResponsesStreamPreCommitFailure(Exception):
             headers=headers,
         )
         setattr(http_exception, "_aawm_provider_returned", self.provider_returned)
+        setattr(
+            http_exception,
+            "_aawm_typed_precommit_error_class",
+            self.error_class,
+        )
         return http_exception
 
 

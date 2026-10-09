@@ -2839,6 +2839,7 @@ def _is_passthrough_pre_first_byte_hidden_retryable(
             in (
                 _RESPONSES_TRANSIENT_CAPACITY_CLASSES
                 | _RESPONSES_TRANSIENT_STREAM_CLASSES
+                | _RESPONSES_ORDINARY_RETRY_CLASSES
             )
             and not exc.pre_commit_retry_exhausted
         )
