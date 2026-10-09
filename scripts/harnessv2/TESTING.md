@@ -38,13 +38,14 @@ v2 is a **new** tree. YAML/JSON is the source of truth. Python changes
 only when a new *kind of step* is invented. Adding a model, prompt,
 forbidden log string, HTTP probe, or Ohmypi argv token is a YAML edit.
 
-Implemented TUIs are Ohmypi (`omp` 17.3.8 via `ompla`) and Codex
-(`codex` interactive TUI). Claude is out of scope, not a stub, and is
-excluded from current closeout: do not select or run Anthropic/Claude
-provider, model, alias, TUI, test, or acceptance work. Historical
-mentions are legacy/non-goal. Grok and
-OpenCode remain stubs (`enabled: false`). Codex never uses `codex exec`,
-`-p`, or `--print`.
+Implemented TUIs are Ohmypi (`omp` via `ompla`), Codex (interactive
+TUI), Grok (`grok` via `grokla`), and Muse (`muse` via `musela`).
+Claude is out of scope, not a stub, and is excluded from current
+closeout: do not select or run Anthropic/Claude provider, model, alias,
+TUI, test, or acceptance work. Historical mentions are legacy/non-goal.
+OpenCode remains the only stub (`enabled: false`). Codex never uses
+`codex exec`, `-p`, or `--print`. Grok and Muse use dedicated tmux
+sessions and do not accept a headless or exec substitute.
 
 Entry point:
 
@@ -103,7 +104,7 @@ scripts/harnessv2/
   config/
     harness.yaml          # includes + timeouts + artifact schema
     targets.yaml          # instance firewall, Redis, inspect env keys
-    tuis.yaml             # Ohmypi + Codex driver contract; grok/opencode stubs; Claude out
+    tuis.yaml             # Ohmypi, Codex, Grok, Muse; OpenCode stub; Claude out
     models.yaml           # compiled aliases, groups, skip prefixes
     kinds.yaml            # platform / catalog / model / orchestration
     checks.yaml           # health, HTTP suite, leftover uvicorn, JSONL, Ohmypi rollup identity
@@ -490,9 +491,10 @@ From `config/tuis.yaml`:
 | Orchestration tools | on |
 | Model pass | standalone `hv2-codex-child` **and** a current-turn child spawn plus `Ran date` / `Ran pwd` context with compatible stdout after `spawn_agent` with `model=basic` and a non-empty message (Codex may prefix the token with `• `). Local `/root/hv2_child_*` or `/root/hv2_codex_child*` chrome, a workspace path alone, or a token with no stdout, is not a pass. Provider 404 needles do not pass Codex `tool_command`. Do not spawn ChatGPT-unsupported child models (`qwen`/`kimi`/`deepseek`/`grok`/`moonshot`). Leftover trust-nux `Working with untrusted contents` is not a busy needle; in-flight work is `Working (`. `sota-zai` and `provider-zai` override this walk: exact `PONG`, tools off. A `basic` child in that Z.AI session is a session-owner 409, not Z.AI acceptance. |
 
-`--tui grok` and `--tui opencode` remain stubs. `--tui claude` stays out
-of scope and is excluded from current closeout (do not select or run;
-historical mentions are legacy/non-goal). `--test platform --tui codex`
+`--tui grok` and `--tui muse` are implemented. `--tui opencode` remains
+the only stub. `--tui claude` stays out of scope and is excluded from
+current closeout (do not select or run; historical mentions are
+legacy/non-goal). `--test platform --tui codex`
 is still forbidden. Protected
 containers `aawm-litellm` / `litellm-dev` and ports `4000` / `4001` still
 fail closed.
@@ -678,9 +680,10 @@ leftover-uvicorn invert, Ohmypi forbid `-p`, Ohmypi rollup identity
 `aawm-infrastructure@thoth` and concurrent Codex-client
 `litellm@thoth` + `codex-auto-review`), Codex interactive TUI plans
 (`basic`, identity overlay, dedicated tmux, no print/exec),
-Codex rollup identity (`tui=codex`), grok/opencode stubs, Claude out of
-scope and excluded from current closeout (historical mentions
-legacy/non-goal), dry-run plans, H-6 prompt substring needles.
+Codex rollup identity (`tui=codex`), Grok and Muse interactive plans,
+the OpenCode stub, Claude out of scope and excluded from current
+closeout (historical mentions legacy/non-goal), dry-run plans, H-6
+prompt substring needles.
 
 ### Dry-run a kind
 
@@ -719,6 +722,42 @@ python scripts/harnessv2/run.py \
 ```
 
 Add `--tui ohmypi` only when you also want the picker.
+
+### Suite contract
+
+`--suite` is the multi-TUI matrix. It does not replace `--test`.
+HARNESS-001 resolves the matrix. HARNESS-002 runs it on stock
+interactive clients. HARNESS-003 scores bound evidence. HARNESS-004
+records phase time. HARNESS-005 prints one result as JSON and text.
+A stage is accepted only on its own evidence. The suite is accepted
+only when launch, validation, timing, and the report agree.
+
+Counts: planned is the selected matrix. Finished and executed are
+passed plus failed. Errored, blocked, skipped, running, and incomplete
+are separate. Child assertions and shared checks are not cases. Retries
+are attempts.
+
+Exit codes: 0 success, 1 validation failure, 2 runner or setup failure,
+3 incomplete. Exit 0 requires every selected case and every required
+suite assertion to pass.
+
+Timing fields are seconds. `timing.suite.wall_seconds` is monotonic
+suite elapsed time. `timing.nested_span_sum_seconds` is the sum of
+provider, tool, and child spans and is not part of wall time.
+`timing.overlap_seconds` is raw phase sum minus the union of those
+intervals. `timing.unattributed_seconds` is wall time not covered by
+the phase union plus shared overhead. Null durations are listed in
+`timing.unavailable`.
+
+Evidence inventory: Codex uses dedicated tmux and
+`codex_spawn_tool_evidence` (exact PONG only on the declared model
+overrides). Ohmypi uses dedicated tmux, exact PONG or an expected
+provider 404, and `child_spawn_evidence` for orchestration. Grok uses
+`grok_spawn_tool_evidence`. Muse uses `muse_spawn_tool_evidence`.
+OpenCode is unsupported. Claude is out of scope. Headless or exec
+substitutes do not satisfy TUI acceptance. Allowed live target remains
+`litellm-alpha`. `aawm-litellm` (`:4000`) and `litellm-dev` (`:4001`)
+stay forbidden.
 
 ### Live model (interactive Ohmypi)
 

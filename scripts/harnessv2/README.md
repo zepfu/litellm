@@ -1,7 +1,8 @@
 # Harness v2
 
-YAML/JSON-first LiteLLM acceptance harness. Implemented TUIs are Ohmypi
-and Codex. Claude is out of scope. Grok and OpenCode are stubs.
+YAML/JSON-first LiteLLM acceptance harness. Implemented TUIs are Ohmypi,
+Codex, Grok (`grokla`), and Muse (`musela`). Claude is out of scope.
+OpenCode is the only stub.
 
 Current Harness v2 closeout excludes Anthropic/Claude provider, model,
 alias, TUI, test, and acceptance work. Do not select or run it.
@@ -109,9 +110,10 @@ defaults to `basic` only.
 Do not treat Ohmypi
 `--model all` as the Codex OC-003 surface. Codex model/orchestration is
 tool-bearing (child `date`/`pwd`); it is not Ohmypi `--no-tools` PONG.
-`--tui grok` and `--tui opencode` remain stubs. `--tui claude` stays out
-of scope and is excluded from current closeout (do not select or run;
-historical mentions are legacy/non-goal).
+`--tui grok` and `--tui muse` are implemented interactive clients.
+`--tui opencode` remains a stub. `--tui claude` stays out of scope and
+is excluded from current closeout (do not select or run; historical
+mentions are legacy/non-goal).
 
 Provider-pinned orchestration is a separate group. It is not the
 baseline mixed-alias walk:
@@ -243,6 +245,68 @@ successor and later nodes/files. Never rerun a passed prefix or the
 full gate unless that evidence is invalidated or the operator
 explicitly requests it. At the next failure: stop, preserve the
 checkpoint, fix, and continue there.
+
+## Suite
+
+`--suite` selects an explicit matrix beside `--test`. One case is one
+TUI plus one scenario plus one model or one orchestration parent. Shared
+platform checks and child or tool assertions have their own counts and
+do not increase the headline planned or passed totals. Retries add
+attempts on the same case.
+
+```text
+python scripts/harnessv2/run.py \
+  --instance litellm-alpha \
+  --suite \
+  --suite-tui ohmypi --suite-tui codex \
+  --suite-kind orchestration \
+  --suite-parent sota-openai,basic \
+  --dry-run
+```
+
+Dry-run prints the resolved matrix (stable run, case, and attempt ids,
+planned counts, configuration and prompt hashes, source commit, and
+target container) and launches no TUI and sends no provider request.
+Ordering, concurrency, deadlines, retry budget, fail-fast, resume
+eligibility, and dedicated-session retention come from `suite.policy`
+before execution. Resume reuses a passed case only while the frozen
+configuration and source contract match.
+
+Exit codes: `0` complete success, `1` validation failure, `2` runner or
+setup failure, `3` incomplete execution. Success cannot hide a skipped
+required case, missing terminal evidence, or a failed required suite
+check. Finished means passed plus failed. Errored, blocked, skipped,
+running, and incomplete stay out of that total.
+
+Client evidence inventory (frozen contracts; OpenCode has none):
+
+| TUI | Launch | Terminal evidence |
+|---|---|---|
+| Codex | dedicated `hv2-codex-*` tmux, never `codex exec` | `codex_spawn_tool_evidence` or exact `PONG` where the model override says so |
+| Ohmypi | dedicated `hv2-ohmypi-*` tmux, never `-p` | exact `PONG` or an expected provider 404; orchestration uses `child_spawn_evidence` |
+| Grok | dedicated `hv2-grok-*` via `grokla` | `grok_spawn_tool_evidence` |
+| Muse | dedicated `hv2-muse-*` via `musela` | `muse_spawn_tool_evidence`; a child token alone is not a pass |
+
+Recap, echoed prompts, selector text, idle glyphs, and spawn
+acknowledgements are not success. A provider 404 passes only a case
+that expects that error and its attribution. Missing, stale, or
+cross-session evidence stays inconclusive. Docker log and error-JSONL
+findings are suite infrastructure and are not the cause of a case
+unless a machine correlation names that case.
+
+Timing uses UTC timestamps for correlation and monotonic seconds for
+local intervals. `wall_seconds` is suite elapsed time. Provider, tool,
+and child spans are nested and are not added into wall time. Overlap is
+the excess of summed phase intervals over their union. Unattributed and
+unavailable intervals stay explicit. Phases are preparation,
+launch/readiness, prompt delivery, response execution, validation,
+evidence collection, and cleanup/retention. A client process kept after
+the run is not harness duration. `session_history` export, when enabled,
+names its database and consumes `metadata.wait_accounting` by latest
+sequence instead of summing checkpoints.
+
+Stdout JSON, the artifact, and the readable report are projections of
+one result object.
 
 ## Unit tests
 
