@@ -138,8 +138,7 @@ account failover, or another hidden retry.
 The exact OpenAI provider signature `internal_error` / `error` /
 `response protection is unavailable` remains ordinary-retry eligible but is
 never classified as capacity overload; after its bounded retries it normalizes
-to HTTP 503 with `Retry-After: 0` and cannot receive that additional
-authorization.
+to HTTP 503 and cannot receive that additional authorization.
 
 Reservation closes any previously active upstream response first and disables
 opaque redirects for ledger-owned sends. Observable connection failures are

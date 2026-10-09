@@ -205,10 +205,7 @@ class ResponsesStreamPreCommitFailure(Exception):
         if self.retryable or self.pre_commit_retry_exhausted:
             retry_after = self.retry_after_seconds
             if retry_after is None:
-                if self.error_class == "openai_response_protection_unavailable":
-                    retry_after = 0.0
-                else:
-                    retry_after = RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS
+                retry_after = RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS
             if retry_after == int(retry_after):
                 retry_after_header = str(int(retry_after))
             else:

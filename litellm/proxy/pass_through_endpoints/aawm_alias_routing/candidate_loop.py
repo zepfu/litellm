@@ -1584,9 +1584,6 @@ async def handle_alias_route(  # noqa: PLR0915
     from litellm.proxy.pass_through_endpoints import (
         pass_through_endpoints as _passthrough_helpers,
     )
-    from litellm.proxy.pass_through_endpoints.streaming_handler import (
-        ResponsesStreamPreCommitFailure,
-    )
 
     _codex_auto_agent_request_has_continuation_state = _lpe._codex_auto_agent_request_has_continuation_state
     _get_codex_auto_agent_native_grok_continuation_transient_max_attempts = (
@@ -2882,8 +2879,6 @@ async def handle_alias_route(  # noqa: PLR0915
             or (
                 error_class
                 not in _error_signals._RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES
-                and error_class
-                != "openai_response_protection_unavailable"
             )
         ):
             return
@@ -5501,8 +5496,6 @@ async def handle_alias_route(  # noqa: PLR0915
                     if (
                         error_class
                         not in _error_signals._RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES
-                        and error_class
-                        != "openai_response_protection_unavailable"
                     ):
                         capacity_retry_coordinator.record_terminal(
                             "non_capacity_error",
@@ -5818,29 +5811,10 @@ async def handle_alias_route(  # noqa: PLR0915
                         "retryable": True,
                     }
                     if error_class == "openai_response_protection_unavailable":
-                        protection_failure = ResponsesStreamPreCommitFailure(
-                            error_class=error_class,
-                            classification="transient_upstream",
-                            retryable=True,
-                            retry_after_seconds=float(
-                                pre_commit_retry_plan["wait_seconds"] or 10.0
-                            ),
-                            error_code=getattr(failure_exc, "error_code", None),
-                            error_type=getattr(failure_exc, "error_type", None),
-                            message=getattr(failure_exc, "message", None),
-                            status_code=getattr(failure_exc, "status_code", None),
-                            pre_commit_retry_exhausted=True,
-                            error_payload=getattr(failure_exc, "error_payload", None),
-                            provider_returned=bool(
-                                getattr(failure_exc, "provider_returned", True)
-                            ),
-                            failure_origin=getattr(
-                                failure_exc,
-                                "failure_origin",
-                                None,
-                            ),
+                        _raise_terminal_alias_failure(
+                            failure_exc,
+                            preserve_upstream_failure=True,
                         )
-                        raise protection_failure from failure_exc
                     if _provider_owned_continuation():
                         raise HTTPException(
                             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
