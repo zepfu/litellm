@@ -203,12 +203,23 @@ def _bound(case: Mapping[str, Any], session: Any) -> dict[str, Any]:
 
 
 def _apply_model_fields(evidence: dict[str, Any], turn: Mapping[str, Any]) -> None:
-    if "exact_pong" in turn and turn.get("exact_pong") is True:
+    tool_contract = str(turn.get("pass_mode") or "") == "tool_command" or turn.get("tool_pass") is True
+    if tool_contract:
+        evidence["contract"] = "tool_command"
+        command = turn.get("tool_command") if isinstance(turn.get("tool_command"), str) else None
+        stdout = turn.get("tool_stdout") if isinstance(turn.get("tool_stdout"), str) else None
+        exit_status = turn.get("tool_exit_status")
+        if command or stdout or exit_status is not None:
+            evidence["tool"] = {
+                "command": command,
+                "stdout": stdout,
+                "exit_status": exit_status,
+            }
+            evidence["expected_tool"] = {"command": command, "exit_status": 0}
+    if "exact_pong" in turn and turn.get("exact_pong") is True and not tool_contract:
         evidence["response_value"] = "PONG"
     if "provider_404" in turn and turn.get("provider_404") is True:
         evidence["provider_error"] = {"status": 404}
-    if "tool_pass" in turn and turn.get("tool_pass") is True:
-        evidence["contract"] = "tool_command"
     if "completed" in turn:
         evidence["completed"] = bool(turn.get("completed"))
 
