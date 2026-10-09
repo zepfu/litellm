@@ -202,20 +202,35 @@ def _bound(case: Mapping[str, Any], session: Any) -> dict[str, Any]:
     }
 
 
+def _recorded_tool(turn: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Copy command evidence only when the step actually recorded a field."""
+
+    command = turn.get("tool_command")
+    stdout = turn.get("tool_stdout")
+    exit_status = turn.get("tool_exit_status")
+    command_text = command if isinstance(command, str) and command.strip() else None
+    stdout_text = stdout if isinstance(stdout, str) and stdout.strip() else None
+    exit_value = exit_status if isinstance(exit_status, int) and not isinstance(exit_status, bool) else None
+    if command_text is None and stdout_text is None and exit_value is None:
+        return None
+    return {
+        "command": command_text,
+        "stdout": stdout_text,
+        "exit_status": exit_value,
+    }
+
+
 def _apply_model_fields(evidence: dict[str, Any], turn: Mapping[str, Any]) -> None:
     tool_contract = str(turn.get("pass_mode") or "") == "tool_command"
     if tool_contract:
         evidence["contract"] = "tool_command"
-        command = turn.get("tool_command") if isinstance(turn.get("tool_command"), str) else None
-        stdout = turn.get("tool_stdout") if isinstance(turn.get("tool_stdout"), str) else None
-        exit_status = turn.get("tool_exit_status")
-        if command or stdout or exit_status is not None:
-            evidence["tool"] = {
-                "command": command,
-                "stdout": stdout,
-                "exit_status": exit_status,
-            }
-            evidence["expected_tool"] = {"command": command, "exit_status": 0}
+        recorded = _recorded_tool(turn)
+        if recorded is not None:
+            evidence["tool"] = recorded
+            evidence["expected_tool"] = {"command": recorded["command"], "exit_status": 0}
+        elif "tool_pass" in turn:
+            # The model runner records tool_pass, not command/stdout/exit.
+            evidence["tool_pass_recorded"] = turn.get("tool_pass") is True
     if "exact_pong" in turn and turn.get("exact_pong") is True and not tool_contract:
         evidence["response_value"] = "PONG"
     if "provider_404" in turn and turn.get("provider_404") is True:
@@ -245,6 +260,7 @@ def _apply_orchestration_fields(evidence: dict[str, Any], turn: Mapping[str, Any
         )
         if isinstance(failures, list):
             evidence["spawn_failures"] = list(failures)
+        _apply_spawn_contract(evidence, recorded)
     command = turn.get("tool_command") if isinstance(turn.get("tool_command"), str) else None
     stdout = turn.get("tool_stdout") if isinstance(turn.get("tool_stdout"), str) else None
     exit_status = turn.get("tool_exit_status")
@@ -327,6 +343,25 @@ def _codex_child_rows(items: list[Any]) -> list[dict[str, Any]] | None:
             }
         )
     return rows or None
+
+
+def _apply_spawn_contract(evidence: dict[str, Any], recorded: Mapping[str, Any]) -> None:
+    """Grok and Muse record a parent spawn contract, not per-alias child rows."""
+
+    kind = recorded.get("kind")
+    if kind == "grok_spawn_tool":
+        evidence["spawn_contract"] = "grok_spawn_tool"
+        evidence["spawn_detail"] = {
+            "spawn_chrome": recorded.get("spawn_chrome") is True,
+            "pwd_row": recorded.get("pwd_row") is True,
+            "uname_row": recorded.get("uname_row") is True,
+        }
+    elif kind == "muse_spawn_tool":
+        evidence["spawn_contract"] = "muse_spawn_tool"
+        evidence["spawn_detail"] = {
+            "spawn_chrome": recorded.get("spawn_chrome") is True,
+            "child_completed": recorded.get("child_completed") is True,
+        }
 
 
 def _child_rows(recorded: Mapping[str, Any]) -> list[dict[str, Any]] | None:

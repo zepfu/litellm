@@ -234,23 +234,48 @@ def _model_assertions(
     contract = str(evidence.get("contract") or "response")
     if contract == "tool_command":
         tool = evidence.get("tool") if isinstance(evidence.get("tool"), Mapping) else {}
-        expected = evidence.get("expected_tool") if isinstance(evidence.get("expected_tool"), Mapping) else {
-            "command": tool.get("command"),
-            "exit_status": 0,
-        }
-        command_ok = bool(tool.get("command")) and tool.get("command") == expected.get("command")
-        exit_ok = tool.get("exit_status") == expected.get("exit_status", 0)
-        stdout_ok = bool(str(tool.get("stdout") or "").strip())
-        status = "pass" if command_ok and exit_ok and stdout_ok else "fail" if tool else "inconclusive"
+        has_fields = any(
+            tool.get(name) is not None for name in ("command", "stdout", "exit_status")
+        )
+        if has_fields:
+            expected = evidence.get("expected_tool") if isinstance(evidence.get("expected_tool"), Mapping) else {
+                "command": tool.get("command"),
+                "exit_status": 0,
+            }
+            command_ok = bool(tool.get("command")) and tool.get("command") == expected.get("command")
+            exit_ok = tool.get("exit_status") == expected.get("exit_status", 0)
+            stdout_ok = bool(str(tool.get("stdout") or "").strip())
+            status = "pass" if command_ok and exit_ok and stdout_ok else "fail"
+            observed: Any = {
+                "command": tool.get("command"),
+                "exit_status": tool.get("exit_status"),
+                "stdout": tool.get("stdout"),
+            }
+            expected_row: Any = dict(expected)
+        elif evidence.get("tool_pass_recorded") is True and evidence.get("completed") is True:
+            status = "pass"
+            expected_row = {"tool_pass": True, "completed": True}
+            observed = {"tool_pass": True, "completed": True}
+        elif evidence.get("tool_pass_recorded") is False or evidence.get("completed") is False:
+            status = "fail"
+            expected_row = {"tool_pass": True, "completed": True}
+            observed = {
+                "tool_pass": evidence.get("tool_pass_recorded"),
+                "completed": evidence.get("completed"),
+            }
+        else:
+            status = "inconclusive"
+            expected_row = {"tool_pass": True, "completed": True}
+            observed = {
+                "command": None,
+                "exit_status": None,
+                "stdout": None,
+            }
         return [
             assertion(
                 code="tool.command",
-                expected=dict(expected),
-                observed={
-                    "command": tool.get("command"),
-                    "exit_status": tool.get("exit_status"),
-                    "stdout": tool.get("stdout"),
-                },
+                expected=expected_row,
+                observed=observed,
                 status=status,
                 evidence_refs=list(refs),
                 case_id=case_id,
@@ -286,6 +311,63 @@ def _parent_tool_ok(tool: Mapping[str, Any] | None) -> bool:
     return bool(command) and tool.get("exit_status") == 0 and bool(stdout)
 
 
+def _spawn_contract_ok(evidence: Mapping[str, Any]) -> bool:
+    if evidence.get("parent_completed") is not True or not _spawn_ok(evidence):
+        return False
+    detail = evidence.get("spawn_detail")
+    if not isinstance(detail, Mapping):
+        return False
+    contract = evidence.get("spawn_contract")
+    if contract == "grok_spawn_tool":
+        return (
+            detail.get("spawn_chrome") is True
+            and detail.get("pwd_row") is True
+            and detail.get("uname_row") is True
+        )
+    if contract == "muse_spawn_tool":
+        return (
+            detail.get("spawn_chrome") is True
+            and detail.get("child_completed") is True
+        )
+    return False
+
+
+def _spawn_contract_assertion(
+    case_id: str,
+    evidence: Mapping[str, Any],
+    refs: Sequence[Mapping[str, Any]],
+    correlation: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    detail = evidence.get("spawn_detail") if isinstance(evidence.get("spawn_detail"), Mapping) else {}
+    recorded = evidence.get("spawn_contract") in {"grok_spawn_tool", "muse_spawn_tool"}
+    if _spawn_contract_ok(evidence):
+        status = "pass"
+    elif recorded and (
+        evidence.get("spawn_ok") is False or evidence.get("parent_completed") is False
+    ):
+        status = "fail"
+    else:
+        status = "inconclusive"
+    return assertion(
+        code="orchestration.spawn",
+        expected={
+            "contract": evidence.get("spawn_contract"),
+            "parent_completed": True,
+            "spawn_ok": True,
+        },
+        observed={
+            "contract": evidence.get("spawn_contract"),
+            "parent_completed": evidence.get("parent_completed"),
+            "spawn_ok": evidence.get("spawn_ok"),
+            "detail": dict(detail),
+        },
+        status=status,
+        evidence_refs=list(refs),
+        case_id=case_id,
+        correlation=correlation,
+    )
+
+
 def _spawn_ok(evidence: Mapping[str, Any]) -> bool:
     if evidence.get("spawn_ok") is not True:
         return False
@@ -302,6 +384,13 @@ def _child_assertions(
     case_id = str(case.get("case_id") or "")
     wanted = [str(item) for item in (case.get("children") or [])]
     rows = evidence.get("children") if isinstance(evidence.get("children"), list) else None
+    if rows is None and evidence.get("spawn_contract") in {
+        "grok_spawn_tool",
+        "muse_spawn_tool",
+    }:
+        return [
+            _spawn_contract_assertion(case_id, evidence, refs, correlation)
+        ]
     if rows is None:
         return [
             assertion(

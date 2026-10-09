@@ -31,6 +31,7 @@ def _load() -> Any:
     from hv2.suite.timing import consume_wait_checkpoints, reconcile
     from hv2.suite.verdict import classify_infrastructure, evaluate_case
     from hv2.suite.execute import execute_suite
+    from hv2.suite.live import _evidence_from_step
     from hv2.suite.matrix import selection_from_args
 
     return SimpleNamespace(
@@ -45,6 +46,7 @@ def _load() -> Any:
         reconcile=reconcile,
         classify_infrastructure=classify_infrastructure,
         evaluate_case=evaluate_case,
+        evidence_from_step=_evidence_from_step,
         execute_suite=execute_suite,
         selection_from_args=selection_from_args,
     )
@@ -423,6 +425,188 @@ def test_exit_classes_from_projected_results(hv2: Any, tmp_path: Path) -> None:
     missing_projected = hv2.project(missing)
     assert missing_projected["exit_code"] != 0
     assert missing_projected["reconciliation"]["missing"] == ["omitted"]
+
+
+def _stock_case(kind: str, case_id: str, alias: str) -> dict[str, Any]:
+    return {
+        "case_id": case_id,
+        "kind": kind,
+        "alias": alias,
+        "children": [],
+    }
+
+
+def _assert_one(hv2: Any, case: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
+    evidence = hv2.evidence_from_step(case, step)
+    rows = hv2.evaluate_case(case, evidence)
+    assert len(rows) == 1
+    return rows[0]
+
+
+def test_evidence_from_step_maps_stock_model_and_spawn_records(hv2: Any) -> None:
+    """Stock tui_model and tui_orchestration rows, not hand-built verdicts."""
+
+    codex = _stock_case("model", "codex-case", "basic")
+    passed = _assert_one(
+        hv2,
+        codex,
+        {
+            "models": [
+                {
+                    "session": "hv2-codex-basic",
+                    "pass_mode": "tool_command",
+                    "tool_pass": True,
+                    "completed": True,
+                    "exact_pong": False,
+                }
+            ]
+        },
+    )
+    assert passed["code"] == "tool.command"
+    assert passed["status"] == "pass"
+
+    missing = _assert_one(
+        hv2,
+        codex,
+        {
+            "models": [
+                {
+                    "session": "hv2-codex-basic",
+                    "pass_mode": "tool_command",
+                    "completed": True,
+                    "exact_pong": False,
+                }
+            ]
+        },
+    )
+    assert missing["status"] == "inconclusive"
+    assert missing["observed"]["command"] is None
+
+    failed = _assert_one(
+        hv2,
+        codex,
+        {
+            "models": [
+                {
+                    "session": "hv2-codex-basic",
+                    "pass_mode": "tool_command",
+                    "tool_pass": False,
+                    "completed": False,
+                }
+            ]
+        },
+    )
+    assert failed["status"] == "fail"
+
+    pong = _assert_one(
+        hv2,
+        codex,
+        {
+            "models": [
+                {
+                    "session": "hv2-codex-basic",
+                    "pass_mode": "exact_pong",
+                    "exact_pong": True,
+                    "tool_pass": True,
+                    "completed": True,
+                }
+            ]
+        },
+    )
+    assert pong["code"] == "response.value"
+    assert pong["status"] == "pass"
+    assert pong["observed"] == "PONG"
+
+    grok = _stock_case("orchestration", "grok-case", "grok-4.7")
+    grok_pass = _assert_one(
+        hv2,
+        grok,
+        {
+            "parents": [
+                {
+                    "session": "hv2-grok-parent",
+                    "completed": True,
+                    "child_evidence": {
+                        "kind": "grok_spawn_tool",
+                        "ok": True,
+                        "failures": [],
+                        "spawn_chrome": True,
+                        "pwd_row": True,
+                        "uname_row": True,
+                    },
+                }
+            ]
+        },
+    )
+    assert grok_pass["code"] == "orchestration.spawn"
+    assert grok_pass["status"] == "pass"
+
+    grok_ack = _assert_one(
+        hv2,
+        grok,
+        {
+            "parents": [
+                {
+                    "session": "hv2-grok-parent",
+                    "completed": True,
+                    "tool_pass": True,
+                    "child_evidence": {
+                        "kind": "grok_spawn_tool",
+                        "ok": False,
+                        "failures": ["prompt-echo-only spawn"],
+                        "spawn_chrome": False,
+                        "pwd_row": False,
+                        "uname_row": False,
+                    },
+                }
+            ]
+        },
+    )
+    assert grok_ack["status"] == "fail"
+
+    muse = _stock_case("orchestration", "muse-case", "muse-spark-1.3-contributor")
+    muse_pass = _assert_one(
+        hv2,
+        muse,
+        {
+            "parents": [
+                {
+                    "session": "hv2-muse-parent",
+                    "completed": True,
+                    "child_evidence": {
+                        "kind": "muse_spawn_tool",
+                        "ok": True,
+                        "failures": [],
+                        "spawn_chrome": True,
+                        "child_completed": True,
+                    },
+                }
+            ]
+        },
+    )
+    assert muse_pass["code"] == "orchestration.spawn"
+    assert muse_pass["status"] == "pass"
+
+    muse_open = _assert_one(
+        hv2,
+        muse,
+        {
+            "parents": [
+                {
+                    "session": "hv2-muse-parent",
+                    "completed": True,
+                    "child_evidence": {
+                        "kind": "muse_spawn_tool",
+                        "ok": True,
+                        "failures": [],
+                        "spawn_chrome": True,
+                        "child_completed": False,
+                    },
+                }
+            ]
+        },
+    )
+    assert muse_open["status"] == "inconclusive"
 
 
 def test_session_history_shipped_config_stays_skipped(hv2: Any) -> None:
