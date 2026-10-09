@@ -272,6 +272,13 @@ def _apply_orchestration_fields(evidence: dict[str, Any], turn: Mapping[str, Any
         }
     if "completed" in turn:
         evidence["parent_completed"] = bool(turn.get("completed"))
+    elif (
+        evidence.get("spawn_contract") in {"grok_spawn_tool", "muse_spawn_tool"}
+        and "tool_pass" in turn
+    ):
+        # Spawn-tool parents record tool_pass from evidence.ok and never write
+        # completed. That recorded flag is the parent's terminal state.
+        evidence["parent_completed"] = turn.get("tool_pass") is True
 
 
 def _producer_text(value: Any) -> str | None:

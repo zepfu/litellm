@@ -31,7 +31,7 @@ def _load() -> Any:
     from hv2.suite.timing import consume_wait_checkpoints, reconcile
     from hv2.suite.verdict import classify_infrastructure, evaluate_case
     from hv2.suite.execute import execute_suite
-    from hv2.suite.live import _evidence_from_step
+    from hv2.suite.live import _evidence_from_step, _run_case
     from hv2.suite.matrix import selection_from_args
 
     return SimpleNamespace(
@@ -47,6 +47,7 @@ def _load() -> Any:
         classify_infrastructure=classify_infrastructure,
         evaluate_case=evaluate_case,
         evidence_from_step=_evidence_from_step,
+        run_case=_run_case,
         execute_suite=execute_suite,
         selection_from_args=selection_from_args,
     )
@@ -518,6 +519,30 @@ def test_evidence_from_step_maps_stock_model_and_spawn_records(hv2: Any) -> None
     assert pong["observed"] == "PONG"
 
     grok = _stock_case("orchestration", "grok-case", "grok-4.7")
+    grok_recorded = _assert_one(
+        hv2,
+        grok,
+        {
+            "parents": [
+                {
+                    "session": "hv2-grok-parent",
+                    "tool_pass": True,
+                    "child_evidence": {
+                        "kind": "grok_spawn_tool",
+                        "ok": True,
+                        "failures": [],
+                        "spawn_chrome": True,
+                        "pwd_row": True,
+                        "uname_row": True,
+                    },
+                }
+            ]
+        },
+    )
+    assert grok_recorded["code"] == "orchestration.spawn"
+    assert grok_recorded["status"] == "pass"
+    assert grok_recorded["observed"]["parent_completed"] is True
+
     grok_pass = _assert_one(
         hv2,
         grok,
@@ -607,6 +632,208 @@ def test_evidence_from_step_maps_stock_model_and_spawn_records(hv2: Any) -> None
         },
     )
     assert muse_open["status"] == "inconclusive"
+
+
+class _RecordedToolDriver:
+    """Stand in for a stock TUI. The suite still calls run_plan."""
+
+    def __init__(self, spec: dict[str, Any], pane: str, session_dir: Path) -> None:
+        self.spec = spec
+        self._pane = pane
+        self._session_dir = session_dir
+        self._sent = False
+
+    def alias_session_dir(self, _alias: str) -> Path:
+        return self._session_dir
+
+    def launch_argv(self, model: str) -> list[str]:
+        return ["tui", "--model", model]
+
+    def assert_no_print_flags(self, argv: list[str]) -> None:
+        return None
+
+    def model_selector(self, model: str) -> str:
+        return model
+
+    def pane_has_selector(self, model: str, pane: str) -> bool:
+        return model in pane
+
+    def ensure_session(self, model: str, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "selected": True,
+            "session": f"hv2-recorded-{model}",
+            "selector": model,
+            "argv": self.launch_argv(model),
+        }
+
+    def send_prompt_and_wait(self, prompt: str, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "send": {"ok": True},
+            "pane": self._pane,
+            "idle": True,
+            "after_echo_index": -1,
+        }
+
+    def send_keys(self, _prompt: str) -> dict[str, Any]:
+        self._sent = True
+        return {"ok": True}
+
+    def capture_pane(self) -> str:
+        return self._pane if self._sent else ""
+
+    def _tmux_float(self, key: str, default: float) -> float:
+        if key == "wait_reply_seconds":
+            return 0.0
+        return default
+
+
+def _current_turn_pane(prompt: str, body: str) -> str:
+    return f"{prompt.strip()}\n{body}"
+
+
+def _recorded_spec(pass_mode: str, token: str) -> dict[str, Any]:
+    return {
+        "select_model": {
+            "tools_for_model": True,
+            "tools_for_orchestration": True,
+            "pass_mode": pass_mode,
+            "standalone_pass_tokens": [token],
+            "orchestration_pass_needles": [token],
+            "pass_needles": ["PONG"],
+            "provider_404_needles": ["404 Not Found"],
+            "reply_needles": [token, "PONG"],
+        }
+    }
+
+
+def _assert_recorded(
+    hv2: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    tui: str,
+    kind: str,
+    alias: str,
+    spec: dict[str, Any],
+    pane: str,
+    children: list[str] | None = None,
+) -> dict[str, Any]:
+    monkeypatch.setattr(
+        "hv2.kinds.runner.driver_for",
+        lambda _name, _config: _RecordedToolDriver(spec, pane, tmp_path / "empty-sessions"),
+    )
+    def _resolved(*_args: Any, **_kwargs: Any) -> Any:
+        return SimpleNamespace(
+            container="litellm-alpha",
+            base_url="http://127.0.0.1:4011",
+            host_port=4011,
+            inspect_env={},
+        )
+
+    monkeypatch.setattr("hv2.kinds.runner.inspect_instance", _resolved)
+    case = {
+        "case_id": f"{tui}-recorded",
+        "kind": kind,
+        "tui": tui,
+        "alias": alias,
+        "parent": alias if kind == "orchestration" else None,
+        "children": children or [],
+        "instance_token": "litellm-alpha",
+    }
+    result = hv2.run_case(hv2.load_config(), case)
+    assert result["ready"] is True, result
+    rows = hv2.evaluate_case(case, result["evidence"])
+    assert len(rows) == 1
+    return rows[0]
+
+
+def test_run_plan_records_tool_pass_and_spawn_contracts(
+    hv2: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """run_plan writes the stock step. The suite scores that recorded step."""
+
+    monkeypatch.setattr(
+        "hv2.kinds.runner.grok_workspace_session_root",
+        lambda _cwd=None: tmp_path / "empty-sessions",
+    )
+    from hv2.plan import _prompt_text
+
+    config = hv2.load_config()
+    codex_prompt = _prompt_text(config, "codex_model", {}).strip()
+    grok_prompt = _prompt_text(
+        config, "grok_orchestration", {"parent": "grok-4.7"}
+    ).strip()
+    muse_prompt = _prompt_text(
+        config,
+        "muse_orchestration",
+        {"parent": "muse-spark-1.3-contributor"},
+    ).strip()
+
+    passed = _assert_recorded(
+        hv2,
+        monkeypatch,
+        tmp_path,
+        tui="codex",
+        kind="model",
+        alias="basic",
+        spec=_recorded_spec("tool_command", "hv2-codex-child"),
+        pane=_current_turn_pane(
+            codex_prompt,
+            "• Ran date\n"
+            "  └ Mon Aug 24 11:24:30 EDT 2026\n"
+            "• hv2-codex-child\n",
+        ),
+    )
+    assert passed["code"] == "tool.command"
+    assert passed["status"] == "pass"
+    assert passed["observed"]["tool_pass"] is True
+
+    missing = _assert_recorded(
+        hv2,
+        monkeypatch,
+        tmp_path,
+        tui="codex",
+        kind="model",
+        alias="basic",
+        spec=_recorded_spec("tool_command", "hv2-codex-child"),
+        pane=_current_turn_pane(codex_prompt, "• hv2-codex-child\n"),
+    )
+    assert missing["status"] == "fail"
+    assert missing["observed"]["tool_pass"] is False
+
+    grok = _assert_recorded(
+        hv2,
+        monkeypatch,
+        tmp_path,
+        tui="grok",
+        kind="orchestration",
+        alias="grok-4.7",
+        spec=_recorded_spec("tool_command", "hv2-grok-child"),
+        pane=_current_turn_pane(
+            grok_prompt,
+            "     ◆ Subagent completed in 5.5s: Run pwd in workspace\n"
+            "     ◆ Run pwd in this workspace\n"
+            "     ◆ Run Print kernel name via uname\n",
+        ),
+        children=["grok-4.7"],
+    )
+    assert grok["code"] == "orchestration.spawn"
+    assert grok["status"] == "pass"
+
+    muse = _assert_recorded(
+        hv2,
+        monkeypatch,
+        tmp_path,
+        tui="muse",
+        kind="orchestration",
+        alias="muse-spark-1.3-contributor",
+        spec=_recorded_spec("tool_command", "hv2-muse-child"),
+        pane=_current_turn_pane(muse_prompt, "idle\n"),
+        children=["muse-spark-1.3-contributor"],
+    )
+    assert muse["code"] == "orchestration.spawn"
+    assert muse["status"] == "fail"
 
 
 def test_session_history_shipped_config_stays_skipped(hv2: Any) -> None:
