@@ -1270,6 +1270,10 @@ def _get_codex_oauth_affinity_continuation_state(
     ``model`` is omitted for alias and model-less native requests; in those
     cases the signed token model becomes the frozen concrete scope.
     """
+    if inventory is None:
+        peeked_inventory = _peek_request_codex_oauth_inventory(request)
+        if isinstance(peeked_inventory, (CodexOAuthInventory, CodexOAuthInventoryError)):
+            inventory = peeked_inventory
     token, token_declared = _codex_oauth_affinity_token_request_state(body=body)
     _remove_codex_oauth_affinity_token_from_body(body)
     normalized_model = _clean_codex_auth_value(model) or ""
@@ -1568,12 +1572,11 @@ def _codex_oauth_affinity_from_authenticated_token(
         return None
     if request_model is not None and token_model != request_model:
         return None
+    if inventory is None:
+        return None
     if len(account_ref) != hashlib.sha256().digest_size * 2:
         return None
-    try:
-        resolved_inventory = resolve_codex_oauth_inventory(inventory)
-    except Exception:  # noqa: BLE001
-        return None
+    resolved_inventory = inventory
     selected_record: Optional[CodexOAuthCredentialRecord] = None
     for record in resolved_inventory.records:
         expected_ref = _codex_oauth_affinity_account_ref(

@@ -9574,6 +9574,7 @@ def _fetch_kimi_usage_payload(
             method="GET",
         )
         response_body: Optional[str] = None
+        usage_http_failure: Optional[BaseException] = None
         try:
             with urllib_request.urlopen(
                 request,
