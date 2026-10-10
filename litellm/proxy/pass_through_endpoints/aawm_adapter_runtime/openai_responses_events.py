@@ -916,7 +916,7 @@ class ResponsesEventPipeline:
             raw_event=retained_raw,
             separator=separator,
         )
-        self._hold_event(event, operator=operator)
+        self._hold_event(event)
         self._emit(event)
         if self.summary_reducer is not None and self.summary_reducer.overflow:
             raise ResponsesEventRetentionTooLarge(
