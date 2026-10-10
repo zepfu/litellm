@@ -493,8 +493,6 @@ class BaseOpenAIPassThroughHandler:
         expected_target_family: Optional[str] = None
         selected_openai_headers: Optional[dict[str, str]] = None
         openai_selected_credential_family: Optional[str] = None
-        if forward_headers:
-            openai_selected_credential_family = "codex_oauth"
         endpoint_custom_body: Optional[dict[str, Any]] = None
         canonical_managed_oa_xai_request_body: Optional[dict[str, Any]] = None
         bound_codex_oauth_identity: Optional[dict[str, str]] = None
