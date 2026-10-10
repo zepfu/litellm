@@ -7,6 +7,7 @@ Does NOT import llm_passthrough_endpoints at module scope.
 from __future__ import annotations
 
 import json
+import sys
 import time
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -241,11 +242,22 @@ def _configure_selection():
     )
     # Assign the stub names onto the live module dict. patch.dict(..., clear=True)
     # would drop module imports such as sys and make later LOAD_GLOBAL lookups
-    # raise NameError inside the shipped selector.
+    # raise NameError inside the shipped selector. install() may already have
+    # rebound the selector onto the passthrough host dict, so stub that too.
     assigned_runtime = {
         name: runtime_globals.get(name, _MISSING) for name in runtime
     }
     runtime_globals.update(runtime)
+    passthrough = sys.modules.get(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints"
+    )
+    host_globals = passthrough.__dict__ if passthrough is not None else None
+    previous_host = {}
+    if host_globals is not None:
+        previous_host = {
+            name: host_globals.get(name, _MISSING) for name in runtime
+        }
+        host_globals.update(runtime)
     try:
         yield
     finally:
@@ -262,6 +274,12 @@ def _configure_selection():
                 runtime_globals.pop(name, None)
             else:
                 runtime_globals[name] = value
+        if host_globals is not None:
+            for name, value in previous_host.items():
+                if value is _MISSING:
+                    host_globals.pop(name, None)
+                else:
+                    host_globals[name] = value
 
 
 # ---------------------------------------------------------------------------
@@ -4244,7 +4262,11 @@ class TestAlibabaTokenPlanQuotaObservations:
             ]
         )
         monkeypatch.setattr(selection.time, "time", lambda: now)
-        monkeypatch.setattr(selection, "alias_routing_state", manager)
+        _set_selection_runtime_value(
+            "alias_routing_state",
+            manager,
+            monkeypatch,
+        )
         _set_selection_runtime_value(
             "_get_codex_quota_observation_environment",
             lambda: "prod",
@@ -4253,6 +4275,15 @@ class TestAlibabaTokenPlanQuotaObservations:
         _set_selection_runtime_value(
             "_hydrate_alibaba_token_plan_quota_observations",
             AsyncMock(return_value=None),
+            monkeypatch,
+        )
+
+        async def _cooldown_state(key: str) -> tuple[float, str]:
+            return (0.0, "local_fallback")
+
+        _set_selection_runtime_value(
+            "_get_codex_active_cooldown_state",
+            _cooldown_state,
             monkeypatch,
         )
         _set_selection_candidates(
@@ -4280,77 +4311,71 @@ class TestAlibabaTokenPlanQuotaObservations:
             cooldown_state, "clear_alias_family_cooldown_state", _clear
         )
 
-        evidence, windows = selection._alibaba_token_plan_quota_evidence(
-            state_manager=manager,
-            now_epoch=now,
-            subscription_identity=identity,
-        )
-        assert evidence is not None
-        assert evidence["freshness_status"] == "missing_required_window"
-        assert evidence["missing_required_windows"] == ["7d"]
-        assert [window["quota_period"] for window in windows] == ["5h"]
-
-        direct_clear = await selection._clear_alibaba_token_plan_account_quota_cooldown(
-            evidence
-        )
-        assert direct_clear is False
-
-        # Drive the decision the shipped selector uses before it clears.
-        # Importing llm_passthrough_endpoints rebinds the selector onto host
-        # callbacks this quota-module process cannot configure. Earlier tests
-        # can leave the evidence helper reading a different globals dict, so
-        # publish the environment onto every loaded copy.
-        evidence_fns = {
-            id(fn): fn
-            for fn in (
-                selection._alibaba_token_plan_quota_evidence,
-                selection._select_codex_auto_agent_candidate.__globals__.get(
-                    "_alibaba_token_plan_quota_evidence"
-                ),
-                selection._clear_alibaba_token_plan_account_quota_cooldown.__globals__.get(
-                    "_alibaba_token_plan_quota_evidence"
-                ),
-            )
-            if fn is not None
+        # install() binds shipped helpers to the passthrough host. That host
+        # dict is not visible to gc until a rebound frame is running, so a
+        # profile hook stubs the names those late-binding callbacks call.
+        host_names = {
+            "_get_grok_account_quota_lane_cooldown_key": (
+                lambda _candidate, _lane_key: None
+            ),
+            "_get_codex_auto_agent_grok_account_quota_lane_cooldown_key": (
+                lambda _candidate, _lane_key: None
+            ),
+            "_is_kimi_code_candidate": (
+                lambda candidate: isinstance(candidate, dict)
+                and candidate.get("provider") == "kimi_code"
+            ),
+            "_is_kimi_code_auto_agent_candidate": (
+                lambda candidate: isinstance(candidate, dict)
+                and candidate.get("provider") == "kimi_code"
+            ),
+            "_get_kimi_managed_account_cooldown_key": (
+                lambda: "kimi_code:__managed_account__:kimi_code_managed_account"
+            ),
+            "_get_kimi_code_managed_account_cooldown_key": (
+                lambda: "kimi_code:__managed_account__:kimi_code_managed_account"
+            ),
+            "_get_first_secret_value": lambda _names: "prod",
+            "_get_codex_quota_observation_environment": lambda: "prod",
+            "_get_codex_active_cooldown_state": _cooldown_state,
+            "_get_codex_auto_agent_active_cooldown_state": _cooldown_state,
+            "alias_routing_state": manager,
+            "alibaba_token_plan_account_quota_cooldown_key": (
+                alibaba_token_plan_account_quota_cooldown_key
+            ),
+            "subscription_identity_for_candidate": (
+                subscription_identity_for_candidate
+            ),
+            "_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER": (
+                CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
+            ),
         }
-        for evidence_fn in evidence_fns.values():
-            evidence_fn.__globals__[
-                "_get_codex_quota_observation_environment"
-            ] = lambda: "prod"
-            evidence_fn.__globals__["alias_routing_state"] = manager
-        selector_evidence, selector_windows = (
-            selection._select_codex_auto_agent_candidate.__globals__[
-                "_alibaba_token_plan_quota_evidence"
-            ](
-                subscription_identity=identity,
-            )
-        )
-        assert selector_evidence is not None
-        assert selector_evidence["freshness_status"] == "missing_required_window"
-        assert selector_evidence["missing_required_windows"] == ["7d"]
-        assert [window["quota_period"] for window in selector_windows] == ["5h"]
-        if selection._alibaba_token_plan_positive_windows_can_clear_account_cooldown(
-            selector_evidence,
-            now_epoch=now,
-        ):
-            await selection._clear_alibaba_token_plan_account_quota_cooldown(
-                selector_evidence
-            )
 
-        state = selection._attach_alibaba_token_plan_quota_state(
-            {
-                "candidate": {
-                    "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
-                    "model": "alibaba_token_plan/qwen3.8-max",
-                    "subscription_identity": identity,
-                }
-            },
-            state_manager=manager,
-            now_epoch=now,
-        )
+        def _stub_rebound_host(frame, event, arg):
+            if event != "call":
+                return None
+            host = frame.f_globals
+            if host.get("__name__") != (
+                "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints"
+            ):
+                return None
+            for name, value in host_names.items():
+                host.setdefault(name, value)
+            return None
 
-        assert state.get("skip_reason") is None
-        assert state["quota_freshness_status"] == "missing_required_window"
+        sys.setprofile(_stub_rebound_host)
+        try:
+            result = await selection._select_codex_auto_agent_candidate(
+                request=_make_request(),
+                request_body={"model": "basic"},
+            )
+        finally:
+            sys.setprofile(None)
+
+        assert result["candidate"]["model"] == "alibaba_token_plan/qwen3.8-max"
+        assert result.get("skip_reason") is None
+        assert result["quota_freshness_status"] == "missing_required_window"
+        assert result["quota_missing_required_windows"] == ["7d"]
         assert clear_calls == []
         assert account_key in manager.codex.cooldown_until_monotonic_by_key
 
