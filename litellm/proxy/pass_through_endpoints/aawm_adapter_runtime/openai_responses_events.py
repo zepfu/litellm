@@ -1169,7 +1169,6 @@ class ResponsesEventPipeline:
         self._replay_consumed_bytes = 0
         self._replay_consumed_event_bytes = 0
         self._replay_buffer = bytes(self._buffer)
-        self._replay_prefix_association: Optional[bytes] = None
         # Already-held events are the precommit prefix. Live remainder is
         # bounded by max_stream_events, not the hold budget.
         self.retain_events = False
@@ -1187,7 +1186,7 @@ class ResponsesEventPipeline:
         return ready
 
     def feed_replayed(self, chunk: bytes) -> list[ParsedResponsesEvent]:
-        """Consume a replayed prefix without decoding it a second time."""
+        """Return previously parsed events for bytes already admitted upstream."""
         data = _coerce_bytes(chunk)
         if not data:
             return []
@@ -1195,41 +1194,17 @@ class ResponsesEventPipeline:
             self.retain_events = False
             return self.feed(data)
 
-        prefix_length = min(len(data), self._replay_remaining_bytes)
-        self._replay_remaining_bytes -= prefix_length
-        self._replay_consumed_bytes += prefix_length
+        if len(data) > self._replay_remaining_bytes:
+            raise ValueError("feed_replayed cannot consume bytes outside the admitted prefix")
+        self._replay_remaining_bytes -= len(data)
+        self._replay_consumed_bytes += len(data)
         events = self._drain_replayed_events()
-        if events:
-            accepted_wire = b"".join(
-                event.forward_event or event.raw_event or b""
-                for event in events
-            )
-            if accepted_wire:
-                accepted_event = ParsedResponsesEvent(
-                    sequence_number=self._next_sequence_number,
-                    event_type="openai_responses_accepted_prefix",
-                    payload=None,
-                    is_done_marker=False,
-                    is_malformed=False,
-                    byte_count=len(accepted_wire),
-                    observed_at=datetime.now(),
-                    forward_event=accepted_wire,
-                    raw_event=None,
-                    separator=b"",
-                )
-                self._replay_prefix_association = attach_responses_events(
-                    accepted_wire,
-                    [accepted_event],
-                )
         if self._replay_remaining_bytes == 0 and self._replay_buffer is not None:
             self._buffer = bytearray(self._replay_buffer)
             self._pending_cr = self._buffer.endswith(b"\r") and not self._buffer.endswith(b"\r\n")
             self._replay_buffer = None
         if self._replay_remaining_bytes == 0:
             self.retain_events = False
-        remainder = data[prefix_length:]
-        if remainder:
-            events.extend(self.feed(remainder))
         return events
 
     def attach_to_response(self, response: Any) -> Any:

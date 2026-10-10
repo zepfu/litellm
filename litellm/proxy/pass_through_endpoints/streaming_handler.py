@@ -255,15 +255,14 @@ class _PrefixedHttpxByteStream:
         self._prefix = prefix
         self._remainder = remainder
         self._aawm_responses_event_pipeline = event_pipeline
-        self._last_prefix_chunk: Any = None
         if event_pipeline is not None:
             prepare_replay = getattr(event_pipeline, "prepare_replay", None)
             prefix_bytes = getattr(prefix, "byte_count", 0)
             if callable(prepare_replay):
                 # feed_until may stop in the middle of a coalesced HTTPX
                 # read. Replay only the bytes the parser has already admitted;
-                # feed_replayed restores its framing buffer and then consumes
-                # the stored suffix as the beginning of the live remainder.
+                # the wrapper routes the stored suffix through live admission
+                # after the accepted prefix has been yielded.
                 admitted_bytes = int(
                     getattr(event_pipeline, "total_stream_bytes", prefix_bytes)
                 )
@@ -278,6 +277,32 @@ class _PrefixedHttpxByteStream:
             close()
 
     async def aiter_bytes(self):
+        async def _iter_live_chunk(chunk: bytes):
+            pipeline = self._aawm_responses_event_pipeline
+            if pipeline is None:
+                yield chunk
+                return
+            try:
+                events = pipeline.feed(chunk)
+            except (
+                ResponsesBoundFailure,
+                ResponsesEventTooLarge,
+                ResponsesStreamTooLarge,
+            ) as exc:
+                bound_failure = ResponsesBoundFailure.from_exception(exc)
+                accepted_frames = [
+                    event.forward_event or event.raw_event or b""
+                    for event in bound_failure.accepted_events
+                    if (event.forward_event or event.raw_event)
+                ]
+                if accepted_frames:
+                    yield attach_responses_events(
+                        b"".join(accepted_frames),
+                        bound_failure.accepted_events,
+                    )
+                raise bound_failure from exc
+            yield attach_responses_events(chunk, events)
+
         try:
             if hasattr(self._prefix, "iter_chunks"):
                 prefix_chunks = self._prefix.iter_chunks()
@@ -285,17 +310,22 @@ class _PrefixedHttpxByteStream:
                 prefix_chunks = iter(self._prefix)
             for chunk in prefix_chunks:
                 if chunk:
-                    if self._aawm_responses_event_pipeline is None:
-                        events = []
-                    else:
-                        events = self._aawm_responses_event_pipeline.feed_replayed(chunk)
-                        self._last_prefix_chunk = getattr(
-                            self._aawm_responses_event_pipeline,
-                            "_replay_prefix_association",
-                            None,
-                        ) or chunk
-                    yield attach_responses_events(chunk, events)
-                    self._last_prefix_chunk = None
+                    pipeline = self._aawm_responses_event_pipeline
+                    if pipeline is None:
+                        yield chunk
+                        continue
+                    replay_length = min(
+                        len(chunk),
+                        int(getattr(pipeline, "replay_remaining_bytes", 0)),
+                    )
+                    replayed = chunk[:replay_length]
+                    if replayed:
+                        events = pipeline.feed_replayed(replayed)
+                        yield attach_responses_events(replayed, events)
+                    live_suffix = chunk[replay_length:]
+                    if live_suffix:
+                        async for live_chunk in _iter_live_chunk(live_suffix):
+                            yield live_chunk
             if self._remainder is None:
                 return
             if self._aawm_responses_event_pipeline is not None:
@@ -303,37 +333,8 @@ class _PrefixedHttpxByteStream:
             async for chunk in self._remainder:
                 if not chunk:
                     continue
-                if self._aawm_responses_event_pipeline is None:
-                    yield chunk
-                    continue
-                try:
-                    events = self._aawm_responses_event_pipeline.feed(chunk)
-                except (
-                    ResponsesBoundFailure,
-                    ResponsesEventTooLarge,
-                    ResponsesStreamTooLarge,
-                ) as exc:
-                    bound_failure = ResponsesBoundFailure.from_exception(exc)
-                    if self._last_prefix_chunk is not None:
-                        bound_failure.accepted_events = []
-                        bound_failure.accepted_bytes = max(
-                            0,
-                            int(getattr(self._aawm_responses_event_pipeline, "last_feed_admitted_bytes", 0)),
-                        )
-                    accepted_frames = [
-                        event.forward_event or event.raw_event or b""
-                        for event in bound_failure.accepted_events
-                        if (event.forward_event or event.raw_event)
-                    ]
-                    if not accepted_frames and self._last_prefix_chunk is not None:
-                        accepted_frames = [self._last_prefix_chunk]
-                    if accepted_frames:
-                        yield attach_responses_events(
-                            b"".join(accepted_frames),
-                            bound_failure.accepted_events,
-                        )
-                    raise bound_failure from exc
-                yield attach_responses_events(chunk, events)
+                async for live_chunk in _iter_live_chunk(bytes(chunk)):
+                    yield live_chunk
         except BaseException:
             await self.aclose()
             raise
