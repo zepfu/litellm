@@ -1353,24 +1353,42 @@ class ResponsesEventSummaryReducer:
             return f"output:{output_index}"
         return f"fallback:{fallback}"
 
+    def _can_remember_delta_key(self, key: str) -> bool:
+        if key in self._delta_keys_seen:
+            return True
+        if len(self._delta_key_order) < self._DELTA_KEY_LIMIT:
+            return True
+        return any(
+            retained_key not in self._delta_key_fields
+            for retained_key in self._delta_key_order
+        )
+
     def _remember_delta_key(self, key: str) -> None:
         # Keep the active representation at the newest lifecycle position.  A
         # repeated key is not a second item: appending it again could evict the
-        # key that is still accepting deltas.
+        # key that is still accepting deltas. Only completed keys are evictable.
         try:
             self._delta_key_order.remove(key)
         except ValueError:
-            pass
-        while len(self._delta_key_order) >= self._DELTA_KEY_LIMIT:
-            evicted = self._delta_key_order.popleft()
-            self._delta_keys_seen.discard(evicted)
-            self._forget_delta_key(evicted)
+            if len(self._delta_key_order) >= self._DELTA_KEY_LIMIT:
+                evicted = next(
+                    (
+                        retained_key
+                        for retained_key in self._delta_key_order
+                        if retained_key not in self._delta_key_fields
+                    ),
+                    None,
+                )
+                assert evicted is not None
+                self._delta_key_order.remove(evicted)
+                self._delta_keys_seen.discard(evicted)
+                self._forget_delta_key(evicted)
         self._delta_keys_seen.add(key)
         self._delta_key_order.append(key)
 
     @property
     def _retained_delta_key_count(self) -> int:
-        return len(self._output_items) + len(self._delta_key_payloads)
+        return len(self._output_items.keys() | self._delta_key_payloads.keys())
 
     def _delta_key_slots(
         self,
@@ -1383,6 +1401,10 @@ class ResponsesEventSummaryReducer:
             and key not in self._output_items
             and self._retained_delta_key_count >= self.max_output_items
         ):
+            self._overflow = True
+            self._omitted_items += 1
+            return {}, 0
+        if not self._can_remember_delta_key(key):
             self._overflow = True
             self._omitted_items += 1
             return {}, 0
@@ -1465,16 +1487,15 @@ class ResponsesEventSummaryReducer:
         self,
         key: str,
         item: dict[str, Any],
-    ) -> None:
+    ) -> bool:
         payload = self._materialize_delta_payload(key)
         if payload is None:
-            return
-        created = key not in self._output_items
+            return False
         previous_size = _json_size(payload) or 0
         candidate = {**payload, **copy.deepcopy(item)}
         candidate_size = _json_size(candidate)
         if not self._charge_delta(previous_size, candidate_size):
-            return
+            return False
         self._delta_key_payloads[key] = copy.deepcopy(candidate)
         candidate_size = candidate_size or 0
         self._delta_key_base_sizes[key] = candidate_size
@@ -1494,8 +1515,9 @@ class ResponsesEventSummaryReducer:
             if current:
                 state.parts.append(current)
             state.byte_count = len(current.encode("utf-8"))
-        if created:
+        if key not in self._ordered_keys:
             self._ordered_keys.append(key)
+        return True
 
     def _record_event_type(self, event_type: Optional[str]) -> None:
         if not event_type:
@@ -1588,17 +1610,9 @@ class ResponsesEventSummaryReducer:
         return True
 
     def _charge_new_output_item(self, candidate: dict[str, Any]) -> bool:
-        if self._retained_delta_key_count >= self.max_output_items:
-            self._overflow = True
-            self._omitted_items += 1
-            return False
         return self._charge_delta(0, _json_size(candidate))
 
     def _charge_new_output_item_size(self, new_size: Optional[int]) -> bool:
-        if self._retained_delta_key_count >= self.max_output_items:
-            self._overflow = True
-            self._omitted_items += 1
-            return False
         return self._charge_delta(0, new_size)
 
     def _commit_delta_item(
@@ -1620,54 +1634,60 @@ class ResponsesEventSummaryReducer:
             return
         key = self._item_key(payload, fallback=len(self._ordered_keys))
         index = payload.get("output_index")
+        pending_index: Optional[int] = None
         if isinstance(index, int) and not isinstance(index, bool):
             existing_key = self._key_by_output_index.get(index)
             if existing_key:
                 key = existing_key
             elif len(self._key_by_output_index) < self._ALIAS_LIMIT:
-                self._key_by_output_index[index] = key
-        for alias in (
+                pending_index = index
+        aliases = (
             self._bounded_identity(item.get("id")),
             self._bounded_identity(item.get("call_id")),
             self._bounded_identity(payload.get("item_id")),
-        ):
+        )
+        if key in self._delta_key_payloads:
+            if not self._merge_item_into_active_delta(key, item):
+                return
+        else:
+            slot = self._item_slot(key)
+            if slot is None:
+                return
+            target, created = slot
+            previous_size = _json_size(target) or 0
+            candidate = {**copy.deepcopy(target), **copy.deepcopy(item)}
+            if not self._charge_delta(previous_size, _json_size(candidate)):
+                return
+            self._commit_item(key, candidate, created=created)
+        if pending_index is not None:
+            self._key_by_output_index[pending_index] = key
+        for alias in aliases:
             if alias and (alias in self._aliases or len(self._aliases) < self._ALIAS_LIMIT):
                 self._aliases[alias] = key
-        if key in self._delta_key_payloads:
-            self._merge_item_into_active_delta(key, item)
-            return
-        slot = self._item_slot(key)
-        if slot is None:
-            return
-        target, created = slot
-        previous_size = _json_size(target) or 0
-        candidate = {**copy.deepcopy(target), **copy.deepcopy(item)}
-        if not self._charge_delta(previous_size, _json_size(candidate)):
-            return
-        self._commit_item(key, candidate, created=created)
 
     def _append_text(self, key: str, value: Any, *, done: bool) -> None:
         if not isinstance(value, str):
             return
         if done and key in self._delta_keys_seen:
             return
+        created_payload = key not in self._delta_key_payloads
         payload, payload_size = self._delta_key_slots(
             key,
             default_type="message",
         )
         if not payload:
             return
-        fields = self._delta_key_fields.setdefault(key, {})
-        if "text" not in fields:
+        fields = self._delta_key_fields.get(key)
+        state = fields.get("text") if fields is not None else None
+        created_field = state is None
+        if created_field:
             _output_text, state = self._delta_field(
                 payload,
                 field="text",
                 create_target=self._output_text_target,
             )
-            fields["text"] = state
             payload_size = _json_size(payload) or 0
-            self._delta_key_payload_sizes[key] = payload_size
-        state = fields["text"]
+        assert state is not None
         first_delta = key not in self._output_items and key not in self._delta_keys_seen
         old_bytes = state.byte_count
         encoded = value.encode("utf-8")
@@ -1675,9 +1695,15 @@ class ResponsesEventSummaryReducer:
         new_size = payload_size - old_bytes + next_bytes
         if first_delta:
             if not self._charge_new_output_item_size(new_size):
+                if created_payload:
+                    self._forget_delta_key(key)
                 return
         elif not self._charge_delta(payload_size, new_size):
+            if created_payload:
+                self._forget_delta_key(key)
             return
+        if created_field:
+            self._delta_key_fields.setdefault(key, {})["text"] = state
         materialized_text: Optional[str] = None
         if done:
             materialized_text = (
@@ -1722,22 +1748,23 @@ class ResponsesEventSummaryReducer:
             return
         if done and key in self._delta_keys_seen:
             return
+        created_payload = key not in self._delta_key_payloads
         delta_payload, payload_size = self._delta_key_slots(
             key,
             default_type="function_call",
         )
         if not delta_payload:
             return
-        fields = self._delta_key_fields.setdefault(key, {})
-        if "arguments" not in fields:
+        fields = self._delta_key_fields.get(key)
+        state = fields.get("arguments") if fields is not None else None
+        created_field = state is None
+        if created_field:
             _arguments_target, state = self._delta_field(
                 delta_payload,
                 field="arguments",
             )
-            fields["arguments"] = state
             payload_size = _json_size(delta_payload) or 0
-            self._delta_key_payload_sizes[key] = payload_size
-        state = fields["arguments"]
+        assert state is not None
         first_delta = key not in self._output_items and key not in self._delta_keys_seen
         old_bytes = state.byte_count
         encoded = value.encode("utf-8")
@@ -1745,9 +1772,15 @@ class ResponsesEventSummaryReducer:
         new_size = payload_size - old_bytes + next_bytes
         if first_delta:
             if not self._charge_new_output_item_size(new_size):
+                if created_payload:
+                    self._forget_delta_key(key)
                 return
         elif not self._charge_delta(payload_size, new_size):
+            if created_payload:
+                self._forget_delta_key(key)
             return
+        if created_field:
+            self._delta_key_fields.setdefault(key, {})["arguments"] = state
         materialized_arguments: Optional[str] = None
         if done:
             materialized_arguments = (
