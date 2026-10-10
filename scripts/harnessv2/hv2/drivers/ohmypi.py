@@ -22,6 +22,21 @@ except ImportError as exc:  # pragma: no cover
 _MODEL_ID_CONTINUE = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:+/")
 
 
+def ohmypi_composer_ready(pane: str) -> bool:
+    """True when the Ohmypi composer is up.
+
+    A standalone ``π`` line and composer ``π >`` chrome count. The
+    selected footer ``π ·`` contains the same glyph and does not.
+    """
+
+    for line in pane.splitlines():
+        if "π >" in line or "π  >" in line:
+            return True
+        if line.strip() == "π":
+            return True
+    return False
+
+
 def ohmypi_launch_startup(
     *,
     ready: bool,
@@ -636,11 +651,13 @@ class OhmypiDriver:
                 f"{(proc.stderr or proc.stdout or '').strip()}"
             )
         self._active_session = session
-        ready_needles = as_str_list(select.get("ready_needles")) or ["π"]
-        ready = self.wait_for_pane(
-            ready_needles,
-            timeout_seconds=self._tmux_float("wait_ready_seconds", 20),
-        )
+        ready_timeout = self._tmux_float("wait_ready_seconds", 20)
+        ready = ohmypi_composer_ready(self.capture_pane())
+        if not ready and self.wait_for_pane(
+            ["π >", "π  >"],
+            timeout_seconds=ready_timeout,
+        ):
+            ready = ohmypi_composer_ready(self.capture_pane())
         selector = self.model_selector(model)
         selected_needles = [
             expand_string(token, self._context({"selector": selector, "model": model}))

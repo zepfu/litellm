@@ -83,8 +83,10 @@ tuis:
       reuse_operator_session: false
       tools_for_model: false
       tools_for_orchestration: true
+      # Composer prompt, not the selected footer glyph "π ·".
       ready_needles:
-        - "π"
+        - "π >"
+        - "π  >"
       mcp_ready_needles:
         - "Connected to MCP"
         - "No MCP"
