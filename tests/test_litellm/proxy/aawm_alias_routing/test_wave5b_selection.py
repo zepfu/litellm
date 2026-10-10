@@ -1492,10 +1492,13 @@ class TestCodexSelectorFirstChoice:
 
         assert first_key in cooldown_keys
         assert second_key in cooldown_keys
+        # Identity-less candidates have no hashed account key, so the shared
+        # policy key is not consulted.
         assert (
             CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
-            in cooldown_keys
+            not in cooldown_keys
         )
+        assert _alibaba_account_cooldown_key() not in cooldown_keys
         assert first_key != CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
         assert second_key != CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
 
@@ -1652,25 +1655,13 @@ class TestCodexSelectorFirstChoice:
         self,
     ) -> None:
         request = _make_request()
-        candidates = (
-            {
-                "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
-                "model": "alibaba_token_plan/qwen3.8-max",
-                "route_family": "alibaba_token_plan_chat_completions_adapter",
-                "last_resort": False,
-            },
-            {
-                "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
-                "model": "alibaba_token_plan/qwen3.7-max",
-                "route_family": "alibaba_token_plan_chat_completions_adapter",
-                "last_resort": True,
-            },
-        )
+        candidates = _bound_alibaba_candidates()
+        account_key = _alibaba_account_cooldown_key()
         states: list[dict[str, Any]] = []
         state_keys: list[str] = []
 
         async def _cooldown_state(cooldown_key: str) -> tuple[float, str]:
-            if cooldown_key == CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY:
+            if cooldown_key == account_key:
                 return (8434.5, "memory")
             return (0.0, "local_fallback")
 
@@ -1717,20 +1708,8 @@ class TestCodexSelectorFirstChoice:
         )
 
         request = _make_request()
-        candidates = (
-            {
-                "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
-                "model": "alibaba_token_plan/qwen3.8-max",
-                "route_family": "alibaba_token_plan_chat_completions_adapter",
-                "last_resort": False,
-            },
-            {
-                "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
-                "model": "alibaba_token_plan/qwen3.7-max",
-                "route_family": "alibaba_token_plan_chat_completions_adapter",
-                "last_resort": True,
-            },
-        )
+        candidates = _bound_alibaba_candidates()
+        account_key = _alibaba_account_cooldown_key()
         durable_reads: list[str] = []
         durable_cache_reads: list[str] = []
         manager = AliasRoutingStateManager()
@@ -1739,7 +1718,7 @@ class TestCodexSelectorFirstChoice:
         canonical_cache_key = durable.build_aawm_alias_routing_durable_cache_key(
             alias_family="codex",
             state_kind="cooldown",
-            state_key=CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
+            state_key=account_key,
         )
 
         class _DurableCache:
@@ -1809,17 +1788,10 @@ class TestCodexSelectorFirstChoice:
             "alibaba_token_plan_account:durable_cache",
             "alibaba_token_plan_account:memory",
         }
-        assert (
-            durable_reads.count(
-                CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
-            )
-            >= 1
-        )
+        assert durable_reads.count(account_key) >= 1
         assert durable_cache_reads.count(canonical_cache_key) >= 1
         assert (
-            manager.codex.cooldown_until_monotonic_by_key[
-                CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
-            ]
+            manager.codex.cooldown_until_monotonic_by_key[account_key]
             > time.monotonic()
         )
 
