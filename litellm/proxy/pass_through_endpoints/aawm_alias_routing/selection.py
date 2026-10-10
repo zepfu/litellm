@@ -2617,6 +2617,39 @@ def _attach_alibaba_token_plan_quota_state(
     return state
 
 
+def _alibaba_token_plan_positive_windows_can_clear_account_cooldown(
+    evidence: Mapping[str, Any],
+    *,
+    now_epoch: float,
+) -> bool:
+    """A lone positive window does not clear the account cooldown.
+
+    Required siblings that are missing or not fresh keep the cooldown. Callers
+    that only see the present `windows` list would otherwise treat that partial
+    snapshot as a complete positive family.
+    """
+    if evidence.get("freshness_status") != "fresh":
+        return False
+    missing_required_windows = evidence.get("missing_required_windows")
+    if isinstance(missing_required_windows, list) and missing_required_windows:
+        return False
+    windows = evidence.get("windows")
+    if not isinstance(windows, list) or not windows:
+        return False
+    return all(
+        isinstance(window, dict)
+        and not window.get("exhausted")
+        and isinstance(window.get("remaining_pct"), (int, float))
+        and not isinstance(window.get("remaining_pct"), bool)
+        and float(window["remaining_pct"]) > 0.0
+        and isinstance(window.get("expected_reset_at"), (int, float))
+        and not isinstance(window.get("expected_reset_at"), bool)
+        and math.isfinite(float(window["expected_reset_at"]))
+        and float(window["expected_reset_at"]) > now_epoch
+        for window in windows
+    )
+
+
 async def _clear_alibaba_token_plan_account_quota_cooldown(
     evidence: Mapping[str, Any],
     *,
@@ -2624,6 +2657,14 @@ async def _clear_alibaba_token_plan_account_quota_cooldown(
 ) -> bool:
     windows = evidence.get("windows")
     if not isinstance(windows, list) or not windows:
+        return False
+    # Callers that only inspect `windows` can mistake one positive window for
+    # a complete family. A missing required window keeps the cooldown.
+    freshness_status = evidence.get("freshness_status")
+    if freshness_status not in (None, "fresh"):
+        return False
+    missing_required_windows = evidence.get("missing_required_windows")
+    if isinstance(missing_required_windows, list) and missing_required_windows:
         return False
     if any(
         window.get("exhausted")
@@ -7353,21 +7394,10 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         )
         if alibaba_evidence is None:
             continue
-        windows = alibaba_evidence["windows"]
-        now_epoch = time.time()
-        valid_positive_windows = all(
-            isinstance(window, dict)
-            and not window.get("exhausted")
-            and isinstance(window.get("remaining_pct"), (int, float))
-            and not isinstance(window.get("remaining_pct"), bool)
-            and float(window["remaining_pct"]) > 0.0
-            and isinstance(window.get("expected_reset_at"), (int, float))
-            and not isinstance(window.get("expected_reset_at"), bool)
-            and math.isfinite(float(window["expected_reset_at"]))
-            and float(window["expected_reset_at"]) > now_epoch
-            for window in windows
-        )
-        if valid_positive_windows:
+        if _alibaba_token_plan_positive_windows_can_clear_account_cooldown(
+            alibaba_evidence,
+            now_epoch=time.time(),
+        ):
             await _clear_alibaba_token_plan_account_quota_cooldown(
                 alibaba_evidence
             )
@@ -8320,6 +8350,9 @@ def install(host_globals: dict) -> None:
         ),
         "_clear_alibaba_token_plan_account_quota_cooldown": (
             _clear_alibaba_token_plan_account_quota_cooldown
+        ),
+        "_alibaba_token_plan_positive_windows_can_clear_account_cooldown": (
+            _alibaba_token_plan_positive_windows_can_clear_account_cooldown
         ),
         "_ZAI_CODING_PLAN_QUOTA_CLIENT": _ZAI_CODING_PLAN_QUOTA_CLIENT,
         "_ZAI_CODING_PLAN_QUOTA_SOURCE": _ZAI_CODING_PLAN_QUOTA_SOURCE,
