@@ -116,6 +116,14 @@ That resolves the greatest integer `grok-4.<N>` among `xai/grok-4.*`
 keys in `model_prices_and_context_window.json` and launches
 `--model grok-4.<N>`. It does not pin a Grok minor. Cursor Agent
 `cursor_agent/cursor-grok-4.6-high` stays a separate product route.
+Muse single-line and multiline prompts both paste, wait
+`submit_delay_seconds` (default `1.0`), then send `submit_keys`
+(`C-m`). A prompt counts as started only after the dedicated session
+JSONL records `runtime.user_intent.accepted` for that session and the
+exact submitted text. A pane echo or tmux return code of 0 is not
+acceptance. A missing acknowledgement is a submission failure bounded
+by `wait_ready_seconds` (default 25), not the model reply wait.
+
 `--tui opencode` remains a stub. `--tui claude` stays out of scope and
 is excluded from current closeout (do not select or run; historical
 mentions are legacy/non-goal).

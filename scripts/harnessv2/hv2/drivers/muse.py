@@ -8,6 +8,7 @@ Dedicated tmux sessions only. Never send-keys leftover operator
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -35,6 +36,10 @@ _FORBIDDEN_WRAPPER_NAMES = frozenset(
 _OPERATOR_SESSION_NAMES = frozenset(
     {"muse", MUSELA_WRAPPER_NAME, MUSELT_WRAPPER_NAME, MUSEL_WRAPPER_NAME}
 )
+_INTENT_ACCEPTED = "runtime.user_intent.accepted"
+_JSONL_SCAN_CAP = 64
+_JSONL_MAX_BYTES = 2 * 1024 * 1024
+_JSONL_MAX_LINES = 20000
 
 
 class MuseDriver:
@@ -350,8 +355,159 @@ class MuseDriver:
             needles = [selector, model]
         return any(token and token in text for token in needles)
 
+    def _submit_keys(self) -> list[str]:
+        keys = [token for token in as_str_list(self.spec.get("submit_keys")) if token]
+        return keys or ["C-m"]
+
+    def _submit_delay_seconds(self) -> float:
+        raw = self.spec.get("submit_delay_seconds")
+        if raw is None:
+            raw = self._tmux_cfg().get("submit_delay_seconds")
+        if raw is None:
+            return 1.0
+        try:
+            delay = float(raw)
+        except (TypeError, ValueError):
+            return 1.0
+        return delay if delay > 0 else 0.0
+
+    def _intent_session_dir(self) -> Path | None:
+        model = str(self._active_model or "").strip()
+        if not model:
+            return None
+        return self.alias_session_dir(model)
+
+    def _session_jsonl_paths(self, root: Path) -> list[Path]:
+        """Newest ``*.jsonl`` under the dedicated alias session dir only."""
+
+        if not root.is_dir():
+            return []
+        rows: list[Path] = []
+        mtimes: dict[Path, float] = {}
+        for path in root.rglob("*.jsonl"):
+            try:
+                resolved = path.resolve()
+            except OSError:
+                continue
+            if not resolved.is_relative_to(root.resolve()):
+                continue
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            rows.append(path)
+            mtimes[path] = mtime
+        rows.sort(key=lambda item: (mtimes[item], str(item)), reverse=True)
+        return rows[:_JSONL_SCAN_CAP]
+
+    def _iter_jsonl_objects(self, path: Path) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        try:
+            handle = path.open("r", encoding="utf-8", errors="replace")
+        except OSError:
+            return records
+        with handle:
+            consumed = 0
+            for index, line in enumerate(handle):
+                if index >= _JSONL_MAX_LINES:
+                    break
+                line_bytes = len(line.encode("utf-8", errors="replace"))
+                if (
+                    line_bytes > _JSONL_MAX_BYTES
+                    or consumed + line_bytes > _JSONL_MAX_BYTES
+                ):
+                    break
+                consumed += line_bytes
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(obj, dict):
+                    records.append(obj)
+        return records
+
+    def _intent_texts(self, payload: Mapping[str, Any]) -> list[str]:
+        messages = payload.get("model_messages")
+        if not isinstance(messages, list):
+            return []
+        texts: list[str] = []
+        for message in messages:
+            if not isinstance(message, Mapping):
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                texts.append(content)
+                continue
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if isinstance(item, Mapping) and isinstance(item.get("text"), str):
+                    texts.append(item["text"])
+                elif isinstance(item, str):
+                    texts.append(item)
+        return texts
+
+    def _accepted_intent(self, prompt: str) -> str | None:
+        """Exact ``runtime.user_intent.accepted`` text, or ``None``.
+
+        Delivery is not acceptance. A pane echo and a tmux return code of
+        0 do not count. The event must name this dedicated session when
+        ``source_session_id`` is present, and its model-message text must
+        match the stripped prompt exactly.
+        """
+
+        root = self._intent_session_dir()
+        if root is None:
+            return None
+        expected = prompt.strip()
+        if not expected:
+            return None
+        session_id = root.name
+        for path in self._session_jsonl_paths(root):
+            for obj in self._iter_jsonl_objects(path):
+                if obj.get("payload_type") != _INTENT_ACCEPTED:
+                    continue
+                payload = obj.get("payload")
+                if not isinstance(payload, Mapping):
+                    continue
+                source = payload.get("source_session_id")
+                if isinstance(source, str) and source.strip() and source != session_id:
+                    continue
+                for text in self._intent_texts(payload):
+                    if text.strip() == expected:
+                        return expected
+        return None
+
+    def _wait_for_intent_accepted(self, prompt: str) -> dict[str, Any]:
+        timeout = self._tmux_float("wait_ready_seconds", 25)
+        interval = self._tmux_float("poll_interval_seconds", 1)
+        deadline = time.time() + timeout
+        while True:
+            accepted = self._accepted_intent(prompt)
+            if accepted is not None:
+                return {"accepted": True, "intent": accepted}
+            if time.time() >= deadline:
+                return {
+                    "accepted": False,
+                    "submission_error": (
+                        "missing runtime.user_intent.accepted for the "
+                        "submitted prompt"
+                    ),
+                }
+            time.sleep(max(interval, 0.05))
+
     def send_keys(self, text: str) -> dict[str, Any]:
-        """Submit *text* to the dedicated musela tmux session."""
+        """Submit *text* to the dedicated musela tmux session.
+
+        Single-line and multiline prompts both paste, wait YAML
+        ``submit_delay_seconds``, then send YAML ``submit_keys``. A tmux
+        return code of 0 is delivery only. ``ok`` also requires a
+        ``runtime.user_intent.accepted`` event for this session and the
+        exact stripped prompt, found before ``wait_ready_seconds``.
+        """
 
         self.assert_no_print_flags(["muse", text])
         session = self._session_name()
@@ -362,34 +518,43 @@ class MuseDriver:
                 f"{session}; dedicated hv2-muse sessions only"
             )
         payload = text if text.endswith("\n") else f"{text}\n"
-        submit_keys = as_str_list(self.spec.get("submit_keys")) or ["C-m"]
-        delay = float(self.spec.get("submit_delay_seconds") or 1.0)
-        if "\n" in text.strip("\n"):
-            loaded = self._run_tmux(["load-buffer", "-"], stdin_text=payload)
-            pasted = self._run_tmux(["paste-buffer", "-d", "-t", session])
-            if delay > 0:
-                time.sleep(delay)
-            submitted = self._run_tmux(["send-keys", "-t", session, *submit_keys])
-            ok = (
-                loaded.returncode == 0
-                and pasted.returncode == 0
-                and submitted.returncode == 0
-            )
-            return {
-                "ok": ok,
-                "returncode": submitted.returncode
-                if ok
-                else (loaded.returncode or pasted.returncode or submitted.returncode),
-                "stderr": loaded.stderr or pasted.stderr or submitted.stderr,
-                "method": "paste-buffer",
-            }
-        proc = self._run_tmux(["send-keys", "-t", session, text, *submit_keys])
-        return {
-            "ok": proc.returncode == 0,
-            "returncode": proc.returncode,
-            "stderr": proc.stderr,
-            "method": "send-keys",
+        submit_keys = self._submit_keys()
+        delay = self._submit_delay_seconds()
+        loaded = self._run_tmux(["load-buffer", "-"], stdin_text=payload)
+        pasted = self._run_tmux(["paste-buffer", "-d", "-t", session])
+        if delay > 0:
+            time.sleep(delay)
+        submitted = self._run_tmux(["send-keys", "-t", session, *submit_keys])
+        delivered = (
+            loaded.returncode == 0
+            and pasted.returncode == 0
+            and submitted.returncode == 0
+        )
+        result: dict[str, Any] = {
+            "ok": delivered,
+            "returncode": submitted.returncode
+            if delivered
+            else (loaded.returncode or pasted.returncode or submitted.returncode),
+            "stderr": loaded.stderr or pasted.stderr or submitted.stderr,
+            "method": "paste-buffer",
+            "submit_keys": list(submit_keys),
+            "submit_delay_seconds": delay,
+            "accepted": False,
         }
+        if not delivered:
+            result["submission_error"] = "tmux paste or submit failed"
+            return result
+        acceptance = self._wait_for_intent_accepted(text)
+        result["accepted"] = bool(acceptance.get("accepted"))
+        if acceptance.get("accepted"):
+            result["intent"] = acceptance.get("intent")
+            return result
+        result["ok"] = False
+        result["submission_error"] = str(
+            acceptance.get("submission_error")
+            or "missing runtime.user_intent.accepted for the submitted prompt"
+        )
+        return result
 
     def capture_pane(self) -> str:
         try:
@@ -559,6 +724,18 @@ class MuseDriver:
         pre_pane = self.capture_pane()
         pre_echo = _latest_prompt_echo_index(pre_pane, sent_prompt)
         sent = self.send_keys(sent_prompt)
+        if not sent.get("ok") or sent.get("accepted") is False:
+            pane = self.capture_pane()
+            return {
+                "ok": False,
+                "send": sent,
+                "idle": False,
+                "replied": False,
+                "pane": pane,
+                "after_echo_index": pre_echo,
+                "submission_error": sent.get("submission_error")
+                or "Muse prompt was not accepted",
+            }
         replied = False
         if needles:
             replied = self.wait_for_pane(

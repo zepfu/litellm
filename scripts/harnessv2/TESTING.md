@@ -526,6 +526,35 @@ the Codex default path (`--model` omitted) is `basic`, not the Ohmypi
 
 ---
 
+## 6.2 Muse driver contract
+
+From `config/tuis.yaml`. Dedicated `hv2-muse-*` sessions only; never
+send-keys into leftover operator `muse` / `musela` / `muselt` / `musel`
+panes.
+
+| Item | Value |
+|---|---|
+| Binary | `muse` with inspect-derived `--base-url` (never exec `musela` / `muselt` / `musel`) |
+| CWD | `/tmp/hv2-muse-workspace` |
+| Session dir | `/tmp/hv2-muse-sessions/hv2-<model>` (`XDG_DATA_HOME`) |
+| tmux socket | `tmux37` |
+| Submit | YAML `submit_keys` (default `C-m`) after YAML `submit_delay_seconds` (default `1.0`) for single-line and multiline |
+
+Delivery is not native acceptance. Single-line and multiline prompts
+both `load-buffer`, `paste-buffer`, sleep `submit_delay_seconds`, then
+send `submit_keys`. Before a prompt counts as started, the dedicated
+session directory's `*.jsonl` must contain
+`runtime.user_intent.accepted` bound to that session
+(`payload.source_session_id` equals the `hv2-<model>` directory name
+when present) and the exact stripped prompt text in
+`payload.model_messages[].content[].text`. A pane echo and a tmux
+return code of 0 are not acceptance. If that acknowledgement is missing
+after `wait_ready_seconds` (default 25), `send_keys` /
+`send_prompt_and_wait` return a submission failure and do not fall
+through into `wait_reply_seconds`. The driver does not auto-resubmit.
+
+---
+
 ## 7. Halt protocol (logging regression)
 
 After every kind, `docker_logs` scans alpha logs since run start.
@@ -683,7 +712,8 @@ leftover-uvicorn invert, Ohmypi forbid `-p`, Ohmypi rollup identity
 `aawm-infrastructure@thoth` and concurrent Codex-client
 `litellm@thoth` + `codex-auto-review`), Codex interactive TUI plans
 (`basic`, identity overlay, dedicated tmux, no print/exec),
-Codex rollup identity (`tui=codex`), Grok and Muse interactive plans,
+Codex rollup identity (`tui=codex`), Grok and Muse interactive plans
+(Muse paste delay plus `runtime.user_intent.accepted`),
 the OpenCode stub, Claude out of scope and excluded from current
 closeout (historical mentions legacy/non-goal), dry-run plans, H-6
 prompt substring needles.
