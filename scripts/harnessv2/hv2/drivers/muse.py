@@ -465,7 +465,7 @@ class MuseDriver:
         expected = prompt.strip()
         if not expected:
             return None
-        session_id = root.name
+        bound = str(getattr(self, "_active_native_session_id", None) or "").strip()
         for path in self._session_jsonl_paths(root):
             for obj in self._iter_jsonl_objects(path):
                 if obj.get("payload_type") != _INTENT_ACCEPTED:
@@ -474,10 +474,13 @@ class MuseDriver:
                 if not isinstance(payload, Mapping):
                     continue
                 source = payload.get("source_session_id")
-                if isinstance(source, str) and source.strip() and source != session_id:
+                source_id = source.strip() if isinstance(source, str) else ""
+                if bound and source_id != bound:
                     continue
                 for text in self._intent_texts(payload):
                     if text.strip() == expected:
+                        if source_id:
+                            self._active_native_session_id = source_id
                         return expected
         return None
 
@@ -670,6 +673,7 @@ class MuseDriver:
             )
         self._active_session = session
         self._active_model = model
+        self._active_native_session_id = None
         ready_needles = as_str_list(select.get("ready_needles")) or [
             "Muse Code",
             "muse-spark",

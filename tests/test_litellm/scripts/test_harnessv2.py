@@ -3728,6 +3728,40 @@ def test_should_fail_muse_submit_without_intent_acceptance(
     assert "runtime.user_intent.accepted" in str(waited.get("submission_error"))
 
 
+def test_should_bind_muse_intent_to_native_session_id(
+    hv, config, monkeypatch, tmp_path: Path
+) -> None:
+    from hv2.drivers.muse import MuseDriver
+
+    cfg = _clone_config(config)
+    cfg["tuis"]["muse"]["session_dir"] = str(tmp_path)
+    cfg["tuis"]["muse"]["tmux"]["wait_ready_seconds"] = 0.05
+    cfg["tuis"]["muse"]["tmux"]["poll_interval_seconds"] = 0.01
+    driver = MuseDriver(cfg)
+    model = "muse-spark-1.3-contributor"
+    driver._active_model = model
+    driver._active_session = "hv2-muse-dedicated"
+    alias = driver.alias_session_dir(model)
+    native = "01a12349-91cc-76a1-83f8-b8eaa188d4f5"
+    prompt = "Reply with exactly the word PONG."
+    other = "spawn a child and run pwd"
+    _write_muse_intent(alias / "muse" / "sessions" / "2026" / "10" / "09", native, prompt)
+    _write_muse_intent(alias, "01a12349-other-session", other)
+    monkeypatch.setattr(
+        driver,
+        "_run_tmux",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr("hv2.drivers.muse.time.sleep", lambda _seconds: None)
+    sent = driver.send_keys(prompt)
+    assert sent["accepted"] is True
+    assert sent["intent"] == prompt
+    assert driver._active_native_session_id == native
+    later = driver.send_keys(other)
+    assert later["accepted"] is False
+    assert later["ok"] is False
+
+
 def test_should_reject_muse_intent_from_another_session(
     hv, config, monkeypatch, tmp_path: Path
 ) -> None:
