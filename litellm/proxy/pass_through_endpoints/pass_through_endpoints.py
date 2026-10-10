@@ -9180,13 +9180,15 @@ async def pass_through_request(  # noqa: PLR0915
         async def _retire_openai_precommit_response(
             response: Optional[httpx.Response],
         ) -> bool:
-            """Close and clear the exact raw response registered by the send."""
+            """Close and positively record raw-response retirement."""
 
             if response is None:
                 setattr(
                     request.state,
                     "aawm_openai_precommit_retirement_failed",
                     False,
+                    "aawm_openai_precommit_retirement_state",
+                    "not_applicable",
                 )
                 return True
             closed = True
@@ -9198,6 +9200,8 @@ async def pass_through_request(  # noqa: PLR0915
                     request.state,
                     "aawm_openai_precommit_retirement_failed",
                     True,
+                    "aawm_openai_precommit_retirement_state",
+                    "failed",
                 )
                 verbose_proxy_logger.debug(
                     "Failed to close OpenAI precommit response",
@@ -9210,6 +9214,8 @@ async def pass_through_request(  # noqa: PLR0915
                     request.state,
                     "aawm_openai_precommit_retirement_failed",
                     False,
+                    "aawm_openai_precommit_retirement_state",
+                    "retired",
                 )
             return closed
 
@@ -9856,6 +9862,35 @@ async def pass_through_request(  # noqa: PLR0915
                 ledger_calls_before = openai_call_ledger.snapshot().get(
                     "logical_provider_calls"
                 )
+                if (
+                    isinstance(ledger_calls_before, int)
+                    and not isinstance(ledger_calls_before, bool)
+                    and ledger_calls_before >= 1
+                ):
+                    retirement_state = getattr(
+                        request.state,
+                        "aawm_openai_precommit_retirement_state",
+                        None,
+                    )
+                    if retirement_state != "retired":
+                        raise RuntimeError(
+                            "OpenAI precommit response retirement is required "
+                            "before another provider send"
+                        )
+                has_prior_provider_send = (
+                    isinstance(ledger_calls_before, int)
+                    and not isinstance(ledger_calls_before, bool)
+                    and ledger_calls_before >= 1
+                )
+                retirement_state = getattr(
+                    request.state,
+                    "aawm_openai_precommit_retirement_state",
+                    None,
+                )
+                prior_response_closed = (
+                    not has_prior_provider_send
+                    or retirement_state == "retired"
+                )
                 owner_comparison_mode = (
                     "strict_managed_openai"
                     if immutable_openai_binding.protected_openai_headers
@@ -9918,7 +9953,14 @@ async def pass_through_request(  # noqa: PLR0915
                                 else "none"
                             )
                         )
-                    if strict_owner_enabled:
+                    # Portable transition authority outranks strict managed
+                    # ownership for this send. Keep the guards mutually
+                    # exclusive so an authorized failover cannot fall into
+                    # strict same-account validation.
+                    if (
+                        strict_owner_enabled
+                        and portable_transition_authority is None
+                    ):
                         owner_attributes = (
                             _build_final_openai_owner_attributes(
                                 model=serialized_model or expected_model or "",
@@ -10076,11 +10118,7 @@ async def pass_through_request(  # noqa: PLR0915
                         reason=reason or "passthrough_provider_request",
                         candidate_context=immutable_openai_binding.candidate_context,
                         prior_response_closed=(
-                            not getattr(
-                                request.state,
-                                "aawm_openai_precommit_retirement_failed",
-                                False,
-                            )
+                            prior_response_closed
                         ),
                         allow_capacity_retry=capacity_retry_coordinator is not None,
                     )

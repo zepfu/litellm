@@ -433,6 +433,9 @@ from .aawm_alias_routing import streaming as _aawm_alias_streaming  # noqa: F401
 from .aawm_alias_routing import candidate_loop as _aawm_alias_candidate_loop
 from .aawm_alias_routing import durable as _aawm_alias_durable
 from .aawm_alias_routing import dev_fault_plan as _aawm_dev_fault_plan
+from .aawm_adapter_runtime.provider_call_ledger import (
+    get_request_provider_call_ledger_snapshot,
+)
 
 # Wave 4 pure-leaf extraction imports
 from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen import constants as _opencode_zen_constants
@@ -3604,6 +3607,13 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
     retry_attempt_record["replay_safety"] = (
         "replay_safe" if account_failover_replay_safe else "replay_unsafe"
     )
+    if (
+        error_class == "capacity_exhausted"
+        and "send_ledger_snapshot" not in retry_attempt_record
+    ):
+        retry_attempt_record["send_ledger_snapshot"] = (
+            get_request_provider_call_ledger_snapshot(request)
+        )
     authenticated_token_pin = (
         selection.get("selection_reason")
         == "authenticated_continuation_token_pin"
@@ -3987,11 +3997,43 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
                 if isinstance(current_candidate, dict)
                 else request_body.get("model")
             ),
-            route_family="codex_oauth",
-            endpoint_contract="openai_responses",
-            state_format="openai_responses",
-            ingress="openai_passthrough",
+            route_family=(
+                current_candidate.get("route_family")
+                if isinstance(current_candidate, dict)
+                else None
+            ) or "codex_responses",
+            endpoint_contract=(
+                current_candidate.get("route_family")
+                if isinstance(current_candidate, dict)
+                else None
+            ) or "codex_responses",
+            state_format=(
+                current_candidate.get("route_family")
+                if isinstance(current_candidate, dict)
+                else None
+            ) or "codex_responses",
+            ingress="pass_through_request",
             requested_model=request_body.get("model"),
+            account_label=(
+                current_candidate.get("codex_oauth_account_label")
+                if isinstance(current_candidate, dict)
+                else None
+            ),
+            account_hash=(
+                current_candidate.get("codex_oauth_account_hash")
+                if isinstance(current_candidate, dict)
+                else None
+            ),
+            account_lane=(
+                current_candidate.get("codex_oauth_lane_key")
+                if isinstance(current_candidate, dict)
+                else None
+            ),
+            credential_affinity=(
+                current_candidate.get("codex_oauth_credential_affinity")
+                if isinstance(current_candidate, dict)
+                else None
+            ),
             candidate=current_candidate
             if isinstance(current_candidate, dict)
             else None,
@@ -4003,11 +4045,43 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
                 if isinstance(alternate_candidate, dict)
                 else request_body.get("model")
             ),
-            route_family="codex_oauth",
-            endpoint_contract="openai_responses",
-            state_format="openai_responses",
-            ingress="openai_passthrough",
+            route_family=(
+                alternate_candidate.get("route_family")
+                if isinstance(alternate_candidate, dict)
+                else None
+            ) or "codex_responses",
+            endpoint_contract=(
+                alternate_candidate.get("route_family")
+                if isinstance(alternate_candidate, dict)
+                else None
+            ) or "codex_responses",
+            state_format=(
+                alternate_candidate.get("route_family")
+                if isinstance(alternate_candidate, dict)
+                else None
+            ) or "codex_responses",
+            ingress="pass_through_request",
             requested_model=request_body.get("model"),
+            account_label=(
+                alternate_candidate.get("codex_oauth_account_label")
+                if isinstance(alternate_candidate, dict)
+                else None
+            ),
+            account_hash=(
+                alternate_candidate.get("codex_oauth_account_hash")
+                if isinstance(alternate_candidate, dict)
+                else None
+            ),
+            account_lane=(
+                alternate_candidate.get("codex_oauth_lane_key")
+                if isinstance(alternate_candidate, dict)
+                else None
+            ),
+            credential_affinity=(
+                alternate_candidate.get("codex_oauth_credential_affinity")
+                if isinstance(alternate_candidate, dict)
+                else None
+            ),
             candidate=alternate_candidate
             if isinstance(alternate_candidate, dict)
             else None,
@@ -6617,13 +6691,36 @@ async def openai_proxy_route(  # noqa: PLR0915
                 use_direct_codex_oauth_inventory
                 and attempted_provider_call
                 and provider_returned
+                and _aawm_error_signals._is_codex_responses_capacity_returned(
+                    candidate=candidate if isinstance(candidate, dict) else None,
+                    status_code=(
+                        _aawm_error_signals._extract_adapter_exception_status_code(
+                            exc
+                        )
+                    ),
+                    tokens=(
+                        _aawm_error_signals._extract_codex_auto_agent_error_tokens(
+                            exc
+                        )
+                    ),
+                    attempted_provider_call=attempted_provider_call,
+                    provider_returned=provider_returned,
+                )
+            ):
+                # Capacity evidence is provider-attributed and exact. Supply
+                # the request ledger fingerprint so account rotation is
+                # confirmed rather than inferred from status alone.
+                direct_account_error_class = "capacity_exhausted"
+            elif (
+                use_direct_codex_oauth_inventory
+                and attempted_provider_call
+                and provider_returned
                 and _aawm_error_signals._extract_adapter_exception_status_code(exc)
                 == status.HTTP_429_TOO_MANY_REQUESTS
             ):
-                # A provider 429 without the structured Codex usage-limit
-                # payload is model/account capacity, not exhausted quota.
-                # Let the direct inventory retry path move to the next OAuth
-                # account for fresh, unbound agent requests.
+                # A bare provider 429 is ordinary rate limiting. Without
+                # exact capacity evidence it cannot prove account exhaustion
+                # and must not authorize rotation.
                 direct_account_error_class = "rate_limited"
             elif (
                 use_direct_codex_oauth_inventory
