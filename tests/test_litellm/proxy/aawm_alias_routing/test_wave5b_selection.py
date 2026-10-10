@@ -9,8 +9,9 @@ from __future__ import annotations
 import json
 import sys
 import time
+from contextlib import contextmanager
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -121,6 +122,93 @@ def _set_selection_candidates(
             enumeration
         ),
     )
+
+
+@contextmanager
+def _rebound_passthrough_host(**overrides: Any) -> Iterator[None]:
+    """Stub names that a live passthrough install left unbound.
+
+    ``selection.install()`` rebinds shipped helpers onto the passthrough
+    module dict. That dict is invisible until a rebound frame is running, so
+    the profile hook fills only the callbacks those helpers LOAD_GLOBAL.
+    Evidence, attach, and clear stay the shipped functions.
+    """
+
+    host_names: dict[str, Any] = {
+        "_get_grok_account_quota_lane_cooldown_key": (
+            lambda _candidate, _lane_key: None
+        ),
+        "_get_codex_auto_agent_grok_account_quota_lane_cooldown_key": (
+            lambda _candidate, _lane_key: None
+        ),
+        "_is_kimi_code_candidate": (
+            lambda candidate: isinstance(candidate, dict)
+            and candidate.get("provider") == "kimi_code"
+        ),
+        "_is_kimi_code_auto_agent_candidate": (
+            lambda candidate: isinstance(candidate, dict)
+            and candidate.get("provider") == "kimi_code"
+        ),
+        "_get_kimi_managed_account_cooldown_key": (
+            lambda: "kimi_code:__managed_account__:kimi_code_managed_account"
+        ),
+        "_get_kimi_code_managed_account_cooldown_key": (
+            lambda: "kimi_code:__managed_account__:kimi_code_managed_account"
+        ),
+        "_get_first_secret_value": lambda _names: "prod",
+        "_get_codex_quota_observation_environment": lambda: "prod",
+        "_get_codex_active_cooldown_state": AsyncMock(
+            return_value=(0.0, "local_fallback")
+        ),
+        "_get_codex_auto_agent_active_cooldown_state": AsyncMock(
+            return_value=(0.0, "local_fallback")
+        ),
+        "alibaba_token_plan_account_quota_cooldown_key": (
+            alibaba_token_plan_account_quota_cooldown_key
+        ),
+        "subscription_identity_for_candidate": (
+            subscription_identity_for_candidate
+        ),
+        "_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER": (
+            CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
+        ),
+        "math": __import__("math"),
+    }
+    # Evidence and attach LOAD_GLOBAL these on the rebound host. Copy the
+    # shipped module values so a partial passthrough dict cannot NameError
+    # and hide a real clear or block decision.
+    for name in (
+        "_ALIBABA_TOKEN_PLAN_QUOTA_WINDOWS",
+        "_ALIBABA_TOKEN_PLAN_QUOTA_CLIENT",
+        "_ALIBABA_TOKEN_PLAN_QUOTA_SOURCE",
+        "_ALIBABA_TOKEN_PLAN_QUOTA_PARSER_VERSION",
+        "_ALIBABA_TOKEN_PLAN_QUOTA_TYPE",
+        "_ALIBABA_TOKEN_PLAN_QUOTA_UNIT",
+        "_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY",
+        "_alibaba_observation_matches_subscription",
+        "_codex_oauth_quota_json_mapping",
+    ):
+        host_names.setdefault(name, getattr(selection, name))
+    host_names.update(overrides)
+
+    def _stub_rebound_host(frame, event, arg):
+        if event != "call":
+            return None
+        host = frame.f_globals
+        if host.get("__name__") != (
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints"
+        ):
+            return None
+        for name, value in host_names.items():
+            host.setdefault(name, value)
+        return None
+
+    previous = sys.getprofile()
+    sys.setprofile(_stub_rebound_host)
+    try:
+        yield
+    finally:
+        sys.setprofile(previous)
 
 
 @pytest.fixture(autouse=True)
@@ -2720,6 +2808,7 @@ def _seed_alibaba_windows(
     remaining_pct: float,
     observed_at: Optional[float] = None,
     environment: str = "prod",
+    account_hash: str = "hash-alibaba-1",
     models: tuple[str, str] = (
         "alibaba_token_plan/qwen3.8-max",
         "alibaba_token_plan/qwen3.7-max",
@@ -2733,6 +2822,7 @@ def _seed_alibaba_windows(
                 remaining_pct=remaining_pct,
                 observed_at=now,
                 environment=environment,
+                account_hash=account_hash,
                 model=models[0],
             ),
             _alibaba_observation(
@@ -2740,6 +2830,7 @@ def _seed_alibaba_windows(
                 remaining_pct=remaining_pct,
                 observed_at=now,
                 environment=environment,
+                account_hash=account_hash,
                 model=models[1],
             ),
         ]
@@ -2761,6 +2852,26 @@ def _alibaba_candidates() -> tuple[dict[str, Any], dict[str, Any]]:
             "last_resort": True,
         },
     )
+
+
+def _bound_alibaba_candidates(
+    identity: str = _ALIBABA_FRESHNESS_IDENTITY,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Stamp the contract hash the selector uses for account cooldown."""
+
+    first, second = _alibaba_candidates()
+    return (
+        {**first, "subscription_identity": identity},
+        {**second, "subscription_identity": identity},
+    )
+
+
+def _alibaba_account_cooldown_key(
+    identity: str = _ALIBABA_FRESHNESS_IDENTITY,
+) -> str:
+    cooldown_key = alibaba_token_plan_account_quota_cooldown_key(identity)
+    assert cooldown_key is not None
+    return cooldown_key
 
 
 def _opencode_candidates() -> tuple[dict[str, Any], ...]:
@@ -3011,7 +3122,9 @@ class TestAlibabaTokenPlanQuotaObservations:
     def _require_isolated_selection_runtime(self):
         assert selection._get_codex_quota_observation_environment is None
         assert selection._get_codex_quota_observation_pool is None
+        selection.alias_routing_state.reset_for_tests()
         yield
+        selection.alias_routing_state.reset_for_tests()
 
     @pytest.mark.asyncio
     async def test_install_rebound_hydration_and_cooldown_clear(
@@ -3538,8 +3651,8 @@ class TestAlibabaTokenPlanQuotaObservations:
             lambda: "prod",
             monkeypatch,
         )
-        _set_selection_candidates(_alibaba_candidates())
-        account_key = CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+        _set_selection_candidates(_bound_alibaba_candidates())
+        account_key = _alibaba_account_cooldown_key()
 
         async def _cooldown_state(key: str) -> tuple[float, str]:
             if key == account_key:
@@ -3556,19 +3669,35 @@ class TestAlibabaTokenPlanQuotaObservations:
             monkeypatch,
         )
 
-        with pytest.raises(HTTPException) as caught:
-            await selection._select_codex_auto_agent_candidate(
-                request=_make_request(),
-                request_body={
-                    "model": "basic",
-                    "litellm_metadata": {"redispatch_ordinal": 1},
-                },
-            )
+        with _rebound_passthrough_host(
+            alias_routing_state=manager,
+            _get_codex_active_cooldown_state=_cooldown_state,
+            _get_codex_quota_observation_environment=lambda: "prod",
+            _clear_alibaba_token_plan_account_quota_cooldown=clear,
+        ):
+            with pytest.raises(HTTPException) as caught:
+                await selection._select_codex_auto_agent_candidate(
+                    request=_make_request(),
+                    request_body={
+                        "model": "basic",
+                        "litellm_metadata": {"redispatch_ordinal": 1},
+                    },
+                )
 
         assert [
             candidate["reason"] for candidate in caught.value.detail["candidates"]
         ] == ["account_quota_cooldown", "account_quota_cooldown"]
-        assert not manager._normalized_quota_observations
+        # Unavailable rows are not a contract replacement. The prior snapshot
+        # for the other account stays, and the bound account cooldown is not
+        # cleared from that unknown batch.
+        observations = list(manager._normalized_quota_observations.values())
+        assert observations
+        assert {
+            observation["account_hash"] for observation in observations
+        } == {"hash-alibaba-1"}
+        assert all(
+            observation["remaining_pct"] == 40.0 for observation in observations
+        )
         clear.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -3580,22 +3709,29 @@ class TestAlibabaTokenPlanQuotaObservations:
             AliasRoutingStateManager(),
             monkeypatch,
         )
-        _seed_alibaba_windows(remaining_pct=0.0)
-        _set_selection_candidates(_alibaba_candidates())
+        _seed_alibaba_windows(
+            remaining_pct=0.0,
+            account_hash=_ALIBABA_FRESHNESS_IDENTITY,
+        )
+        _set_selection_candidates(_bound_alibaba_candidates())
         _set_selection_runtime_value(
             "_get_codex_quota_observation_environment",
             lambda: "prod",
             monkeypatch,
         )
 
-        with pytest.raises(HTTPException) as caught:
-            await selection._select_codex_auto_agent_candidate(
-                request=_make_request(),
-                request_body={
-                    "model": "basic",
-                    "litellm_metadata": {"redispatch_ordinal": 1},
-                },
-            )
+        with _rebound_passthrough_host(
+            alias_routing_state=selection.alias_routing_state,
+            _get_codex_quota_observation_environment=lambda: "prod",
+        ):
+            with pytest.raises(HTTPException) as caught:
+                await selection._select_codex_auto_agent_candidate(
+                    request=_make_request(),
+                    request_body={
+                        "model": "basic",
+                        "litellm_metadata": {"redispatch_ordinal": 1},
+                    },
+                )
 
         detail = caught.value.detail
         assert [candidate["reason"] for candidate in detail["candidates"]] == [
@@ -3626,6 +3762,7 @@ class TestAlibabaTokenPlanQuotaObservations:
             window="5h",
             remaining_pct=0.0,
             observed_at=now - 10,
+            account_hash=_ALIBABA_FRESHNESS_IDENTITY,
         )
         selection.alias_routing_state.record_normalized_quota_observations(
             [
@@ -3635,15 +3772,17 @@ class TestAlibabaTokenPlanQuotaObservations:
                     remaining_pct=40.0,
                     observed_at=now,
                     model="alibaba_token_plan/qwen3.7-max",
+                    account_hash=_ALIBABA_FRESHNESS_IDENTITY,
                 ),
                 _alibaba_observation(
                     window="7d",
                     remaining_pct=40.0,
                     observed_at=now,
+                    account_hash=_ALIBABA_FRESHNESS_IDENTITY,
                 ),
             ]
         )
-        _set_selection_candidates(_alibaba_candidates())
+        _set_selection_candidates(_bound_alibaba_candidates())
         _set_selection_runtime_value(
             "_get_codex_quota_observation_environment",
             lambda: "prod",
@@ -3656,14 +3795,19 @@ class TestAlibabaTokenPlanQuotaObservations:
             monkeypatch,
         )
 
-        with pytest.raises(HTTPException) as caught:
-            await selection._select_codex_auto_agent_candidate(
-                request=_make_request(),
-                request_body={
-                    "model": "basic",
-                    "litellm_metadata": {"redispatch_ordinal": 1},
-                },
-            )
+        with _rebound_passthrough_host(
+            alias_routing_state=selection.alias_routing_state,
+            _get_codex_quota_observation_environment=lambda: "prod",
+            _clear_alibaba_token_plan_account_quota_cooldown=clear,
+        ):
+            with pytest.raises(HTTPException) as caught:
+                await selection._select_codex_auto_agent_candidate(
+                    request=_make_request(),
+                    request_body={
+                        "model": "basic",
+                        "litellm_metadata": {"redispatch_ordinal": 1},
+                    },
+                )
 
         detail = caught.value.detail
         assert [candidate["reason"] for candidate in detail["candidates"]] == [
@@ -3714,10 +3858,15 @@ class TestAlibabaTokenPlanQuotaObservations:
             monkeypatch,
         )
 
-        result = await selection._select_codex_auto_agent_candidate(
-            request=_make_request(),
-            request_body={"model": "basic"},
-        )
+        with _rebound_passthrough_host(
+            alias_routing_state=selection.alias_routing_state,
+            _get_codex_quota_observation_environment=lambda: "prod",
+            _clear_alibaba_token_plan_account_quota_cooldown=clear,
+        ):
+            result = await selection._select_codex_auto_agent_candidate(
+                request=_make_request(),
+                request_body={"model": "basic"},
+            )
 
         assert result["candidate"]["model"] == (
             "alibaba_token_plan/qwen3.8-max"
@@ -3744,12 +3893,13 @@ class TestAlibabaTokenPlanQuotaObservations:
             window="5h",
             remaining_pct=0.0,
             observed_at=now - 30,
+            account_hash=_ALIBABA_FRESHNESS_IDENTITY,
         )
         observation["expected_reset_at"] = now - 1
         selection.alias_routing_state.record_normalized_quota_observations(
             [observation]
         )
-        _set_selection_candidates(_alibaba_candidates())
+        _set_selection_candidates(_bound_alibaba_candidates())
         _set_selection_runtime_value(
             "_get_codex_quota_observation_environment",
             lambda: "prod",
@@ -3762,14 +3912,19 @@ class TestAlibabaTokenPlanQuotaObservations:
             monkeypatch,
         )
 
-        with pytest.raises(HTTPException) as caught:
-            await selection._select_codex_auto_agent_candidate(
-                request=_make_request(),
-                request_body={
-                    "model": "basic",
-                    "litellm_metadata": {"redispatch_ordinal": 1},
-                },
-            )
+        with _rebound_passthrough_host(
+            alias_routing_state=selection.alias_routing_state,
+            _get_codex_quota_observation_environment=lambda: "prod",
+            _clear_alibaba_token_plan_account_quota_cooldown=clear,
+        ):
+            with pytest.raises(HTTPException) as caught:
+                await selection._select_codex_auto_agent_candidate(
+                    request=_make_request(),
+                    request_body={
+                        "model": "basic",
+                        "litellm_metadata": {"redispatch_ordinal": 1},
+                    },
+                )
 
         detail = caught.value.detail
         assert [candidate["reason"] for candidate in detail["candidates"]] == [
@@ -3796,6 +3951,7 @@ class TestAlibabaTokenPlanQuotaObservations:
                 window=window,
                 remaining_pct=40.0,
                 observed_at=now - 30,
+                account_hash=_ALIBABA_FRESHNESS_IDENTITY,
             )
             for window in ("5h", "7d")
         ]
@@ -3804,13 +3960,13 @@ class TestAlibabaTokenPlanQuotaObservations:
         selection.alias_routing_state.record_normalized_quota_observations(
             observations
         )
-        _set_selection_candidates(_alibaba_candidates())
+        _set_selection_candidates(_bound_alibaba_candidates())
         _set_selection_runtime_value(
             "_get_codex_quota_observation_environment",
             lambda: "prod",
             monkeypatch,
         )
-        account_key = CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+        account_key = _alibaba_account_cooldown_key()
 
         async def _cooldown_state(key: str) -> tuple[float, str]:
             if key == account_key:
@@ -3827,14 +3983,20 @@ class TestAlibabaTokenPlanQuotaObservations:
             monkeypatch,
         )
 
-        with pytest.raises(HTTPException) as caught:
-            await selection._select_codex_auto_agent_candidate(
-                request=_make_request(),
-                request_body={
-                    "model": "basic",
-                    "litellm_metadata": {"redispatch_ordinal": 1},
-                },
-            )
+        with _rebound_passthrough_host(
+            alias_routing_state=selection.alias_routing_state,
+            _get_codex_active_cooldown_state=_cooldown_state,
+            _get_codex_quota_observation_environment=lambda: "prod",
+            _clear_alibaba_token_plan_account_quota_cooldown=clear,
+        ):
+            with pytest.raises(HTTPException) as caught:
+                await selection._select_codex_auto_agent_candidate(
+                    request=_make_request(),
+                    request_body={
+                        "model": "basic",
+                        "litellm_metadata": {"redispatch_ordinal": 1},
+                    },
+                )
 
         assert [
             candidate["reason"] for candidate in caught.value.detail["candidates"]
@@ -3858,6 +4020,7 @@ class TestAlibabaTokenPlanQuotaObservations:
             window="5h",
             remaining_pct=40.0,
             observed_at=now,
+            account_hash=_ALIBABA_FRESHNESS_IDENTITY,
         )
         observation["quota_period"] = "7d"
         observation["quota_key"] = "alibaba_token_plan_5h:credits"
@@ -3868,16 +4031,17 @@ class TestAlibabaTokenPlanQuotaObservations:
                     window="7d",
                     remaining_pct=40.0,
                     observed_at=now,
+                    account_hash=_ALIBABA_FRESHNESS_IDENTITY,
                 ),
             ]
         )
-        _set_selection_candidates(_alibaba_candidates())
+        _set_selection_candidates(_bound_alibaba_candidates())
         _set_selection_runtime_value(
             "_get_codex_quota_observation_environment",
             lambda: "prod",
             monkeypatch,
         )
-        account_key = CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+        account_key = _alibaba_account_cooldown_key()
 
         async def _cooldown_state(key: str) -> tuple[float, str]:
             if key == account_key:
@@ -3894,14 +4058,20 @@ class TestAlibabaTokenPlanQuotaObservations:
             monkeypatch,
         )
 
-        with pytest.raises(HTTPException) as caught:
-            await selection._select_codex_auto_agent_candidate(
-                request=_make_request(),
-                request_body={
-                    "model": "basic",
-                    "litellm_metadata": {"redispatch_ordinal": 1},
-                },
-            )
+        with _rebound_passthrough_host(
+            alias_routing_state=selection.alias_routing_state,
+            _get_codex_active_cooldown_state=_cooldown_state,
+            _get_codex_quota_observation_environment=lambda: "prod",
+            _clear_alibaba_token_plan_account_quota_cooldown=clear,
+        ):
+            with pytest.raises(HTTPException) as caught:
+                await selection._select_codex_auto_agent_candidate(
+                    request=_make_request(),
+                    request_body={
+                        "model": "basic",
+                        "litellm_metadata": {"redispatch_ordinal": 1},
+                    },
+                )
 
         assert [
             candidate["reason"] for candidate in caught.value.detail["candidates"]
@@ -3917,11 +4087,14 @@ class TestAlibabaTokenPlanQuotaObservations:
             AliasRoutingStateManager(),
             monkeypatch,
         )
-        _seed_alibaba_windows(remaining_pct=40.0)
-        _set_selection_candidates(_alibaba_candidates())
+        _seed_alibaba_windows(
+            remaining_pct=40.0,
+            account_hash=_ALIBABA_FRESHNESS_IDENTITY,
+        )
+        _set_selection_candidates(_bound_alibaba_candidates())
         manager = selection.alias_routing_state
         monkeypatch.setattr(cooldown_state, "_manager", manager)
-        account_key = CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+        account_key = _alibaba_account_cooldown_key()
         candidate_key = (
             "alibaba_token_plan:alibaba_token_plan/qwen3.8-max:"
             "alibaba_token_plan"
@@ -3955,10 +4128,15 @@ class TestAlibabaTokenPlanQuotaObservations:
             cooldown_state, "clear_alias_family_cooldown_state", _clear
         )
 
-        result = await selection._select_codex_auto_agent_candidate(
-            request=_make_request(),
-            request_body={"model": "basic"},
-        )
+        with _rebound_passthrough_host(
+            alias_routing_state=manager,
+            _get_codex_active_cooldown_state=_cooldown_state,
+            _get_codex_quota_observation_environment=lambda: "prod",
+        ):
+            result = await selection._select_codex_auto_agent_candidate(
+                request=_make_request(),
+                request_body={"model": "basic"},
+            )
 
         assert result["candidate"]["model"] in {
             "alibaba_token_plan/qwen3.8-max",
@@ -4311,66 +4489,15 @@ class TestAlibabaTokenPlanQuotaObservations:
             cooldown_state, "clear_alias_family_cooldown_state", _clear
         )
 
-        # install() binds shipped helpers to the passthrough host. That host
-        # dict is not visible to gc until a rebound frame is running, so a
-        # profile hook stubs the names those late-binding callbacks call.
-        host_names = {
-            "_get_grok_account_quota_lane_cooldown_key": (
-                lambda _candidate, _lane_key: None
-            ),
-            "_get_codex_auto_agent_grok_account_quota_lane_cooldown_key": (
-                lambda _candidate, _lane_key: None
-            ),
-            "_is_kimi_code_candidate": (
-                lambda candidate: isinstance(candidate, dict)
-                and candidate.get("provider") == "kimi_code"
-            ),
-            "_is_kimi_code_auto_agent_candidate": (
-                lambda candidate: isinstance(candidate, dict)
-                and candidate.get("provider") == "kimi_code"
-            ),
-            "_get_kimi_managed_account_cooldown_key": (
-                lambda: "kimi_code:__managed_account__:kimi_code_managed_account"
-            ),
-            "_get_kimi_code_managed_account_cooldown_key": (
-                lambda: "kimi_code:__managed_account__:kimi_code_managed_account"
-            ),
-            "_get_first_secret_value": lambda _names: "prod",
-            "_get_codex_quota_observation_environment": lambda: "prod",
-            "_get_codex_active_cooldown_state": _cooldown_state,
-            "_get_codex_auto_agent_active_cooldown_state": _cooldown_state,
-            "alias_routing_state": manager,
-            "alibaba_token_plan_account_quota_cooldown_key": (
-                alibaba_token_plan_account_quota_cooldown_key
-            ),
-            "subscription_identity_for_candidate": (
-                subscription_identity_for_candidate
-            ),
-            "_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER": (
-                CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
-            ),
-        }
-
-        def _stub_rebound_host(frame, event, arg):
-            if event != "call":
-                return None
-            host = frame.f_globals
-            if host.get("__name__") != (
-                "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints"
-            ):
-                return None
-            for name, value in host_names.items():
-                host.setdefault(name, value)
-            return None
-
-        sys.setprofile(_stub_rebound_host)
-        try:
+        with _rebound_passthrough_host(
+            alias_routing_state=manager,
+            _get_codex_active_cooldown_state=_cooldown_state,
+            _get_codex_quota_observation_environment=lambda: "prod",
+        ):
             result = await selection._select_codex_auto_agent_candidate(
                 request=_make_request(),
                 request_body={"model": "basic"},
             )
-        finally:
-            sys.setprofile(None)
 
         assert result["candidate"]["model"] == "alibaba_token_plan/qwen3.8-max"
         assert result.get("skip_reason") is None
@@ -4440,13 +4567,13 @@ class TestAlibabaTokenPlanQuotaObservations:
     async def test_unknown_sidecar_leaves_ali004_cooldown_intact(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        _set_selection_candidates(_alibaba_candidates())
+        _set_selection_candidates(_bound_alibaba_candidates())
         _set_selection_runtime_value(
             "_get_codex_quota_observation_environment",
             lambda: "prod",
             monkeypatch,
         )
-        account_key = CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+        account_key = _alibaba_account_cooldown_key()
 
         async def _cooldown_state(key: str) -> tuple[float, str]:
             if key == account_key:
@@ -4463,14 +4590,20 @@ class TestAlibabaTokenPlanQuotaObservations:
             monkeypatch,
         )
 
-        with pytest.raises(HTTPException) as caught:
-            await selection._select_codex_auto_agent_candidate(
-                request=_make_request(),
-                request_body={
-                    "model": "basic",
-                    "litellm_metadata": {"redispatch_ordinal": 1},
-                },
-            )
+        with _rebound_passthrough_host(
+            alias_routing_state=selection.alias_routing_state,
+            _get_codex_active_cooldown_state=_cooldown_state,
+            _get_codex_quota_observation_environment=lambda: "prod",
+            _clear_alibaba_token_plan_account_quota_cooldown=clear,
+        ):
+            with pytest.raises(HTTPException) as caught:
+                await selection._select_codex_auto_agent_candidate(
+                    request=_make_request(),
+                    request_body={
+                        "model": "basic",
+                        "litellm_metadata": {"redispatch_ordinal": 1},
+                    },
+                )
 
         assert [
             candidate["reason"] for candidate in caught.value.detail["candidates"]
