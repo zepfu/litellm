@@ -1854,8 +1854,11 @@ def test_should_submit_codex_prompt_with_ctrl_m_not_enter(
     assert sent["submit_keys"] == ["C-m"]
     assert sent["submit_delay_seconds"] == 1.0
     assert sleeps == [1.0]
-    assert any(row[0][:1] == ["load-buffer"] for row in calls)
-    assert any(row[0][:1] == ["paste-buffer"] for row in calls)
+    assert any(row[0][:3] == ["load-buffer", "-b", "hv2-hv2-codex-basic-1"] for row in calls)
+    assert any(
+        row[0][:5] == ["paste-buffer", "-b", "hv2-hv2-codex-basic-1", "-d", "-t"]
+        for row in calls
+    )
     assert any(
         row[0] == ["send-keys", "-t", "hv2-codex-basic-1", "C-m"] for row in calls
     )
@@ -2006,8 +2009,8 @@ def test_should_delay_codex_submit_after_paste_before_ctrl_m(
     assert sent["submit_delay_seconds"] == 0.25
     kinds = [row[0] for row in events]
     assert kinds == ["tmux", "tmux", "sleep", "tmux"]
-    assert events[0][1][:1] == ["load-buffer"]
-    assert events[1][1][:1] == ["paste-buffer"]
+    assert events[0][1][:3] == ["load-buffer", "-b", "hv2-hv2-codex-basic-1"]
+    assert events[1][1][:3] == ["paste-buffer", "-b", "hv2-hv2-codex-basic-1"]
     assert events[2] == ("sleep", 0.25)
     assert events[3][1] == ["send-keys", "-t", "hv2-codex-basic-1", "C-m"]
     assert not any("Enter" in (row[1] or []) for row in events if row[0] == "tmux")

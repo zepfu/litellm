@@ -468,8 +468,16 @@ class CodexDriver:
             }
         session = self._session_name()
         payload = text if text.endswith("\n") else f"{text}\n"
-        loaded = self._run_tmux(["load-buffer", "-"], stdin_text=payload)
-        pasted = self._run_tmux(["paste-buffer", "-d", "-t", session])
+        # The tmux server has one default paste buffer. Parallel Codex
+        # sessions on socket tmux37 would otherwise paste each other's
+        # prompts. Name the buffer for this session.
+        buffer = f"hv2-{session}"
+        loaded = self._run_tmux(
+            ["load-buffer", "-b", buffer, "-"], stdin_text=payload
+        )
+        pasted = self._run_tmux(
+            ["paste-buffer", "-b", buffer, "-d", "-t", session]
+        )
         delay = self._submit_delay_seconds()
         if delay > 0:
             time.sleep(delay)
