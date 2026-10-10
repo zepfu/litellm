@@ -645,7 +645,12 @@ async def _restore_responses_function_names_in_sse_chunks(
         associated_emissions = responses_emissions_from_chunk(event_block)
         wire = _sse_block_wire_bytes(event_block, had_separator)
         if associated_emissions is None:
-            yield _restore_responses_sse_frame(wire, rewrite)
+            for rendered_frame in _restore_responses_sse_frame(
+                wire,
+                rewrite,
+                output_gate=output_gate,
+            ):
+                yield rendered_frame
             continue
         restored_emissions = []
         for emission in associated_emissions:
@@ -660,6 +665,8 @@ async def _restore_responses_function_names_in_sse_chunks(
                 continue
             restored_emissions.append(emission.transformed(restored_payload))
         yield attach_responses_emissions(b"", restored_emissions)
+    if output_gate is not None:
+        output_gate.finish()
 
 
 # Global registry to track registered pass-through routes and prevent memory leaks

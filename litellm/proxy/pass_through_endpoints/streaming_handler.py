@@ -1310,15 +1310,20 @@ class PassThroughStreamingHandler:
         )
         parser = _ResponsesPreCommitSSEParser(prefix, pipeline)
         iterator: Any = None
+        retired = False
 
         async def _close_precommit_resources() -> None:
+            nonlocal retired
+            if retired:
+                return
+            retired = True
             prefix.close()
             close_iterator = getattr(iterator, "aclose", None)
             if callable(close_iterator):
                 try:
                     result = close_iterator()
                     if inspect.isawaitable(result):
-                        await result
+                        await wait_for("resource_cleanup", result)
                 except Exception:
                     pass
             close_response = getattr(response, "aclose", None)
@@ -1326,7 +1331,7 @@ class PassThroughStreamingHandler:
                 try:
                     result = close_response()
                     if inspect.isawaitable(result):
-                        await result
+                        await wait_for("resource_cleanup", result)
                 except Exception:
                     pass
 

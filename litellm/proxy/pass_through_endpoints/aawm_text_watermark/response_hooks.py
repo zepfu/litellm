@@ -626,6 +626,7 @@ def maybe_wrap_passthrough_watermark_responses_stream(
             iterator,
             event_pipeline=event_pipeline,
         )
+        iterator = iterator()
         return _wrap_passthrough_watermark_responses_stream_buffer_response(
             iterator,
             config=loaded,
