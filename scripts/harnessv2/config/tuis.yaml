@@ -83,8 +83,10 @@ tuis:
       reuse_operator_session: false
       tools_for_model: false
       tools_for_orchestration: true
+      # Composer prompt, not the selected footer glyph "π ·".
       ready_needles:
-        - "π"
+        - "π >"
+        - "π  >"
       mcp_ready_needles:
         - "Connected to MCP"
         - "No MCP"
@@ -118,6 +120,8 @@ tuis:
         # alias is prefixed with AAWM alias, not a raw model id.
         - "╭── π > ◕ AAWM alias {model} >"
         # OhMyPi 18.8.6 footer: "π ·" plus "AAWM alias {model}".
+        # Selected footer chrome is not MCP readiness and is not launch
+        # success. mcp_ready_needles stay required when configured.
         - "π ·"
       # Recap is wait-only. Exact PONG is NOT a substring wait needle:
       # recent-session titles can contain the word PONG. Live PONG is a
@@ -327,10 +331,10 @@ tuis:
     cwd: /tmp/hv2-grok-workspace
     session_dir: /tmp/hv2-grok-sessions
     default_models:
-      - grok-4.7
-    default_orchestration_parent: grok-4.7
+      - latest_grok
+    default_orchestration_parent: latest_grok
     default_orchestration_children:
-      - grok-4.7
+      - latest_grok
     model_prompt: grok_model
     orchestration_prompt: grok_orchestration
     tmux:

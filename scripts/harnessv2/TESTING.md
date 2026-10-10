@@ -221,7 +221,7 @@ skip the logging gate. Independent `--test model` stays available
 |---|---|---|
 | `platform` | forbidden | Health, custom HTTP, error JSONL, Redis prefix SCAN, docker logs |
 | `catalog` | optional | CFG-023/024 HTTP catalog; Ohmypi picker if `--tui ohmypi`; Codex skips live picker |
-| `model` | required | Independent per-alias TUI turn (not baseline). Ohmypi: idle exact PONG or provider 404. Codex: tool-bearing child command on `basic` |
+| `model` | required | Independent per-alias TUI turn (not baseline). Ohmypi: idle exact PONG or provider 404. Codex: tool-bearing child command on `basic`; the prompt requires a serialized exact-three-key `spawn_agent` message string |
 | `orchestration` | required | Ohmypi parent spawns the selected children group (default thirteen mixed aliases, or `provider_coverage`); Codex defaults to parent `basic` and requires explicit children |
 
 `--dry-run` prints the resolved plan and exits 0. No TUI, no HTTP, no
@@ -424,7 +424,7 @@ From `config/tuis.yaml`:
 | Item | Value |
 |---|---|
 | Binary | `omp` (wrapper `ompla`) |
-| Min version | 17.3.8 (live 18.2.4 may omit MCP chrome; selected idle composer still ready) |
+| Min version | 17.3.8 |
 | Overlay | Identity first, then operator: `PI_CONFIG_FILES=<session_dir>/hv2-ohmypi-identity.yml:$HOME/.omp/agent/litellm-alpha.yml`. Ohmypi `task` children inherit tmux env, not parent `--config`. Identity first so those children inherit `x-aawm-client*` headers; parent still gets `--config`. Do not revert this to operator-only `PI_CONFIG_FILES`. That overlay is what stamps rollup as `litellm#Ohmypi[<version>]@<host>`. |
 | CWD | `/tmp/omp-alpha-workspace` |
 | Session dir | `/tmp/omp-alpha-sessions/hv2-<alias>` (identity overlay stays in `/tmp/omp-alpha-sessions`) |
@@ -462,6 +462,17 @@ evidence. `ensure_session` waits for selected needles again after MCP
 because Ohmypi can paint the alias chrome after connect. Do not invent
 live greens from truncated chrome alone.
 
+Ohmypi launch success requires `ready`, `selected`, and `mcp_ready`
+separately. `ok` / `launch_ok` is true only when all three are true and
+`rejected` is empty. A selected alias footer (`π · host · AAWM alias
+<selected>`, or the same chrome while idle) is not acceptance and is
+not MCP readiness. When MCP needles are configured, `mcp_ready` stays
+false until one of those needles is present. A genuine init, selection,
+or MCP miss stays a distinct launch failure: `session_identity.startup`
+is `ready`, `selected_only`, `mcp_waiting`, or `rejected`. Selected-only
+is not `launch_ok`. Do not drop model selection, MCP-required scenarios,
+or rejection checks to force a launch.
+
 Unclassified alias-loop provider errors (OpenRouter 422, missing Z.AI
 Coding Plan key) must become `ProxyException` / classified cooldown —
 not uvicorn `Exception in ASGI application` plus a full traceback. Do
@@ -489,9 +500,12 @@ From `config/tuis.yaml`:
 | Forbid | `-p`, `--print`, `--profile`, `exec` |
 | Model tools | on (not `--no-tools` PONG) |
 | Orchestration tools | on |
-| Model pass | standalone `hv2-codex-child` **and** a current-turn child spawn plus `Ran date` / `Ran pwd` context with compatible stdout after `spawn_agent` with `model=basic` and a non-empty message (Codex may prefix the token with `• `). Local `/root/hv2_child_*` or `/root/hv2_codex_child*` chrome, a workspace path alone, or a token with no stdout, is not a pass. Provider 404 needles do not pass Codex `tool_command`. Do not spawn ChatGPT-unsupported child models (`qwen`/`kimi`/`deepseek`/`grok`/`moonshot`). Leftover trust-nux `Working with untrusted contents` is not a busy needle; in-flight work is `Working (`. `sota-zai` and `provider-zai` override this walk: exact `PONG`, tools off. A `basic` child in that Z.AI session is a session-owner 409, not Z.AI acceptance. |
+| Model pass | standalone `hv2-codex-child` **and** a current-turn child spawn plus `Ran date` / `Ran pwd` context with compatible stdout after `spawn_agent` with `agent_type=basic` (Codex may prefix the token with `• `). The model prompt requires the native `message` argument to be a STRING of serialized exact-three-key JSON (`cfg047`, `encoding`, `text`), not a JSON object and not bare prose. The harness does not decrypt or normalize that assignment. Local `/root/hv2_child_*` or `/root/hv2_codex_child*` chrome, a workspace path alone, a spawn acknowledgement, or a token with no stdout, is not a pass. Provider 404 needles do not pass Codex `tool_command`. Do not spawn ChatGPT-unsupported child models (`qwen`/`kimi`/`deepseek`/`grok`/`moonshot`). Leftover trust-nux `Working with untrusted contents` is not a busy needle; in-flight work is `Working (`. `sota-zai` and `provider-zai` override this walk: exact `PONG`, tools off. A `basic` child in that Z.AI session is a session-owner 409, not Z.AI acceptance. |
 
-`--tui grok` and `--tui muse` are implemented. `--tui opencode` remains
+`--tui grok` and `--tui muse` are implemented. Grok model and
+orchestration defaults use the `latest_grok` sentinel, which resolves
+the greatest integer `grok-4.<N>` from `xai/grok-4.*` keys in the
+model cost map rather than a hardcoded Grok minor. `--tui opencode` remains
 the only stub. `--tui claude` stays out of scope and is excluded from
 current closeout (do not select or run; historical mentions are
 legacy/non-goal). `--test platform --tui codex`
@@ -520,6 +534,35 @@ chord into leftover operator panes.
 Codex `--model all` still expands compiled aliases if the operator asks, but
 the Codex default path (`--model` omitted) is `basic`, not the Ohmypi
 27-alias catalog.
+
+---
+
+## 6.2 Muse driver contract
+
+From `config/tuis.yaml`. Dedicated `hv2-muse-*` sessions only; never
+send-keys into leftover operator `muse` / `musela` / `muselt` / `musel`
+panes.
+
+| Item | Value |
+|---|---|
+| Binary | `muse` with inspect-derived `--base-url` (never exec `musela` / `muselt` / `musel`) |
+| CWD | `/tmp/hv2-muse-workspace` |
+| Session dir | `/tmp/hv2-muse-sessions/hv2-<model>` (`XDG_DATA_HOME`) |
+| tmux socket | `tmux37` |
+| Submit | YAML `submit_keys` (default `C-m`) after YAML `submit_delay_seconds` (default `1.0`) for single-line and multiline |
+
+Delivery is not native acceptance. Single-line and multiline prompts
+both `load-buffer`, `paste-buffer`, sleep `submit_delay_seconds`, then
+send `submit_keys`. Before a prompt counts as started, the dedicated
+session directory's `*.jsonl` must contain
+`runtime.user_intent.accepted` bound to that session
+(`payload.source_session_id` equals the `hv2-<model>` directory name
+when present) and the exact stripped prompt text in
+`payload.model_messages[].content[].text`. A pane echo and a tmux
+return code of 0 are not acceptance. If that acknowledgement is missing
+after `wait_ready_seconds` (default 25), `send_keys` /
+`send_prompt_and_wait` return a submission failure and do not fall
+through into `wait_reply_seconds`. The driver does not auto-resubmit.
 
 ---
 
@@ -680,7 +723,8 @@ leftover-uvicorn invert, Ohmypi forbid `-p`, Ohmypi rollup identity
 `aawm-infrastructure@thoth` and concurrent Codex-client
 `litellm@thoth` + `codex-auto-review`), Codex interactive TUI plans
 (`basic`, identity overlay, dedicated tmux, no print/exec),
-Codex rollup identity (`tui=codex`), Grok and Muse interactive plans,
+Codex rollup identity (`tui=codex`), Grok and Muse interactive plans
+(Muse paste delay plus `runtime.user_intent.accepted`),
 the OpenCode stub, Claude out of scope and excluded from current
 closeout (historical mentions legacy/non-goal), dry-run plans, H-6
 prompt substring needles.
@@ -798,10 +842,13 @@ without green post-TUI `docker_logs` is not a full orch pass.
 
 For Codex orchestration, `codex_parallel_child_tools` requires every selected
 child to be tied to a current-turn `spawn_agent` record and a started
-`SubAgentActivity`. Each child transcript must contain exactly adjacent
-`exec_command` calls for `pwd` and `uname -s`, matching successful
-`CommandExecution` and `function_call_output` records, followed by both
-`final_answer` and `task_complete`.
+`SubAgentActivity`. The orchestration prompt requires the native `message`
+argument to be a STRING of serialized exact-three-key JSON (`cfg047`,
+`encoding`, `text`), not a JSON object and not bare prose. The harness does
+not decrypt or normalize that assignment. Each child transcript must contain
+exactly adjacent `exec_command` calls for `pwd` and `uname -s`, matching
+successful `CommandExecution` and `function_call_output` records, followed by
+both `final_answer` and `task_complete`.
 
 ```text
 python scripts/harnessv2/run.py \

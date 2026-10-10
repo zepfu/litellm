@@ -29,6 +29,12 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_apply impo
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.interfaces import (
     CooldownPublicationPlan,
 )
+from litellm.llms.alibaba_token_plan.chat.transformation import (
+    alibaba_token_plan_account_quota_cooldown_key,
+)
+from litellm.secret_managers.alibaba_token_plan_subscription import (
+    alibaba_token_plan_subscription_identity,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES,
@@ -557,35 +563,91 @@ class TestResolvePublicationPlan:
         "error_class",
         sorted(CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES),
     )
-    def test_alibaba_exhaustion_uses_canonical_account_key_only(
+    def test_alibaba_exhaustion_publishes_bound_subscription_key_only(
         self,
         configured_runtime: dict,
         error_class: str,
     ) -> None:
         configured_runtime["scope_fn"].return_value = "candidate"
+        identity = "ab" * 32
+        other_identity = "cd" * 32
+        expected_key = alibaba_token_plan_account_quota_cooldown_key(identity)
+        other_key = alibaba_token_plan_account_quota_cooldown_key(other_identity)
+        assert expected_key is not None
+        assert other_key is not None
+        assert expected_key != other_key
+        assert expected_key.startswith(
+            f"{CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY}:"
+        )
 
         plan = _resolve_auto_agent_cooldown_publication_plan(
             request=None,
             candidate={
                 "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
                 "model": "alibaba_token_plan/qwen3.8-max",
+                "subscription_identity": identity,
                 "last_resort": True,
             },
             lane_key="alibaba_token_plan",
             selected_cooldown_key="selected-candidate-key",
-            cooldown_seconds=8434.5,
+            cooldown_seconds=120.0,
             error_class=error_class,
         )
 
-        expected_key = (
-            CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
-        )
-        assert plan.memory_keys == expected_key
-        assert plan.durable_keys == expected_key
+        assert plan.memory_keys == (expected_key,)
+        assert plan.durable_keys == (expected_key,)
+        assert other_key not in plan.memory_keys
+        assert other_key not in plan.durable_keys
         assert plan.applied_scope == "candidate"
         assert plan.request_local_action is None
-        assert plan.duration_seconds == 8434.5
+        assert plan.duration_seconds == 120.0
         assert plan.allow_ttl_shrink is False
+
+    @pytest.mark.parametrize(
+        "candidate_identity",
+        [
+            {},
+            {"subscription_identity": "not-a-sha256"},
+            {
+                "subscription_identity": "ab" * 32,
+                "instance_code": "instance-that-hashes-elsewhere",
+            },
+        ],
+    )
+    def test_alibaba_exhaustion_without_bound_identity_stays_request_local(
+        self,
+        configured_runtime: dict,
+        candidate_identity: dict,
+    ) -> None:
+        configured_runtime["scope_fn"].return_value = "candidate"
+        other_key = alibaba_token_plan_account_quota_cooldown_key("cd" * 32)
+        supplied_identity = candidate_identity.get("subscription_identity")
+        supplied_instance = candidate_identity.get("instance_code")
+        if isinstance(supplied_identity, str) and isinstance(supplied_instance, str):
+            assert (
+                alibaba_token_plan_subscription_identity(supplied_instance)
+                != supplied_identity.lower()
+            )
+        assert other_key is not None
+
+        plan = _resolve_auto_agent_cooldown_publication_plan(
+            request=None,
+            candidate={
+                "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+                "model": "alibaba_token_plan/qwen3.8-max",
+                **candidate_identity,
+            },
+            lane_key="alibaba_token_plan",
+            selected_cooldown_key="selected-candidate-key",
+            cooldown_seconds=7200.0,
+            error_class=CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_WEEKLY_EXHAUSTED_ERROR_CLASS,
+        )
+
+        assert plan.applied_scope == "request_local"
+        assert plan.memory_keys == ()
+        assert plan.durable_keys == ()
+        assert other_key not in plan.memory_keys
+        assert plan.duration_seconds == 7200.0
 
     def test_alibaba_exhaustion_bypasses_codex_failure_evidence_gate(
         self,
@@ -597,25 +659,26 @@ class TestResolvePublicationPlan:
             duration_seconds=10.0,
             scope="candidate",
         )
+        identity = "ab" * 32
+        expected_key = alibaba_token_plan_account_quota_cooldown_key(identity)
 
         plan = _resolve_auto_agent_cooldown_publication_plan(
             request=None,
             candidate={
                 "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
                 "model": "alibaba_token_plan/qwen3.7-max",
+                "subscription_identity": identity,
             },
             lane_key="alibaba_token_plan",
             selected_cooldown_key="selected-candidate-key",
-            cooldown_seconds=8434.5,
+            cooldown_seconds=120.0,
             error_class=CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_WEEKLY_EXHAUSTED_ERROR_CLASS,
             codex_failure_evidence_alias="codex-auto-agent",
         )
 
         assert configured_runtime["gate"].current_calls == []
-        assert plan.memory_keys == (
-            CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
-        )
-        assert plan.duration_seconds == 8434.5
+        assert plan.memory_keys == (expected_key,)
+        assert plan.duration_seconds == 120.0
 
 
 # ---------------------------------------------------------------------------
@@ -1010,6 +1073,9 @@ class TestApplyCodexFailureEvidence:
         configured_runtime["gate"]._decision = _FakeDecision(should_cool=False)
         mgr = configured_runtime["mgr"]
         setter = AsyncMock()
+        identity = "ab" * 32
+        expected_key = alibaba_token_plan_account_quota_cooldown_key(identity)
+        assert expected_key is not None
 
         result = await _apply_codex_failure_evidence_cooldown(
             canonical_alias="codex-auto-agent",
@@ -1017,19 +1083,19 @@ class TestApplyCodexFailureEvidence:
             candidate={
                 "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
                 "model": "alibaba_token_plan/qwen3.8-max",
+                "subscription_identity": identity,
                 "last_resort": True,
             },
             lane_key="alibaba_token_plan",
             selected_cooldown_key="selected-candidate-key",
-            cooldown_seconds=8434.5,
+            cooldown_seconds=120.0,
             error_class=error_class,
             set_candidate_cooldown=setter,
         )
 
-        expected_key = CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
         assert result == "candidate"
-        assert mgr.codex.get_memory_cooldown_remaining(expected_key) > 8434.0
-        setter.assert_awaited_once_with(expected_key, 8434.5)
+        assert mgr.codex.get_memory_cooldown_remaining(expected_key) > 119.0
+        setter.assert_awaited_once_with(expected_key, 120.0)
 
 
 # ---------------------------------------------------------------------------
