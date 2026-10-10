@@ -13,6 +13,7 @@ readonly TAILNET_SOURCE_CIDR="100.64.0.0/10"
 readonly TAILNET_MARK="0x00040000"
 readonly TAILNET_MARK_CLEAR_MASK="0xfffbffff"
 readonly NMSLOT_CONN_NAME="litellm-dev-vip"
+readonly NMSLOT_CONN_UUID="5027c35f-f0d6-4111-96fa-2e72885bfb26"
 readonly NMSLOT_IFACE="litellm-dev-vip"
 readonly NFT_TABLE="litellm_dev_transport"
 readonly LISTEN_TIMEOUT_SECONDS="30"
@@ -46,17 +47,17 @@ USAGE
 }
 
 nmcli_connection_value() {
-  local profile="$1"
+  local profile_uuid="$1"
   local primary_field="$2"
   local fallback_field="${3:-}"
 
   local value
-  value="$(nmcli -t -g "$primary_field" connection show "$profile" 2>/dev/null || true)"
+  value="$(nmcli -t -g "$primary_field" connection show uuid "$profile_uuid" 2>/dev/null || true)"
   [[ "$value" == "--" ]] && value=""
   [[ -n "$value" ]] && { printf '%s\n' "$value"; return 0; }
 
   if [[ -n "$fallback_field" ]]; then
-    value="$(nmcli -t -g "$fallback_field" connection show "$profile" 2>/dev/null || true)"
+    value="$(nmcli -t -g "$fallback_field" connection show uuid "$profile_uuid" 2>/dev/null || true)"
     [[ "$value" == "--" ]] && value=""
     [[ -n "$value" ]] && { printf '%s\n' "$value"; return 0; }
   fi
@@ -65,15 +66,15 @@ nmcli_connection_value() {
 }
 
 nmcli_connection_exists() {
-  local profile="$1"
-  [[ -n "$(nmcli_connection_value "$profile" connection.id)" ]]
+  local profile_uuid="$1"
+  [[ -n "$(nmcli_connection_value "$profile_uuid" connection.id)" ]]
 }
 
 find_other_vip_owner() {
   local conn_id
   local conn_uuid
   local conn_addrs
-  while IFS=':' read -r conn_id conn_uuid; do
+  while IFS=':' read -r conn_uuid conn_id; do
     [[ "$conn_id" == "$NMSLOT_CONN_NAME" ]] && continue
     conn_addrs="$(nmcli_connection_value "$conn_uuid" ipv4.addresses)"
     if [[ -z "$conn_addrs" ]]; then
@@ -83,51 +84,57 @@ find_other_vip_owner() {
       printf '%s\n' "$conn_id"
       return 0
     fi
-  done < <(nmcli -t -f NAME,UUID connection show)
+  done < <(nmcli -t -f UUID,NAME connection show)
   return 1
 }
 
 validate_nic_ownership() {
-  local owner
-  owner="$(nmcli -g GENERAL.CONNECTION device show "$NMSLOT_IFACE" 2>/dev/null || true)"
-  if [[ -n "$owner" && "$owner" != "$NMSLOT_CONN_NAME" ]]; then
-    die "unexpected ${NMSLOT_IFACE} owner: ${owner}"
+  local owner_uuid
+  owner_uuid="$(nmcli -g GENERAL.CON-UUID device show "$NMSLOT_IFACE" 2>/dev/null || true)"
+  [[ "$owner_uuid" == "--" ]] && owner_uuid=""
+  if [[ -n "$owner_uuid" && "$owner_uuid" != "$NMSLOT_CONN_UUID" ]]; then
+    die "unexpected ${NMSLOT_IFACE} owner UUID: ${owner_uuid}"
   fi
 }
 
 require_nmt_connection() {
   local existing
-  existing="$(nmcli_connection_value "$NMSLOT_CONN_NAME" connection.id || true)"
+  existing="$(nmcli_connection_value "$NMSLOT_CONN_UUID" connection.id || true)"
   if [[ -n "$existing" ]]; then
+    [[ "$existing" == "$NMSLOT_CONN_NAME" ]] \
+      || die "canonical UUID ${NMSLOT_CONN_UUID} belongs to unexpected connection ${existing}"
+
     local conn_type
-    conn_type="$(nmcli_connection_value "$NMSLOT_CONN_NAME" connection.type || true)"
-    [[ -n "$conn_type" ]] || die "cannot resolve type for connection ${NMSLOT_CONN_NAME}"
-    [[ "$conn_type" == "dummy" ]] || die "connection ${NMSLOT_CONN_NAME} is not dummy"
+    conn_type="$(nmcli_connection_value "$NMSLOT_CONN_UUID" connection.type || true)"
+    [[ -n "$conn_type" ]] || die "cannot resolve type for connection UUID ${NMSLOT_CONN_UUID}"
+    [[ "$conn_type" == "dummy" ]] || die "connection UUID ${NMSLOT_CONN_UUID} is not dummy"
 
     local conn_iface
-    conn_iface="$(nmcli_connection_value "$NMSLOT_CONN_NAME" connection.interface-name || true)"
+    conn_iface="$(nmcli_connection_value "$NMSLOT_CONN_UUID" connection.interface-name || true)"
     if [[ -n "$conn_iface" && "$conn_iface" != "$NMSLOT_IFACE" ]]; then
-      die "connection ${NMSLOT_CONN_NAME} bound to ${conn_iface}, expected ${NMSLOT_IFACE}"
+      die "connection UUID ${NMSLOT_CONN_UUID} bound to ${conn_iface}, expected ${NMSLOT_IFACE}"
     fi
   fi
 }
 
 apply_nic_config() {
   local existing_addr
-  existing_addr="$(nmcli_connection_value "$NMSLOT_CONN_NAME" ipv4.addresses || true)"
+  existing_addr="$(nmcli_connection_value "$NMSLOT_CONN_UUID" ipv4.addresses || true)"
   existing_addr="$(printf '%s\n' "$existing_addr" | tr ',' '\n' | sed '/^$/d')"
 
   nmcli connection add \
     type dummy \
     ifname "$NMSLOT_IFACE" \
     con-name "$NMSLOT_CONN_NAME" \
+    -- \
+    connection.uuid "$NMSLOT_CONN_UUID" \
+    connection.autoconnect yes \
     ipv4.addresses "$SERVICE_CIDR" \
     ipv4.method manual \
     ipv4.never-default yes \
-    ipv6.method ignore \
-    autoconnect yes >/dev/null 2>&1 || true
+    ipv6.method ignore >/dev/null 2>&1 || true
 
-  nmcli connection modify "$NMSLOT_CONN_NAME" \
+  nmcli connection modify uuid "$NMSLOT_CONN_UUID" \
     connection.interface-name "$NMSLOT_IFACE" \
     ipv4.addresses "$SERVICE_CIDR" \
     ipv4.method manual \
@@ -136,10 +143,11 @@ apply_nic_config() {
     autoconnect yes >/dev/null
 
   if ! grep -Fxq "$SERVICE_CIDR" <<<"$existing_addr"; then
-    printf 'prepared connection %s with service VIP %s\n' "$NMSLOT_CONN_NAME" "$SERVICE_CIDR"
+    printf 'prepared connection %s (%s) with service VIP %s\n' \
+      "$NMSLOT_CONN_NAME" "$NMSLOT_CONN_UUID" "$SERVICE_CIDR"
   fi
 
-  nmcli connection up "$NMSLOT_CONN_NAME" >/dev/null
+  nmcli connection up uuid "$NMSLOT_CONN_UUID" >/dev/null
 }
 
 assert_vip_present() {
@@ -248,23 +256,24 @@ PY
 }
 
 status_nic() {
-  local owner
-  owner="$(nmcli -g GENERAL.CONNECTION device show "$NMSLOT_IFACE" 2>/dev/null || true)"
+  local owner_uuid
+  owner_uuid="$(nmcli -g GENERAL.CON-UUID device show "$NMSLOT_IFACE" 2>/dev/null || true)"
+  [[ "$owner_uuid" == "--" ]] && owner_uuid=""
 
   local conn_id conn_uuid conn_type conn_iface conn_addrs
-  conn_id="$(nmcli_connection_value "$NMSLOT_CONN_NAME" connection.id || true)"
-  conn_uuid="$(nmcli_connection_value "$NMSLOT_CONN_NAME" connection.uuid || true)"
-  conn_type="$(nmcli_connection_value "$NMSLOT_CONN_NAME" connection.type || true)"
-  conn_iface="$(nmcli_connection_value "$NMSLOT_CONN_NAME" connection.interface-name || true)"
-  conn_addrs="$(nmcli_connection_value "$NMSLOT_CONN_NAME" ipv4.addresses || true)"
+  conn_id="$(nmcli_connection_value "$NMSLOT_CONN_UUID" connection.id || true)"
+  conn_uuid="$(nmcli_connection_value "$NMSLOT_CONN_UUID" connection.uuid || true)"
+  conn_type="$(nmcli_connection_value "$NMSLOT_CONN_UUID" connection.type || true)"
+  conn_iface="$(nmcli_connection_value "$NMSLOT_CONN_UUID" connection.interface-name || true)"
+  conn_addrs="$(nmcli_connection_value "$NMSLOT_CONN_UUID" ipv4.addresses || true)"
 
   if [[ -n "$conn_id" ]]; then
     printf 'nm-connection: name=%s uuid=%s type=%s iface=%s addresses=%s\n' \
       "$conn_id" "${conn_uuid:-<none>}" "${conn_type:-<none>}" "${conn_iface:-<none>}" "${conn_addrs:-<none>}"
-    printf 'nm-device %s -> %s\n' "$NMSLOT_IFACE" "${owner:-<none>}"
+    printf 'nm-device %s -> %s\n' "$NMSLOT_IFACE" "${owner_uuid:-<none>}"
   else
     printf 'nm-connection: missing\n'
-    printf 'nm-device %s -> %s\n' "$NMSLOT_IFACE" "${owner:-<none>}"
+    printf 'nm-device %s -> %s\n' "$NMSLOT_IFACE" "${owner_uuid:-<none>}"
   fi
 }
 
