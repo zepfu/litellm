@@ -1477,7 +1477,11 @@ def _codex_oauth_account_exhaustion_is_confirmed(
     provider_status_code: Optional[int],
 ) -> bool:
     """Authorize rotation only for exhaustion attributed to this account."""
-    if error_class not in {"usage_limit_reached", "candidate_unavailable"}:
+    if error_class not in {
+        "usage_limit_reached",
+        "candidate_unavailable",
+        "capacity_exhausted",
+    }:
         return False
     account_hash = str(candidate.get("codex_oauth_account_hash") or "").strip()
     if not account_hash:
@@ -1523,8 +1527,17 @@ def _codex_oauth_account_exhaustion_is_confirmed(
         ):
             return True
     elif attempted_provider_call or provider_returned:
-        # A provider-returned candidate-unavailable response is not quota
-        # evidence; model capacity and generic throttling stay non-portable.
+        # Provider-returned candidate_unavailable may admit a portable replay
+        # only when admission explicitly classified this account as exhausted.
+        # Generic throttle evidence remains a generic lane, not quota proof.
+        if (
+            error_class == "candidate_unavailable"
+            and admission_decision == "confirmed_exhausted"
+            and str(attempt_record.get("admission_account_hash") or "").strip()
+            == account_hash
+        ):
+            return True
+        # Model capacity and generic throttling stay non-portable.
         return False
 
     def _iter_observations(value: Any) -> Sequence[Mapping[str, Any]]:
