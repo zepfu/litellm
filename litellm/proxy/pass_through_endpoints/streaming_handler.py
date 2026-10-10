@@ -255,6 +255,7 @@ class _PrefixedHttpxByteStream:
         self._prefix = prefix
         self._remainder = remainder
         self._aawm_responses_event_pipeline = event_pipeline
+        self._last_prefix_chunk: Any = None
         if event_pipeline is not None:
             prepare_replay = getattr(event_pipeline, "prepare_replay", None)
             prefix_bytes = getattr(prefix, "byte_count", 0)
@@ -284,12 +285,17 @@ class _PrefixedHttpxByteStream:
                 prefix_chunks = iter(self._prefix)
             for chunk in prefix_chunks:
                 if chunk:
-                    events = (
-                        self._aawm_responses_event_pipeline.feed_replayed(chunk)
-                        if self._aawm_responses_event_pipeline is not None
-                        else []
-                    )
+                    if self._aawm_responses_event_pipeline is None:
+                        events = []
+                    else:
+                        events = self._aawm_responses_event_pipeline.feed_replayed(chunk)
+                        self._last_prefix_chunk = getattr(
+                            self._aawm_responses_event_pipeline,
+                            "_replay_prefix_association",
+                            None,
+                        ) or chunk
                     yield attach_responses_events(chunk, events)
+                    self._last_prefix_chunk = None
             if self._remainder is None:
                 return
             if self._aawm_responses_event_pipeline is not None:
@@ -308,11 +314,19 @@ class _PrefixedHttpxByteStream:
                     ResponsesStreamTooLarge,
                 ) as exc:
                     bound_failure = ResponsesBoundFailure.from_exception(exc)
+                    if self._last_prefix_chunk is not None:
+                        bound_failure.accepted_events = []
+                        bound_failure.accepted_bytes = max(
+                            0,
+                            int(getattr(self._aawm_responses_event_pipeline, "last_feed_admitted_bytes", 0)),
+                        )
                     accepted_frames = [
                         event.forward_event or event.raw_event or b""
                         for event in bound_failure.accepted_events
                         if (event.forward_event or event.raw_event)
                     ]
+                    if not accepted_frames and self._last_prefix_chunk is not None:
+                        accepted_frames = [self._last_prefix_chunk]
                     if accepted_frames:
                         yield attach_responses_events(
                             b"".join(accepted_frames),
@@ -1404,16 +1418,16 @@ class PassThroughStreamingHandler:
                     ResponsesEventTooLarge,
                     ResponsesStreamTooLarge,
                 ) as exc:
+                    admitted_bytes = max(
+                        0,
+                        int(getattr(pipeline, "last_feed_admitted_bytes", 0)),
+                    )
                     # A decisive event earlier in this stored read is already
                     # accepted and observed. Save only the parser-admitted
                     # prefix so replay can forward it; never reconstruct the
                     # rejected suffix or turn every fatal rejection into
                     # recoverable output.
-                    if parser._first_terminal_decision == "substantive":
-                        admitted_bytes = max(
-                            0,
-                            int(getattr(pipeline, "last_feed_admitted_bytes", 0)),
-                        )
+                    if parser._first_terminal_decision == "substantive" and admitted_bytes:
                         try:
                             prefix.append(chunk[:admitted_bytes])
                         except (

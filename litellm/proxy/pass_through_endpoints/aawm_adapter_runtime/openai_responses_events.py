@@ -1169,6 +1169,7 @@ class ResponsesEventPipeline:
         self._replay_consumed_bytes = 0
         self._replay_consumed_event_bytes = 0
         self._replay_buffer = bytes(self._buffer)
+        self._replay_prefix_association: Optional[bytes] = None
         # Already-held events are the precommit prefix. Live remainder is
         # bounded by max_stream_events, not the hold budget.
         self.retain_events = False
@@ -1198,6 +1199,28 @@ class ResponsesEventPipeline:
         self._replay_remaining_bytes -= prefix_length
         self._replay_consumed_bytes += prefix_length
         events = self._drain_replayed_events()
+        if events:
+            accepted_wire = b"".join(
+                event.forward_event or event.raw_event or b""
+                for event in events
+            )
+            if accepted_wire:
+                accepted_event = ParsedResponsesEvent(
+                    sequence_number=self._next_sequence_number,
+                    event_type="openai_responses_accepted_prefix",
+                    payload=None,
+                    is_done_marker=False,
+                    is_malformed=False,
+                    byte_count=len(accepted_wire),
+                    observed_at=datetime.now(),
+                    forward_event=accepted_wire,
+                    raw_event=None,
+                    separator=b"",
+                )
+                self._replay_prefix_association = attach_responses_events(
+                    accepted_wire,
+                    [accepted_event],
+                )
         if self._replay_remaining_bytes == 0 and self._replay_buffer is not None:
             self._buffer = bytearray(self._replay_buffer)
             self._pending_cr = self._buffer.endswith(b"\r") and not self._buffer.endswith(b"\r\n")
@@ -1370,6 +1393,10 @@ class ResponsesEventSummaryReducer:
         self._delta_keys_seen.add(key)
         self._delta_key_order.append(key)
 
+    @property
+    def _retained_delta_key_count(self) -> int:
+        return len(self._output_items) + len(self._delta_key_payloads)
+
     def _delta_key_slots(
         self,
         key: str,
@@ -1379,7 +1406,7 @@ class ResponsesEventSummaryReducer:
         if (
             key not in self._delta_key_payloads
             and key not in self._output_items
-            and len(self._output_items) >= self.max_output_items
+            and self._retained_delta_key_count >= self.max_output_items
         ):
             self._overflow = True
             self._omitted_items += 1
@@ -1477,6 +1504,8 @@ class ResponsesEventSummaryReducer:
         candidate_size = candidate_size or 0
         self._delta_key_base_sizes[key] = candidate_size
         self._delta_key_payload_sizes[key] = candidate_size
+        if key not in self._ordered_keys:
+            self._ordered_keys.append(key)
         for field, state in self._delta_key_fields.get(key, {}).items():
             if field == "text":
                 target = self._output_text_target(candidate)
@@ -1554,7 +1583,7 @@ class ResponsesEventSummaryReducer:
         existing = self._output_items.get(key)
         if existing is not None:
             return existing, False
-        if len(self._output_items) >= self.max_output_items:
+        if self._retained_delta_key_count >= self.max_output_items:
             self._overflow = True
             self._omitted_items += 1
             return None
@@ -1584,14 +1613,14 @@ class ResponsesEventSummaryReducer:
         return True
 
     def _charge_new_output_item(self, candidate: dict[str, Any]) -> bool:
-        if len(self._output_items) >= self.max_output_items:
+        if self._retained_delta_key_count >= self.max_output_items:
             self._overflow = True
             self._omitted_items += 1
             return False
         return self._charge_delta(0, _json_size(candidate))
 
     def _charge_new_output_item_size(self, new_size: Optional[int]) -> bool:
-        if len(self._output_items) >= self.max_output_items:
+        if self._retained_delta_key_count >= self.max_output_items:
             self._overflow = True
             self._omitted_items += 1
             return False
