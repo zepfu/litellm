@@ -1515,8 +1515,6 @@ class ResponsesEventSummaryReducer:
             if current:
                 state.parts.append(current)
             state.byte_count = len(current.encode("utf-8"))
-        if key not in self._ordered_keys:
-            self._ordered_keys.append(key)
         return True
 
     def _record_event_type(self, event_type: Optional[str]) -> None:
