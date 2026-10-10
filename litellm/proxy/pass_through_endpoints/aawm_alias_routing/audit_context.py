@@ -247,6 +247,7 @@ def _extract_auto_agent_alias_agent_dispatch_fields(
         "aawm_agent_name",
         "aawm_claude_agent_name",
         "codex_agent_name",
+        "x-aawm-agent-name",
     )
     agent_role = _first_from_sources(
         "agent_role",
@@ -637,11 +638,12 @@ def _get_auto_agent_alias_request_context(
             request,
             request_body,
         )
+        agent_dispatch = _extract_auto_agent_alias_agent_dispatch_fields(
+            request,
+            request_body,
+        )
         cached = {
-            "agent_dispatch": _extract_auto_agent_alias_agent_dispatch_fields(
-                request,
-                request_body,
-            ),
+            "agent_dispatch": agent_dispatch,
             "session_id": (
                 canonical_thread_id or legacy_session_id or parent_thread_id
             ),
@@ -665,6 +667,7 @@ def _get_auto_agent_alias_request_context(
                     repository=repository,
                     client_product_label=client_product_label,
                     host_name=host_attribution.get("host_name"),
+                    agent_name=agent_dispatch.get("agent_name"),
                 )
             ),
         }
