@@ -222,6 +222,23 @@ def _iter_auto_agent_alias_metadata_dicts(
     return sources
 
 
+def _extract_auto_agent_alias_explicit_agent_name(
+    sources: list[dict[str, Any]],
+) -> Optional[str]:
+    for source in sources:
+        for key in (
+            "agent_name",
+            "aawm_agent_name",
+            "aawm_claude_agent_name",
+            "codex_agent_name",
+            "x-aawm-agent-name",
+        ):
+            value = _clean_codex_auth_value(source.get(key))
+            if value is not None:
+                return value
+    return None
+
+
 def _extract_auto_agent_alias_agent_dispatch_fields(
     request: Request,
     request_body: dict[str, Any],
@@ -242,13 +259,7 @@ def _extract_auto_agent_alias_agent_dispatch_fields(
                     return value
         return None
 
-    agent_name = _first_from_sources(
-        "agent_name",
-        "aawm_agent_name",
-        "aawm_claude_agent_name",
-        "codex_agent_name",
-        "x-aawm-agent-name",
-    )
+    agent_name = _extract_auto_agent_alias_explicit_agent_name(sources)
     agent_role = _first_from_sources(
         "agent_role",
         "aawm_agent_role",
@@ -642,6 +653,9 @@ def _get_auto_agent_alias_request_context(
             request,
             request_body,
         )
+        explicit_agent_name = _extract_auto_agent_alias_explicit_agent_name(
+            _iter_auto_agent_alias_metadata_dicts(request, request_body)
+        )
         cached = {
             "agent_dispatch": agent_dispatch,
             "session_id": (
@@ -667,7 +681,7 @@ def _get_auto_agent_alias_request_context(
                     repository=repository,
                     client_product_label=client_product_label,
                     host_name=host_attribution.get("host_name"),
-                    agent_name=agent_dispatch.get("agent_name"),
+                    agent_name=explicit_agent_name,
                 )
             ),
         }
@@ -772,6 +786,7 @@ _HOST_FUNCTION_NAMES = (
     "_extract_auto_agent_alias_role_from_text",
     "_infer_auto_agent_alias_role_from_request_body",
     "_iter_auto_agent_alias_metadata_dicts",
+    "_extract_auto_agent_alias_explicit_agent_name",
     "_extract_auto_agent_alias_agent_dispatch_fields",
     "_walk_auto_agent_alias_prior_tool_activity",
     "_summarize_auto_agent_alias_actual_prior_tool_activity",
