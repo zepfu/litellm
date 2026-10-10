@@ -70,7 +70,7 @@ a baseline full-suite step.
 |---|---|---|
 | `platform` | forbidden | Health, custom endpoints, error JSONL, Redis prefix SCAN, docker logs |
 | `catalog` | optional | CFG-023/024 HTTP catalog; Ohmypi picker if `--tui ohmypi`; Codex skips live picker |
-| `model` | required | Independent per-alias TUI turn (not baseline). Ohmypi: idle exact PONG or provider 404. Codex: tool-bearing child `date`/`pwd` stdout plus `hv2-codex-child` on `basic`; local `/root/hv2_child_*` or `/root/hv2_codex_child*` chrome is not a pass |
+| `model` | required | Independent per-alias TUI turn (not baseline). Ohmypi: idle exact PONG or provider 404. Codex: tool-bearing child `date`/`pwd` stdout plus `hv2-codex-child` on `basic`; the prompt requires a native `spawn_agent` `message` STRING of serialized exact-three-key JSON (`cfg047`, `encoding`, `text`); local `/root/hv2_child_*` or `/root/hv2_codex_child*` chrome is not a pass |
 | `orchestration` | required | Parent alias spawns children. Ohmypi default is the thirteen mixed aliases; `--orchestration-children provider_coverage` spawns the provider-pinned aliases. Codex defaults to parent `basic` and requires explicit children |
 
 `--test model` and `--test orchestration` launch a dedicated interactive
@@ -110,7 +110,24 @@ defaults to `basic` only.
 Do not treat Ohmypi
 `--model all` as the Codex OC-003 surface. Codex model/orchestration is
 tool-bearing (child `date`/`pwd`); it is not Ohmypi `--no-tools` PONG.
+The Codex model and orchestration prompts require the native outer
+`spawn_agent` `message` to be a string of serialized exact-three-key JSON
+(`{"cfg047":1,"encoding":"text","text":"<actual child assignment>"}`).
+The harness does not decrypt or normalize that assignment.
 `--tui grok` and `--tui muse` are implemented interactive clients.
+Grok model and orchestration defaults are the `latest_grok` sentinel.
+That resolves the greatest integer `grok-4.<N>` among `xai/grok-4.*`
+keys in `model_prices_and_context_window.json` and launches
+`--model grok-4.<N>`. It does not pin a Grok minor. Cursor Agent
+`cursor_agent/cursor-grok-4.6-high` stays a separate product route.
+Muse single-line and multiline prompts both paste, wait
+`submit_delay_seconds` (default `1.0`), then send `submit_keys`
+(`C-m`). A prompt counts as started only after the dedicated session
+JSONL records `runtime.user_intent.accepted` for that session and the
+exact submitted text. A pane echo or tmux return code of 0 is not
+acceptance. A missing acknowledgement is a submission failure bounded
+by `wait_ready_seconds` (default 25), not the model reply wait.
+
 `--tui opencode` remains a stub. `--tui claude` stays out of scope and
 is excluded from current closeout (do not select or run; historical
 mentions are legacy/non-goal).
@@ -288,8 +305,8 @@ Client evidence inventory (frozen contracts; OpenCode has none):
 | TUI | Launch | Terminal evidence |
 |---|---|---|
 | Codex | dedicated `hv2-codex-*` tmux, never `codex exec` | `codex_spawn_tool_evidence` or exact `PONG` where the model override says so. A model `tool_command` case passes when the step records command, exit status, and stdout, or when it records a completed `tool_pass`. A missing tool record stays inconclusive. A pane token alone is not a suite pass |
-| Ohmypi | dedicated `hv2-ohmypi-*` tmux, never `-p` | exact `PONG` or an expected provider 404; orchestration uses `child_spawn_evidence` |
-| Grok | dedicated `hv2-grok-*` via `grokla` | `grok_spawn_tool_evidence` |
+| Ohmypi | dedicated `hv2-ohmypi-*` tmux, never `-p`. Launch success requires `ready`, `selected`, and `mcp_ready` separately. A selected alias footer is not acceptance and is not `launch_ok` | exact `PONG` or an expected provider 404; orchestration uses `child_spawn_evidence` |
+| Grok | dedicated `hv2-grok-*` via `grokla`; default model is the latest `grok-4.<N>` from the model cost map | `grok_spawn_tool_evidence` |
 | Muse | dedicated `hv2-muse-*` via `musela` | `muse_spawn_tool_evidence`; a child token alone is not a pass |
 
 Recap, echoed prompts, selector text, idle glyphs, and spawn

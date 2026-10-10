@@ -9,6 +9,11 @@ from typing import Any, Mapping, Sequence
 from hv2.cli import split_csv
 from hv2.docker_guard import assert_container_allowed
 from hv2.errors import PlanError
+from hv2.grok_latest import (
+    cached_latest_grok_model_id,
+    repo_root_for,
+    resolve_served_concrete_ids,
+)
 from hv2.instance import ResolvedInstance, resolve_container_name
 from hv2.load_config import as_str_list, expand_string
 
@@ -78,6 +83,15 @@ def _models_block(config: Mapping[str, Any]) -> dict[str, Any]:
     return models
 
 
+def served_concrete_ids(config: Mapping[str, Any]) -> list[str]:
+    """Served catalog ids with the ``latest_grok`` pair resolved."""
+
+    return resolve_served_concrete_ids(
+        as_str_list(_models_block(config).get("served_concrete_ids")),
+        repo_root_for(config),
+    )
+
+
 def skip_prefixes(config: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(
         prefix
@@ -116,9 +130,16 @@ def expand_group(name: str, config: Mapping[str, Any]) -> list[str]:
     return _expand_group(name, config, skip_prefixes(config))
 
 
+def _resolve_expanded_id(model_id: str, config: Mapping[str, Any]) -> str:
+    if model_id != "latest_grok":
+        return model_id
+    return cached_latest_grok_model_id(repo_root_for(config))
+
+
 def _expand_group(
     name: str, config: Mapping[str, Any], prefixes: Sequence[str]
 ) -> list[str]:
+    name = _resolve_expanded_id(name, config)
     block = _models_block(config)
     compiled = _drop_skipped_ids(_raw_compiled_aliases(config), prefixes)
     if name in compiled:
@@ -133,13 +154,16 @@ def _expand_group(
             if item == "compiled_aliases" or item in groups or item in block:
                 out.extend(_expand_group(item, config, prefixes))
             else:
-                out.append(item)
+                out.append(_resolve_expanded_id(item, config))
         return _unique(_drop_skipped_ids(out, prefixes))
     if name == "compiled_aliases":
         return compiled
     sample = block.get(name)
     if isinstance(sample, list):
-        return _drop_skipped_ids(as_str_list(sample), prefixes)
+        return _drop_skipped_ids(
+            [_resolve_expanded_id(item, config) for item in as_str_list(sample)],
+            prefixes,
+        )
     # Unknown token is treated as a concrete model id (operator overlay).
     return _drop_skipped_ids([name], prefixes)
 
@@ -372,7 +396,7 @@ def build_plan(  # noqa: PLR0915
             child_token = orchestration_children
         elif "default_orchestration_children" in tui_spec:
             child_token = tui_spec.get("default_orchestration_children")
-            if not child_token:
+            if child_token is None:
                 raise PlanError("--orchestration-children is required")
         else:
             child_token = (

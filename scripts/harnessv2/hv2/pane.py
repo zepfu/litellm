@@ -7,7 +7,7 @@ import re
 _EXACT_PONG = "PONG"
 # Codex TUI prefixes assistant lines with a list bullet. Standalone pass
 # tokens such as `hv2-codex-child` still count when the line is `• token`.
-_LEADING_LIST_MARKER = re.compile(r"^(?:[•●▪▸›❯*]|\d+[.)]|-)\s+")
+_LEADING_LIST_MARKER = re.compile(r"^(?:[•●▪▸›❯◆*]|\d+[.)]|-)\s*")
 _TRAILING_BLOCK_CHAR_RE = re.compile(r"[█▌]+$")
 _TREE_PREFIX = re.compile(r"^[└├│]\s*")
 _DATE_STDOUT_LINE = re.compile(

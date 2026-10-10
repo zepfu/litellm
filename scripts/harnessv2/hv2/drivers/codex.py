@@ -423,6 +423,24 @@ class CodexDriver:
             return 1.0
         return delay if delay > 0 else 0.0
 
+    def _wait_for_paste_marker(self, payload: str) -> bool:
+        """True once the composer shows the paste, or immediately for short text.
+
+        The wait is bounded by ``wait_ready_seconds``. A missing marker is
+        a submit failure, not the model reply deadline.
+        """
+
+        # Codex brackets a paste only above its large-paste threshold.
+        # Shorter multiline text is inserted raw and must not wait.
+        if "\n" not in payload.strip() or len(payload) <= 1000:
+            return True
+        # Codex reports its own bracketed length, which is not len(payload).
+        # Any "[Pasted Content N chars]" means the composer has the paste.
+        return self.wait_for_pane(
+            "[Pasted Content ",
+            timeout_seconds=self._tmux_float("wait_ready_seconds", 25),
+        )
+
     def send_keys(self, text: str) -> dict[str, Any]:
         """Submit *text* to the active interactive tmux session. Not codex exec -p.
 
@@ -451,12 +469,29 @@ class CodexDriver:
             }
         session = self._session_name()
         payload = text if text.endswith("\n") else f"{text}\n"
-        loaded = self._run_tmux(["load-buffer", "-"], stdin_text=payload)
-        pasted = self._run_tmux(["paste-buffer", "-d", "-t", session])
+        # The tmux server has one default paste buffer. Parallel Codex
+        # sessions on socket tmux37 would otherwise paste each other's
+        # prompts. Name the buffer for this session.
+        buffer = f"hv2-{session}"
+        loaded = self._run_tmux(
+            ["load-buffer", "-b", buffer, "-"], stdin_text=payload
+        )
+        pasted = self._run_tmux(
+            ["paste-buffer", "-b", buffer, "-d", "-t", session]
+        )
         delay = self._submit_delay_seconds()
         if delay > 0:
             time.sleep(delay)
         submit_keys = self._submit_keys()
+        # Codex 0.162 brackets a paste as "[Pasted Content N chars]" and
+        # ignores C-m until that bracket is visible. A fixed 1s delay
+        # submits before the bracket, so the prompt stays in the composer.
+        marker = self._wait_for_paste_marker(payload)
+        # Codex 0.162 opens a startup warning when -c overrides force
+        # embedded mode ("f2 to view"). Escape dismisses it. C-m while
+        # that overlay is up does not submit the composer.
+        if "f2 to view" in self.capture_pane():
+            self._run_tmux(["send-keys", "-t", session, "Escape"])
         submitted = self._run_tmux(
             ["send-keys", "-t", session, *submit_keys]
         )
@@ -464,6 +499,7 @@ class CodexDriver:
             loaded.returncode == 0
             and pasted.returncode == 0
             and submitted.returncode == 0
+            and marker
         )
         return {
             "ok": ok,

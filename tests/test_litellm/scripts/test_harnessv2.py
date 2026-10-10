@@ -42,6 +42,7 @@ if str(_HV2) not in sys.path:
 def _load() -> Any:
     importlib.invalidate_caches()
     from hv2.cli import build_parser, parse_args, split_csv
+    from hv2.grok_latest import latest_grok_model_id
     from hv2.docker_guard import (
         assert_container_allowed,
         assert_host_port_allowed,
@@ -76,6 +77,7 @@ def _load() -> Any:
         build_plan=build_plan,
         compiled_aliases=compiled_aliases,
         expand_group=expand_group,
+        latest_grok_model_id=latest_grok_model_id,
     )
 
 
@@ -968,7 +970,9 @@ def test_should_plan_grok_tui_against_alpha_not_as_stub(hv, config) -> None:
     )
     assert plan.tui == "grok"
     assert plan.container == "litellm-alpha"
-    assert plan.orchestration_parents == ("grok-4.7",)
+    latest = hv.latest_grok_model_id(_REPO)
+    assert plan.orchestration_parents == (latest,)
+    assert plan.orchestration_children == (latest,)
     artifact = hv.run_plan(plan)
     assert artifact["ok"] is True
     assert artifact["dry_run"] is True
@@ -1568,18 +1572,18 @@ def test_should_plan_codex_catalog_model_and_orchestration_as_non_stub(hv, confi
         dry_run=True,
         write_artifact=None,
     )
-    with pytest.raises(hv.PlanError, match="orchestration-children"):
-        hv.build_plan(
-            config=config,
-            kind="orchestration",
-            instance_token="alpha",
-            tui="codex",
-            models=None,
-            orchestration_parent=None,
-            orchestration_children=None,
-            dry_run=True,
-            write_artifact=None,
-        )
+    default_orch = hv.build_plan(
+        config=config,
+        kind="orchestration",
+        instance_token="alpha",
+        tui="codex",
+        models=None,
+        orchestration_parent=None,
+        orchestration_children=None,
+        dry_run=True,
+        write_artifact=None,
+    )
+    assert list(default_orch.orchestration_children) == []
     assert catalog.tui == "codex"
     assert catalog.kind == "catalog"
     assert model.tui == "codex"
@@ -1595,7 +1599,7 @@ def test_should_plan_codex_catalog_model_and_orchestration_as_non_stub(hv, confi
     assert "Do not run the command yourself" in model.extra["pong_prompt"]
     assert "print that exact stdout" in model.extra["pong_prompt"]
     assert "Call spawn_agent" in model.extra["pong_prompt"]
-    assert "non-empty message" in model.extra["pong_prompt"]
+    _assert_codex_cfg047_prompt(model.extra["pong_prompt"], task_name="hv2_child_pwd")
     work = hv.build_plan(
         config=config,
         kind="orchestration",
@@ -1612,6 +1616,10 @@ def test_should_plan_codex_catalog_model_and_orchestration_as_non_stub(hv, confi
     assert "Call spawn_agent" in work.extra["orchestration_prompt_template"]
     assert "model=work" not in work.extra["orchestration_prompt_template"]
     assert "hv2-codex-child" in work.extra["orchestration_prompt_template"]
+    _assert_codex_cfg047_prompt(
+        work.extra["orchestration_prompt_template"],
+        task_name="hv2_child_pwd_uname",
+    )
     assert "agent=sota-xai" not in work.extra["orchestration_prompt_template"]
     assert "agent=work" not in work.extra["orchestration_prompt_template"]
 
@@ -1834,6 +1842,8 @@ def test_should_submit_codex_prompt_with_ctrl_m_not_enter(
 
     monkeypatch.setattr(driver, "_run_tmux", fake_run)
     monkeypatch.setattr("hv2.drivers.codex.time.sleep", sleeps.append)
+    monkeypatch.setattr(driver, "wait_for_pane", lambda *a, **k: True)
+    monkeypatch.setattr(driver, "capture_pane", lambda: "")
     prompt = (
         "Spawn one child agent now. The child must execute a harmless local "
         "shell command (`date` or `pwd`)."
@@ -1844,8 +1854,11 @@ def test_should_submit_codex_prompt_with_ctrl_m_not_enter(
     assert sent["submit_keys"] == ["C-m"]
     assert sent["submit_delay_seconds"] == 1.0
     assert sleeps == [1.0]
-    assert any(row[0][:1] == ["load-buffer"] for row in calls)
-    assert any(row[0][:1] == ["paste-buffer"] for row in calls)
+    assert any(row[0][:3] == ["load-buffer", "-b", "hv2-hv2-codex-basic-1"] for row in calls)
+    assert any(
+        row[0][:5] == ["paste-buffer", "-b", "hv2-hv2-codex-basic-1", "-d", "-t"]
+        for row in calls
+    )
     assert any(
         row[0] == ["send-keys", "-t", "hv2-codex-basic-1", "C-m"] for row in calls
     )
@@ -1855,6 +1868,115 @@ def test_should_submit_codex_prompt_with_ctrl_m_not_enter(
     joined = " ".join(token for row, _stdin in calls for token in row)
     assert "exec" not in joined
     assert "-p" not in joined
+
+
+def test_should_dismiss_codex_startup_warning_before_submit(
+    hv, config, monkeypatch
+) -> None:
+    _skip_unless_codex_tui_shipped(config)
+    from hv2.drivers.codex import CodexDriver
+
+    driver = CodexDriver(config)
+    driver._active_session = "hv2-codex-basic-1"
+    calls: list[list[str]] = []
+
+    def fake_run(args: Any, *, timeout: int = 10, stdin_text: str | None = None) -> Any:
+        calls.append([str(item) for item in args])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(driver, "_run_tmux", fake_run)
+    monkeypatch.setattr("hv2.drivers.codex.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr(driver, "wait_for_pane", lambda *a, **k: True)
+    monkeypatch.setattr(
+        driver,
+        "capture_pane",
+        lambda: "› [Pasted Content 1024 chars]\n⚠ 1 warning · f2 to view\n",
+    )
+    sent = driver.send_keys("line one\nline two")
+    assert sent["ok"] is True
+    escape = ["send-keys", "-t", "hv2-codex-basic-1", "Escape"]
+    submit = ["send-keys", "-t", "hv2-codex-basic-1", "C-m"]
+    assert calls.index(escape) < calls.index(submit)
+
+
+def test_should_not_wait_for_codex_marker_on_short_multiline_paste(
+    hv, config, monkeypatch
+) -> None:
+    _skip_unless_codex_tui_shipped(config)
+    from hv2.drivers.codex import CodexDriver
+
+    driver = CodexDriver(config)
+    driver._active_session = "hv2-codex-basic-1"
+    waited: list[Any] = []
+
+    monkeypatch.setattr(
+        driver,
+        "_run_tmux",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr("hv2.drivers.codex.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr(driver, "capture_pane", lambda: "")
+
+    def fake_wait(needle: Any, timeout_seconds: float | None = None, **kwargs: Any) -> bool:
+        waited.append(needle)
+        return False
+
+    monkeypatch.setattr(driver, "wait_for_pane", fake_wait)
+    sent = driver.send_keys("line one\nline two")
+    assert sent["ok"] is True
+    assert waited == []
+
+
+def test_should_submit_codex_multiline_paste_after_the_composer_marker(
+    hv, config, monkeypatch
+) -> None:
+    _skip_unless_codex_tui_shipped(config)
+    from hv2.drivers.codex import CodexDriver
+
+    cfg = _clone_config(config)
+    cfg["tuis"]["codex"]["submit_delay_seconds"] = 0.25
+    driver = CodexDriver(cfg)
+    driver._active_session = "hv2-codex-basic-1"
+    prompt = "line one\n" + ("x" * 1000)
+    seen: list[str] = []
+
+    def fake_run(args: Any, *, timeout: int = 10, stdin_text: str | None = None) -> Any:
+        seen.append(str(args[0]) if args else "")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_wait(needle: Any, timeout_seconds: float | None = None, **kwargs: Any) -> bool:
+        seen.append(f"wait:{needle}")
+        return needle == "[Pasted Content "
+
+    monkeypatch.setattr(driver, "_run_tmux", fake_run)
+    monkeypatch.setattr(driver, "wait_for_pane", fake_wait)
+    monkeypatch.setattr(driver, "capture_pane", lambda: "")
+    monkeypatch.setattr("hv2.drivers.codex.time.sleep", lambda _seconds: None)
+    sent = driver.send_keys(prompt)
+    assert sent["ok"] is True
+    assert seen.index("wait:[Pasted Content ") < seen.index("send-keys")
+
+
+def test_should_fail_codex_submit_when_multiline_paste_marker_never_appears(
+    hv, config, monkeypatch
+) -> None:
+    _skip_unless_codex_tui_shipped(config)
+    from hv2.drivers.codex import CodexDriver
+
+    cfg = _clone_config(config)
+    cfg["tuis"]["codex"]["submit_delay_seconds"] = 0
+    driver = CodexDriver(cfg)
+    driver._active_session = "hv2-codex-basic-1"
+    monkeypatch.setattr(
+        driver,
+        "_run_tmux",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(driver, "wait_for_pane", lambda *a, **k: False)
+    monkeypatch.setattr(driver, "capture_pane", lambda: "")
+    sent = driver.send_keys("line one\n" + ("x" * 1000))
+    assert sent["ok"] is False
+    assert sent["returncode"] == 0
 
 
 def test_should_delay_codex_submit_after_paste_before_ctrl_m(
@@ -1878,14 +2000,16 @@ def test_should_delay_codex_submit_after_paste_before_ctrl_m(
 
     monkeypatch.setattr(driver, "_run_tmux", fake_run)
     monkeypatch.setattr("hv2.drivers.codex.time.sleep", fake_sleep)
+    monkeypatch.setattr(driver, "wait_for_pane", lambda *a, **k: True)
+    monkeypatch.setattr(driver, "capture_pane", lambda: "")
     sent = driver.send_keys("Spawn one child agent now and run date.")
     assert sent["ok"] is True
     assert sent["submit_keys"] == ["C-m"]
     assert sent["submit_delay_seconds"] == 0.25
     kinds = [row[0] for row in events]
     assert kinds == ["tmux", "tmux", "sleep", "tmux"]
-    assert events[0][1][:1] == ["load-buffer"]
-    assert events[1][1][:1] == ["paste-buffer"]
+    assert events[0][1][:3] == ["load-buffer", "-b", "hv2-hv2-codex-basic-1"]
+    assert events[1][1][:3] == ["paste-buffer", "-b", "hv2-hv2-codex-basic-1"]
     assert events[2] == ("sleep", 0.25)
     assert events[3][1] == ["send-keys", "-t", "hv2-codex-basic-1", "C-m"]
     assert not any("Enter" in (row[1] or []) for row in events if row[0] == "tmux")
@@ -1911,6 +2035,8 @@ def test_should_skip_codex_submit_delay_when_yaml_sets_zero(
 
     monkeypatch.setattr(driver, "_run_tmux", fake_run)
     monkeypatch.setattr("hv2.drivers.codex.time.sleep", sleeps.append)
+    monkeypatch.setattr(driver, "wait_for_pane", lambda *a, **k: True)
+    monkeypatch.setattr(driver, "capture_pane", lambda: "")
     sent = driver.send_keys("Spawn one child agent now.")
     assert sent["ok"] is True
     assert sent["submit_delay_seconds"] == 0.0
@@ -2281,7 +2407,9 @@ def test_should_wait_for_codex_model_chrome_before_paste(
 
     monkeypatch.setattr(driver, "_run_tmux", fake_run)
     monkeypatch.setattr(driver, "capture_pane", fake_capture)
+    monkeypatch.setattr(driver, "wait_for_pane", lambda *a, **k: True)
     sent = driver.send_keys("Spawn one child agent now.")
+    # capture_pane above is the model header, which has no f2 warning.
     assert sent["ok"] is True
     assert captures["n"] >= 4
     assert any(row[:1] == ["paste-buffer"] for row in calls)
@@ -2956,8 +3084,9 @@ def _catalog_payload(ids: list[str]) -> dict[str, Any]:
 
 
 def _catalog_id_set(hv: Any, config: dict[str, Any], *, drop: set[str], extra: list[str]) -> list[str]:
-    models = config.get("models") if isinstance(config.get("models"), dict) else {}
-    served = [str(item) for item in (models.get("served_concrete_ids") or [])]
+    from hv2.plan import served_concrete_ids
+
+    served = served_concrete_ids(config)
     aliases = [name for name in hv.compiled_aliases(config) if name not in drop]
     out: list[str] = []
     seen: set[str] = set()
@@ -3306,6 +3435,120 @@ def test_should_refuse_protected_url_without_calling_urlopen(hv, config) -> None
         mocked.assert_not_called()
 
 
+def _write_grok_catalog(root: Path, keys: list[str]) -> None:
+    payload = {key: {"litellm_provider": "xai"} for key in keys}
+    (root / "model_prices_and_context_window.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+
+
+def test_should_resolve_greatest_integer_grok_minor_and_fail_closed(
+    hv, tmp_path: Path
+) -> None:
+    _write_grok_catalog(
+        tmp_path,
+        [
+            "xai/grok-4.7",
+            "xai/grok-4.9",
+            "xai/grok-4.20-0309-reasoning",
+            "xai/grok-4.3",
+            "openai/gpt-5.4",
+        ],
+    )
+    assert hv.latest_grok_model_id(tmp_path) == "grok-4.9"
+    missing = tmp_path / "empty"
+    missing.mkdir()
+    with pytest.raises(hv.PlanError, match="cannot read Grok catalog"):
+        hv.latest_grok_model_id(missing)
+    _write_grok_catalog(tmp_path, ["xai/grok-4.20-0309-reasoning"])
+    with pytest.raises(hv.PlanError, match="no xai/grok-4"):
+        hv.latest_grok_model_id(tmp_path)
+
+
+def test_should_plan_grok_defaults_from_latest_catalog_minor(
+    hv, config, tmp_path: Path
+) -> None:
+    from hv2.plan import served_concrete_ids
+    from hv2.suite.matrix import resolve_matrix
+
+    _write_grok_catalog(
+        tmp_path,
+        ["xai/grok-4.7", "xai/grok-4.9", "xai/grok-4.20-0309-reasoning"],
+    )
+    cfg = _clone_config(config)
+    cfg.setdefault("_meta", {})["repo_root"] = str(tmp_path)
+    model_plan = hv.build_plan(
+        config=cfg,
+        kind="model",
+        instance_token="alpha",
+        tui="grok",
+        models=None,
+        orchestration_parent=None,
+        orchestration_children=None,
+        dry_run=True,
+        write_artifact=None,
+    )
+    orch_plan = hv.build_plan(
+        config=cfg,
+        kind="orchestration",
+        instance_token="alpha",
+        tui="grok",
+        models=None,
+        orchestration_parent=None,
+        orchestration_children=None,
+        dry_run=True,
+        write_artifact=None,
+    )
+    assert model_plan.models == ("grok-4.9",)
+    assert orch_plan.orchestration_parents == ("grok-4.9",)
+    assert orch_plan.orchestration_children == ("grok-4.9",)
+    matrix = resolve_matrix(
+        cfg,
+        {
+            "tuis": ["grok"],
+            "kinds": ["model", "orchestration"],
+            "models": [],
+            "parents": [],
+            "children": None,
+            "include_shared": False,
+        },
+        instance_token="alpha",
+        dry_run=True,
+    )
+    by_kind = {row["kind"]: row for row in matrix["cases"]}
+    assert by_kind["model"]["model"] == "grok-4.9"
+    assert by_kind["orchestration"]["parent"] == "grok-4.9"
+    assert by_kind["orchestration"]["children"] == ["grok-4.9"]
+    served = served_concrete_ids(cfg)
+    assert "xai/grok-4.9" in served
+    assert "oa_xai/grok-4.9" in served
+    assert "latest_grok" not in served
+    assert "xai/grok-4.7" not in served
+    assert "cursor_agent/cursor-grok-4.6-high" in served
+
+
+def test_should_not_name_retired_grok_4_6_served_ids_in_harness_tree() -> None:
+    banned = ("xai/grok-4.6", "oa_xai/grok-4.6")
+    root = _HV2
+    offenders: list[str] = []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        if path == root / "fixtures" / "orch" / "xai.stamped.jsonl":
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for needle in banned:
+            if needle not in text:
+                continue
+            if needle == "xai/grok-4.6" and "cursor_agent/cursor-grok-4.6-high" in text:
+                stripped = text.replace("cursor_agent/cursor-grok-4.6-high", "")
+                if needle not in stripped:
+                    continue
+            offenders.append(f"{path.relative_to(root)}:{needle}")
+    assert offenders == []
+
+
 def test_should_warn_on_sha_drift_without_invalidating(hv) -> None:
     from hv2.artifact import sha_drift_warning
 
@@ -3466,6 +3709,238 @@ def test_should_expand_ohmypi_catalog_find_argv(hv, config) -> None:
     assert "work" in argv
     assert "--json" in argv
     assert "-p" not in argv
+
+
+def _muse_intent_event(session_id: str, prompt: str) -> dict[str, Any]:
+    return {
+        "payload_type": "runtime.user_intent.accepted",
+        "payload": {
+            "source_session_id": session_id,
+            "model_messages": [
+                {"content": [{"kind": "text", "text": prompt}]}
+            ],
+        },
+    }
+
+
+def _write_muse_intent(
+    root: Path, session_id: str, prompt: str, *, name: str = "session.jsonl"
+) -> None:
+    session = root / session_id
+    session.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(_muse_intent_event(session_id, prompt))
+    (session / name).write_text(line + "\n", encoding="utf-8")
+
+
+def test_should_paste_single_line_muse_prompt_after_submit_delay(
+    hv, config, monkeypatch, tmp_path: Path
+) -> None:
+    from hv2.drivers.muse import MuseDriver
+
+    cfg = _clone_config(config)
+    cfg["tuis"]["muse"]["session_dir"] = str(tmp_path)
+    cfg["tuis"]["muse"]["submit_delay_seconds"] = 0.25
+    driver = MuseDriver(cfg)
+    model = "muse-spark-1.3-contributor"
+    driver._active_model = model
+    driver._active_session = "hv2-muse-muse-spark-1-3-contributor-1"
+    session_id = driver.alias_session_dir(model).name
+    prompt = "Reply with exactly the word PONG."
+    _write_muse_intent(tmp_path, session_id, prompt)
+    events: list[tuple[str, Any]] = []
+
+    def fake_run(args: Any, *, timeout: int = 10, stdin_text: str | None = None) -> Any:
+        events.append(("tmux", [str(item) for item in args], stdin_text))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_sleep(seconds: float) -> None:
+        events.append(("sleep", float(seconds)))
+
+    monkeypatch.setattr(driver, "_run_tmux", fake_run)
+    monkeypatch.setattr("hv2.drivers.muse.time.sleep", fake_sleep)
+    sent = driver.send_keys(prompt)
+    assert sent["ok"] is True
+    assert sent["accepted"] is True
+    assert sent["intent"] == prompt
+    assert sent["method"] == "paste-buffer"
+    assert sent["submit_keys"] == ["C-m"]
+    assert sent["submit_delay_seconds"] == 0.25
+    assert events[0][1][:1] == ["load-buffer"]
+    assert prompt in (events[0][2] or "")
+    assert events[1][1][:1] == ["paste-buffer"]
+    assert events[2] == ("sleep", 0.25)
+    assert events[3][1] == [
+        "send-keys",
+        "-t",
+        driver._active_session,
+        "C-m",
+    ]
+    assert not any(
+        row[0] == "tmux" and row[1][:1] == ["send-keys"] and prompt in row[1]
+        for row in events
+    )
+
+
+def test_should_accept_muse_intent_from_matching_session_jsonl(
+    hv, config, monkeypatch, tmp_path: Path
+) -> None:
+    from hv2.drivers.muse import MuseDriver
+
+    cfg = _clone_config(config)
+    cfg["tuis"]["muse"]["session_dir"] = str(tmp_path)
+    driver = MuseDriver(cfg)
+    model = "muse-spark-1.3-contributor"
+    driver._active_model = model
+    driver._active_session = "hv2-muse-dedicated"
+    session_id = driver.alias_session_dir(model).name
+    prompt = "Reply with exactly the word PONG."
+    _write_muse_intent(tmp_path, session_id, f"  {prompt}\n")
+    monkeypatch.setattr(
+        driver,
+        "_run_tmux",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr("hv2.drivers.muse.time.sleep", lambda _seconds: None)
+    sent = driver.send_keys(prompt)
+    assert sent["accepted"] is True
+    assert sent["intent"] == prompt
+    assert sent["ok"] is True
+
+
+def test_should_fail_muse_submit_without_intent_acceptance(
+    hv, config, monkeypatch, tmp_path: Path
+) -> None:
+    from hv2.drivers.muse import MuseDriver
+
+    cfg = _clone_config(config)
+    cfg["tuis"]["muse"]["session_dir"] = str(tmp_path)
+    cfg["tuis"]["muse"]["tmux"]["wait_ready_seconds"] = 0.05
+    cfg["tuis"]["muse"]["tmux"]["poll_interval_seconds"] = 0.01
+    driver = MuseDriver(cfg)
+    driver._active_model = "muse-spark-1.3-contributor"
+    driver._active_session = "hv2-muse-dedicated"
+    driver.alias_session_dir(driver._active_model)
+    prompt = "Reply with exactly the word PONG."
+    echo = f"{prompt}\n"
+    waits: list[Any] = []
+
+    monkeypatch.setattr(
+        driver,
+        "_run_tmux",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout=echo, stderr=""),
+    )
+    monkeypatch.setattr(driver, "capture_pane", lambda: echo)
+    monkeypatch.setattr(
+        driver,
+        "wait_for_pane",
+        lambda *a, **k: waits.append("wait_for_pane") or True,
+    )
+    monkeypatch.setattr("hv2.drivers.muse.time.sleep", lambda _seconds: None)
+    sent = driver.send_keys(prompt)
+    assert sent["ok"] is False
+    assert sent["accepted"] is False
+    assert sent["returncode"] == 0
+    assert "runtime.user_intent.accepted" in str(sent.get("submission_error"))
+    waited = driver.send_prompt_and_wait(prompt, reply_needles=["PONG"])
+    assert waited["ok"] is False
+    assert waited["replied"] is False
+    assert waits == []
+    assert "runtime.user_intent.accepted" in str(waited.get("submission_error"))
+
+
+def test_should_bind_muse_intent_to_native_session_id(
+    hv, config, monkeypatch, tmp_path: Path
+) -> None:
+    from hv2.drivers.muse import MuseDriver
+
+    cfg = _clone_config(config)
+    cfg["tuis"]["muse"]["session_dir"] = str(tmp_path)
+    cfg["tuis"]["muse"]["tmux"]["wait_ready_seconds"] = 0.05
+    cfg["tuis"]["muse"]["tmux"]["poll_interval_seconds"] = 0.01
+    driver = MuseDriver(cfg)
+    model = "muse-spark-1.3-contributor"
+    driver._active_model = model
+    driver._active_session = "hv2-muse-dedicated"
+    alias = driver.alias_session_dir(model)
+    native = "01a12349-91cc-76a1-83f8-b8eaa188d4f5"
+    prompt = "Reply with exactly the word PONG."
+    other = "spawn a child and run pwd"
+    _write_muse_intent(alias / "muse" / "sessions" / "2026" / "10" / "09", native, prompt)
+    _write_muse_intent(alias, "01a12349-other-session", other)
+    monkeypatch.setattr(
+        driver,
+        "_run_tmux",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr("hv2.drivers.muse.time.sleep", lambda _seconds: None)
+    sent = driver.send_keys(prompt)
+    assert sent["accepted"] is True
+    assert sent["intent"] == prompt
+    assert driver._active_native_session_id == native
+    later = driver.send_keys(other)
+    assert later["accepted"] is False
+    assert later["ok"] is False
+
+
+def test_should_reject_muse_intent_from_another_session(
+    hv, config, monkeypatch, tmp_path: Path
+) -> None:
+    from hv2.drivers.muse import MuseDriver
+
+    cfg = _clone_config(config)
+    cfg["tuis"]["muse"]["session_dir"] = str(tmp_path)
+    cfg["tuis"]["muse"]["tmux"]["wait_ready_seconds"] = 0.01
+    cfg["tuis"]["muse"]["tmux"]["poll_interval_seconds"] = 0.01
+    driver = MuseDriver(cfg)
+    driver._active_model = "muse-spark-1.3-contributor"
+    driver._active_session = "hv2-muse-dedicated"
+    prompt = "Reply with exactly the word PONG."
+    _write_muse_intent(tmp_path, "hv2-other-session", prompt)
+    monkeypatch.setattr(
+        driver,
+        "_run_tmux",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr("hv2.drivers.muse.time.sleep", lambda _seconds: None)
+    sent = driver.send_keys(prompt)
+    assert sent["accepted"] is False
+    assert sent["ok"] is False
+
+
+def test_should_paste_multiline_muse_prompt_after_submit_delay(
+    hv, config, monkeypatch, tmp_path: Path
+) -> None:
+    from hv2.drivers.muse import MuseDriver
+
+    cfg = _clone_config(config)
+    cfg["tuis"]["muse"]["session_dir"] = str(tmp_path)
+    cfg["tuis"]["muse"]["submit_delay_seconds"] = 0.4
+    driver = MuseDriver(cfg)
+    model = "muse-spark-1.3-contributor"
+    driver._active_model = model
+    driver._active_session = "hv2-muse-dedicated"
+    prompt = "line one\nline two"
+    _write_muse_intent(tmp_path, driver.alias_session_dir(model).name, prompt)
+    events: list[tuple[str, Any]] = []
+
+    def fake_run(args: Any, *, timeout: int = 10, stdin_text: str | None = None) -> Any:
+        events.append(("tmux", [str(item) for item in args]))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_sleep(seconds: float) -> None:
+        events.append(("sleep", float(seconds)))
+
+    monkeypatch.setattr(driver, "_run_tmux", fake_run)
+    monkeypatch.setattr("hv2.drivers.muse.time.sleep", fake_sleep)
+    sent = driver.send_keys(prompt)
+    assert sent["ok"] is True
+    assert sent["accepted"] is True
+    assert sent["method"] == "paste-buffer"
+    assert [row[0] for row in events[:4]] == ["tmux", "tmux", "sleep", "tmux"]
+    assert events[2] == ("sleep", 0.4)
+    assert events[0][1][:1] == ["load-buffer"]
+    assert events[1][1][:1] == ["paste-buffer"]
+    assert events[3][1][-1:] == ["C-m"]
 
 
 def test_should_paste_multiline_ohmypi_prompt_instead_of_send_keys(
@@ -3767,31 +4242,63 @@ def test_should_count_recap_needle_not_in_prompt_as_pass_evidence() -> None:
     assert _pane_has_pass_evidence(pane, ["※ recap:"], prompt=prompt) is True
 
 
+def test_should_require_cfg047_string_on_codex_model_and_orchestration_prompts(
+    hv, config
+) -> None:
+    from hv2.codex_assignment import (
+        CodexAssignmentError,
+        assert_codex_assignment_message,
+        codex_assignment_message,
+    )
+    from hv2.plan import _prompt_text, expand_orchestration_prompt
+
+    _skip_unless_codex_tui_shipped(config)
+    model_prompt = _prompt_text(config, "codex_model", {})
+    orchestration_prompt = expand_orchestration_prompt(
+        _prompt_text(
+            config,
+            "codex_orchestration",
+            {"parent": "{parent}", "home": str(Path.home())},
+        ),
+        parent="basic",
+        children=["work"],
+    )
+    _assert_codex_cfg047_prompt(model_prompt, task_name="hv2_child_pwd")
+    _assert_codex_cfg047_prompt(
+        orchestration_prompt, task_name="hv2_child_pwd_uname"
+    )
+    assert "agent_type=basic" in model_prompt
+    assert "`date` or `pwd`" in model_prompt
+    assert "agent_type=work" in orchestration_prompt
+    assert "`pwd` and `uname -s`" in orchestration_prompt
+    assert "{parent}" not in orchestration_prompt
+    assert "{child}" not in orchestration_prompt
+    assert "basic" in orchestration_prompt
+
+    message = codex_assignment_message(
+        "Execute pwd in this workspace and return only that command stdout."
+    )
+    frame = assert_codex_assignment_message(message)
+    assert frame["cfg047"] == 1
+    assert frame["encoding"] == "text"
+    assert set(frame) == {"cfg047", "encoding", "text"}
+    with pytest.raises(CodexAssignmentError, match="JSON object"):
+        assert_codex_assignment_message(
+            {"cfg047": 1, "encoding": "text", "text": "Execute pwd."}
+        )
+    with pytest.raises(CodexAssignmentError, match="bare prose"):
+        assert_codex_assignment_message(
+            "Execute pwd in this workspace and return only that command stdout."
+        )
+
+
 def test_should_accept_codex_bullet_prefixed_standalone_pass_token() -> None:
     from hv2.kinds.runner import _pane_has_any
     from hv2.load_config import load_config
-    from pathlib import Path
 
-    if not (_HV2 / "config" / "prompts" / "codex_model.txt").is_file():
-        pytest.skip("Codex model prompt is not shipped")
-
-    prompt = (
-        Path(_HV2 / "config" / "prompts" / "codex_model.txt")
-        .read_text(encoding="utf-8")
-        .strip()
-    )
+    prompt = _codex_model_prompt()
     assert "hv2-codex-child" in prompt
-    wrapped_prompt_only = (
-        "› Call spawn_agent now with model=basic and a non-empty message that tells the\n"
-        "  child to execute a harmless local shell command (`date` or `pwd`) in this\n"
-        "  workspace and return only that command's stdout. Do not guess the result. Do\n"
-        "  not skip the child spawn. Do not run the command yourself. Do not spawn qwen,\n"
-        "  kimi, deepseek, grok, moonshot, or any ChatGPT-unsupported model. After the\n"
-        "  child returns stdout, print that exact stdout on its own line, then reply with\n"
-        "  the exact token hv2-codex-child on its own line. Do not print the token until\n"
-        "  the child's stdout is visible.\n"
-        "› Ask Codex to do anything\n"
-    )
+    wrapped_prompt_only = _wrapped_codex_model_prompt_echo()
     assert (
         _pane_has_any(wrapped_prompt_only, ["hv2-codex-child"], prompt=prompt) is False
     )
@@ -3879,25 +4386,52 @@ def test_should_accept_codex_bullet_prefixed_standalone_pass_token() -> None:
     assert "Working (" not in "Do you trust the contents of this directory? Working with untrusted contents"
 
 
+def _assert_codex_cfg047_prompt(prompt: str, *, task_name: str) -> None:
+    """The shipped prompt requires a serialized exact-three-key message string."""
+
+    assert "cfg047" in prompt
+    assert "encoding" in prompt
+    assert '"text"' in prompt or "text" in prompt
+    assert task_name in prompt
+    assert '\\"cfg047\\"' in prompt
+    assert "not a JSON object" in prompt
+    assert "do not retry with bare prose" in prompt
+    assert "Do not run the command" in prompt
+    assert "print that exact stdout" in prompt
+    assert "hv2-codex-child" in prompt
+    assert "Do not print the token until the child's stdout is visible" in prompt
+
+
 def _codex_model_prompt() -> str:
-    prompt_path = _HV2 / "config" / "prompts" / "codex_model.txt"
-    if not prompt_path.is_file():
+    from hv2.load_config import load_config
+    from hv2.plan import _prompt_text
+
+    if not (_HV2 / "config" / "prompts" / "codex_model.txt").is_file():
         pytest.skip("Codex model prompt is not shipped")
-    return prompt_path.read_text(encoding="utf-8").strip()
+    return _prompt_text(load_config(), "codex_model", {}).strip()
+
+
+def _wrap_codex_prompt_echo(prompt: str, *, width: int = 80) -> str:
+    """Paint *prompt* as Codex wrapped composer lines that still match the echo."""
+
+    words = prompt.split()
+    lines: list[str] = []
+    current = "›"
+    for word in words:
+        candidate = f"{current} {word}"
+        if len(candidate) > width and current != "›":
+            lines.append(current)
+            current = f"  {word}"
+        else:
+            current = candidate
+    if current.strip():
+        lines.append(current)
+    lines.append("› Ask Codex to do anything")
+    return "\n".join(lines) + "\n"
 
 
 def _wrapped_codex_model_prompt_echo() -> str:
-    return (
-        "› Call spawn_agent now with model=basic and a non-empty message that tells the\n"
-        "  child to execute a harmless local shell command (`date` or `pwd`) in this\n"
-        "  workspace and return only that command's stdout. Do not guess the result. Do\n"
-        "  not skip the child spawn. Do not run the command yourself. Do not spawn qwen,\n"
-        "  kimi, deepseek, grok, moonshot, or any ChatGPT-unsupported model. After the\n"
-        "  child returns stdout, print that exact stdout on its own line, then reply with\n"
-        "  the exact token hv2-codex-child on its own line. Do not print the token until\n"
-        "  the child's stdout is visible.\n"
-        "› Ask Codex to do anything\n"
-    )
+    return _wrap_codex_prompt_echo(_codex_model_prompt())
 
 
 def _prior_wrapped_codex_echo_proof() -> str:
@@ -4260,6 +4794,21 @@ def test_should_accept_standalone_exact_pong_line() -> None:
         "π  > ⬢ AAWM alias / model work\n"
     )
     assert _pane_exact_pong(pane, prompt) is True
+
+
+def test_should_accept_muse_diamond_pong_after_prompt_echo() -> None:
+    from hv2.kinds.runner import _pane_exact_pong
+
+    prompt = "Reply with exactly the word PONG."
+    pane = (
+        "  Muse Code 1.4.4\n"
+        "  Model set to muse-spark-1.3-contributor\n"
+        f"❯ {prompt}\n"
+        "◆ PONG\n"
+        "❯\n"
+    )
+    assert _pane_exact_pong(pane, prompt, after_echo_index=-1) is True
+    assert _pane_exact_pong("◆ PONG extra\n", prompt) is False
 
 
 def test_should_reject_prompt_echo_and_non_exact_pong() -> None:
@@ -6775,14 +7324,11 @@ def test_should_treat_ohmypi_18_2_4_composer_chrome_as_selected(hv, config) -> N
     assert driver._pane_is_idle(pane) is True
 
 
-def test_should_launch_ohmypi_when_18_2_4_idle_composer_omits_mcp_chrome(
-    hv, config, monkeypatch
-) -> None:
-    from hv2.drivers.ohmypi import OhmypiDriver
+def _fake_ohmypi_launch(driver: Any, pane: str, monkeypatch: Any) -> None:
+    """Drive ensure_session from a fixed pane. Needle waits use the real matcher."""
+
     from hv2.pane import _pane_has_any
 
-    pane = (_FIXTURES / "ohmypi_idle_18_2_4.txt").read_text(encoding="utf-8")
-    driver = OhmypiDriver(config)
     monkeypatch.setattr(
         driver,
         "_run_tmux",
@@ -6797,17 +7343,93 @@ def test_should_launch_ohmypi_when_18_2_4_idle_composer_omits_mcp_chrome(
         timeout_seconds: float | None = None,
         *,
         prompt: str | None = None,
+        after_echo_index: int | None = None,
     ) -> bool:
         needles = [needle] if isinstance(needle, str) else [str(item) for item in needle]
-        if any("Connected to MCP" in item or "No MCP" in item for item in needles):
-            return False
-        return _pane_has_any(pane, needles)
+        return _pane_has_any(
+            pane, needles, prompt=prompt, after_echo_index=after_echo_index
+        )
 
     monkeypatch.setattr(driver, "wait_for_pane", fake_wait)
-    launched = driver.ensure_session("sota-xai", tools=False)
+
+
+def test_should_not_treat_ohmypi_selected_footer_as_launch_ready(
+    hv, config, monkeypatch
+) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+
+    pane = "π · host · AAWM alias work\n"
+    driver = OhmypiDriver(config)
+    _fake_ohmypi_launch(driver, pane, monkeypatch)
+    launched = driver.ensure_session("work", tools=False)
+    identity = launched["session_identity"]
+    assert launched["selected"] is True
+    assert launched["ready"] is False
+    assert launched["mcp_ready"] is False
+    assert launched["ok"] is False
+    assert launched["rejected"] == []
+    assert identity["startup"] == "selected_only"
+    assert identity["selector"] == "litellm-alpha-passthrough/work"
+    assert identity["session"].startswith("hv2-ohmypi-work-")
+    assert "-p" not in launched["argv"]
+    assert "--print" not in launched["argv"]
+
+
+def test_should_launch_ohmypi_when_ready_selector_and_mcp_are_present(
+    hv, config, monkeypatch
+) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+
+    pane = (
+        "π\n"
+        "Default model: litellm-alpha-passthrough/work\n"
+        "Connected to MCP server: aawm-transcript.\n"
+    )
+    driver = OhmypiDriver(config)
+    _fake_ohmypi_launch(driver, pane, monkeypatch)
+    launched = driver.ensure_session("work", tools=False)
+    assert launched["ready"] is True
     assert launched["selected"] is True
     assert launched["mcp_ready"] is True
+    assert launched["rejected"] == []
     assert launched["ok"] is True
+    assert launched["session_identity"]["startup"] == "ready"
+
+
+def test_should_reject_ohmypi_launch_when_reject_needle_is_present(
+    hv, config, monkeypatch
+) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+
+    pane = (
+        "π\n"
+        "Default model: litellm-alpha-passthrough/work\n"
+        "Connected to MCP server: aawm-transcript.\n"
+        "Error: No model selected\n"
+    )
+    driver = OhmypiDriver(config)
+    _fake_ohmypi_launch(driver, pane, monkeypatch)
+    launched = driver.ensure_session("work", tools=False)
+    assert launched["selected"] is True
+    assert launched["ok"] is False
+    assert launched["rejected"]
+    assert "Error: No model selected" in launched["rejected"]
+    assert launched["session_identity"]["startup"] == "rejected"
+
+
+def test_should_keep_ohmypi_18_2_4_idle_composer_without_mcp_as_not_launch_ok(
+    hv, config, monkeypatch
+) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+
+    pane = (_FIXTURES / "ohmypi_idle_18_2_4.txt").read_text(encoding="utf-8")
+    driver = OhmypiDriver(config)
+    _fake_ohmypi_launch(driver, pane, monkeypatch)
+    launched = driver.ensure_session("sota-xai", tools=False)
+    assert launched["selected"] is True
+    assert launched["mcp_ready"] is False
+    assert launched["ok"] is False
+    assert launched["session_identity"]["startup"] == "selected_only"
     assert "Connected to MCP" not in pane
     assert "-p" not in launched["argv"]
     assert "--print" not in launched["argv"]
