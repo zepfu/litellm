@@ -10341,9 +10341,13 @@ async def pass_through_request(  # noqa: PLR0915
                 e: httpx.HTTPStatusError,
                 req: httpx.Request,
             ) -> NoReturn:
-                error_content = await wait_for(
-                    "upstream_body_read", e.response.aread()
-                )
+                try:
+                    error_content = await wait_for(
+                        "upstream_body_read", e.response.aread()
+                    )
+                except BaseException:
+                    await _retire_openai_precommit_response(e.response)
+                    raise
                 await _retire_openai_precommit_response(e.response)
                 await _record_retired_openai_precommit_response()
                 _capture_passthrough_error_shape(
