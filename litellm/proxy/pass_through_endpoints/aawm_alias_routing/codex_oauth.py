@@ -1772,6 +1772,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     if token_affinity is not None and not portable_replay_failover:
         planned_portable_failover = False
     owner_affinity: Optional[dict[str, Any]] = None
+    has_account_bound_state = token_affinity is not None
     if session_identity is not None and not planned_portable_failover:
         has_body_continuation_state = _codex_auto_agent_request_has_continuation_state(
             body

@@ -6829,25 +6829,19 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         and account_failover_context.get("portable_replay")
     ):
         account_identity_pinned = False
-        affinity = dict(affinity)
-        for field in (
-            "codex_oauth_account_label",
-            "codex_oauth_account_hash",
-            "codex_oauth_lane_key",
-        ):
-            affinity.pop(field, None)
+        if affinity is not None:
+            affinity = dict(affinity)
+            for field in (
+                "codex_oauth_account_label",
+                "codex_oauth_account_hash",
+                "codex_oauth_lane_key",
+            ):
+                affinity.pop(field, None)
 
     affinity = _apply_codex_oauth_inventory_affinity_policy(
         affinity,
         account_bound=account_identity_pinned,
     )
-    if (
-        not account_identity_pinned
-        and affinity is not None
-        and affinity.get("provider") == _CODEX_AUTO_AGENT_NATIVE_PROVIDER
-        and affinity.get("codex_oauth_credential_affinity") == "interchangeable"
-    ):
-        affinity = None
     affinity_selection_reason = (
         _codex_oauth_mod._codex_oauth_affinity_selection_reason(affinity)
         if affinity is not None
