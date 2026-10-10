@@ -67,6 +67,20 @@ from .llm_provider_handlers.vertex_passthrough_logging_handler import (
 )
 from .aawm_alias_routing.audit_persist import _emit_aawm_terminal_error
 from .aawm_adapter_runtime.deferred_success import DeferredPassthroughSuccess
+from .aawm_adapter_runtime.openai_responses_events import (
+    ParsedResponsesEvent,
+    ResponsesBoundFailure,
+    ResponsesEventRetentionTooLarge,
+    ResponsesEventPipeline,
+    ResponsesEventTooLarge,
+    ResponsesStreamTooLarge,
+    attach_responses_emissions,
+    attach_responses_events,
+    create_responses_event_pipeline,
+    responses_emissions_from_chunk,
+    responses_event_pipeline_from_response,
+    responses_events_from_chunk,
+)
 from .success_handler import PassThroughEndpointLogging
 
 
@@ -234,10 +248,18 @@ class _PrefixedHttpxByteStream:
         response: httpx.Response,
         prefix: Any,
         remainder: Any = None,
+        *,
+        event_pipeline: Optional[ResponsesEventPipeline] = None,
     ) -> None:
         self._response = response
         self._prefix = prefix
         self._remainder = remainder
+        self._aawm_responses_event_pipeline = event_pipeline
+        if event_pipeline is not None:
+            prepare_replay = getattr(event_pipeline, "prepare_replay", None)
+            prefix_bytes = getattr(prefix, "byte_count", 0)
+            if callable(prepare_replay):
+                prepare_replay(int(prefix_bytes))
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._response, name)
@@ -255,11 +277,42 @@ class _PrefixedHttpxByteStream:
                 prefix_chunks = iter(self._prefix)
             for chunk in prefix_chunks:
                 if chunk:
-                    yield chunk
+                    events = (
+                        self._aawm_responses_event_pipeline.feed_replayed(chunk)
+                        if self._aawm_responses_event_pipeline is not None
+                        else []
+                    )
+                    yield attach_responses_events(chunk, events)
             if self._remainder is None:
                 return
+            if self._aawm_responses_event_pipeline is not None:
+                self._aawm_responses_event_pipeline.retain_events = False
             async for chunk in self._remainder:
-                yield chunk
+                if not chunk:
+                    continue
+                if self._aawm_responses_event_pipeline is None:
+                    yield chunk
+                    continue
+                try:
+                    events = self._aawm_responses_event_pipeline.feed(chunk)
+                except (
+                    ResponsesBoundFailure,
+                    ResponsesEventTooLarge,
+                    ResponsesStreamTooLarge,
+                ) as exc:
+                    bound_failure = ResponsesBoundFailure.from_exception(exc)
+                    accepted_frames = [
+                        event.forward_event or event.raw_event or b""
+                        for event in bound_failure.accepted_events
+                        if (event.forward_event or event.raw_event)
+                    ]
+                    if accepted_frames:
+                        yield attach_responses_events(
+                            b"".join(accepted_frames),
+                            bound_failure.accepted_events,
+                        )
+                    raise bound_failure from exc
+                yield attach_responses_events(chunk, events)
         except BaseException:
             await self.aclose()
             raise
@@ -281,8 +334,19 @@ class _ResponsesPreCommitPrefixStore:
 
     _CHUNK_LENGTH = struct.Struct("!Q")
 
-    def __init__(self, max_buffer_bytes: int) -> None:
+    def __init__(
+        self,
+        max_buffer_bytes: int,
+        *,
+        max_storage_bytes: Optional[int] = None,
+    ) -> None:
         memory_limit = max(0, int(max_buffer_bytes))
+        self._max_storage_bytes = (
+            None
+            if max_storage_bytes is None
+            else max(0, int(max_storage_bytes))
+        )
+        self._byte_count = 0
         self._data = tempfile.SpooledTemporaryFile(
             max_size=memory_limit,
             mode="w+b",
@@ -298,10 +362,22 @@ class _ResponsesPreCommitPrefixStore:
             raise RuntimeError("Responses pre-commit prefix store is closed")
         if not chunk:
             return
+        if (
+            self._max_storage_bytes is not None
+            and self._byte_count + len(chunk) > self._max_storage_bytes
+        ):
+            raise ResponsesStreamTooLarge(
+                "Responses pre-commit prefix exceeded configured storage bound"
+            )
         self._data.seek(0, os.SEEK_END)
         self._data.write(chunk)
         self._lengths.seek(0, os.SEEK_END)
         self._lengths.write(self._CHUNK_LENGTH.pack(len(chunk)))
+        self._byte_count += len(chunk)
+
+    @property
+    def byte_count(self) -> int:
+        return self._byte_count
 
     def read_range(self, start: int, end: int) -> bytes:
         if self._closed or end <= start:
@@ -338,45 +414,41 @@ class _ResponsesPreCommitPrefixStore:
 
 
 class _ResponsesPreCommitSSEParser:
-    """Inspect complete SSE frames without retaining the whole prefix in RAM."""
+    """Inspect events from the attempt-scoped pipeline in arrival order."""
 
-    def __init__(self, prefix: _ResponsesPreCommitPrefixStore) -> None:
+    def __init__(
+        self,
+        prefix: _ResponsesPreCommitPrefixStore,
+        pipeline: Optional[ResponsesEventPipeline] = None,
+    ) -> None:
+        # Keep the prefix reference for compatibility and diagnostics. Framing
+        # and JSON admission are owned exclusively by ``pipeline``.
         self._prefix = prefix
-        self._frame_start = 0
-        self._position = 0
-        self._search_tail = b""
+        self._pipeline = pipeline or create_responses_event_pipeline(
+            retain_events=True,
+        )
         self._saw_lifecycle = False
         self._first_error_payload: Optional[Dict[str, Any]] = None
         self._first_error_event: Optional[str] = None
         self._saw_substantive = False
         self._substantive_event: Optional[str] = None
+        self._first_terminal_decision: Optional[str] = None
 
-    @staticmethod
-    def _find_boundary(
-        value: bytes,
-        start: int,
-    ) -> Optional[tuple[int, int]]:
-        lf_index = value.find(b"\n\n", start)
-        crlf_index = value.find(b"\r\n\r\n", start)
-        if lf_index < 0 and crlf_index < 0:
-            return None
-        if crlf_index < 0 or (lf_index >= 0 and lf_index < crlf_index):
-            return lf_index, 2
-        return crlf_index, 4
-
-    def _consume_frame(self, frame: bytes) -> None:
-        decision, error_payload, event_type = (
-            PassThroughStreamingHandler._inspect_responses_pre_commit_chunks([frame])
+    def _consume_event(self, parsed_event: ParsedResponsesEvent) -> None:
+        decision, error_payload, event_type = PassThroughStreamingHandler._inspect_responses_events(
+            parsed_event
         )
-        if decision == "substantive":
+        if decision in {"failed", "substantive"}:
+            # The first terminal/substantive event wins. A later event in the
+            # same HTTPX read must not erase the earlier precommit outcome.
+            if self._first_terminal_decision is None:
+                self._first_terminal_decision = decision
+        if decision == "substantive" and not self._saw_substantive:
             self._saw_substantive = True
             self._substantive_event = event_type
-            return
-        if decision == "failed":
-            if self._first_error_payload is None:
-                self._first_error_payload = error_payload
-                self._first_error_event = event_type
-            return
+        elif decision == "failed" and self._first_error_payload is None:
+            self._first_error_payload = error_payload
+            self._first_error_event = event_type
         if decision == "lifecycle":
             self._saw_lifecycle = True
 
@@ -386,37 +458,21 @@ class _ResponsesPreCommitSSEParser:
     ) -> tuple[str, Optional[Dict[str, Any]], Optional[str]]:
         if not chunk:
             return self.decision()
+        for parsed_event in self._pipeline.feed(chunk):
+            self._consume_event(parsed_event)
+        return self.decision()
 
-        position_before = self._position
-        search = self._search_tail + chunk
-        search_base = position_before - len(self._search_tail)
-        self._position += len(chunk)
-        search_start = 0
-        while True:
-            boundary = self._find_boundary(search, search_start)
-            if boundary is None:
-                break
-            boundary_index, boundary_length = boundary
-            frame_end = search_base + boundary_index + boundary_length
-            self._consume_frame(
-                self._prefix.read_range(self._frame_start, frame_end)
-            )
-            self._frame_start = frame_end
-            search_start = boundary_index + boundary_length
-            if self._saw_substantive:
-                break
-        self._search_tail = search[search_start:][-3:]
+    def finish(self) -> tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+        for parsed_event in self._pipeline.finish():
+            self._consume_event(parsed_event)
         return self.decision()
 
     def decision(
         self,
     ) -> tuple[str, Optional[Dict[str, Any]], Optional[str]]:
-        if self._saw_substantive:
+        if self._first_terminal_decision == "substantive":
             return "substantive", None, self._substantive_event
-        if (
-            self._first_error_payload is not None
-            or self._first_error_event is not None
-        ):
+        if self._first_terminal_decision == "failed":
             return (
                 "failed",
                 self._first_error_payload,
@@ -590,6 +646,7 @@ class PassThroughStreamingHandler:
         *,
         request_body: Optional[Dict[str, Any]],
         custom_llm_provider: Optional[str],
+        events: Optional[List[ParsedResponsesEvent]] = None,
     ) -> bytes:
         """OPENAI-006: delegate SSE provenance stamping to the helper module."""
         from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
@@ -600,6 +657,7 @@ class PassThroughStreamingHandler:
             chunk,
             request_body=request_body,
             custom_llm_provider=custom_llm_provider,
+            events=events,
         )
 
     @staticmethod
@@ -678,6 +736,26 @@ class PassThroughStreamingHandler:
         return chunk[:boundary_end], chunk[boundary_end:]
 
     @staticmethod
+    def _partition_responses_emissions_by_count(
+        prefix: bytes,
+        suffix: bytes,
+        emissions: List[Any],
+    ) -> tuple[List[Any], List[Any]]:
+        """Keep one ordered emission per frame after a done-marker split."""
+        del suffix
+        if not emissions:
+            return [], []
+        prefix_count = 0
+        remaining = bytes(prefix)
+        for emission in emissions:
+            wire = getattr(emission, "wire_bytes", b"") or b""
+            if not wire or not remaining.startswith(wire):
+                break
+            remaining = remaining[len(wire):]
+            prefix_count += 1
+        return emissions[:prefix_count], emissions[prefix_count:]
+
+    @staticmethod
     def _chunk_lines(chunks: List[bytes]) -> List[str]:
         accumulator = _PassThroughStreamLineAccumulator()
         for chunk in chunks:
@@ -706,44 +784,6 @@ class PassThroughStreamingHandler:
             if event_type in PassThroughStreamingHandler._RESPONSES_TERMINAL_EVENTS:
                 return True
         return False
-
-    @staticmethod
-    def _iter_responses_sse_events(
-        lines: List[str],
-    ) -> List[tuple[Optional[str], Optional[Dict[str, Any]]]]:
-        events: List[tuple[Optional[str], Optional[Dict[str, Any]]]] = []
-        pending_event_type: Optional[str] = None
-        for raw_line in lines:
-            line = _strip_chunk_line(raw_line)
-            if not line:
-                continue
-            if line.startswith("event:"):
-                pending_event_type = line.removeprefix("event:").strip() or None
-                continue
-            if not line.startswith("data:"):
-                continue
-            payload_text = line.removeprefix("data:").strip()
-            if payload_text == "[DONE]":
-                events.append(("[DONE]", None))
-                pending_event_type = None
-                continue
-            payload: Optional[Dict[str, Any]] = None
-            payload_type: Optional[str] = None
-            try:
-                decoded = json.loads(payload_text)
-            except (TypeError, json.JSONDecodeError):
-                decoded = None
-            if isinstance(decoded, dict):
-                payload = decoded
-                raw_type = decoded.get("type")
-                if isinstance(raw_type, str) and raw_type.strip():
-                    payload_type = raw_type.strip()
-            event_type = pending_event_type or payload_type
-            events.append((event_type, payload))
-            pending_event_type = None
-        if pending_event_type is not None:
-            events.append((pending_event_type, None))
-        return events
 
     @staticmethod
     def _is_responses_non_substantive_lifecycle_event(
@@ -1065,48 +1105,79 @@ class PassThroughStreamingHandler:
         chunks: List[bytes],
     ) -> tuple[str, Optional[Dict[str, Any]], Optional[str]]:
         buffered = b"".join(chunks)
-        complete_chunk, _partial_chunk = (
-            PassThroughStreamingHandler._split_responses_sse_event_buffer(buffered)
+        pipeline = ResponsesEventPipeline(
+            max_raw_events=0,
         )
-        lines = PassThroughStreamingHandler._chunk_lines([complete_chunk])
-        events = PassThroughStreamingHandler._iter_responses_sse_events(lines)
+        events = pipeline.feed(buffered)
+        if pipeline.buffered_event_bytes:
+            events.extend(pipeline.finish())
         if not events:
             return "empty", None, None
-        first_error_payload: Optional[Dict[str, Any]] = None
-        first_error_event: Optional[str] = None
-        saw_lifecycle = False
-        for event_type, payload in events:
-            if event_type == "[DONE]":
-                continue
-            error_payload = (
-                PassThroughStreamingHandler._extract_responses_stream_error_payload(
-                    event_type,
-                    payload,
-                )
+        parser = _ResponsesPreCommitSSEParser(
+            _ResponsesPreCommitPrefixStore(0),
+            pipeline,
+        )
+        for event in events:
+            parser._consume_event(event)
+        return parser.decision()
+
+    @staticmethod
+    def _inspect_responses_events(
+        parsed_event: ParsedResponsesEvent,
+    ) -> tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+        if parsed_event.is_malformed or parsed_event.is_done_marker:
+            return "empty", None, None
+        event_type = parsed_event.event_type
+        payload = parsed_event.payload
+        error_payload = (
+            PassThroughStreamingHandler._extract_responses_stream_error_payload(
+                event_type,
+                payload,
             )
-            if error_payload is not None or event_type in _RESPONSES_PRE_COMMIT_FAILURE_EVENTS:
-                if first_error_payload is None:
-                    first_error_payload = error_payload or payload
-                    first_error_event = event_type
-                continue
-            if PassThroughStreamingHandler._is_responses_non_substantive_lifecycle_event(
+        )
+        if error_payload is not None or event_type in (
+            _RESPONSES_PRE_COMMIT_FAILURE_EVENTS
+        ):
+            return "failed", error_payload or payload, event_type
+        if (
+            PassThroughStreamingHandler._is_responses_non_substantive_lifecycle_event(
                 event_type,
                 payload,
-            ):
-                saw_lifecycle = True
-                continue
-            if PassThroughStreamingHandler._is_responses_substantive_event(
-                event_type,
-                payload,
-            ):
-                return "substantive", None, event_type
-            if event_type not in {None, ""}:
-                return "substantive", None, event_type
-        if first_error_payload is not None or first_error_event is not None:
-            return "failed", first_error_payload, first_error_event
-        if saw_lifecycle:
+            )
+        ):
             return "lifecycle", None, None
+        if PassThroughStreamingHandler._is_responses_substantive_event(
+            event_type,
+            payload,
+        ):
+            return "substantive", None, event_type
+        if event_type not in {None, ""}:
+            return "substantive", None, event_type
         return "empty", None, None
+
+    @staticmethod
+    def _iter_responses_sse_events(
+        lines: List[str],
+    ) -> List[tuple[Optional[str], Optional[Dict[str, Any]]]]:
+        pipeline = ResponsesEventPipeline()
+        text = "\n\n".join(lines)
+        encoded = text.encode("utf-8") if text else b""
+        if not text.endswith("\n\n"):
+            encoded += b"\n\n"
+        events = pipeline.feed(encoded)
+        events.extend(pipeline.finish())
+        converted: List[tuple[Optional[str], Optional[Dict[str, Any]]]] = []
+        for parsed_event in events:
+            if parsed_event.is_malformed or parsed_event.is_done_marker:
+                event_type: Optional[str] = None
+                payload: Optional[Dict[str, Any]] = None
+            else:
+                event_type = parsed_event.event_type
+                payload = parsed_event.payload
+            if event_type is None and payload is None:
+                continue
+            converted.append((event_type, payload))
+        return converted
 
     @staticmethod
     def _build_responses_pre_commit_failure(
@@ -1222,45 +1293,53 @@ class PassThroughStreamingHandler:
         return None
 
     @staticmethod
-    def _remove_responses_stream_recovery_failure_events(
-        chunk: bytes,
-    ) -> tuple[bytes, bool]:
-        """Remove native recovery errors while retaining same-chunk output."""
-        if not chunk:
-            return chunk, False
-        try:
-            decoded = chunk.decode("utf-8")
-        except (AttributeError, UnicodeDecodeError):
-            return b"", False
-
-        normalized = decoded.replace("\r\n", "\n")
-        blocks = normalized.split("\n\n")
-        filtered_blocks: List[str] = []
-        removed = False
-        for block in blocks:
-            if block:
-                failure = PassThroughStreamingHandler._find_responses_stream_recovery_failure(
-                    block.splitlines()
-                )
-                if failure is not None:
-                    removed = True
-                    continue
-            filtered_blocks.append(block)
-        if not removed:
-            return chunk, False
-        return "\n\n".join(filtered_blocks).encode("utf-8"), True
-
-    @staticmethod
-    async def peek_responses_pre_commit_stream(
+    async def peek_responses_pre_commit_stream(  # noqa: PLR0915
         response: httpx.Response,
         *,
         max_buffer_bytes: int = _RESPONSES_PRE_COMMIT_MAX_BUFFER_BYTES,
         openai_alpha_capacity_retry_enabled: bool = False,
+        event_pipeline: Optional[ResponsesEventPipeline] = None,
     ) -> tuple[httpx.Response, Optional[ResponsesStreamPreCommitFailure]]:
         """Hold lifecycle-only Responses bytes until a commit or pre-SSE failure."""
-        prefix = _ResponsesPreCommitPrefixStore(max_buffer_bytes)
-        parser = _ResponsesPreCommitSSEParser(prefix)
+        pipeline = event_pipeline or create_responses_event_pipeline(
+            retain_events=True,
+        )
+        prefix = _ResponsesPreCommitPrefixStore(
+            max_buffer_bytes,
+            max_storage_bytes=pipeline.max_stream_bytes,
+        )
+        parser = _ResponsesPreCommitSSEParser(prefix, pipeline)
         iterator: Any = None
+
+        async def _close_precommit_resources() -> None:
+            prefix.close()
+            close_iterator = getattr(iterator, "aclose", None)
+            if callable(close_iterator):
+                try:
+                    result = close_iterator()
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    pass
+            close_response = getattr(response, "aclose", None)
+            if callable(close_response):
+                try:
+                    result = close_response()
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    pass
+
+        def _bound_failure(exc: BaseException) -> ResponsesStreamPreCommitFailure:
+            bound_failure = ResponsesBoundFailure.from_exception(exc)
+            return PassThroughStreamingHandler._build_responses_pre_commit_failure(
+                error_payload=bound_failure.error_payload,
+                event_type=bound_failure.code,
+                openai_alpha_capacity_retry_enabled=(
+                    openai_alpha_capacity_retry_enabled
+                ),
+            )
+
         try:
             iterator = response.aiter_bytes()
             while True:
@@ -1295,11 +1374,20 @@ class PassThroughStreamingHandler:
                 if not chunk:
                     continue
                 chunk = bytes(chunk)
-                prefix.append(chunk)
-                decision, error_payload, event_type = parser.feed(chunk)
+                try:
+                    decision, error_payload, event_type = parser.feed(chunk)
+                    prefix.append(chunk)
+                except (
+                    ResponsesBoundFailure,
+                    ResponsesEventTooLarge,
+                    ResponsesStreamTooLarge,
+                ) as exc:
+                    await _close_precommit_resources()
+                    return response, _bound_failure(exc)
                 if decision == "failed":
+                    await _close_precommit_resources()
                     return (
-                        _PrefixedHttpxByteStream(response, prefix, iterator),
+                        response,
                         PassThroughStreamingHandler._build_responses_pre_commit_failure(
                             error_payload=error_payload,
                             event_type=event_type,
@@ -1309,15 +1397,32 @@ class PassThroughStreamingHandler:
                         ),
                     )
                 if decision == "substantive":
+                    prefixed = _PrefixedHttpxByteStream(
+                        response,
+                        prefix,
+                        iterator,
+                        event_pipeline=pipeline,
+                    )
+                    pipeline.attach_to_response(prefixed)
                     return (
-                        _PrefixedHttpxByteStream(response, prefix, iterator),
+                        prefixed,
                         None,
                     )
 
-            decision, error_payload, event_type = parser.decision()
+            leftover_incomplete = pipeline.buffered_event_bytes > 0
+            try:
+                decision, error_payload, event_type = parser.finish()
+            except (
+                ResponsesBoundFailure,
+                ResponsesEventTooLarge,
+                ResponsesStreamTooLarge,
+            ) as exc:
+                await _close_precommit_resources()
+                return response, _bound_failure(exc)
             if decision == "failed":
+                await _close_precommit_resources()
                 return (
-                    _PrefixedHttpxByteStream(response, prefix, iterator),
+                    response,
                     PassThroughStreamingHandler._build_responses_pre_commit_failure(
                         error_payload=error_payload,
                         event_type=event_type,
@@ -1327,8 +1432,7 @@ class PassThroughStreamingHandler:
                     ),
                 )
             if decision in {"empty", "lifecycle"}:
-                return (
-                    _PrefixedHttpxByteStream(response, prefix, iterator),
+                missing_terminal = (
                     PassThroughStreamingHandler._build_responses_pre_commit_failure(
                         error_payload={
                             "code": "openai_responses_stream_missing_terminal",
@@ -1344,9 +1448,30 @@ class PassThroughStreamingHandler:
                         ),
                         provider_returned=False,
                         failure_origin="local_missing_terminal",
-                    ),
+                    )
                 )
-            return _PrefixedHttpxByteStream(response, prefix, iterator), None
+                # T-4: a truncated UTF-8 remainder after a complete lifecycle
+                # frame is not itself a missing-terminal event. Replay the
+                # exact prefix and let the live pipeline finish.
+                if prefix.byte_count > 0 and leftover_incomplete:
+                    prefixed = _PrefixedHttpxByteStream(
+                        response,
+                        prefix,
+                        iterator,
+                        event_pipeline=pipeline,
+                    )
+                    pipeline.attach_to_response(prefixed)
+                    return prefixed, None
+                await _close_precommit_resources()
+                return response, missing_terminal
+            prefixed = _PrefixedHttpxByteStream(
+                response,
+                prefix,
+                iterator,
+                event_pipeline=pipeline,
+            )
+            pipeline.attach_to_response(prefixed)
+            return prefixed, None
         except BaseException:
             prefix.close()
             close_iterator = getattr(iterator, "aclose", None)
@@ -1859,6 +1984,7 @@ class PassThroughStreamingHandler:
         deferred_success_holder: Optional[DeferredPassthroughSuccess] = None,
         openai_wire_trace: Optional[Any] = None,
         openai_stream_bookkeeping_state: Optional[Dict[str, Any]] = None,
+        responses_event_pipeline: Optional[ResponsesEventPipeline] = None,
     ):
         """
         - Yields chunks from the response
@@ -1886,7 +2012,6 @@ class PassThroughStreamingHandler:
             )
 
         try:
-            raw_bytes: List[bytes] = []
             line_accumulator: Optional[_PassThroughStreamLineAccumulator] = None
             model_name = PassThroughStreamingHandler._extract_model_for_cost_injection(
                 request_body=request_body,
@@ -1907,6 +2032,7 @@ class PassThroughStreamingHandler:
                     custom_llm_provider=custom_llm_provider,
                 )
             )
+            raw_bytes: Any = []
             is_non_openai_responses_stream = (
                 endpoint_type == EndpointType.OPENAI
                 and not is_fork_owned_responses_stream
@@ -1915,11 +2041,14 @@ class PassThroughStreamingHandler:
                     url_route
                 )
             )
-            responses_terminal_accumulator = (
-                _PassThroughStreamLineAccumulator()
+            responses_event_pipeline = responses_event_pipeline or (
+                responses_event_pipeline_from_response(response)
                 if is_fork_owned_responses_stream
                 else None
             )
+            if is_fork_owned_responses_stream and responses_event_pipeline is None:
+                responses_event_pipeline = create_responses_event_pipeline()
+                responses_event_pipeline.attach_to_response(response)
             responses_sse_tracker = (
                 OpenAIPassthroughLoggingHandler._create_responses_sse_state_tracker(
                     fallback_model=model_name or "unknown"
@@ -1932,17 +2061,27 @@ class PassThroughStreamingHandler:
             held_responses_done_suffix = b""
             responses_sse_event_buffer = b""
             buffer_raw_bytes = True
-            if PassThroughStreamingHandler._stream_summary_first_finalize_eligible(
-                endpoint_type=endpoint_type,
-                url_route=url_route,
-                custom_llm_provider=custom_llm_provider,
+            if (
+                not is_fork_owned_responses_stream
+                and PassThroughStreamingHandler._stream_summary_first_finalize_eligible(
+                    endpoint_type=endpoint_type,
+                    url_route=url_route,
+                    custom_llm_provider=custom_llm_provider,
+                )
             ):
                 line_accumulator = _PassThroughStreamLineAccumulator()
-            buffer_raw_bytes = (
-                PassThroughStreamingHandler._should_buffer_raw_stream_bytes(
-                    line_accumulator_enabled=line_accumulator is not None,
+            if is_fork_owned_responses_stream:
+                # Logging/cost state comes from the attempt-scoped reducer.
+                # Retain raw bytes only for explicit diagnostic capture.
+                buffer_raw_bytes = (
+                    PassThroughStreamingHandler._raw_stream_bytes_capture_required()
                 )
-            )
+            else:
+                buffer_raw_bytes = (
+                    PassThroughStreamingHandler._should_buffer_raw_stream_bytes(
+                        line_accumulator_enabled=line_accumulator is not None,
+                    )
+                )
             chunk_count = 0
             total_stream_bytes = 0
             first_chunk_at: Optional[datetime] = None
@@ -1992,6 +2131,16 @@ class PassThroughStreamingHandler:
                     ),
                 )
 
+            def _final_wire_committed() -> bool:
+                if openai_wire_trace is None:
+                    return first_emitted_at is not None
+                return bool(
+                    getattr(openai_wire_trace, "first_body_sent", False)
+                    or getattr(openai_wire_trace, "terminal_wire_committed", False)
+                    or getattr(openai_wire_trace, "done_wire_committed", False)
+                    or getattr(openai_wire_trace, "asgi_delivery_complete", False)
+                )
+
             def _mark_first_emitted_chunk() -> None:
                 nonlocal first_emitted_at
                 if first_emitted_at is not None:
@@ -2021,60 +2170,52 @@ class PassThroughStreamingHandler:
                 downstream_byte_count += len(chunk)
                 _mark_first_emitted_chunk()
 
-            def _consume_responses_lines(
-                lines: List[str],
+            def _consume_responses_event(
+                parsed_event: ParsedResponsesEvent,
             ) -> Optional[ResponsesStreamPreCommitFailure]:
                 nonlocal responses_terminal_seen, responses_substantive_seen
                 if responses_sse_tracker is None:
                     return None
-                if not responses_terminal_seen:
-                    responses_terminal_seen = (
-                        PassThroughStreamingHandler._responses_lines_have_terminal_event(
-                            lines
-                        )
+                if parsed_event.is_malformed:
+                    OpenAIPassthroughLoggingHandler._mark_responses_sse_parse_ambiguity(
+                        responses_sse_tracker
                     )
+                    return None
+                if not responses_terminal_seen and parsed_event.event_type in (
+                    PassThroughStreamingHandler._RESPONSES_TERMINAL_EVENTS
+                ):
+                    responses_terminal_seen = True
+                decoded_event = parsed_event.payload
+                if decoded_event is None:
+                    return None
+                if PassThroughStreamingHandler._is_responses_substantive_event(
+                    parsed_event.event_type,
+                    decoded_event,
+                ):
+                    responses_substantive_seen = True
+                extracted_error = (
+                    PassThroughStreamingHandler._extract_responses_stream_error_payload(
+                        parsed_event.event_type,
+                        decoded_event,
+                    )
+                )
                 recovery_failure: Optional[ResponsesStreamPreCommitFailure] = None
-                for raw_line in lines:
-                    line = _strip_chunk_line(raw_line)
-                    if not line.startswith("data:"):
-                        continue
-                    payload_text = line.removeprefix("data:").strip()
-                    if payload_text == "[DONE]":
-                        continue
-                    try:
-                        decoded_event = json.loads(payload_text)
-                    except json.JSONDecodeError:
-                        OpenAIPassthroughLoggingHandler._mark_responses_sse_parse_ambiguity(
-                            responses_sse_tracker
+                if extracted_error is not None:
+                    candidate_failure = (
+                        PassThroughStreamingHandler._build_responses_pre_commit_failure(
+                            error_payload=extracted_error,
+                            event_type=parsed_event.event_type,
                         )
-                        continue
-                    if PassThroughStreamingHandler._is_responses_substantive_event(
-                        decoded_event.get("type"),
-                        decoded_event,
+                    )
+                    if (
+                        candidate_failure.error_class
+                        in _RESPONSES_STREAM_REDISPATCH_CLASSES
                     ):
-                        responses_substantive_seen = True
-                    extracted_error = (
-                        PassThroughStreamingHandler._extract_responses_stream_error_payload(
-                            decoded_event.get("type"),
-                            decoded_event,
-                        )
-                    )
-                    if extracted_error is not None and recovery_failure is None:
-                        candidate_failure = (
-                            PassThroughStreamingHandler._build_responses_pre_commit_failure(
-                                error_payload=extracted_error,
-                                event_type=decoded_event.get("type"),
-                            )
-                        )
-                        if (
-                            candidate_failure.error_class
-                            in _RESPONSES_STREAM_REDISPATCH_CLASSES
-                        ):
-                            recovery_failure = candidate_failure
-                    OpenAIPassthroughLoggingHandler._consume_responses_sse_event(
-                        responses_sse_tracker,
-                        decoded_event,
-                    )
+                        recovery_failure = candidate_failure
+                OpenAIPassthroughLoggingHandler._consume_responses_sse_event(
+                    responses_sse_tracker,
+                    decoded_event,
+                )
                 return recovery_failure
 
             def _finalize_responses_tracking() -> Optional[Dict[str, Any]]:
@@ -2082,20 +2223,19 @@ class PassThroughStreamingHandler:
                 nonlocal responses_sse_event_buffer, held_responses_done_suffix
                 if (
                     responses_tracking_finalized
-                    or responses_terminal_accumulator is None
+                    or responses_event_pipeline is None
                 ):
                     return None
                 responses_tracking_finalized = True
                 if responses_sse_event_buffer or (
-                    responses_terminal_accumulator.has_pending_frame()
+                    responses_event_pipeline.buffered_event_bytes
                 ):
                     OpenAIPassthroughLoggingHandler._mark_responses_sse_partial_frame(
                         responses_sse_tracker
                     )
                 else:
-                    _consume_responses_lines(
-                        responses_terminal_accumulator.finish()
-                    )
+                    for parsed_event in responses_event_pipeline.finish():
+                        _consume_responses_event(parsed_event)
 
                 if responses_sse_event_buffer:
                     # Native Responses partial frames are not client-deliverable
@@ -2106,7 +2246,7 @@ class PassThroughStreamingHandler:
                     held_responses_done_suffix = b""
 
                 synthetic_terminal: Optional[Dict[str, Any]] = None
-                if first_emitted_at is not None and not responses_terminal_seen:
+                if _final_wire_committed() and not responses_terminal_seen:
                     synthetic_terminal = (
                         OpenAIPassthroughLoggingHandler._classify_responses_sse_clean_eof(
                             responses_sse_tracker
@@ -2216,8 +2356,8 @@ class PassThroughStreamingHandler:
                     if line_accumulator is not None:
                         precomputed_lines = line_accumulator.finish()
 
-                    logging_work = (
-                        PassThroughStreamingHandler._route_streaming_logging_to_handler(
+                    if openai_wire_trace is not None:
+                        await PassThroughStreamingHandler._route_streaming_logging_to_handler(
                             litellm_logging_obj=litellm_logging_obj,
                             passthrough_success_handler_obj=passthrough_success_handler_obj,
                             response=response,
@@ -2233,12 +2373,29 @@ class PassThroughStreamingHandler:
                             success_handler_kwargs=success_handler_kwargs,
                             local_prepare_ms=local_prepare_ms,
                             error_log_context=error_log_context,
+                            responses_event_pipeline=responses_event_pipeline,
                         )
-                    )
-                    if openai_wire_trace is not None:
-                        await logging_work
                     else:
-                        asyncio.create_task(logging_work)
+                        asyncio.create_task(
+                            PassThroughStreamingHandler._route_streaming_logging_to_handler(
+                                litellm_logging_obj=litellm_logging_obj,
+                                passthrough_success_handler_obj=passthrough_success_handler_obj,
+                                response=response,
+                                url_route=url_route,
+                                request_body=request_body or {},
+                                endpoint_type=endpoint_type,
+                                start_time=start_time,
+                                raw_bytes=raw_bytes,
+                                precomputed_lines=precomputed_lines,
+                                end_time=end_time,
+                                passthrough_logging_payload=passthrough_logging_payload,
+                                custom_llm_provider=custom_llm_provider,
+                                success_handler_kwargs=success_handler_kwargs,
+                                local_prepare_ms=local_prepare_ms,
+                                error_log_context=error_log_context,
+                                responses_event_pipeline=responses_event_pipeline,
+                            )
+                        )
 
                 if (
                     deferred_success_holder is not None
@@ -2322,14 +2479,49 @@ class PassThroughStreamingHandler:
                     )
                     await _publish_transfer_chunks(first_upstream=True, force=True)
 
-                if responses_terminal_accumulator is not None:
-                    responses_sse_event_buffer += chunk
-                    complete_chunk, responses_sse_event_buffer = (
-                        PassThroughStreamingHandler._split_responses_sse_event_buffer(
-                            responses_sse_event_buffer
+                if responses_event_pipeline is not None:
+                    limit_exception: Optional[ResponsesBoundFailure] = None
+                    try:
+                        admitted_events = responses_events_from_chunk(chunk)
+                        if admitted_events is None:
+                            parsed_events = responses_event_pipeline.feed(chunk)
+                        else:
+                            # The precommit wrapper already admitted this
+                            # carrier. Consume its typed associations without
+                            # invoking the parser or reducer again.
+                            parsed_events = admitted_events
+                    except (
+                        ResponsesBoundFailure,
+                        ResponsesEventTooLarge,
+                        ResponsesStreamTooLarge,
+                    ) as exception:
+                        limit_exception = ResponsesBoundFailure.from_exception(
+                            exception
                         )
-                    )
+                        parsed_events = list(limit_exception.accepted_events)
+
                     recovery_failure: Optional[ResponsesStreamPreCommitFailure] = None
+                    delivered_event_chunks: list[bytes] = []
+                    delivered_events: list[ParsedResponsesEvent] = []
+                    for parsed_event in parsed_events:
+                        if recovery_failure is not None:
+                            break
+                        candidate_failure = _consume_responses_event(parsed_event)
+                        if candidate_failure is not None:
+                            recovery_failure = candidate_failure
+                            break
+                        if parsed_event.forward_event is not None:
+                            delivered_event_chunks.append(parsed_event.forward_event)
+                            delivered_events.append(parsed_event)
+
+                    if delivered_event_chunks:
+                        complete_chunk = attach_responses_events(
+                            b"".join(delivered_event_chunks),
+                            delivered_events,
+                        )
+                    else:
+                        complete_chunk = b""
+
                     if complete_chunk:
                         complete_chunk = PassThroughStreamingHandler._stamp_encrypted_reasoning_in_responses_sse_chunk(
                             complete_chunk,
@@ -2339,34 +2531,21 @@ class PassThroughStreamingHandler:
                                 else None
                             ),
                             custom_llm_provider=custom_llm_provider,
+                            events=delivered_events,
                         )
-                        responses_terminal_accumulator.feed(complete_chunk)
-                        recovery_failure = _consume_responses_lines(
-                            responses_terminal_accumulator.lines
-                        )
-                        responses_terminal_accumulator.lines.clear()
 
-                    if (
-                        recovery_failure is not None
-                        and (
-                            responses_substantive_seen
-                            or downstream_chunk_count > 0
-                        )
+                    if recovery_failure is not None and (
+                        responses_substantive_seen or downstream_chunk_count > 0
                     ):
-                        filtered_chunk, removed_failure = (
-                            PassThroughStreamingHandler._remove_responses_stream_recovery_failure_events(
-                                complete_chunk
-                            )
-                        )
-                        if filtered_chunk and (
-                            removed_failure or recovery_failure is None
-                        ):
-                            _record_responses_wire_chunk(filtered_chunk)
+                        # The recovery event is typed and isolated; do not
+                        # forward a redispatch-only failure envelope.
+                        if complete_chunk:
+                            _record_responses_wire_chunk(complete_chunk)
                             await _publish_transfer_chunks(
                                 first_downstream=first_emitted_at is not None
                                 and downstream_chunk_count == 1
                             )
-                            yield filtered_chunk
+                            yield complete_chunk
                         failure_context = (
                             PassThroughStreamingHandler._build_responses_stream_redispatch_failure_context(
                                 failure=recovery_failure,
@@ -2395,6 +2574,73 @@ class PassThroughStreamingHandler:
                                 custom_llm_provider=custom_llm_provider,
                                 failure_context=failure_context,
                                 exc=recovery_failure,
+                                responses_event_pipeline=responses_event_pipeline,
+                            )
+                        )
+                        _mark_responses_terminal_pending()
+                        for terminal_chunk in terminal_chunks:
+                            _record_responses_wire_chunk(terminal_chunk)
+                            yield terminal_chunk
+                        break
+
+                    if limit_exception is not None:
+                        responses_sse_event_buffer = b""
+                        held_responses_done_suffix = b""
+                        if responses_sse_tracker is not None:
+                            OpenAIPassthroughLoggingHandler._mark_responses_sse_partial_frame(
+                                responses_sse_tracker
+                            )
+                        failure_kind = (
+                            "streaming_upstream_event_too_large"
+                            if limit_exception.kind == "event_too_large"
+                            else "streaming_upstream_too_large"
+                        )
+                        committed_downstream = _final_wire_committed()
+                        failure_context = dict(error_log_context or {})
+                        failure_context.update(
+                            {
+                                "failure_kind": failure_kind,
+                                "error_class": type(limit_exception.cause).__name__,
+                                "error_code": limit_exception.code,
+                                "error_message": str(limit_exception),
+                                "terminal_error_payload": dict(
+                                    limit_exception.error_payload
+                                ),
+                                "stream_failure_stage": (
+                                    "stream_interrupted_after_first_byte"
+                                    if committed_downstream
+                                    else "stream_interrupted_before_emit"
+                                ),
+                                "stream_chunks_seen": chunk_count,
+                                "stream_bytes_seen": total_stream_bytes,
+                                "stream_hidden_retry_safe": False,
+                                "aawm_stream_incomplete_reason": (
+                                    limit_exception.incomplete_reason
+                                ),
+                                "responses_api_terminal": True,
+                            }
+                        )
+                        if isinstance(error_log_context, dict):
+                            error_log_context.update(failure_context)
+                        metadata.update(failure_context)
+                        metadata["aawm_stream_interrupted"] = True
+                        metadata["aawm_stream_incomplete"] = True
+                        metadata["aawm_route_rollup_turn_suppressed"] = True
+                        if complete_chunk:
+                            _record_responses_wire_chunk(complete_chunk)
+                            await _publish_transfer_chunks(
+                                first_downstream=first_emitted_at is not None
+                                and downstream_chunk_count == 1
+                            )
+                            yield complete_chunk
+                        terminal_chunks = (
+                            PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
+                                endpoint_type=endpoint_type,
+                                url_route=url_route,
+                                custom_llm_provider=custom_llm_provider,
+                                failure_context=failure_context,
+                                exc=limit_exception,
+                                responses_event_pipeline=responses_event_pipeline,
                             )
                         )
                         _mark_responses_terminal_pending()
@@ -2426,12 +2672,40 @@ class PassThroughStreamingHandler:
                         # completion bookkeeping path below.
                         break
 
+                    prior_held = responses_emissions_from_chunk(
+                        held_responses_done_suffix
+                    ) or []
+                    current_emissions = responses_emissions_from_chunk(
+                        complete_chunk
+                    ) or [event.emission() for event in delivered_events]
+                    combined_emissions = [*prior_held, *current_emissions]
+                    combined_chunk = attach_responses_emissions(
+                        b"",
+                        combined_emissions,
+                    )
                     (
                         chunk_without_done,
                         held_responses_done_suffix,
                     ) = PassThroughStreamingHandler._split_trailing_done_chunk(
-                        held_responses_done_suffix + complete_chunk
+                        combined_chunk
                     )
+                    prefix_emissions, suffix_emissions = (
+                        PassThroughStreamingHandler._partition_responses_emissions_by_count(
+                            chunk_without_done,
+                            held_responses_done_suffix,
+                            combined_emissions,
+                        )
+                    )
+                    if chunk_without_done and prefix_emissions:
+                        chunk_without_done = attach_responses_emissions(
+                            b"",
+                            prefix_emissions,
+                        )
+                    if held_responses_done_suffix and suffix_emissions:
+                        held_responses_done_suffix = attach_responses_emissions(
+                            b"",
+                            suffix_emissions,
+                        )
                     if chunk_without_done:
                         _record_responses_wire_chunk(chunk_without_done)
                         await _publish_transfer_chunks(
@@ -2516,7 +2790,7 @@ class PassThroughStreamingHandler:
                 )
                 yield chunk
 
-            if responses_terminal_accumulator is not None:
+            if responses_event_pipeline is not None:
                 synthetic_terminal = _finalize_responses_tracking()
                 terminal_chunks: List[bytes] = []
                 if synthetic_terminal is not None:
@@ -2532,6 +2806,14 @@ class PassThroughStreamingHandler:
                         ).encode("utf-8"),
                         b"data: [DONE]\n\n",
                     ]
+                    terminal_chunks = (
+                        PassThroughStreamingHandler._attach_responses_terminal_events(
+                            terminal_chunks,
+                            event_pipeline=responses_event_pipeline,
+                            event_type=event_type,
+                            payload=synthetic_terminal,
+                        )
+                    )
 
                 if terminal_chunks:
                     held_responses_done_suffix = b""
@@ -2702,6 +2984,76 @@ class PassThroughStreamingHandler:
                     first_emitted_at=local_first_emitted_at,
                 )
             )
+            if isinstance(e, ResponsesBoundFailure):
+                bound_failure = e
+                failure_kind = (
+                    "streaming_upstream_event_too_large"
+                    if bound_failure.kind == "event_too_large"
+                    else "streaming_upstream_too_large"
+                )
+                failure_context = dict(error_log_context or {})
+                failure_context.update(
+                    {
+                        "failure_kind": failure_kind,
+                        "error_class": type(bound_failure.cause).__name__,
+                        "error_code": bound_failure.code,
+                        "error_message": str(bound_failure),
+                        "terminal_error_payload": dict(bound_failure.error_payload),
+                        "stream_failure_stage": (
+                            "stream_interrupted_after_first_byte"
+                            if (
+                                openai_wire_trace is not None
+                                and (
+                                    getattr(openai_wire_trace, "first_body_sent", False)
+                                    or getattr(
+                                        openai_wire_trace,
+                                        "terminal_wire_committed",
+                                        False,
+                                    )
+                                    or getattr(
+                                        openai_wire_trace,
+                                        "asgi_delivery_complete",
+                                        False,
+                                    )
+                                )
+                            )
+                            or (
+                                openai_wire_trace is None
+                                and local_first_emitted_at is not None
+                            )
+                            else "stream_interrupted_before_emit"
+                        ),
+                        "stream_chunks_seen": local_chunk_count,
+                        "stream_bytes_seen": local_total_stream_bytes,
+                        "stream_hidden_retry_safe": False,
+                        "aawm_stream_incomplete_reason": (
+                            bound_failure.incomplete_reason
+                        ),
+                        "responses_api_terminal": True,
+                    }
+                )
+                if isinstance(error_log_context, dict):
+                    error_log_context.update(failure_context)
+                metadata.update(failure_context)
+                metadata["aawm_stream_interrupted"] = True
+                metadata["aawm_stream_incomplete"] = True
+                metadata["aawm_route_rollup_turn_suppressed"] = True
+                terminal_chunks = (
+                    PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
+                        endpoint_type=endpoint_type,
+                        url_route=url_route,
+                        custom_llm_provider=custom_llm_provider,
+                        failure_context=failure_context,
+                        exc=bound_failure,
+                        responses_event_pipeline=responses_event_pipeline,
+                    )
+                )
+                _mark_responses_terminal_pending()
+                for terminal_chunk in terminal_chunks:
+                    if "_record_responses_wire_chunk" in locals():
+                        _record_responses_wire_chunk(terminal_chunk)
+                    yield terminal_chunk
+                return
             if (
                 isinstance(e, httpx.ReadTimeout)
                 and local_first_emitted_at is not None
@@ -2721,6 +3073,7 @@ class PassThroughStreamingHandler:
                         first_chunk_at=local_first_chunk_at,
                         first_emitted_at=local_first_emitted_at,
                         defer_failure_consumers=openai_wire_trace is not None,
+                        responses_event_pipeline=responses_event_pipeline,
                     )
                 )
                 for terminal_chunk in terminal_chunks:
@@ -2759,6 +3112,7 @@ class PassThroughStreamingHandler:
         local_prepare_ms: Optional[float] = None,
         error_log_context: Optional[Dict[str, Any]] = None,
         upstream_prefix_bytes: Optional[List[bytes]] = None,
+        responses_event_pipeline: Optional[ResponsesEventPipeline] = None,
     ) -> None:
         """Finish native stream bookkeeping when the body iterator never starts."""
 
@@ -2772,9 +3126,13 @@ class PassThroughStreamingHandler:
         ).strip().lower()
         metadata["aawm_delivered_wire_disposition"] = dict(delivered_snapshot)
         metadata["aawm_delivered_disposition"] = delivered_disposition
+        prefix_source: Any = upstream_prefix_bytes or []
+        iter_prefix_chunks = getattr(prefix_source, "iter_chunks", None)
+        if callable(iter_prefix_chunks):
+            prefix_source = iter_prefix_chunks()
         prefix_chunks = [
             chunk
-            for chunk in (upstream_prefix_bytes or [])
+            for chunk in prefix_source
             if isinstance(chunk, (bytes, bytearray, memoryview)) and chunk
         ]
         upstream_chunk_count = len(prefix_chunks)
@@ -2839,6 +3197,10 @@ class PassThroughStreamingHandler:
             success_handler_kwargs=success_handler_kwargs,
             local_prepare_ms=local_prepare_ms,
             error_log_context=error_log_context,
+            responses_event_pipeline=(
+                responses_event_pipeline
+                or responses_event_pipeline_from_response(response)
+            ),
         )
 
     @staticmethod
@@ -2857,6 +3219,7 @@ class PassThroughStreamingHandler:
         first_chunk_at: Optional[datetime],
         first_emitted_at: Optional[datetime],
         defer_failure_consumers: bool = False,
+        responses_event_pipeline: Optional[ResponsesEventPipeline] = None,
     ) -> List[bytes]:
         failure_context = PassThroughStreamingHandler._build_streaming_failure_context(
             exc=exc,
@@ -2988,6 +3351,7 @@ class PassThroughStreamingHandler:
             custom_llm_provider=custom_llm_provider,
             failure_context=failure_context,
             exc=exc,
+            responses_event_pipeline=responses_event_pipeline,
         )
 
     @staticmethod
@@ -3002,6 +3366,7 @@ class PassThroughStreamingHandler:
         success_handler_kwargs: Optional[Dict[str, Any]],
         chunk_count: int,
         total_stream_bytes: int,
+        responses_event_pipeline: Optional[ResponsesEventPipeline] = None,
     ) -> List[bytes]:
         metadata = PassThroughStreamingHandler._ensure_streaming_metadata(
             success_handler_kwargs
@@ -3121,6 +3486,7 @@ class PassThroughStreamingHandler:
             custom_llm_provider=custom_llm_provider,
             failure_context=failure_context,
             incomplete_reason=PassThroughStreamingHandler._CLEAN_EOF_INCOMPLETE_REASON,
+            responses_event_pipeline=responses_event_pipeline,
         )
 
     @staticmethod
@@ -3327,6 +3693,55 @@ class PassThroughStreamingHandler:
         }
 
     @staticmethod
+    def _attach_responses_terminal_events(
+        chunks: List[bytes],
+        *,
+        event_pipeline: Optional[ResponsesEventPipeline],
+        event_type: str,
+        payload: Optional[Dict[str, Any]],
+    ) -> List[bytes]:
+        """Associate generated Responses terminal bytes with the attempt owner."""
+        if event_pipeline is None or not chunks:
+            return chunks
+
+        carried = list(chunks)
+        try:
+            terminal_event = event_pipeline.adopt_event(
+                payload,
+                event_type=event_type,
+                wire_event=carried[0],
+                control=True,
+            )
+            carried[0] = attach_responses_events(
+                carried[0],
+                [terminal_event],
+                replace=True,
+            )
+            if len(carried) > 1 and PassThroughStreamingHandler._is_done_chunk(
+                carried[1]
+            ):
+                done_event = event_pipeline.adopt_event(
+                    None,
+                    is_done_marker=True,
+                    wire_event=carried[1],
+                    control=True,
+                )
+                carried[1] = attach_responses_events(
+                    carried[1],
+                    [done_event],
+                    replace=True,
+                )
+        except (
+            ResponsesEventRetentionTooLarge,
+            ResponsesEventTooLarge,
+            ResponsesStreamTooLarge,
+        ):
+            # Generated terminals use reserved control capacity. If even that
+            # bound is exhausted, keep the already-associated prefix.
+            return carried
+        return carried
+
+    @staticmethod
     def _build_post_first_byte_terminal_stream_chunks(
         *,
         endpoint_type: EndpointType,
@@ -3335,6 +3750,7 @@ class PassThroughStreamingHandler:
         failure_context: Dict[str, Any],
         exc: Optional[Exception] = None,
         incomplete_reason: Optional[str] = None,
+        responses_event_pipeline: Optional[ResponsesEventPipeline] = None,
     ) -> List[bytes]:
         legacy_terminal_metadata = {
             "stream_failure_stage": failure_context.get("stream_failure_stage"),
@@ -3375,7 +3791,7 @@ class PassThroughStreamingHandler:
                     "metadata": terminal_metadata,
                 },
             }
-            return [
+            chunks = [
                 (
                     "event: response.incomplete\ndata: "
                     + json.dumps(payload, separators=(",", ":"))
@@ -3383,6 +3799,12 @@ class PassThroughStreamingHandler:
                 ).encode("utf-8"),
                 b"data: [DONE]\n\n",
             ]
+            return PassThroughStreamingHandler._attach_responses_terminal_events(
+                chunks,
+                event_pipeline=responses_event_pipeline,
+                event_type="response.incomplete",
+                payload=payload,
+            )
 
         custom_error_payload = failure_context.get("terminal_error_payload")
         if isinstance(custom_error_payload, dict):
@@ -3447,7 +3869,12 @@ class PassThroughStreamingHandler:
                 ).encode("utf-8")
             ]
             chunks.append(b"data: [DONE]\n\n")
-            return chunks
+            return PassThroughStreamingHandler._attach_responses_terminal_events(
+                chunks,
+                event_pipeline=responses_event_pipeline,
+                event_type="response.failed",
+                payload=payload,
+            )
 
         payload = {
             "error": error_payload,
@@ -3543,6 +3970,7 @@ class PassThroughStreamingHandler:
         custom_llm_provider: Optional[str],
         kwargs: Dict[str, Any],
         handler_branch_state: List[str],
+        responses_event_pipeline: Optional[ResponsesEventPipeline] = None,
     ) -> tuple[
         Optional[PassThroughEndpointLoggingResultValues],
         Dict[str, Any],
@@ -3576,19 +4004,35 @@ class PassThroughStreamingHandler:
 
         if endpoint_type == EndpointType.OPENAI:
             handler_branch = set_branch(handler_branch_state, "openai")
-            openai_passthrough_logging_handler_result = (
-                OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks(
-                    litellm_logging_obj=litellm_logging_obj,
-                    passthrough_success_handler_obj=passthrough_success_handler_obj,
-                    url_route=url_route,
-                    request_body=request_body,
-                    endpoint_type=endpoint_type,
-                    start_time=start_time,
-                    all_chunks=all_chunks,
-                    end_time=end_time,
-                    kwargs=kwargs,
+            try:
+                openai_passthrough_logging_handler_result = (
+                    OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks(
+                        litellm_logging_obj=litellm_logging_obj,
+                        passthrough_success_handler_obj=passthrough_success_handler_obj,
+                        url_route=url_route,
+                        request_body=request_body,
+                        endpoint_type=endpoint_type,
+                        start_time=start_time,
+                        all_chunks=all_chunks,
+                        end_time=end_time,
+                        kwargs=kwargs,
+                        responses_event_pipeline=responses_event_pipeline,
+                    )
                 )
-            )
+            except TypeError:
+                openai_passthrough_logging_handler_result = (
+                    OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks(
+                        litellm_logging_obj=litellm_logging_obj,
+                        passthrough_success_handler_obj=passthrough_success_handler_obj,
+                        url_route=url_route,
+                        request_body=request_body,
+                        endpoint_type=endpoint_type,
+                        start_time=start_time,
+                        all_chunks=all_chunks,
+                        end_time=end_time,
+                        kwargs=kwargs,
+                    )
+                )
             standard_logging_response_object = (
                 openai_passthrough_logging_handler_result["result"]
             )
@@ -3645,6 +4089,7 @@ class PassThroughStreamingHandler:
         endpoint_type: EndpointType,
         url_route: str,
         custom_llm_provider: Optional[str],
+        responses_event_pipeline: Optional[ResponsesEventPipeline] = None,
     ) -> Optional[Dict[str, Any]]:
         if not PassThroughStreamingHandler._is_openai_responses_stream(
             endpoint_type=endpoint_type,
@@ -3653,11 +4098,26 @@ class PassThroughStreamingHandler:
         ):
             return None
 
-        terminal_event_type, terminal_payload = (
-            OpenAIPassthroughLoggingHandler._extract_terminal_response_payload_from_stream(
-                all_chunks
-            )
+        summary = (
+            responses_event_pipeline.summary_snapshot()
+            if responses_event_pipeline is not None
+            else None
         )
+        terminal_event_type = (
+            summary.get("terminal_event_type") if isinstance(summary, dict) else None
+        )
+        terminal_payload = (
+            summary.get("terminal_response_payload")
+            if isinstance(summary, dict)
+            else None
+        )
+        if terminal_event_type is None:
+            terminal_event_type, terminal_payload = (
+                OpenAIPassthroughLoggingHandler._extract_terminal_response_payload_from_stream(
+                    all_chunks,
+                    responses_event_pipeline=responses_event_pipeline,
+                )
+            )
         if (
             terminal_event_type != "response.completed"
             or not isinstance(terminal_payload, dict)
@@ -3667,8 +4127,11 @@ class PassThroughStreamingHandler:
 
         completed_output = terminal_payload.get("output")
         reconstructed_output = (
-            OpenAIPassthroughLoggingHandler._reconstruct_responses_output_items_from_stream(
-                all_chunks
+            summary.get("output")
+            if isinstance(summary, dict) and isinstance(summary.get("output"), list)
+            else OpenAIPassthroughLoggingHandler._reconstruct_responses_output_items_from_stream(
+                all_chunks,
+                responses_event_pipeline=responses_event_pipeline,
             )
         )
         merged_output = OpenAIPassthroughLoggingHandler._merge_responses_output_lists(
@@ -3676,8 +4139,11 @@ class PassThroughStreamingHandler:
             reconstructed_output,
         )
         streamed_output_text = (
-            OpenAIPassthroughLoggingHandler._extract_responses_api_stream_text(
-                all_chunks
+            summary.get("stream_text")
+            if isinstance(summary, dict) and isinstance(summary.get("stream_text"), str)
+            else OpenAIPassthroughLoggingHandler._extract_responses_api_stream_text(
+                all_chunks,
+                responses_event_pipeline=responses_event_pipeline,
             )
         )
         if streamed_output_text:
@@ -3805,25 +4271,45 @@ class PassThroughStreamingHandler:
         *,
         all_chunks: List[str],
         terminal_payload: Optional[Dict[str, Any]],
+        terminal_event_type: Optional[str] = None,
+        responses_event_pipeline: Optional[ResponsesEventPipeline] = None,
     ) -> Optional[Dict[str, Any]]:
-        events = PassThroughStreamingHandler._iter_responses_sse_events(all_chunks)
         first_error: Optional[Dict[str, Any]] = None
         failed_error: Optional[Dict[str, Any]] = None
-        for event_type, payload in events:
-            extracted = PassThroughStreamingHandler._extract_responses_stream_error_payload(
-                event_type,
-                payload,
-            )
-            if extracted is None:
-                continue
-            if event_type == "error" and first_error is None:
-                first_error = extracted
-            if event_type == "response.failed" and failed_error is None:
-                failed_error = extracted
+        if responses_event_pipeline is not None:
+            summary = responses_event_pipeline.summary_snapshot()
+            if isinstance(summary, dict):
+                first_error = summary.get("first_error_payload")
+                failed_error = summary.get("failed_error_payload")
+        else:
+            events = PassThroughStreamingHandler._iter_responses_sse_events(all_chunks)
+            for event_type, payload in events:
+                extracted = (
+                    PassThroughStreamingHandler._extract_responses_stream_error_payload(
+                        event_type,
+                        payload,
+                    )
+                )
+                if extracted is None:
+                    continue
+                if event_type == "error" and first_error is None:
+                    first_error = extracted
+                if event_type == "response.failed" and failed_error is None:
+                    failed_error = extracted
+
         if isinstance(terminal_payload, dict) and isinstance(
             terminal_payload.get("error"), dict
         ):
             failed_error = failed_error or terminal_payload.get("error")
+        elif terminal_event_type == "response.failed" and isinstance(
+            terminal_payload, dict
+        ):
+            failed_error = failed_error or (
+                PassThroughStreamingHandler._extract_responses_stream_error_payload(
+                    terminal_event_type,
+                    {"response": terminal_payload},
+                )
+            )
         if first_error is None:
             return failed_error
         if failed_error is None:
@@ -3854,6 +4340,7 @@ class PassThroughStreamingHandler:
         handler_branch_state: List[str],
         delivered_wire_disposition: Optional[Dict[str, Any]] = None,
         openai_alpha_capacity_retry_enabled: bool = False,
+        responses_event_pipeline: Optional[ResponsesEventPipeline] = None,
     ) -> None:
         metadata["aawm_route_rollup_turn_suppressed"] = True
         metadata["aawm_stream_interrupted"] = True
@@ -3887,6 +4374,8 @@ class PassThroughStreamingHandler:
         error_payload = PassThroughStreamingHandler._reconcile_responses_stream_error_payload(
             all_chunks=all_chunks,
             terminal_payload=terminal_payload,
+            terminal_event_type=terminal_event_type,
+            responses_event_pipeline=responses_event_pipeline,
         )
         recognized_terminal = (
             terminal_event_type in _RECOGNIZED_PROVIDER_TERMINAL_EVENTS
@@ -4238,6 +4727,7 @@ class PassThroughStreamingHandler:
         success_handler_kwargs: Optional[Dict[str, Any]] = None,
         local_prepare_ms: Optional[float] = None,
         error_log_context: Optional[Dict[str, Any]] = None,
+        responses_event_pipeline: Optional[ResponsesEventPipeline] = None,
     ):
         """
         Route the logging for the collected chunks to the appropriate handler
@@ -4285,6 +4775,7 @@ class PassThroughStreamingHandler:
                 custom_llm_provider=custom_llm_provider,
                 kwargs=kwargs,
                 handler_branch_state=handler_branch_state,
+                responses_event_pipeline=responses_event_pipeline,
             )
             if early_exit:
                 return
@@ -4300,11 +4791,14 @@ class PassThroughStreamingHandler:
                 if is_native_openai_responses_stream
                 else None
             )
-            if is_native_openai_responses_stream and delivered_wire_disposition is None:
+            skip_success_without_delivery = (
+                is_native_openai_responses_stream
+                and delivered_wire_disposition is None
+            )
+            if skip_success_without_delivery:
                 verbose_proxy_logger.warning(
                     "Skipping native Responses success consumers without a delivered disposition"
                 )
-                return
             if standard_logging_response_object is None:
                 standard_logging_response_object = StandardPassThroughResponseObject(
                     response=f"cannot parse chunks to standard response object. Chunks={all_chunks}"
@@ -4323,7 +4817,8 @@ class PassThroughStreamingHandler:
             )
             terminal_event_type, terminal_payload = (
                 OpenAIPassthroughLoggingHandler._extract_terminal_response_payload_from_stream(
-                    all_chunks
+                    all_chunks,
+                    responses_event_pipeline=responses_event_pipeline,
                 )
             )
             if terminal_event_type is None and isinstance(tracker_state, dict):
@@ -4365,6 +4860,7 @@ class PassThroughStreamingHandler:
                     openai_alpha_capacity_retry_enabled=(
                         PassThroughStreamingHandler._is_openai_capacity_retry_policy_enabled()
                     ),
+                    responses_event_pipeline=responses_event_pipeline,
                 )
                 return
             if synthetic_terminal_event_type == "response.incomplete":
@@ -4410,6 +4906,7 @@ class PassThroughStreamingHandler:
                             endpoint_type=endpoint_type,
                             url_route=url_route,
                             custom_llm_provider=custom_llm_provider,
+                            responses_event_pipeline=responses_event_pipeline,
                         )
                     ),
                 )
@@ -4420,6 +4917,8 @@ class PassThroughStreamingHandler:
                 litellm_logging_obj,
                 kwargs,
             )
+            if skip_success_without_delivery:
+                return
             handler_branch = (
                 await PassThroughStreamingHandler._dispatch_streaming_success_callbacks(
                     litellm_logging_obj=litellm_logging_obj,

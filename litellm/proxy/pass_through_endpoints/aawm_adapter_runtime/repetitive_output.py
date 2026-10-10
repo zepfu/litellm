@@ -19,11 +19,22 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Mappi
 from fastapi import HTTPException
 
 from litellm._logging import verbose_proxy_logger
-from litellm.llms.base_llm.base_model_iterator import BaseModelResponseIterator
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
     _iter_sse_event_blocks_with_separator,
     _mapping_or_attr_get,
+    _sse_block_events,
+    _sse_block_wire_bytes,
     _responses_event_text_key,
+)
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+    ResponsesEventRetentionTooLarge,
+    ResponsesEventPipeline,
+    ResponsesEventTooLarge,
+    ResponsesStreamTooLarge,
+    attach_responses_emissions,
+    attach_responses_events,
+    responses_emissions_from_chunk,
+    responses_event_pipeline_from_response,
 )
 from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
 
@@ -82,15 +93,27 @@ def extract_visible_text_from_responses_event(event: Any) -> Optional[str]:
 class VisibleOutputTextExtractor:
     """Accumulate visible Responses text with the stream_collect delta/done rule."""
 
+    _MAX_IDENTITY_KEYS = 256
+
     def __init__(self) -> None:
         self._delta_keys_seen: set[str] = set()
+        self._delta_key_order: deque[str] = deque()
+
+    def _remember_delta_key(self, key: str) -> None:
+        if key in self._delta_keys_seen:
+            return
+        self._delta_keys_seen.add(key)
+        self._delta_key_order.append(key)
+        while len(self._delta_key_order) > self._MAX_IDENTITY_KEYS:
+            evicted = self._delta_key_order.popleft()
+            self._delta_keys_seen.discard(evicted)
 
     def consume_event(self, event: Any) -> Optional[str]:
         event_type = _event_type(event)
         if event_type == _VISIBLE_DELTA_TYPE:
             text = extract_visible_text_from_responses_event(event)
             if text:
-                self._delta_keys_seen.add(_responses_event_text_key(event))
+                self._remember_delta_key(_responses_event_text_key(event))
             return text
         if event_type == _VISIBLE_DONE_TYPE:
             text_key = _responses_event_text_key(event)
@@ -98,7 +121,7 @@ class VisibleOutputTextExtractor:
                 return None
             text = extract_visible_text_from_responses_event(event)
             if text:
-                self._delta_keys_seen.add(text_key)
+                self._remember_delta_key(text_key)
             return text
         return None
 
@@ -295,6 +318,8 @@ class VisibleTextRepetitionMatch:
 class VisibleTextRepetitionDetector:
     """Rolling-window scorer over normalized visible words."""
 
+    _MAX_PENDING_BYTES = 8 * 1024
+
     def __init__(self, policy: OutputGuardPolicy) -> None:
         self.policy = policy
         self._window: deque[str] = deque(maxlen=policy.window_words)
@@ -313,11 +338,26 @@ class VisibleTextRepetitionDetector:
     ) -> Optional[VisibleTextRepetitionMatch]:
         if self._match is not None:
             return self._match
+        pending_bytes = len(f"{self._pending}{text}".encode("utf-8"))
+        if pending_bytes > self._MAX_PENDING_BYTES:
+            raise ValueError(
+                "Repetitive-output token state exceeded the supported bound"
+            )
         words, self._pending = _normalize_visible_text_with_remainder(
             text, pending=self._pending, flush=flush
         )
+        pending_encoded = self._pending.encode("utf-8")
+        if len(pending_encoded) > self._MAX_PENDING_BYTES:
+            raise ValueError(
+                "Repetitive-output pending token exceeded the supported bound"
+            )
         added_ngrams: list[tuple[str, ...]] = []
         for word in words:
+            encoded_word = word.encode("utf-8")
+            if len(encoded_word) > self._MAX_PENDING_BYTES:
+                raise ValueError(
+                    "Repetitive-output complete token exceeded the supported bound"
+                )
             evicted_ngram = self._ngram_at(0)
             window_was_full = (
                 self._window.maxlen is not None
@@ -362,16 +402,22 @@ class VisibleTextRepetitionDetector:
             self._ngram_counts[ngram] = count
 
     def _ngram_rebuild_required(self, added_ngrams: list[tuple[str, ...]]) -> bool:
-        """Skip whole-window clustering when exact n-gram counts cannot match.
+        """Skip clustering only when a match is still impossible.
 
-        Unique one-word deltas only shift the window; consecutive unique
-        n-grams are within edit-distance 2 of each other, so clustering them
-        would still rebuild on every feed. Exact counts below ``min_repeats``
-        cannot satisfy the detector, and the first armed score already ran a
-        full rebuild. Near-duplicate clustering remains on that first armed
-        score and on later feeds that actually repeat an n-gram.
+        Novelty above ``max_novelty`` cannot produce a match, so unique
+        one-word deltas can skip the whole-window rebuild. Exact n-gram
+        counts are a valid necessary condition only when edit distance is
+        zero; approximate clusters can qualify without any exact duplicate.
         """
         del added_ngrams
+        words = list(self._window)
+        if (
+            _unique_trigram_novelty(words, self.policy.growth_words)
+            > self.policy.max_novelty
+        ):
+            return False
+        if self.policy.max_ngram_edit_distance > 0:
+            return True
         return max(self._ngram_counts.values(), default=0) >= self.policy.min_repeats
 
     def _score(
@@ -417,19 +463,35 @@ class VisibleTextRepetitionDetector:
 
 
 def _parse_sse_event_block(event_block: str) -> list[Any]:
-    events: list[Any] = []
-    for line in event_block.splitlines():
-        parsed = BaseModelResponseIterator._string_to_dict_parser(line)
-        if parsed is not None:
-            events.append(parsed)
-    return events
+    associated_events = _sse_block_events(event_block)
+    if associated_events is not None:
+        return list(associated_events)
+
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+        ResponsesEventPipeline,
+        resolve_responses_event_limits,
+    )
+
+    pipeline = ResponsesEventPipeline(
+        max_event_bytes=resolve_responses_event_limits()[0],
+        max_raw_events=0,
+    )
+    encoded = _sse_block_wire_bytes(event_block)
+    if not encoded.endswith((b"\r\n\r\n", b"\n\n", b"\r\r")):
+        encoded += b"\n\n"
+    return [
+        parsed_event
+        for parsed_event in pipeline.feed(encoded)
+        if parsed_event.payload is not None
+    ]
 
 
 def _encode_sse_block(event_block: str, had_separator: bool) -> bytes:
-    text = event_block if event_block.endswith("\n\n") or not had_separator else f"{event_block}\n\n"
-    if had_separator and not text.endswith("\n\n"):
-        text = f"{event_block}\n\n"
-    return text.encode("utf-8")
+    wire = _sse_block_wire_bytes(event_block, had_separator)
+    associated_emissions = responses_emissions_from_chunk(event_block)
+    if associated_emissions is None:
+        return wire
+    return attach_responses_emissions(wire, associated_emissions)
 
 
 def _as_bytes(chunk: Any) -> bytes:
@@ -752,6 +814,7 @@ def _build_repetitive_output_failed_chunks(
     match: VisibleTextRepetitionMatch,
     request_context: OutputGuardRequestContext,
     visible_delta_forwarded: bool,
+    event_pipeline: Optional[ResponsesEventPipeline] = None,
 ) -> list[bytes]:
     local_payload = _local_repetitive_output_failed_payload(
         match=match,
@@ -782,8 +845,47 @@ def _build_repetitive_output_failed_chunks(
     except Exception:
         chunks = []
     if chunks and _chunks_include_response_failed(chunks):
-        return chunks
-    return _encode_response_failed_sse(local_payload)
+        generated = chunks
+    else:
+        generated = _encode_response_failed_sse(local_payload)
+    if event_pipeline is None:
+        return generated
+    if not generated:
+        return generated
+    carried = list(generated)
+    try:
+        terminal_event = event_pipeline.adopt_event(
+            local_payload,
+            event_type="response.failed",
+            wire_event=carried[0],
+            control=True,
+        )
+        carried[0] = attach_responses_events(
+            carried[0],
+            [terminal_event],
+            replace=True,
+        )
+        if len(carried) > 1:
+            done_event = event_pipeline.adopt_event(
+                None,
+                is_done_marker=True,
+                wire_event=carried[1],
+                control=True,
+            )
+            carried[1] = attach_responses_events(
+                carried[1],
+                [done_event],
+                replace=True,
+            )
+        return carried
+    except (
+        ResponsesEventRetentionTooLarge,
+        ResponsesEventTooLarge,
+        ResponsesStreamTooLarge,
+    ):
+        return carried
+    except Exception:
+        return generated
 
 
 async def _iterate_responses_sse_with_repetitive_output_guard(  # noqa: PLR0915
@@ -795,6 +897,7 @@ async def _iterate_responses_sse_with_repetitive_output_guard(  # noqa: PLR0915
     upstream_cleanup: Optional[Callable[[], Awaitable[None]]] = None,
     retry_fn: Any = None,
     failover_fn: Any = None,
+    event_pipeline: Optional[ResponsesEventPipeline] = None,
 ) -> AsyncIterator[bytes]:
     """Forward Responses SSE until visible text loops, then fail closed."""
     del retry_fn, failover_fn
@@ -805,6 +908,10 @@ async def _iterate_responses_sse_with_repetitive_output_guard(  # noqa: PLR0915
     closed_body_iterator = False
     closed_sse_iterator = False
     closed_inherited_resources = False
+    event_pipeline = (
+        event_pipeline
+        or responses_event_pipeline_from_response(upstream_response)
+    )
     sse_iter = _iter_sse_event_blocks_with_separator(body_iterator)
 
     async def _abort_upstream() -> None:
@@ -851,7 +958,6 @@ async def _iterate_responses_sse_with_repetitive_output_guard(  # noqa: PLR0915
 
     try:
         async for event_block, had_separator in sse_iter:
-            raw_chunk = _encode_sse_block(event_block, had_separator)
             events = _parse_sse_event_block(event_block)
             match: Optional[VisibleTextRepetitionMatch] = None
             block_has_visible = False
@@ -887,10 +993,11 @@ async def _iterate_responses_sse_with_repetitive_output_guard(  # noqa: PLR0915
                     match=match,
                     request_context=request_context,
                     visible_delta_forwarded=visible_delta_forwarded,
+                    event_pipeline=event_pipeline,
                 ):
                     yield chunk
                 return
-            yield raw_chunk
+            yield _encode_sse_block(event_block, had_separator)
             if block_has_visible:
                 yielded_visible = True
     finally:
@@ -906,6 +1013,7 @@ def wrap_responses_sse_with_repetitive_output_guard(
     upstream_cleanup: Optional[Callable[[], Awaitable[None]]] = None,
     retry_fn: Any = None,
     failover_fn: Any = None,
+    event_pipeline: Optional[ResponsesEventPipeline] = None,
 ) -> AsyncIterator[bytes]:
     """Return a guarded iterator for ``_iter_sse_event_blocks_with_separator``.
 
@@ -947,6 +1055,7 @@ def wrap_responses_sse_with_repetitive_output_guard(
             upstream_cleanup=upstream_cleanup,
             retry_fn=retry_fn,
             failover_fn=failover_fn,
+            event_pipeline=event_pipeline,
         ),
         _close_unstarted_resources,
         on_start=_mark_started,
@@ -977,6 +1086,7 @@ def maybe_wrap_passthrough_responses_stream(
     retry_fn: Any = None,
     failover_fn: Any = None,
     policy: Optional[OutputGuardPolicy] = None,
+    event_pipeline: Optional[ResponsesEventPipeline] = None,
 ) -> AsyncIterator[Any]:
     """Install the SSE guard only when the named selector matches.
 
@@ -997,6 +1107,7 @@ def maybe_wrap_passthrough_responses_stream(
         upstream_cleanup=upstream_cleanup,
         retry_fn=retry_fn,
         failover_fn=failover_fn,
+        event_pipeline=event_pipeline,
     )
     try:
         setattr(wrapped, WRAPPED_STREAM_ATTR, True)
@@ -1033,6 +1144,7 @@ def inherit_or_wrap_passthrough_streaming_response(
     source_response: Any = None,
     request_context: Optional[OutputGuardRequestContext] = None,
     upstream_response: Any = None,
+    event_pipeline: Optional[ResponsesEventPipeline] = None,
 ) -> Any:
     """Wrap a reconstructed StreamingResponse iterator when the guard still applies.
 
@@ -1086,6 +1198,7 @@ def inherit_or_wrap_passthrough_streaming_response(
         request_context=context,
         upstream_response=upstream_response,
         upstream_cleanup=guard_cleanup,
+        event_pipeline=event_pipeline,
     )
     if wrapped_iter is iterator:
         return bind_output_guard_to_streaming_response(

@@ -47,6 +47,7 @@ OPENAI-007 remains sole function_call id/call_id owner.
 from __future__ import annotations
 
 import base64
+import copy
 import json
 from typing import Any, Mapping, MutableMapping, Optional, Sequence
 
@@ -54,6 +55,11 @@ from fastapi import HTTPException
 
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
     normalize_codex_collaboration_dispatch_body,
+)
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+    ParsedResponsesEvent,
+    attach_responses_emissions,
+    responses_emissions_from_chunk,
 )
 
 # Exact compatibility source used by the guard and tests.
@@ -1757,13 +1763,14 @@ def is_openai_responses_egress(
 
 
 
-def stamp_encrypted_reasoning_in_responses_sse_chunk(
+def stamp_encrypted_reasoning_in_responses_sse_chunk(  # noqa: PLR0915
     chunk: bytes,
     *,
     request_body: Optional[Mapping[str, Any]] = None,
     custom_llm_provider: Any = None,
     egress_credential_family: Any = None,
     expected_target_family: Any = None,
+    events: Optional[list[Any]] = None,
 ) -> bytes:
     """Stamp producer provenance onto encrypted reasoning in SSE data lines.
 
@@ -1772,6 +1779,45 @@ def stamp_encrypted_reasoning_in_responses_sse_chunk(
     """
     if not chunk:
         return chunk
+
+    associated_emissions = responses_emissions_from_chunk(chunk)
+    if associated_emissions is None and events:
+        associated_emissions = [
+            event.emission()
+            for event in events
+            if isinstance(event, ParsedResponsesEvent)
+        ]
+    if associated_emissions:
+        provenance = build_producer_provenance_from_egress_context(
+            custom_llm_provider=custom_llm_provider,
+            egress_credential_family=egress_credential_family,
+            expected_target_family=expected_target_family,
+            request_body=request_body if isinstance(request_body, Mapping) else None,
+        )
+        updated: list[Any] = []
+        changed = False
+        for emission in associated_emissions:
+            payload = emission.effective_payload
+            source_wire = emission.wire_bytes
+            if not isinstance(payload, dict) or not source_wire:
+                updated.append(emission)
+                continue
+            working = copy.deepcopy(payload)
+            line_changed = _stamp_encrypted_reasoning_in_sse_event(
+                working, provenance
+            )
+            identity_changed = _stamp_route_identity_in_sse_event(
+                working, provenance
+            )
+            if not line_changed and not identity_changed:
+                updated.append(emission)
+                continue
+            changed = True
+            updated.append(emission.transformed(working))
+        if not changed:
+            return chunk
+        return attach_responses_emissions(b"", updated)
+
     try:
         decoded = chunk.decode("utf-8")
     except Exception:

@@ -50,6 +50,10 @@ if TYPE_CHECKING:
 
 # Replicated constant from god module (line 345).
 _AAWM_REQUEST_BODY_WALK_MAX_DEPTH = 64
+_PARSED_RESPONSES_EVENTS_ATTR = "aawm_parsed_responses_events"
+_RESPONSES_WIRE_EMISSIONS_ATTR = "aawm_responses_wire_emissions"
+_RESPONSES_EVENT_WIRE_BYTES_ATTR = "aawm_responses_event_wire_bytes"
+_RESPONSES_EVENT_SEPARATOR_ATTR = "aawm_responses_event_separator"
 
 
 _HOST_FUNCTION_NAMES = (
@@ -96,6 +100,102 @@ _HOST_GLOBAL_DEFAULTS = (
 )
 
 
+class _ParsedResponsesSSEText(str):
+    """String-compatible SSE block carrying exact wire bytes and typed events."""
+
+    def __new__(
+        cls,
+        value: str,
+        *,
+        wire_bytes: Optional[bytes] = None,
+        separator: bytes = b"",
+        events: Any = (),
+        emissions: Any = (),
+    ) -> "_ParsedResponsesSSEText":
+        instance = str.__new__(cls, value)
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+            RESPONSES_EVENTS_ADMITTED_ATTR,
+        )
+
+        setattr(instance, _RESPONSES_EVENT_WIRE_BYTES_ATTR, wire_bytes)
+        setattr(instance, _RESPONSES_EVENT_SEPARATOR_ATTR, separator)
+        setattr(instance, _PARSED_RESPONSES_EVENTS_ATTR, list(events))
+        setattr(instance, _RESPONSES_WIRE_EMISSIONS_ATTR, list(emissions))
+        setattr(instance, RESPONSES_EVENTS_ADMITTED_ATTR, True)
+        return instance
+
+
+def _preserve_parsed_responses_events(
+    value: Any,
+    source: Any,
+) -> Any:
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+        responses_events_from_chunk,
+    )
+
+    parsed_events = responses_events_from_chunk(source)
+    if parsed_events is None:
+        parsed_events = getattr(source, _PARSED_RESPONSES_EVENTS_ATTR, None)
+    if not isinstance(parsed_events, list):
+        return value
+    emissions = getattr(source, _RESPONSES_WIRE_EMISSIONS_ATTR, None)
+    if isinstance(source, _ParsedResponsesSSEText):
+        wire_bytes = getattr(source, _RESPONSES_EVENT_WIRE_BYTES_ATTR, None)
+        separator = getattr(source, _RESPONSES_EVENT_SEPARATOR_ATTR, b"")
+    else:
+        try:
+            wire_bytes = bytes(source)
+        except (TypeError, ValueError):
+            wire_bytes = None
+        separator = _separator_from_wire_bytes(wire_bytes or b"")
+    if isinstance(value, bytes):
+        text_value = value.decode("utf-8", errors="replace")
+    else:
+        text_value = str(value)
+    return _ParsedResponsesSSEText(
+        text_value,
+        wire_bytes=wire_bytes,
+        separator=separator,
+        events=parsed_events,
+        emissions=emissions if isinstance(emissions, list) else (),
+    )
+
+
+def _separator_from_wire_bytes(value: bytes) -> bytes:
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+        _separator_length_at_end,
+    )
+
+    separator_length = _separator_length_at_end(value)
+    return value[-separator_length:] if separator_length else b""
+
+
+def _sse_block_events(value: Any) -> Optional[list[Any]]:
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+        responses_events_from_chunk,
+    )
+
+    events = responses_events_from_chunk(value)
+    if events is not None:
+        return events
+    events = getattr(value, _PARSED_RESPONSES_EVENTS_ATTR, None)
+    return list(events) if isinstance(events, list) else None
+
+
+def _sse_block_wire_bytes(value: Any, had_separator: bool = False) -> bytes:
+    """Return a block's original bytes whenever the compatibility carrier has them."""
+    wire_bytes = getattr(value, _RESPONSES_EVENT_WIRE_BYTES_ATTR, None)
+    if isinstance(wire_bytes, bytes):
+        return wire_bytes
+    if isinstance(value, bytes):
+        return value
+    text = str(value)
+    encoded = text.encode("utf-8")
+    if had_separator and not _separator_from_wire_bytes(encoded):
+        encoded += b"\n\n"
+    return encoded
+
+
 def install(host_globals: dict) -> None:
     """Rebind moved functions to host_globals for live lookup.
 
@@ -132,7 +232,13 @@ def install(host_globals: dict) -> None:
 def _mapping_or_attr_get(obj: Any, key: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
         return obj.get(key, default)
-    return getattr(obj, key, default)
+    value = getattr(obj, key, default)
+    if value is not default:
+        return value
+    payload = getattr(obj, "payload", None)
+    if isinstance(payload, dict):
+        return payload.get(key, default)
+    return value
 
 
 def _coerce_namespace_to_mapping(
@@ -357,50 +463,129 @@ def _serialize_responses_adapter_response(response_obj: Any) -> str:
     return json.dumps(response_obj)
 
 
-async def _iter_sse_event_blocks_with_separator(body_iterator: Any):
+async def _iter_sse_event_blocks_with_separator(body_iterator: Any):  # noqa: PLR0915
     """Yield raw SSE event blocks from an async body iterator.
 
-    Supports LF (`\n`), CRLF (`\r\n`), and CR (`\r`) line endings even when
-    boundaries split across chunks. Uses an incremental UTF-8 decoder so split
-    code points are preserved and flushes a final unterminated block at EOF.
+    Owned Responses carriers keep their typed associations and exact frame
+    bytes. Unassociated legacy input uses the historical incremental decoder
+    so adapter/Grok framing tests keep their documented CR/CRLF behavior.
     """
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+        ResponsesEventPipeline,
+        responses_emissions_from_chunk,
+    )
+
+    typed_buffered = bytearray()
+    pending_emissions: list[Any] = []
     decoder = codecs.getincrementaldecoder("utf-8")()
-    buffer = ""
+    text_buffer = ""
     trailing_cr = False
+    using_typed: Optional[bool] = None
+
+    def _block_from_wire(
+        wire: bytes,
+        emission: Any = None,
+    ):
+        event = (
+            emission.source_event
+            if emission is not None and hasattr(emission, "source_event")
+            else emission
+        )
+        separator = (
+            event.separator
+            if event is not None and getattr(event, "separator", b"")
+            else _separator_from_wire_bytes(wire)
+        )
+        body = wire[:-len(separator)] if separator else wire
+        return (
+            _ParsedResponsesSSEText(
+                body.decode("utf-8", errors="replace"),
+                wire_bytes=wire,
+                separator=separator,
+                events=[event] if event is not None else [],
+                emissions=[emission] if emission is not None else [],
+            ),
+            bool(separator),
+        )
+
+    def _drain_complete_blocks():
+        while typed_buffered:
+            boundary = ResponsesEventPipeline._event_boundary(bytes(typed_buffered))
+            if boundary is None:
+                return
+            complete_end, _ = boundary
+            frame = bytes(typed_buffered[:complete_end])
+            del typed_buffered[:complete_end]
+            emission = pending_emissions.pop(0) if pending_emissions else None
+            yield _block_from_wire(frame, emission)
+
+    def _drain_text_buffer():
+        nonlocal text_buffer
+        while "\n\n" in text_buffer:
+            event_block, text_buffer = text_buffer.split("\n\n", 1)
+            yield event_block, True
 
     async for raw_chunk in body_iterator:
-        text_chunk = decoder.decode(raw_chunk) if isinstance(raw_chunk, bytes) else str(raw_chunk)
-        if not text_chunk:
+        if not raw_chunk:
+            continue
+        associated_events = _sse_block_events(raw_chunk)
+        if using_typed is None:
+            using_typed = associated_events is not None
+        if using_typed:
+            data = _sse_block_wire_bytes(raw_chunk)
+            if not data:
+                continue
+            if associated_events is None:
+                raise TypeError(
+                    "Owned Responses SSE path lost its typed event association"
+                )
+            typed_buffered.extend(data)
+            associated_emissions = responses_emissions_from_chunk(raw_chunk)
+            if associated_emissions is None:
+                associated_emissions = [
+                    event.emission() if hasattr(event, "emission") else event
+                    for event in associated_events
+                ]
+            pending_emissions.extend(associated_emissions)
+            for event_block, has_separator in _drain_complete_blocks():
+                yield event_block, has_separator
             continue
 
+        text_chunk = (
+            decoder.decode(raw_chunk)
+            if isinstance(raw_chunk, bytes)
+            else str(raw_chunk)
+        )
+        if not text_chunk:
+            continue
         if trailing_cr:
             text_chunk = f"\r{text_chunk}"
             trailing_cr = False
-
         if text_chunk.endswith("\r"):
             text_chunk = text_chunk[:-1]
             trailing_cr = True
-
         if text_chunk:
-            buffer += text_chunk.replace("\r\n", "\n").replace("\r", "\n")
+            text_buffer += text_chunk.replace("\r\n", "\n").replace("\r", "\n")
+        for event_block, has_separator in _drain_text_buffer():
+            yield event_block, has_separator
 
-        while "\n\n" in buffer:
-            event_block, buffer = buffer.split("\n\n", 1)
-            yield event_block, True
+    if using_typed:
+        for event_block, has_separator in _drain_complete_blocks():
+            yield event_block, has_separator
+        if typed_buffered:
+            emission = pending_emissions.pop(0) if pending_emissions else None
+            yield _block_from_wire(bytes(typed_buffered), emission)
+        return
 
     tail = decoder.decode(b"", final=True)
     if trailing_cr:
         tail = f"\r{tail}"
-
     if tail:
-        buffer += tail.replace("\r\n", "\n").replace("\r", "\n")
-
-    while "\n\n" in buffer:
-        event_block, buffer = buffer.split("\n\n", 1)
-        yield event_block, True
-
-    if buffer:
-        yield buffer, False
+        text_buffer += tail.replace("\r\n", "\n").replace("\r", "\n")
+    for event_block, has_separator in _drain_text_buffer():
+        yield event_block, has_separator
+    if text_buffer:
+        yield text_buffer, False
 
 
 async def _iter_sse_event_blocks(body_iterator: Any):
@@ -415,8 +600,26 @@ async def _iterate_responses_sse_events(
 ) -> Any:
     """Yield parsed SSE event dicts (RR-054 #27: no dict<->namespace round-trip)."""
     from litellm.llms.base_llm.base_model_iterator import BaseModelResponseIterator
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+        responses_events_from_chunk,
+    )
 
     async for event_block in _iter_sse_blocks(body_iterator):
+        associated_events = responses_events_from_chunk(event_block)
+        if associated_events is None:
+            associated_events = getattr(
+                event_block, "aawm_parsed_responses_events", None
+            )
+        if isinstance(associated_events, list):
+            for parsed_event in associated_events:
+                if (
+                    parsed_event.is_malformed
+                    or parsed_event.is_done_marker
+                    or parsed_event.payload is None
+                ):
+                    continue
+                yield parsed_event.payload
+            continue
         for line in event_block.splitlines():
             parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(line)
             if parsed_chunk is not None:
@@ -424,7 +627,7 @@ async def _iterate_responses_sse_events(
                 yield parsed_chunk
 
 
-async def _responses_sse_from_iterator(
+async def _responses_sse_from_iterator(  # noqa: PLR0915
     responses_iterator: Any,
     on_complete: Optional[Callable[[], None]] = None,
     on_stream_error: Optional[Callable[[Exception], Optional[str]]] = None,

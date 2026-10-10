@@ -205,6 +205,13 @@ from .aawm_adapter_runtime.deferred_success import (
     DeferredPassthroughSuccess,
     bind_deferred_success_holder,
 )
+from .aawm_adapter_runtime.openai_responses_events import (
+    ParsedResponsesEvent,
+    ResponsesEventPipeline,
+    attach_responses_emissions,
+    create_responses_event_pipeline,
+    responses_emissions_from_chunk,
+)
 from .streaming_handler import (
     RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS,
     PassThroughStreamingHandler,
@@ -516,6 +523,9 @@ def _replace_responses_sse_frame_payload(
         elif line.endswith(b"\n"):
             content = line[:-1]
             line_ending = b"\n"
+        elif line.endswith(b"\r"):
+            content = line[:-1]
+            line_ending = b"\r"
         if not content.startswith(b"data:"):
             continue
 
@@ -613,12 +623,9 @@ def _restore_responses_sse_frame(
 
 
 def _next_sse_frame_boundary(buffer: bytes) -> Optional[tuple[int, int]]:
-    boundaries = [
-        (index, len(delimiter))
-        for delimiter in (b"\r\n\r\n", b"\n\n")
-        if (index := buffer.find(delimiter)) >= 0
-    ]
-    return min(boundaries) if boundaries else None
+    from .aawm_adapter_runtime.openai_responses_events import _find_event_boundary
+
+    return _find_event_boundary(buffer)
 
 
 async def _restore_responses_function_names_in_sse_chunks(
@@ -627,36 +634,32 @@ async def _restore_responses_function_names_in_sse_chunks(
     *,
     output_gate: Any = None,
 ) -> AsyncIterator[bytes]:
-    buffer = b""
-    async for chunk in chunks:
-        if isinstance(chunk, str):
-            buffer += chunk.encode("utf-8")
-        elif isinstance(chunk, bytes):
-            buffer += chunk
-        else:
-            buffer += bytes(chunk)
+    from .aawm_adapter_runtime.sse import (
+        _iter_sse_event_blocks_with_separator,
+        _sse_block_wire_bytes,
+    )
 
-        while (boundary := _next_sse_frame_boundary(buffer)) is not None:
-            frame_end, delimiter_length = boundary
-            complete_end = frame_end + delimiter_length
-            frame = buffer[:complete_end]
-            buffer = buffer[complete_end:]
-            for rendered_frame in _restore_responses_sse_frame(
-                frame,
+    async for event_block, had_separator in _iter_sse_event_blocks_with_separator(
+        chunks
+    ):
+        associated_emissions = responses_emissions_from_chunk(event_block)
+        wire = _sse_block_wire_bytes(event_block, had_separator)
+        if associated_emissions is None:
+            yield _restore_responses_sse_frame(wire, rewrite)
+            continue
+        restored_emissions = []
+        for emission in associated_emissions:
+            restored_payload = _restore_responses_sse_payload(
+                copy.deepcopy(emission.effective_payload)
+                if isinstance(emission.effective_payload, dict)
+                else emission.effective_payload,
                 rewrite,
-                output_gate=output_gate,
-            ):
-                yield rendered_frame
-
-    if buffer:
-        for rendered_frame in _restore_responses_sse_frame(
-            buffer,
-            rewrite,
-            output_gate=output_gate,
-        ):
-            yield rendered_frame
-    if output_gate is not None:
-        output_gate.finish()
+            )
+            if restored_payload is emission.effective_payload:
+                restored_emissions.append(emission)
+                continue
+            restored_emissions.append(emission.transformed(restored_payload))
+        yield attach_responses_emissions(b"", restored_emissions)
 
 
 # Global registry to track registered pass-through routes and prevent memory leaks
@@ -7733,6 +7736,7 @@ async def pass_through_request(  # noqa: PLR0915
         if isinstance(status_code, int)
     }
     openai_call_ledger = None
+    responses_event_pipeline: Optional[ResponsesEventPipeline] = None
 
     def _publish_openai_send_telemetry() -> None:
         request_state = getattr(request, "state", None)
@@ -9584,6 +9588,17 @@ async def pass_through_request(  # noqa: PLR0915
             async def _send_stream_pre_first_byte() -> Tuple[
                 httpx.Response, httpx.Request
             ]:
+                nonlocal responses_event_pipeline
+                responses_event_pipeline = (
+                    create_responses_event_pipeline(
+                        retain_events=is_native_openai_responses_route
+                    )
+                    if (
+                        is_native_openai_responses_route
+                        or is_xai_responses_wire_owned_route
+                    )
+                    else None
+                )
                 raw_response: Optional[httpx.Response] = None
                 try:
                     stream_headers = headers
@@ -9682,6 +9697,7 @@ async def pass_through_request(  # noqa: PLR0915
                                 capacity_retry_coordinator is not None
                                 and response.status_code == status.HTTP_200_OK
                             ),
+                            event_pipeline=responses_event_pipeline,
                         )
                         if pre_commit_failure is not None:
                             retired_response = raw_response
@@ -9785,6 +9801,7 @@ async def pass_through_request(  # noqa: PLR0915
                 deferred_success_holder=deferred_success_holder,
                 openai_wire_trace=wire_trace,
                 openai_stream_bookkeeping_state=stream_bookkeeping_state,
+                responses_event_pipeline=responses_event_pipeline,
             )
             cfg072_output_gate = (
                 _build_cfg072_send_message_output_gate(
@@ -9840,6 +9857,7 @@ async def pass_through_request(  # noqa: PLR0915
                         local_prepare_ms=local_prepare_ms,
                         error_log_context=error_log_context,
                         upstream_prefix_bytes=getattr(response, "_prefix", None),
+                        responses_event_pipeline=responses_event_pipeline,
                     )
 
                 try:
@@ -9847,6 +9865,7 @@ async def pass_through_request(  # noqa: PLR0915
                         processed_chunks,
                         request_context=output_guard_request_context,
                         upstream_response=response,
+                        event_pipeline=responses_event_pipeline,
                     )
                     wrapper_cleanup_source = processed_chunks
                     processed_chunks = (
@@ -9858,6 +9877,7 @@ async def pass_through_request(  # noqa: PLR0915
                                 url,
                                 getattr(getattr(request, "url", None), "path", None),
                             ),
+                            event_pipeline=responses_event_pipeline,
                         )
                     )
                     wrapper_cleanup_source = processed_chunks
@@ -9927,6 +9947,7 @@ async def pass_through_request(  # noqa: PLR0915
                     processed_chunks,
                     request_context=output_guard_request_context,
                     upstream_response=response,
+                    event_pipeline=responses_event_pipeline,
                 )
                 processed_chunks = maybe_wrap_passthrough_watermark_responses_stream(
                     processed_chunks,
@@ -9935,6 +9956,7 @@ async def pass_through_request(  # noqa: PLR0915
                     endpoint=_watermark_endpoint_from_path(
                         url, getattr(getattr(request, "url", None), "path", None)
                     ),
+                    event_pipeline=responses_event_pipeline,
                 )
             response_headers = HttpPassThroughEndpointHelpers.get_response_headers(
                 headers=response.headers,
@@ -10063,6 +10085,17 @@ async def pass_through_request(  # noqa: PLR0915
             )
 
         async def _send_non_stream_pre_first_byte() -> httpx.Response:  # noqa: PLR0915
+            nonlocal responses_event_pipeline
+            responses_event_pipeline = (
+                create_responses_event_pipeline(
+                    retain_events=is_native_openai_responses_route
+                )
+                if (
+                    is_native_openai_responses_route
+                    or is_xai_responses_wire_owned_route
+                )
+                else None
+            )
             raw_response: Optional[httpx.Response] = None
             try:
                 non_stream_headers = headers
@@ -10167,6 +10200,7 @@ async def pass_through_request(  # noqa: PLR0915
                         ) = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
                             response,
                             openai_alpha_capacity_retry_enabled=True,
+                            event_pipeline=responses_event_pipeline,
                         )
                         if pre_commit_failure is not None:
                             retired_response = raw_response
@@ -10320,6 +10354,7 @@ async def pass_through_request(  # noqa: PLR0915
                 deferred_success_holder=deferred_success_holder,
                 openai_wire_trace=wire_trace,
                 openai_stream_bookkeeping_state=stream_bookkeeping_state,
+                responses_event_pipeline=responses_event_pipeline,
             )
             cfg072_output_gate = (
                 _build_cfg072_send_message_output_gate(
@@ -10375,6 +10410,7 @@ async def pass_through_request(  # noqa: PLR0915
                         local_prepare_ms=local_prepare_ms,
                         error_log_context=error_log_context,
                         upstream_prefix_bytes=getattr(response, "_prefix", None),
+                        responses_event_pipeline=responses_event_pipeline,
                     )
 
                 try:
@@ -10382,6 +10418,7 @@ async def pass_through_request(  # noqa: PLR0915
                         processed_chunks,
                         request_context=output_guard_request_context,
                         upstream_response=response,
+                        event_pipeline=responses_event_pipeline,
                     )
                     wrapper_cleanup_source = processed_chunks
                     processed_chunks = (
@@ -10393,6 +10430,7 @@ async def pass_through_request(  # noqa: PLR0915
                                 url,
                                 getattr(getattr(request, "url", None), "path", None),
                             ),
+                            event_pipeline=responses_event_pipeline,
                         )
                     )
                     wrapper_cleanup_source = processed_chunks
@@ -10462,6 +10500,7 @@ async def pass_through_request(  # noqa: PLR0915
                     processed_chunks,
                     request_context=output_guard_request_context,
                     upstream_response=response,
+                    event_pipeline=responses_event_pipeline,
                 )
                 processed_chunks = maybe_wrap_passthrough_watermark_responses_stream(
                     processed_chunks,
@@ -10470,6 +10509,7 @@ async def pass_through_request(  # noqa: PLR0915
                     endpoint=_watermark_endpoint_from_path(
                         url, getattr(getattr(request, "url", None), "path", None)
                     ),
+                    event_pipeline=responses_event_pipeline,
                 )
             response_headers = HttpPassThroughEndpointHelpers.get_response_headers(
                 headers=response.headers,
