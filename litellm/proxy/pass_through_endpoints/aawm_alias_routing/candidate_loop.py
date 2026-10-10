@@ -2443,7 +2443,15 @@ async def handle_alias_route(  # noqa: PLR0915
                     or error_class == "usage_limit_reached"
                 )
             )
-        if error_class in _error_signals._RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES:
+        provider_capacity_returned = (
+            error_class == "capacity_exhausted"
+            and attempt_record.get("attempted_provider_call") is True
+            and attempt_record.get("provider_returned") is True
+        )
+        if (
+            error_class in _error_signals._RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES
+            and not provider_capacity_returned
+        ):
             return False
         if error_class not in {
             "capacity_exhausted",

@@ -309,10 +309,13 @@ class BaseOpenAIPassThroughHandler:
         api_key: Optional[str],
         request: "Request",
         extra_headers: Optional[dict] = None,
+        credential_family: Optional[str] = None,
     ) -> dict:
         base_headers: dict[str, str] = {}
         if api_key is not None:
             base_headers["authorization"] = "Bearer {}".format(api_key)
+            if credential_family == litellm.LlmProviders.AZURE:
+                base_headers["api-key"] = "{}".format(api_key)
         if extra_headers is not None:
             base_headers.update(extra_headers)
         return BaseOpenAIPassThroughHandler._append_openai_beta_header(
@@ -468,6 +471,7 @@ class BaseOpenAIPassThroughHandler:
         api_key: Optional[str],
         custom_llm_provider: litellm.LlmProviders,
         extra_headers: Optional[dict] = None,
+        credential_family: Optional[litellm.LlmProviders] = None,
         forward_headers: bool = False,
     ):
         rt = BaseOpenAIPassThroughHandler._get_runtime()
@@ -1136,11 +1140,19 @@ class BaseOpenAIPassThroughHandler:
                         protected_headers=selected_openai_headers,
                     )
                 )
-            assemble_headers = (
-                BaseOpenAIPassThroughHandler._assemble_xai_oauth_headers
-                if managed_xai_oauth_request
-                else BaseOpenAIPassThroughHandler._assemble_headers
-            )
+            def _assemble_provider_headers(current_api_key: Optional[str]):
+                if managed_xai_oauth_request:
+                    return BaseOpenAIPassThroughHandler._assemble_xai_oauth_headers(
+                        api_key=current_api_key,
+                        request=request,
+                        extra_headers=extra_headers,
+                    )
+                return BaseOpenAIPassThroughHandler._assemble_headers(
+                    api_key=current_api_key,
+                    request=request,
+                    extra_headers=extra_headers,
+                    credential_family=credential_family,
+                )
 
             def _build_endpoint_func(current_api_key: Optional[str]):
                 bound_api_key = (
@@ -1149,11 +1161,7 @@ class BaseOpenAIPassThroughHandler:
                 return rt.create_pass_through_route_fn(
                     endpoint=endpoint,
                     target=str(updated_url),
-                    custom_headers=assemble_headers(
-                        api_key=bound_api_key,
-                        request=request,
-                        extra_headers=extra_headers,
-                    ),
+                    custom_headers=_assemble_provider_headers(bound_api_key),
                     _forward_headers=forward_headers,
                     is_streaming_request=is_streaming_request,  # type: ignore
                     custom_llm_provider=custom_llm_provider.value

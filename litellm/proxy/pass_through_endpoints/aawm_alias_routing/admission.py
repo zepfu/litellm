@@ -1967,12 +1967,7 @@ def attach_admission_metadata(
 def admission_deny_error_class(decision: AdmissionDecision) -> str:
     """Map admission denial onto existing retry/failover vocabulary."""
     if decision.reason == AdmissionDenyReason.CONFIRMED_EXHAUSTED.value:
-        return (
-            "usage_limit_reached"
-            if _clean_str(decision.exhaustion_kind)
-            in _CONFIRMED_USAGE_EXHAUSTION_KINDS
-            else "capacity_exhausted"
-        )
+        return "usage_limit_reached"
     return "capacity_exhausted"
 
 

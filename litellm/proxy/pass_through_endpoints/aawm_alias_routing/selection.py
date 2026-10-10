@@ -11,6 +11,7 @@ Direct imports from sibling Wave 4/5A modules (``lane_keys``, ``snapshot_select`
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import math
@@ -1468,7 +1469,7 @@ def _plan_xai_oauth_account_failover(
     return True
 
 
-def _codex_oauth_account_exhaustion_is_confirmed(
+def _codex_oauth_account_exhaustion_is_confirmed(  # noqa: PLR0915
     *,
     candidate: dict[str, Any],
     selection: Mapping[str, Any],
@@ -1500,6 +1501,41 @@ def _codex_oauth_account_exhaustion_is_confirmed(
         attempt_record.get("attempted_provider_call") is True
     )
     provider_returned = attempt_record.get("provider_returned") is True
+    if (
+        error_class == "capacity_exhausted"
+        and attempted_provider_call
+        and provider_returned
+    ):
+        snapshot = attempt_record.get("send_ledger_snapshot")
+        if not isinstance(snapshot, Mapping):
+            return False
+        reservations = snapshot.get("reservations")
+        if not isinstance(reservations, list) or not reservations:
+            return False
+        reservation = reservations[-1]
+        if not isinstance(reservation, Mapping):
+            return False
+        recorded_fingerprint = str(
+            reservation.get("account_fingerprint") or ""
+        ).strip()
+        if not recorded_fingerprint:
+            return False
+        lane_key = str(selection.get("lane_key") or "").strip()
+        if not lane_key:
+            lane_key = str(
+                candidate.get("codex_oauth_lane_key") or ""
+            ).strip()
+        normalized_account_hash = " ".join(account_hash.split())
+        normalized_lane_key = " ".join(lane_key.split()) if lane_key else None
+        if not normalized_account_hash:
+            return False
+        identity_input = "|".join(
+            value or "" for value in (normalized_account_hash, normalized_lane_key)
+        )
+        expected_fingerprint = hashlib.sha256(
+            identity_input.encode("utf-8")
+        ).hexdigest()[:16]
+        return recorded_fingerprint == expected_fingerprint
     if error_class == "usage_limit_reached" and (
         attempted_provider_call and provider_returned
     ):
@@ -1527,14 +1563,9 @@ def _codex_oauth_account_exhaustion_is_confirmed(
         ):
             return True
     elif attempted_provider_call or provider_returned:
-        # The admission producer maps every confirmed exhaustion to the quota
-        # vocabulary. Treat it as portable here only after the hash was checked
-        # above. Provider-returned model capacity and generic throttling remain
-        # non-portable until capacity has its own confirmed admission contract.
         if error_class != "usage_limit_reached":
             return False
         return True
-        return False
 
     def _iter_observations(value: Any) -> Sequence[Mapping[str, Any]]:
         observations: list[Mapping[str, Any]] = []

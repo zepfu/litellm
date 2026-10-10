@@ -1912,7 +1912,7 @@ def _openai_raw_retry_console_should_emit(event: Mapping[str, Any]) -> bool:
     return False
 
 
-def _record_openai_raw_retry_event(
+def _record_openai_raw_retry_event(  # noqa: PLR0915
     *,
     event_type: str,
     event_stage: str,
@@ -5511,6 +5511,17 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         return None
 
     @staticmethod
+    def _explicit_opencode_expected_family(
+        expected_target_family: Optional[str],
+    ) -> Optional[str]:
+        expected = str(expected_target_family or "").strip().casefold()
+        if expected == _OPENCODE_ZEN_TARGET_FAMILY:
+            return _OPENCODE_ZEN_TARGET_FAMILY
+        if expected == _OPENCODE_GO_TARGET_FAMILY:
+            return _OPENCODE_GO_TARGET_FAMILY
+        return None
+
+    @staticmethod
     def get_target_provider_family(url: Union[str, httpx.URL]) -> str:
         parsed_url = urlparse(str(url))
         hostname = (parsed_url.hostname or "").lower()
@@ -5668,13 +5679,19 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 credential_family
             )
         )
-        expected_opencode_route_family = (
-            HttpPassThroughEndpointHelpers._expected_opencode_route_family(
-                credential_family=credential_family,
-                expected_target_family=expected_target_family,
+        explicit_opencode_expected_family = (
+            HttpPassThroughEndpointHelpers._explicit_opencode_expected_family(
+                expected_target_family
             )
         )
-        exact_opencode_expected_family = expected_opencode_route_family is not None
+        expected_opencode_route_family = (
+            explicit_opencode_expected_family
+            or HttpPassThroughEndpointHelpers._expected_opencode_route_family(
+                credential_family=credential_family,
+                expected_target_family=None,
+            )
+        )
+        exact_opencode_expected_family = explicit_opencode_expected_family is not None
         exact_opencode_credential_family = (
             HttpPassThroughEndpointHelpers._is_exact_opencode_egress_family(
                 credential_family
@@ -6964,9 +6981,14 @@ def _build_immutable_openai_binding(
         if egress_credential_family is not None
         else None
     )
-    resolved_target_family = str(
-        expected_target_family or target_family or resolved_credential_family or "openai"
-    )
+    if expected_target_family is not None:
+        resolved_target_family = str(expected_target_family)
+    elif target_family in {"openai", "codex_oauth"}:
+        resolved_target_family = target_family
+    else:
+        resolved_target_family = str(
+            resolved_credential_family or target_family or "openai"
+        )
     managed = resolved_target_family == "codex_oauth"
     account_context = _current_openai_account_context(request) if managed else {}
     account_hash = account_context.get("account_hash")
@@ -9407,7 +9429,11 @@ async def pass_through_request(  # noqa: PLR0915
                     "_aawm_native_openai_responses_affinity_commitment",
                     None,
                 )
+                if not isinstance(pending, dict):
+                    return None
                 transition = pending.get("canonical_owner_transition")
+                if not isinstance(transition, Mapping):
+                    return None
                 selected_context = current_openai_selected_account()
                 if (
                     transition.get("authorization")

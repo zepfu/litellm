@@ -5858,6 +5858,7 @@ async def azure_proxy_route(
         base_target_url=base_target_url,
         api_key=azure_api_key,
         custom_llm_provider=litellm.LlmProviders.AZURE,
+        credential_family=litellm.LlmProviders.AZURE,
     )
 
 
