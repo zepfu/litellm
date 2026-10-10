@@ -6775,14 +6775,11 @@ def test_should_treat_ohmypi_18_2_4_composer_chrome_as_selected(hv, config) -> N
     assert driver._pane_is_idle(pane) is True
 
 
-def test_should_launch_ohmypi_when_18_2_4_idle_composer_omits_mcp_chrome(
-    hv, config, monkeypatch
-) -> None:
-    from hv2.drivers.ohmypi import OhmypiDriver
+def _fake_ohmypi_launch(driver: Any, pane: str, monkeypatch: Any) -> None:
+    """Drive ensure_session from a fixed pane. Needle waits use the real matcher."""
+
     from hv2.pane import _pane_has_any
 
-    pane = (_FIXTURES / "ohmypi_idle_18_2_4.txt").read_text(encoding="utf-8")
-    driver = OhmypiDriver(config)
     monkeypatch.setattr(
         driver,
         "_run_tmux",
@@ -6797,17 +6794,93 @@ def test_should_launch_ohmypi_when_18_2_4_idle_composer_omits_mcp_chrome(
         timeout_seconds: float | None = None,
         *,
         prompt: str | None = None,
+        after_echo_index: int | None = None,
     ) -> bool:
         needles = [needle] if isinstance(needle, str) else [str(item) for item in needle]
-        if any("Connected to MCP" in item or "No MCP" in item for item in needles):
-            return False
-        return _pane_has_any(pane, needles)
+        return _pane_has_any(
+            pane, needles, prompt=prompt, after_echo_index=after_echo_index
+        )
 
     monkeypatch.setattr(driver, "wait_for_pane", fake_wait)
-    launched = driver.ensure_session("sota-xai", tools=False)
+
+
+def test_should_not_treat_ohmypi_selected_footer_as_launch_ready(
+    hv, config, monkeypatch
+) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+
+    pane = "π · host · AAWM alias work\n"
+    driver = OhmypiDriver(config)
+    _fake_ohmypi_launch(driver, pane, monkeypatch)
+    launched = driver.ensure_session("work", tools=False)
+    identity = launched["session_identity"]
+    assert launched["selected"] is True
+    assert launched["ready"] is False
+    assert launched["mcp_ready"] is False
+    assert launched["ok"] is False
+    assert launched["rejected"] == []
+    assert identity["startup"] == "selected_only"
+    assert identity["selector"] == "litellm-alpha-passthrough/work"
+    assert identity["session"].startswith("hv2-ohmypi-work-")
+    assert "-p" not in launched["argv"]
+    assert "--print" not in launched["argv"]
+
+
+def test_should_launch_ohmypi_when_ready_selector_and_mcp_are_present(
+    hv, config, monkeypatch
+) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+
+    pane = (
+        "π\n"
+        "Default model: litellm-alpha-passthrough/work\n"
+        "Connected to MCP server: aawm-transcript.\n"
+    )
+    driver = OhmypiDriver(config)
+    _fake_ohmypi_launch(driver, pane, monkeypatch)
+    launched = driver.ensure_session("work", tools=False)
+    assert launched["ready"] is True
     assert launched["selected"] is True
     assert launched["mcp_ready"] is True
+    assert launched["rejected"] == []
     assert launched["ok"] is True
+    assert launched["session_identity"]["startup"] == "ready"
+
+
+def test_should_reject_ohmypi_launch_when_reject_needle_is_present(
+    hv, config, monkeypatch
+) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+
+    pane = (
+        "π\n"
+        "Default model: litellm-alpha-passthrough/work\n"
+        "Connected to MCP server: aawm-transcript.\n"
+        "Error: No model selected\n"
+    )
+    driver = OhmypiDriver(config)
+    _fake_ohmypi_launch(driver, pane, monkeypatch)
+    launched = driver.ensure_session("work", tools=False)
+    assert launched["selected"] is True
+    assert launched["ok"] is False
+    assert launched["rejected"]
+    assert "Error: No model selected" in launched["rejected"]
+    assert launched["session_identity"]["startup"] == "rejected"
+
+
+def test_should_keep_ohmypi_18_2_4_idle_composer_without_mcp_as_not_launch_ok(
+    hv, config, monkeypatch
+) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+
+    pane = (_FIXTURES / "ohmypi_idle_18_2_4.txt").read_text(encoding="utf-8")
+    driver = OhmypiDriver(config)
+    _fake_ohmypi_launch(driver, pane, monkeypatch)
+    launched = driver.ensure_session("sota-xai", tools=False)
+    assert launched["selected"] is True
+    assert launched["mcp_ready"] is False
+    assert launched["ok"] is False
+    assert launched["session_identity"]["startup"] == "selected_only"
     assert "Connected to MCP" not in pane
     assert "-p" not in launched["argv"]
     assert "--print" not in launched["argv"]

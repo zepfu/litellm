@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from hv2.artifact import (
     append_jsonl,
@@ -477,6 +477,16 @@ def _model_turn_settings(
     return pass_mode, tools, prompt, reply, expect_provider_status
 
 
+def _copy_launch_fields(row: dict[str, Any], launched: Mapping[str, Any]) -> None:
+    """Keep readiness fields on a failed launch. selected-only is not launch_ok."""
+
+    row["ready"] = launched.get("ready")
+    row["selected"] = launched.get("selected")
+    row["mcp_ready"] = launched.get("mcp_ready")
+    row["rejected"] = launched.get("rejected")
+    row["session_identity"] = launched.get("session_identity")
+
+
 def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915
     if not plan.tui:
         raise PlanError("model kind requires --tui")
@@ -531,6 +541,7 @@ def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915
             "selected": launched.get("selected"),
             "expect_provider_status": expect_provider_status,
         }
+        _copy_launch_fields(row, launched)
         if not launched.get("ok"):
             failures.append(
                 f"TUI session for {model} did not become ready on "
@@ -673,6 +684,7 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
     rows[0]["session"] = launched.get("session")
     rows[0]["launch_ok"] = launched.get("ok")
     rows[0]["selected"] = launched.get("selected")
+    _copy_launch_fields(rows[0], launched)
     rows[0]["staged_agents"] = launched.get("staged_agents")
     if launched.get("argv"):
         rows[0]["argv"] = launched.get("argv")
