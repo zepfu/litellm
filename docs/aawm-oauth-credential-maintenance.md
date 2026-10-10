@@ -225,13 +225,21 @@ state use normal server-owned selection and remain unchanged.
 ## OAuth refresh deadline contract
 
 Scheduled Grok OIDC, Codex OAuth, managed xAI OAuth, Kimi OAuth, and Nous
-Portal OAuth refreshes use deadline-aware eligibility. The `300`-second value
-is the eligibility/retry cadence and the minimum threshold input, not a fixed
-normal refresh authority. With valid issued lifetime metadata, non-forced
-refresh uses `max(300, issued_lifetime_seconds * 0.5)`. When lifetime metadata
-is missing or malformed, the helper uses the `300`-second degraded fallback;
-an otherwise usable credential with missing or unparseable `expires_at` remains
-eligible for the safe refresh path and is reported as degraded.
+Portal OAuth refreshes use deadline-aware eligibility. The default
+`300`-second eligibility/retry cadence is not the normal refresh authority.
+Grok, managed xAI, and Nous retain their minimum-or-half-life threshold.
+
+Codex uses `min(configured buffer, issued_lifetime_seconds * 0.5)` with valid
+issued lifetime metadata, or the configured buffer as a degraded fallback
+when lifetime is unavailable. A buffer at or above the issued lifetime is
+still capped at half-life; immediate eligibility requires the remaining
+lifetime to be no greater than the effective threshold. An otherwise usable
+credential with no derivable expiry remains eligible for refresh and is
+reported as degraded. Inspection, locked execution, and telemetry use the
+same lifetime facts, source, and effective threshold. A failed post-refresh
+inspection that lacks expiry retains the complete pre-inspection lifetime,
+threshold, source, and threshold-degraded tuple from that same snapshot. The
+failed post-inspection diagnostic remains separate.
 
 Development Compose defaults `AAWM_GROK_OIDC_FORCE_REFRESH=0` and
 `AAWM_CODEX_OAUTH_FORCE_REFRESH=0`, so normal scheduled checks use the
@@ -456,8 +464,14 @@ hashes. Clear it to restore both accounts:
 ./.venv/bin/python scripts/set_codex_oauth_test_accounts.py --clear
 ```
 
-A running proxy honors overlay/env changes on the next inventory load.
-Changing only the Compose JSON interpolation still requires a recreate.
+A running proxy honors overlay/env changes on the next request's inventory
+load. Async request and readiness paths parse the inventory JSON and overlay
+off the event loop, then reuse that immutable snapshot for the rest of the
+same request. An ordinary loader failure, including invalid UTF-8 or
+unresolvable path expansion, is stored as a sanitized inventory error for
+that request and is not reread by later affinity consumers. The failure does
+not persist across requests. Changing only the Compose JSON interpolation
+still requires a recreate.
 
 The managed proxy mounts `/home/zepfu/.codex` read-only. The provider-status
 sidecar mounts the same parent directory read-write so its lock and atomic
@@ -829,6 +843,39 @@ restart event.
    refresh failures.
 
 ## Implementation map
+
+The shared Codex OAuth reader rejects final symlinks, nonregular files
+(including FIFOs without blocking), modes other than `0600`, oversized
+payloads, and changes during a descriptor-backed read. Managed snapshots also
+validate identity coherence and the configured account pin. Legacy file-only
+health and refresh use the same file and parsing policy without an inventory
+pin. The legacy writer retains its locked metadata-repair step before reading:
+it can correct group/world-readable regular files to `0600`. Read-only
+inspection and managed snapshot loading never repair permissions.
+
+Snapshots hide secrets from `repr()` and recursively freeze token and auth
+payloads. Refresh works on a mutable copy under the writer lock, validates the
+response in memory, and verifies the published generation through the secure
+reader. The bounded process cache reuses facts only after checking the opened
+descriptor's identity, content metadata, mode, and ownership. Token expiry
+does not change the cached facts; each consumer applies its own time policy.
+
+Expiry accepts numeric or ISO timestamps, JWT `exp`, or persisted
+issued/obtained/refreshed time plus `expires_in`. Lifetime precedence is
+positive `expires_in`, three-segment JWT `exp - iat`, then persisted timestamp
+difference. Routing retains its 60-second expiry margin; passive health marks
+tokens expired at expiry. Missing expiry remains routable but is reported as
+degraded by health and eligible by refresh.
+
+Within one managed Codex request, the proxy reuses that selected snapshot for
+account eligibility, selection, and dispatch headers. Request-local recovery
+invalidates the pinned snapshot before its bounded locked re-read. Within one
+sidecar task cycle, enabled Codex accounts reuse the selected snapshot for
+eligibility, passive health, quota polls, and history/account collection.
+Locked and post-refresh reads verify the generation before reuse or
+replacement. Optional workers retain their originating cycle's snapshot set
+until they finish, even when the scheduler starts another cycle. Failed loads
+remain pinned for that cycle and are retried in the next cycle.
 
 The validated inventory exposes
 `codex_oauth_inventory_generation`: a full SHA-256 digest of its canonical

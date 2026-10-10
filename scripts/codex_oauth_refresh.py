@@ -7,6 +7,7 @@ import base64
 import json
 import math
 import os
+import stat
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -34,8 +35,14 @@ from litellm.secret_managers.credential_error_sanitizer import (
 )
 from litellm.secret_managers.codex_oauth_inventory import (
     CodexOAuthCredentialRecord,
+    CodexOAuthCredentialSnapshot,
+    CodexOAuthCredentialError,
     CodexOAuthIdentityMismatchError,
-    validate_codex_oauth_account_identity,
+    build_codex_oauth_credential_snapshot,
+    get_codex_oauth_token_expiry,
+    get_codex_oauth_token_issued_lifetime,
+    read_codex_oauth_auth_payload,
+    read_codex_oauth_snapshot_sync,
 )
 
 # Portable ~ defaults (expanded via Path.expanduser at use sites).
@@ -43,7 +50,7 @@ DEFAULT_CODEX_AUTH_FILE = "~/.codex/auth.json"
 DEFAULT_CODEX_LOCK_FILE = "~/.codex/auth.json.lock"
 DEFAULT_CODEX_OAUTH_TOKEN_ENDPOINT = "https://auth.openai.com/oauth/token"
 DEFAULT_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-DEFAULT_CODEX_REFRESH_MIN_SECONDS = 300
+DEFAULT_CODEX_REFRESH_BUFFER_SECONDS = 300
 DEFAULT_CODEX_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_CODEX_AUTH_FILE_MODE = 0o600
 
@@ -80,30 +87,14 @@ def _issued_lifetime_metadata(
     obtained_at: Any = None,
     refreshed_at: Any = None,
 ) -> Tuple[Optional[float], str]:
-    """Derive an issued lifetime and identify its authoritative source."""
-    provider_lifetime = _as_finite_number(expires_in)
-    if provider_lifetime is not None and provider_lifetime > 0:
-        return provider_lifetime, "expires_in"
-
-    jwt_claims = _jwt_time_claims(access_token)
-    if jwt_claims is not None:
-        issued_timestamp, expiry_timestamp = jwt_claims
-        return expiry_timestamp - issued_timestamp, "jwt"
-
-    persisted_issued_at = _first_timestamp_seconds(
-        issued_at,
-        obtained_at,
-        refreshed_at,
+    return get_codex_oauth_token_issued_lifetime(
+        expires_in=expires_in,
+        access_token=access_token,
+        expires_at=expires_at,
+        issued_at=issued_at,
+        obtained_at=obtained_at,
+        refreshed_at=refreshed_at,
     )
-    persisted_expires_at = _timestamp_seconds(expires_at)
-    if (
-        persisted_issued_at is not None
-        and persisted_expires_at is not None
-        and persisted_expires_at > persisted_issued_at
-    ):
-        return persisted_expires_at - persisted_issued_at, "persisted_timestamp"
-
-    return None, "fallback"
 
 
 def _refresh_threshold_seconds(
@@ -114,9 +105,9 @@ def _refresh_threshold_seconds(
     issued_at: Any = None,
     obtained_at: Any = None,
     refreshed_at: Any = None,
-    min_seconds: float = DEFAULT_CODEX_REFRESH_MIN_SECONDS,
+    min_seconds: float = DEFAULT_CODEX_REFRESH_BUFFER_SECONDS,
 ) -> float:
-    """Return proportional refresh threshold (max of min or half-life)."""
+    """Return proportional refresh threshold (buffer or half-life)."""
     threshold, _source, _degraded = _refresh_threshold_metadata(
         expires_in=expires_in,
         access_token=access_token,
@@ -137,8 +128,9 @@ def _refresh_threshold_metadata(
     issued_at: Any = None,
     obtained_at: Any = None,
     refreshed_at: Any = None,
-    min_seconds: float = DEFAULT_CODEX_REFRESH_MIN_SECONDS,
+    min_seconds: float = DEFAULT_CODEX_REFRESH_BUFFER_SECONDS,
 ) -> Tuple[float, str, bool]:
+    """Return min(configured buffer, half of the issued lifetime)."""
     lifetime, source = _issued_lifetime_metadata(
         expires_in=expires_in,
         access_token=access_token,
@@ -147,14 +139,32 @@ def _refresh_threshold_metadata(
         obtained_at=obtained_at,
         refreshed_at=refreshed_at,
     )
+    return _threshold_from_lifetime(lifetime, source, min_seconds)
+
+
+def _threshold_from_lifetime(lifetime: Optional[float], source: str, buffer_seconds: float) -> Tuple[float, str, bool]:
     if lifetime is None:
-        return float(min_seconds), "fallback", True
-    return max(float(min_seconds), lifetime * 0.5), source, False
+        return float(buffer_seconds), "fallback", True
+    return min(float(buffer_seconds), lifetime * 0.5), source, False
+
+
+def _snapshot_refresh_metadata(
+    snapshot: CodexOAuthCredentialSnapshot, *, buffer_seconds: Optional[int]
+) -> Tuple[Optional[float], float, str, bool]:
+    threshold, source, degraded = _threshold_from_lifetime(
+        snapshot.issued_lifetime_seconds,
+        snapshot.issued_lifetime_source or "fallback",
+        _resolve_buffer_seconds(buffer_seconds),
+    )
+    return snapshot.issued_lifetime_seconds, threshold, source, degraded
 
 
 def _token_refresh_metadata(
     token_data: Mapping[str, Any],
+    *,
+    buffer_seconds: Optional[int] = None,
 ) -> Tuple[Optional[float], float, str, bool]:
+    min_seconds = _resolve_buffer_seconds(buffer_seconds)
     expires_at = _get_token_expiry(token_data)
     lifetime, source = _issued_lifetime_metadata(
         expires_in=token_data.get("expires_in"),
@@ -164,14 +174,7 @@ def _token_refresh_metadata(
         obtained_at=token_data.get("obtained_at"),
         refreshed_at=token_data.get("refreshed_at"),
     )
-    threshold, threshold_source, degraded = _refresh_threshold_metadata(
-        expires_in=token_data.get("expires_in"),
-        access_token=token_data.get("access_token"),
-        expires_at=expires_at,
-        issued_at=token_data.get("issued_at"),
-        obtained_at=token_data.get("obtained_at"),
-        refreshed_at=token_data.get("refreshed_at"),
-    )
+    threshold, threshold_source, degraded = _threshold_from_lifetime(lifetime, source, min_seconds)
     return lifetime, threshold, threshold_source or source, degraded
 
 
@@ -211,7 +214,11 @@ class CodexOAuthRefreshSummary:
         }
 
 
-def inspect_codex_oauth_credential_health(auth_file: str | Path) -> Dict[str, Any]:
+def inspect_codex_oauth_credential_health(
+    auth_file: str | Path,
+    *,
+    buffer_seconds: Optional[int] = None,
+) -> Dict[str, Any]:
     """Read and classify Codex OAuth state without locks, writes, or HTTP."""
     resolved_auth_file = Path(auth_file).expanduser()
     try:
@@ -223,7 +230,7 @@ def inspect_codex_oauth_credential_health(auth_file: str | Path) -> Dict[str, An
             threshold_seconds,
             threshold_source,
             threshold_degraded,
-        ) = _token_refresh_metadata(token_data)
+        ) = _token_refresh_metadata(token_data, buffer_seconds=buffer_seconds)
         expires_at = _get_token_expiry(token_data)
         account_id = _extract_account_id(token_data)
         if expires_at is None:
@@ -273,7 +280,7 @@ def inspect_codex_oauth_credential_health(auth_file: str | Path) -> Dict[str, An
             error_class=exc.__class__.__name__,
             error_message=_sanitize_error_message(str(exc)),
             auth_degraded=True,
-            refresh_threshold_seconds=float(DEFAULT_CODEX_REFRESH_MIN_SECONDS),
+            refresh_threshold_seconds=float(_resolve_buffer_seconds(buffer_seconds)),
             refresh_threshold_source="fallback",
             refresh_threshold_degraded=True,
         )
@@ -320,6 +327,7 @@ def refresh_codex_oauth_auth_file(
     client_id: Optional[str] = None,
     http_timeout_seconds: float = DEFAULT_CODEX_HTTP_TIMEOUT_SECONDS,
     credential_record: Optional[CodexOAuthCredentialRecord] = None,
+    snapshot_reader: Optional[Callable[[CodexOAuthCredentialRecord], CodexOAuthCredentialSnapshot]] = None,
     on_token_endpoint_attempt: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     """Refresh a Codex OAuth auth file when it is near expiry or forced."""
@@ -332,12 +340,10 @@ def refresh_codex_oauth_auth_file(
     if credential_record is None and lock_file is not None:
         resolved_lock_file = Path(lock_file).expanduser()
     elif credential_record is None:
-        resolved_lock_file = resolved_auth_file.with_name(
-            f"{resolved_auth_file.name}.lock"
-        )
+        resolved_lock_file = resolved_auth_file.with_name(f"{resolved_auth_file.name}.lock")
     resolved_buffer_seconds = _resolve_buffer_seconds(buffer_seconds)
     issued_lifetime_seconds: Optional[float] = None
-    threshold_seconds: Optional[float] = float(DEFAULT_CODEX_REFRESH_MIN_SECONDS)
+    threshold_seconds: Optional[float] = float(_resolve_buffer_seconds(buffer_seconds))
     threshold_source: Optional[str] = "fallback"
     threshold_degraded = True
 
@@ -361,29 +367,50 @@ def refresh_codex_oauth_auth_file(
 
     try:
         with _credential_file_lock(resolved_lock_file):
-            auth_data = _read_auth_data(resolved_auth_file)
-            _repair_credential_file_metadata(
-                resolved_auth_file,
-                resolved_lock_file,
-            )
+            if credential_record is not None:
+                snapshot = (snapshot_reader or read_codex_oauth_snapshot_sync)(credential_record)
+                auth_data = snapshot.copy_auth_data()
+            else:
+                _repair_credential_file_metadata(
+                    resolved_auth_file,
+                    resolved_lock_file,
+                )
+                auth_data = _read_auth_data(resolved_auth_file)
+            if credential_record is not None:
+                _repair_credential_file_metadata(
+                    resolved_auth_file,
+                    resolved_lock_file,
+                )
             token_data = _get_token_data(auth_data)
             if credential_record is not None:
-                validate_codex_oauth_account_identity(
-                    credential_record,
+                (
+                    issued_lifetime_seconds,
+                    threshold_seconds,
+                    threshold_source,
+                    threshold_degraded,
+                ) = _snapshot_refresh_metadata(snapshot, buffer_seconds=resolved_buffer_seconds)
+            else:
+                (
+                    issued_lifetime_seconds,
+                    threshold_seconds,
+                    threshold_source,
+                    threshold_degraded,
+                ) = _token_refresh_metadata(
                     token_data,
+                    buffer_seconds=resolved_buffer_seconds,
                 )
-            (
-                issued_lifetime_seconds,
-                threshold_seconds,
-                threshold_source,
-                threshold_degraded,
-            ) = _token_refresh_metadata(token_data)
-            current_expires_at = _format_expires_at(_get_token_expiry(token_data))
-            current_account_id = _extract_account_id(token_data)
+            current_expires_at = _format_expires_at(
+                snapshot.expires_at if credential_record is not None else _get_token_expiry(token_data)
+            )
+            current_account_id = (
+                snapshot.account_id if credential_record is not None else _extract_account_id(token_data)
+            )
 
             if not force and not _token_needs_refresh(
                 token_data,
                 buffer_seconds=resolved_buffer_seconds,
+                refresh_threshold_seconds=threshold_seconds,
+                shared_expires_at=(snapshot.expires_at if credential_record is not None else None),
             ):
                 return CodexOAuthRefreshSummary(
                     attempted=False,
@@ -408,30 +435,19 @@ def refresh_codex_oauth_auth_file(
             )
             _update_token_data(token_data, refreshed)
             if credential_record is not None:
-                validate_codex_oauth_account_identity(
-                    credential_record,
-                    token_data,
+                build_codex_oauth_credential_snapshot(
+                    record=credential_record,
+                    token_data=token_data,
+                    auth_data=auth_data,
                 )
-            (
-                issued_lifetime_seconds,
-                threshold_seconds,
-                threshold_source,
-                threshold_degraded,
-            ) = _token_refresh_metadata(token_data)
             auth_data["last_refresh"] = datetime.now(timezone.utc).isoformat()
             _write_auth_data(resolved_auth_file, auth_data)
-            return CodexOAuthRefreshSummary(
-                attempted=True,
-                refreshed=True,
-                skipped=False,
-                auth_file=str(resolved_auth_file),
-                account_id=_extract_account_id(token_data),
-                expires_at=_format_expires_at(_get_token_expiry(token_data)),
-                issued_lifetime_seconds=issued_lifetime_seconds,
-                auth_degraded=threshold_degraded,
-                refresh_threshold_seconds=threshold_seconds,
-                refresh_threshold_source=threshold_source,
-                refresh_threshold_degraded=threshold_degraded,
+            return _published_refresh_summary(
+                resolved_auth_file,
+                expected_access_token=token_data["access_token"],
+                credential_record=credential_record,
+                snapshot_reader=snapshot_reader,
+                buffer_seconds=resolved_buffer_seconds,
             ).as_dict()
     except Exception as exc:
         if "token_data" in locals():
@@ -441,7 +457,10 @@ def refresh_codex_oauth_auth_file(
                     threshold_seconds,
                     threshold_source,
                     threshold_degraded,
-                ) = _token_refresh_metadata(token_data)
+                ) = _token_refresh_metadata(
+                    token_data,
+                    buffer_seconds=resolved_buffer_seconds,
+                )
             except Exception:
                 pass
         return CodexOAuthRefreshSummary(
@@ -463,41 +482,87 @@ def refresh_codex_oauth_auth_file(
         ).as_dict()
 
 
+def _published_refresh_summary(
+    auth_file: Path,
+    *,
+    expected_access_token: str,
+    credential_record: Optional[CodexOAuthCredentialRecord],
+    snapshot_reader: Optional[Callable[[CodexOAuthCredentialRecord], CodexOAuthCredentialSnapshot]],
+    buffer_seconds: int,
+) -> CodexOAuthRefreshSummary:
+    """Verify publication and report only facts read from the resulting file."""
+    if credential_record is not None:
+        snapshot = (snapshot_reader or read_codex_oauth_snapshot_sync)(credential_record)
+        token_data = snapshot.raw_token_data
+        account_id = snapshot.account_id
+        expires_at = snapshot.expires_at
+        metadata = _snapshot_refresh_metadata(snapshot, buffer_seconds=buffer_seconds)
+    else:
+        token_data = _get_token_data(_read_auth_data(auth_file))
+        account_id = _extract_account_id(token_data)
+        expires_at = _get_token_expiry(token_data)
+        metadata = _token_refresh_metadata(token_data, buffer_seconds=buffer_seconds)
+    if token_data.get("access_token") != expected_access_token:
+        raise CodexOAuthCredentialError("Codex OAuth published credential differs from refresh result.")
+    lifetime, threshold, source, degraded = metadata
+    return CodexOAuthRefreshSummary(
+        attempted=True,
+        refreshed=True,
+        skipped=False,
+        auth_file=str(auth_file),
+        account_id=account_id,
+        expires_at=_format_expires_at(expires_at),
+        issued_lifetime_seconds=lifetime,
+        auth_degraded=degraded,
+        refresh_threshold_seconds=threshold,
+        refresh_threshold_source=source,
+        refresh_threshold_degraded=degraded,
+    )
+
+
 def inspect_codex_oauth_refresh_eligibility(
     auth_file: str | Path,
     *,
-    buffer_seconds: int = DEFAULT_CODEX_REFRESH_MIN_SECONDS,
+    buffer_seconds: Optional[int] = None,
     now: Optional[Callable[[], float | datetime]] = None,
     poll_interval_seconds: float = 300.0,
     credential_record: Optional[CodexOAuthCredentialRecord] = None,
+    snapshot_reader: Optional[Callable[[CodexOAuthCredentialRecord], CodexOAuthCredentialSnapshot]] = None,
 ) -> Dict[str, Any]:
     """Inspect one Codex OAuth file without locks, writes, or HTTP."""
     resolved_auth_file = Path(auth_file).expanduser()
     observed_at = _resolve_wall_timestamp(now)
     try:
-        token_data = _get_token_data(_read_auth_data(resolved_auth_file))
-        access_token = _clean_string(token_data.get("access_token"))
-        if access_token is None:
-            raise ValueError("Codex OAuth credential is missing access_token.")
         if credential_record is not None:
-            validate_codex_oauth_account_identity(
-                credential_record,
+            snapshot = (snapshot_reader or read_codex_oauth_snapshot_sync)(credential_record)
+            expires_at = snapshot.expires_at
+            (
+                issued_lifetime_seconds,
+                threshold_seconds,
+                threshold_source,
+                threshold_degraded,
+            ) = _snapshot_refresh_metadata(snapshot, buffer_seconds=buffer_seconds)
+        else:
+            token_data = _get_token_data(_read_auth_data(resolved_auth_file))
+            access_token = _clean_string(token_data.get("access_token"))
+            if access_token is None:
+                raise ValueError("Codex OAuth credential is missing access_token.")
+            (
+                issued_lifetime_seconds,
+                threshold_seconds,
+                threshold_source,
+                threshold_degraded,
+            ) = _token_refresh_metadata(
                 token_data,
+                buffer_seconds=buffer_seconds,
             )
-        (
-            issued_lifetime_seconds,
-            threshold_seconds,
-            threshold_source,
-            threshold_degraded,
-        ) = _token_refresh_metadata(token_data)
-        expires_at = _get_token_expiry(token_data)
+            expires_at = _get_token_expiry(token_data)
         if expires_at is None:
             return _eligibility_summary(
                 observed_at=observed_at,
                 expires_at=None,
                 refresh_due_at=None,
-                next_refresh_check_at=observed_at
-                + timedelta(seconds=max(1.0, poll_interval_seconds)),
+                next_refresh_check_at=observed_at + timedelta(seconds=max(1.0, poll_interval_seconds)),
                 eligible=True,
                 credential_health="degraded",
                 usable=True,
@@ -509,9 +574,7 @@ def inspect_codex_oauth_refresh_eligibility(
                 refresh_threshold_degraded=threshold_degraded,
             )
         expires_at_datetime = datetime.fromtimestamp(expires_at, timezone.utc)
-        refresh_due_at = expires_at_datetime - timedelta(
-            seconds=threshold_seconds
-        )
+        refresh_due_at = expires_at_datetime - timedelta(seconds=threshold_seconds)
         return _eligibility_summary(
             observed_at=observed_at,
             expires_at=expires_at_datetime,
@@ -522,9 +585,7 @@ def inspect_codex_oauth_refresh_eligibility(
                 else observed_at + timedelta(seconds=max(1.0, poll_interval_seconds))
             ),
             eligible=observed_at >= refresh_due_at,
-            credential_health=(
-                "expired" if expires_at_datetime <= observed_at else "fresh"
-            ),
+            credential_health=("expired" if expires_at_datetime <= observed_at else "fresh"),
             usable=expires_at_datetime > observed_at,
             issued_lifetime_seconds=issued_lifetime_seconds,
             refresh_threshold_seconds=threshold_seconds,
@@ -536,15 +597,14 @@ def inspect_codex_oauth_refresh_eligibility(
             observed_at=observed_at,
             expires_at=None,
             refresh_due_at=None,
-            next_refresh_check_at=observed_at
-            + timedelta(seconds=max(1.0, poll_interval_seconds)),
+            next_refresh_check_at=observed_at + timedelta(seconds=max(1.0, poll_interval_seconds)),
             eligible=True,
             credential_health="malformed",
             usable=False,
             error_class=exc.__class__.__name__,
             error_message="Codex OAuth eligibility inspection failed.",
             issued_lifetime_seconds=None,
-            refresh_threshold_seconds=float(DEFAULT_CODEX_REFRESH_MIN_SECONDS),
+            refresh_threshold_seconds=float(_resolve_buffer_seconds(buffer_seconds)),
             refresh_threshold_source="fallback",
             refresh_threshold_degraded=True,
         )
@@ -568,12 +628,8 @@ def _eligibility_summary(
 ) -> Dict[str, Any]:
     return {
         "eligibility_checked_at": _format_expires_at(observed_at.timestamp()),
-        "expires_at": _format_expires_at(
-            expires_at.timestamp() if expires_at is not None else None
-        ),
-        "refresh_due_at": _format_expires_at(
-            refresh_due_at.timestamp() if refresh_due_at is not None else None
-        ),
+        "expires_at": _format_expires_at(expires_at.timestamp() if expires_at is not None else None),
+        "refresh_due_at": _format_expires_at(refresh_due_at.timestamp() if refresh_due_at is not None else None),
         "next_refresh_check_at": _format_expires_at(next_refresh_check_at.timestamp()),
         "eligible": eligible,
         "credential_health": credential_health,
@@ -607,6 +663,7 @@ def refresh_codex_oauth_inventory_record(
     client_id: Optional[str] = None,
     http_timeout_seconds: float = DEFAULT_CODEX_HTTP_TIMEOUT_SECONDS,
     on_token_endpoint_attempt: Optional[Callable[[], None]] = None,
+    snapshot_reader: Optional[Callable[[CodexOAuthCredentialRecord], CodexOAuthCredentialSnapshot]] = None,
 ) -> Dict[str, Any]:
     """Refresh one explicit inventory record and return only safe identity."""
     if not record.enabled:
@@ -619,13 +676,11 @@ def refresh_codex_oauth_inventory_record(
             "expires_at": None,
             "issued_lifetime_seconds": None,
             "auth_degraded": True,
-            "refresh_threshold_seconds": float(DEFAULT_CODEX_REFRESH_MIN_SECONDS),
+            "refresh_threshold_seconds": float(_resolve_buffer_seconds(buffer_seconds)),
             "refresh_threshold_source": "fallback",
             "refresh_threshold_degraded": True,
             "error_class": "CredentialDisabled",
-            "error_message": (
-                f"Codex OAuth credential '{record.label}' is disabled."
-            ),
+            "error_message": (f"Codex OAuth credential '{record.label}' is disabled."),
             "error_hint": None,
         }
     result = refresh_codex_oauth_auth_file(
@@ -637,6 +692,7 @@ def refresh_codex_oauth_inventory_record(
         client_id=client_id,
         http_timeout_seconds=http_timeout_seconds,
         credential_record=record,
+        snapshot_reader=snapshot_reader,
         on_token_endpoint_attempt=on_token_endpoint_attempt,
     )
     return {
@@ -666,9 +722,7 @@ def _refresh_error_message(
         return _sanitize_error_message(str(exc))
     if isinstance(exc, CodexOAuthIdentityMismatchError):
         return str(exc)
-    return (
-        f"Codex OAuth credential '{credential_record.label}' refresh failed."
-    )
+    return f"Codex OAuth credential '{credential_record.label}' refresh failed."
 
 
 def _resolve_buffer_seconds(buffer_seconds: Optional[int]) -> int:
@@ -676,11 +730,11 @@ def _resolve_buffer_seconds(buffer_seconds: Optional[int]) -> int:
         return max(0, int(buffer_seconds))
     raw_value = os.getenv("AAWM_CODEX_OAUTH_REFRESH_BUFFER_SECONDS")
     if raw_value is None or not raw_value.strip():
-        return DEFAULT_CODEX_REFRESH_MIN_SECONDS
+        return DEFAULT_CODEX_REFRESH_BUFFER_SECONDS
     try:
         return max(0, int(raw_value))
     except ValueError:
-        return DEFAULT_CODEX_REFRESH_MIN_SECONDS
+        return DEFAULT_CODEX_REFRESH_BUFFER_SECONDS
 
 
 @contextmanager
@@ -734,25 +788,24 @@ def _repair_credential_file_metadata(
     lock_path: Path,
 ) -> None:
     metadata = _resolve_credential_file_metadata(auth_path)
-    _apply_credential_file_metadata(auth_path, metadata)
-    if lock_path.exists():
-        _apply_credential_file_metadata(lock_path, metadata)
+    for path in (auth_path, lock_path):
+        if path == lock_path and not path.exists():
+            continue
+        current = _snapshot_credential_file_metadata(path)
+        if not stat.S_ISREG(path.lstat().st_mode):
+            raise CodexOAuthCredentialError("Codex OAuth metadata repair requires a regular file.")
+        if (
+            current.mode == metadata.mode
+            and (metadata.uid is None or current.uid == metadata.uid)
+            and (metadata.gid is None or current.gid == metadata.gid)
+        ):
+            continue
+        _apply_credential_file_metadata(path, metadata)
 
 
 def _read_auth_data(auth_path: Path) -> Dict[str, Any]:
-    try:
-        with auth_path.open("r", encoding="utf-8") as handle:
-            auth_data = json.load(handle)
-    except FileNotFoundError as exc:
-        raise ValueError(f"Codex OAuth auth file not found at {auth_path}.") from exc
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"Codex OAuth auth file at {auth_path} is not valid JSON."
-        ) from exc
-
-    if not isinstance(auth_data, dict):
-        raise ValueError("Codex OAuth auth file must contain a JSON object.")
-    return auth_data
+    payload, _identity = read_codex_oauth_auth_payload(auth_path)
+    return payload
 
 
 def _get_token_data(auth_data: MutableMapping[str, Any]) -> MutableMapping[str, Any]:
@@ -767,9 +820,7 @@ def _get_token_data(auth_data: MutableMapping[str, Any]) -> MutableMapping[str, 
     token_data = auth_data.get("tokens")
     if isinstance(token_data, dict):
         return token_data
-    raise ValueError(
-        "Codex OAuth auth file field 'tokens' must be a JSON object when present."
-    )
+    raise ValueError("Codex OAuth auth file field 'tokens' must be a JSON object when present.")
 
 
 def _decode_jwt_claims_without_validation(token: str) -> Dict[str, Any]:
@@ -793,53 +844,20 @@ def _jwt_time_claims(access_token: Any) -> Optional[Tuple[float, float]]:
     claims = _decode_jwt_claims_without_validation(access_token)
     issued_at = _as_finite_number(claims.get("iat"))
     expires_at = _as_finite_number(claims.get("exp"))
-    if (
-        issued_at is None
-        or expires_at is None
-        or expires_at <= issued_at
-    ):
+    if issued_at is None or expires_at is None or expires_at <= issued_at:
         return None
     return issued_at, expires_at
 
 
 def _get_token_expiry(token_data: Mapping[str, Any]) -> Optional[float]:
-    expires_at = _timestamp_seconds(token_data.get("expires_at"))
-    if expires_at is not None:
-        return expires_at
-
-    access_token = _clean_string(token_data.get("access_token"))
-    if access_token is not None:
-        jwt_claims = _jwt_time_claims(access_token)
-        if jwt_claims is not None:
-            return jwt_claims[1]
-        exp = _as_finite_number(
-            _decode_jwt_claims_without_validation(access_token).get("exp")
-        )
-        if exp is not None:
-            return exp
-
-    issued_at = _first_timestamp_seconds(
-        token_data.get("issued_at"),
-        token_data.get("obtained_at"),
-        token_data.get("refreshed_at"),
-    )
-    lifetime = _as_finite_number(token_data.get("expires_in"))
-    if issued_at is not None and lifetime is not None and lifetime > 0:
-        derived_expires_at = issued_at + lifetime
-        if math.isfinite(derived_expires_at):
-            return derived_expires_at
-    return None
+    return get_codex_oauth_token_expiry(token_data)
 
 
 def _format_expires_at(expires_at: Optional[float]) -> Optional[str]:
     if expires_at is None:
         return None
     try:
-        return (
-            datetime.fromtimestamp(float(expires_at), timezone.utc)
-            .isoformat()
-            .replace("+00:00", "Z")
-        )
+        return datetime.fromtimestamp(float(expires_at), timezone.utc).isoformat().replace("+00:00", "Z")
     except (OSError, OverflowError, ValueError):
         return None
 
@@ -848,6 +866,8 @@ def _token_needs_refresh(
     token_data: Mapping[str, Any],
     *,
     buffer_seconds: int,
+    refresh_threshold_seconds: Optional[float] = None,
+    shared_expires_at: Optional[float] = None,
 ) -> bool:
     """Return True when the token should be refreshed.
 
@@ -858,10 +878,16 @@ def _token_needs_refresh(
     access_token = _clean_string(token_data.get("access_token"))
     if access_token is None:
         return True
-    expires_at = _get_token_expiry(token_data)
+    expires_at = shared_expires_at if shared_expires_at is not None else _get_token_expiry(token_data)
     if expires_at is None:
         return True
-    _lifetime, threshold, _source, _degraded = _token_refresh_metadata(token_data)
+    if refresh_threshold_seconds is None:
+        _lifetime, threshold, _source, _degraded = _token_refresh_metadata(
+            token_data,
+            buffer_seconds=buffer_seconds,
+        )
+    else:
+        threshold = refresh_threshold_seconds
     return time.time() >= expires_at - max(0, threshold)
 
 
@@ -875,10 +901,7 @@ def _refresh_token_data(
 ) -> Mapping[str, Any]:
     refresh_token = _clean_string(token_data.get("refresh_token"))
     if refresh_token is None:
-        raise ValueError(
-            "Codex OAuth access token is expired and the auth file does not "
-            "contain a refresh_token."
-        )
+        raise ValueError("Codex OAuth access token is expired and the auth file does not " "contain a refresh_token.")
 
     payload = {
         "client_id": client_id or DEFAULT_CODEX_CLIENT_ID,
@@ -916,9 +939,7 @@ def _refresh_token_data(
             message += f": {exc.reason}"
         raise ValueError(message) from exc
     except urllib_error.URLError as exc:
-        raise ValueError(
-            f"Codex OAuth refresh failed: {_sanitize_error_message(str(exc.reason))}"
-        ) from exc
+        raise ValueError(f"Codex OAuth refresh failed: {_sanitize_error_message(str(exc.reason))}") from exc
 
     try:
         refreshed = json.loads(body.decode("utf-8"))
@@ -927,9 +948,7 @@ def _refresh_token_data(
     if not isinstance(refreshed, Mapping):
         raise ValueError("Codex OAuth refresh response must contain a JSON object.")
     if _clean_string(refreshed.get("access_token")) is None:
-        raise ValueError(
-            "Codex OAuth refresh response did not contain an access_token."
-        )
+        raise ValueError("Codex OAuth refresh response did not contain an access_token.")
     return refreshed
 
 
@@ -941,13 +960,9 @@ def _update_token_data(
 ) -> None:
     access_token = _clean_string(refreshed.get("access_token"))
     if access_token is None:
-        raise ValueError(
-            "Codex OAuth refresh response did not contain an access_token."
-        )
+        raise ValueError("Codex OAuth refresh response did not contain an access_token.")
 
-    refresh_token = _clean_string(refreshed.get("refresh_token")) or _clean_string(
-        token_data.get("refresh_token")
-    )
+    refresh_token = _clean_string(refreshed.get("refresh_token")) or _clean_string(token_data.get("refresh_token"))
     token_data["access_token"] = access_token
     if refresh_token is not None:
         token_data["refresh_token"] = refresh_token
@@ -965,11 +980,7 @@ def _update_token_data(
 
     expires_in = _as_finite_number(refreshed.get("expires_in"))
     jwt_claims = _jwt_time_claims(access_token)
-    jwt_expires_at = (
-        jwt_claims[1]
-        if jwt_claims is not None
-        else _get_token_expiry({"access_token": access_token})
-    )
+    jwt_expires_at = jwt_claims[1] if jwt_claims is not None else _get_token_expiry({"access_token": access_token})
     response_expires_at = _timestamp_seconds(refreshed.get("expires_at"))
     if expires_in is not None and expires_in > 0:
         token_data["expires_in"] = _json_number(expires_in)
@@ -1011,9 +1022,7 @@ def _write_auth_data(auth_path: Path, auth_data: Mapping[str, Any]) -> None:
             mkdir_parents=True,
         )
     except (OSError, TypeError, ValueError) as exc:
-        raise ValueError(
-            f"Failed to persist refreshed Codex OAuth auth data: {exc}"
-        ) from exc
+        raise ValueError(f"Failed to persist refreshed Codex OAuth auth data: {exc}") from exc
 
 
 def _extract_account_id(token_data: Mapping[str, Any]) -> Optional[str]:
@@ -1124,7 +1133,7 @@ def _as_finite_number(value: Any) -> Optional[float]:
         return None
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
 
@@ -1136,7 +1145,3 @@ def _json_number(value: float) -> int | float:
 def _sanitize_error_message(message: str, *, limit: int = 500) -> str:
     """Redact secret *values* keyed by known field names (not just the labels)."""
     return sanitize_credential_error_message(message, limit=limit)
-
-# Backward-compatible alias for tests and callers that still reference
-# the old buffer-seconds constant.
-DEFAULT_CODEX_REFRESH_BUFFER_SECONDS = DEFAULT_CODEX_REFRESH_MIN_SECONDS
