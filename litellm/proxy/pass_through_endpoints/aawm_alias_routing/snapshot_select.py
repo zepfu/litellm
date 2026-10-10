@@ -548,7 +548,10 @@ def _resolve_snapshot_alias_candidates(
                     entry.priority == 0
                 )
                 shaped["alias_reference"] = entry.alias_name
-                shaped["alias_path"] = [*next_path, entry.alias_name]
+                # A child already carries its complete path through the alias
+                # graph. Re-prepending the reference would duplicate the graph
+                # root and make nested reference paths ambiguous.
+                shaped["alias_path"] = list(child["alias_path"])
                 if alias.distribution_strategy is not None:
                     shaped["selection_group"] = alias.name
                     shaped["selection_strategy"] = alias.distribution_strategy
