@@ -146,6 +146,11 @@ tracked separately from logical calls, and telemetry exposes only bounded
 fingerprints for targets, candidates, and account lanes. Non-OpenAI pass-through
 providers bypass this ledger and retain their existing transport behavior.
 
+Client-owned Codex model discovery preserves its OAuth authorization and
+account headers through the Codex egress binding. Credential family does not
+assign retry ownership: model discovery retains shared pre-first-byte retry,
+while inventory-bound generation callers retain their account-retry loop.
+
 The Responses wire coordinator remains the sole authority for replay
 commitment. It publishes a bounded request snapshot through
 `publish_wire_commitment_snapshot`; the send wrapper calls

@@ -1142,18 +1142,7 @@ class BaseOpenAIPassThroughHandler:
                         protected_headers=selected_openai_headers,
                     )
                 )
-            elif forward_headers:
-                extra_headers = dict(
-                    HttpPassThroughEndpointHelpers.canonicalize_openai_protected_headers(
-                        dict(extra_headers or {}),
-                        protected_headers={
-                            name: value
-                            for name, value in request.headers.items()
-                            if str(name).casefold()
-                            in _OPENAI_PROTECTED_PASSTHROUGH_HEADERS
-                        },
-                    )
-                )
+
             def _assemble_provider_headers(current_api_key: Optional[str]):
                 if managed_xai_oauth_request:
                     return BaseOpenAIPassThroughHandler._assemble_xai_oauth_headers(
@@ -1193,9 +1182,10 @@ class BaseOpenAIPassThroughHandler:
                         if openai_selected_credential_family == "codex_oauth"
                         else None
                     ),
+                    # Inventory-bound callers own account retries. Forwarded
+                    # client OAuth still uses shared pre-first-byte retries.
                     caller_managed_hidden_retry=(
-                        openai_selected_credential_family == "codex_oauth"
-                        or bound_codex_oauth_identity is not None
+                        bound_codex_oauth_identity is not None
                     ),
                     egress_selected_openai_headers=selected_openai_headers,
                     managed_xai_oauth_request=managed_xai_oauth_request,
