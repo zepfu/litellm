@@ -396,7 +396,7 @@ def build_plan(  # noqa: PLR0915
             child_token = orchestration_children
         elif "default_orchestration_children" in tui_spec:
             child_token = tui_spec.get("default_orchestration_children")
-            if not child_token:
+            if child_token is None:
                 raise PlanError("--orchestration-children is required")
         else:
             child_token = (

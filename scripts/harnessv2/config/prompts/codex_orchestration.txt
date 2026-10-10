@@ -3,9 +3,9 @@ You are the parent on alias {parent}.
 Call spawn_agent now with agent_type={child}. The spawn_agent message argument must be a STRING, not a JSON object. That string is serialized exact-three-key JSON: {"cfg047":1,"encoding":"text","text":"<actual child assignment>"}. The text field is the child assignment. Do not pass message as an object. If spawn rejects the argument, do not retry with bare prose or a JSON object.
 
 spawn_agent arguments:
-task_name: "hv2-child-pwd-uname"
+task_name: "hv2_child_pwd_uname"
 message: "{\"cfg047\":1,\"encoding\":\"text\",\"text\":\"Execute pwd and uname -s in parallel in this workspace and return only those two command stdout strings.\"}"
 
-Use a non-empty task_name token such as hv2-child-pwd-uname. The child must execute two independent harmless local shell commands in parallel, not sequentially: `pwd` and `uname -s`. The child must return only those two stdout strings. Do not run the command yourself. A parent-run command, a spawn acknowledgement, or an unsupported replacement profile does not satisfy the child. Do not spawn any other children. Do not spawn qwen, kimi, deepseek, grok, moonshot, or any ChatGPT-unsupported model.
+Use a non-empty task_name token such as hv2_child_pwd_uname. The name must use only lowercase letters, digits, and underscores. The child must execute two independent harmless local shell commands in parallel, not sequentially: `pwd` and `uname -s`. The child must return only those two stdout strings. Do not run the command yourself. A parent-run command, a spawn acknowledgement, or an unsupported replacement profile does not satisfy the child. Do not spawn any other children. Do not spawn qwen, kimi, deepseek, grok, moonshot, or any ChatGPT-unsupported model.
 
 After the child returns, print that exact stdout on its own line, list the child alias, then reply with the exact token hv2-codex-child on its own line. Do not print the token until the child's stdout is visible.

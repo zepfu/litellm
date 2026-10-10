@@ -1572,18 +1572,18 @@ def test_should_plan_codex_catalog_model_and_orchestration_as_non_stub(hv, confi
         dry_run=True,
         write_artifact=None,
     )
-    with pytest.raises(hv.PlanError, match="orchestration-children"):
-        hv.build_plan(
-            config=config,
-            kind="orchestration",
-            instance_token="alpha",
-            tui="codex",
-            models=None,
-            orchestration_parent=None,
-            orchestration_children=None,
-            dry_run=True,
-            write_artifact=None,
-        )
+    default_orch = hv.build_plan(
+        config=config,
+        kind="orchestration",
+        instance_token="alpha",
+        tui="codex",
+        models=None,
+        orchestration_parent=None,
+        orchestration_children=None,
+        dry_run=True,
+        write_artifact=None,
+    )
+    assert list(default_orch.orchestration_children) == []
     assert catalog.tui == "codex"
     assert catalog.kind == "catalog"
     assert model.tui == "codex"
@@ -1599,7 +1599,7 @@ def test_should_plan_codex_catalog_model_and_orchestration_as_non_stub(hv, confi
     assert "Do not run the command yourself" in model.extra["pong_prompt"]
     assert "print that exact stdout" in model.extra["pong_prompt"]
     assert "Call spawn_agent" in model.extra["pong_prompt"]
-    _assert_codex_cfg047_prompt(model.extra["pong_prompt"], task_name="hv2-child-pwd")
+    _assert_codex_cfg047_prompt(model.extra["pong_prompt"], task_name="hv2_child_pwd")
     work = hv.build_plan(
         config=config,
         kind="orchestration",
@@ -1618,7 +1618,7 @@ def test_should_plan_codex_catalog_model_and_orchestration_as_non_stub(hv, confi
     assert "hv2-codex-child" in work.extra["orchestration_prompt_template"]
     _assert_codex_cfg047_prompt(
         work.extra["orchestration_prompt_template"],
-        task_name="hv2-child-pwd-uname",
+        task_name="hv2_child_pwd_uname",
     )
     assert "agent=sota-xai" not in work.extra["orchestration_prompt_template"]
     assert "agent=work" not in work.extra["orchestration_prompt_template"]
@@ -4261,9 +4261,9 @@ def test_should_require_cfg047_string_on_codex_model_and_orchestration_prompts(
         parent="basic",
         children=["work"],
     )
-    _assert_codex_cfg047_prompt(model_prompt, task_name="hv2-child-pwd")
+    _assert_codex_cfg047_prompt(model_prompt, task_name="hv2_child_pwd")
     _assert_codex_cfg047_prompt(
-        orchestration_prompt, task_name="hv2-child-pwd-uname"
+        orchestration_prompt, task_name="hv2_child_pwd_uname"
     )
     assert "agent_type=basic" in model_prompt
     assert "`date` or `pwd`" in model_prompt
