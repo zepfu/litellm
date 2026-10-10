@@ -19,6 +19,7 @@ from typing import (
     Awaitable,
     Callable,
     Dict,
+    Iterable,
     List,
     Mapping,
     Optional,
@@ -71,12 +72,6 @@ from litellm.integrations.aawm_passthrough_shape_capture import (
 )
 
 _capture_passthrough_error_shape = capture_passthrough_shape
-from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen.constants import (
-    _OPENCODE_GO_CREDENTIAL_FAMILY,
-    _OPENCODE_GO_TARGET_FAMILY,
-    _OPENCODE_ZEN_CREDENTIAL_FAMILY,
-    _OPENCODE_ZEN_TARGET_FAMILY,
-)
 from litellm.llms.xai.route_descriptors import (
     GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
     GROK_NATIVE_OAUTH_ROUTE_FAMILY,
@@ -298,6 +293,7 @@ _MANAGED_XAI_OAUTH_BLOCKED_PASSTHROUGH_HEADERS = (
 _OPENAI_PROTECTED_PASSTHROUGH_HEADERS = (
     "authorization",
     "api-key",
+    "openai-api-key",
     "x-api-key",
     "proxy-authorization",
     "chatgpt-account-id",
@@ -306,7 +302,67 @@ _OPENAI_PROTECTED_PASSTHROUGH_HEADERS = (
     "session_id",
     "session-id",
 )
+_OPENAI_NATIVE_FORBIDDEN_HEADERS = frozenset(
+    {
+        "api-key",
+        "openai-api-key",
+        "x-api-key",
+        "proxy-authorization",
+        "chatgpt-account-id",
+    }
+)
+_OPENAI_MANAGED_FORBIDDEN_HEADERS = frozenset(
+    {
+        "api-key",
+        "openai-api-key",
+        "x-api-key",
+        "proxy-authorization",
+    }
+)
 _OPENAI_ALLOWED_REDIRECT_STATUS_CODES = frozenset()
+
+
+@dataclass(frozen=True)
+class _OpenAIEgressBinding:
+    """Immutable server-owned contract for one OpenAI egress attempt."""
+
+    custom_llm_provider: Optional[str]
+    egress_credential_family: Optional[str]
+    route_family: str
+    expected_target_family: str
+    target_url: str
+    selected_openai_headers: tuple[tuple[str, str], ...]
+    expected_account_hash: Optional[str]
+    expected_lane_key: Optional[str]
+    expected_model: Optional[str]
+    account_label: Optional[str]
+    credential_affinity: Optional[str]
+    endpoint_contract: str
+    state_format: str
+    follow_redirects: bool = False
+
+    @property
+    def protected_openai_headers(self) -> dict[str, str]:
+        return dict(self.selected_openai_headers)
+
+    @property
+    def account_context(self) -> dict[str, Any]:
+        return {
+            "account_hash": self.expected_account_hash,
+            "lane_key": self.expected_lane_key,
+            "account_label": self.account_label,
+            "credential_affinity": self.credential_affinity,
+        }
+
+    @property
+    def candidate_context(self) -> dict[str, Any]:
+        return {
+            "provider": "openai",
+            "model": self.expected_model,
+            "route_family": self.route_family,
+            "account_hash": self.expected_account_hash,
+            "lane_key": self.expected_lane_key,
+        }
 
 
 def _is_xai_egress_credential_family(value: Optional[str]) -> bool:
@@ -3094,6 +3150,7 @@ def _record_passthrough_hidden_retry_metadata(
     request: Optional[Request] = None,
     logical_provider_call_start: Optional[int] = None,
     reservation_rejected: bool = False,
+    immutable_openai_binding: Optional[Any] = None,
 ) -> None:
     if not isinstance(kwargs, dict):
         return
@@ -3121,6 +3178,9 @@ def _record_passthrough_hidden_retry_metadata(
         attempt_record["status_code"] = status_code
     if failure_classification is not None:
         attempt_record["failure_classification"] = failure_classification
+    if isinstance(immutable_openai_binding, _OpenAIEgressBinding):
+        attempt_record["expected_model"] = immutable_openai_binding.expected_model
+        attempt_record["route_family"] = immutable_openai_binding.route_family
 
     logical_provider_send_count: Optional[int] = None
     request_ledger = (
@@ -3182,6 +3242,10 @@ def _record_passthrough_hidden_retry_metadata(
         metadata[
             "aawm_passthrough_hidden_retry_failure_classification"
         ] = failure_classification
+    if isinstance(immutable_openai_binding, _OpenAIEgressBinding):
+        metadata["aawm_openai_final_send_binding_expected_model"] = (
+            immutable_openai_binding.expected_model
+        )
 
 
 def _mark_passthrough_hidden_retry_budget_exhausted(
@@ -3209,6 +3273,7 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
     request: Optional[Request] = None,
     url: Optional[httpx.URL] = None,
     custom_llm_provider: Optional[str] = None,
+    immutable_openai_binding: Optional[_OpenAIEgressBinding] = None,
     openai_capacity_coordinator: Optional[
         OpenAIAlphaCapacityRetryCoordinator
     ] = None,
@@ -3385,6 +3450,7 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     final_outcome="success_after_retry",
                     request=request,
                     logical_provider_call_start=logical_provider_call_start,
+                    immutable_openai_binding=immutable_openai_binding,
                 )
             return result
         except Exception as exc:
@@ -3420,6 +3486,7 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     failure_classification=failure_classification,
                     request=request,
                     logical_provider_call_start=logical_provider_call_start,
+                    immutable_openai_binding=immutable_openai_binding,
                 )
                 _mark_passthrough_hidden_retry_budget_exhausted(
                     kwargs,
@@ -3561,6 +3628,7 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         failure_classification=failure_classification,
                         request=request,
                         logical_provider_call_start=logical_provider_call_start,
+                        immutable_openai_binding=immutable_openai_binding,
                         reservation_rejected=bool(
                             getattr(
                                 terminal_exception,
@@ -3659,6 +3727,7 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     failure_classification=failure_classification,
                     request=request,
                     logical_provider_call_start=logical_provider_call_start,
+                    immutable_openai_binding=immutable_openai_binding,
                     reservation_rejected=bool(
                         getattr(exc, "aawm_call_ledger_exhausted", False)
                         or getattr(
@@ -3707,6 +3776,7 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     failure_classification=failure_classification,
                     request=request,
                     logical_provider_call_start=logical_provider_call_start,
+                    immutable_openai_binding=immutable_openai_binding,
                     reservation_rejected=bool(
                         getattr(exc, "aawm_call_ledger_exhausted", False)
                         or getattr(
@@ -3743,6 +3813,7 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                 failure_classification=failure_classification,
                 request=request,
                 logical_provider_call_start=logical_provider_call_start,
+                immutable_openai_binding=immutable_openai_binding,
             )
             verbose_proxy_logger.info(
                 "Pass-through %s hidden retry attempt %s/%s after %s; sleeping %.1fs",
@@ -5176,38 +5247,145 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         credential_family = str(
             egress_credential_family or ""
         ).strip().casefold()
-        target_family = str(expected_target_family or "").strip().casefold()
+        target_family = HttpPassThroughEndpointHelpers.get_target_provider_family(url)
         return (
             provider == "openai"
-            or credential_family == "codex_oauth"
-            or target_family == "openai"
-            or HttpPassThroughEndpointHelpers.get_target_provider_family(url)
-            == "openai"
+            or credential_family in {"openai", "codex_oauth"}
+            or expected_target_family in {"openai", "codex_oauth"}
+            or target_family in {"openai", "codex_oauth"}
         )
 
     @staticmethod
+    def validate_openai_header_duplicates(
+        items: Iterable[tuple[str, str]],
+        *,
+        reject_prefixed: bool = False,
+        allow_prefixed_client_credentials: bool = False,
+        allowed_prefixed_names: Optional[Iterable[str]] = None,
+    ) -> None:
+        seen: set[str] = set()
+        seen_unprefixed: set[str] = set()
+        seen_prefixed: set[str] = set()
+        allowed_prefixed = (
+            {str(name).casefold() for name in allowed_prefixed_names}
+            if allowed_prefixed_names is not None
+            else None
+        )
+        for name, _value in items:
+            normalized = str(name).casefold()
+            prefixed = normalized.startswith(PASS_THROUGH_HEADER_PREFIX)
+            protected_name = (
+                normalized[len(PASS_THROUGH_HEADER_PREFIX) :]
+                if prefixed
+                else normalized
+            )
+            if protected_name not in _OPENAI_PROTECTED_PASSTHROUGH_HEADERS:
+                continue
+            if prefixed and (
+                reject_prefixed
+                or (
+                    allowed_prefixed is not None
+                    and protected_name not in allowed_prefixed
+                )
+            ):
+                raise HTTPException(
+                    status_code=500,
+                    detail="Blocked OpenAI egress: ambiguous or forwarded protected headers.",
+                )
+            if allow_prefixed_client_credentials:
+                # Client-owned x-pass-* is a distinct credential class from
+                # unprefixed inbound names, which may be another provider's
+                # auth on the same request.
+                seen_names = seen_prefixed if prefixed else seen_unprefixed
+            else:
+                seen_names = seen
+            if protected_name in seen_names:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Blocked OpenAI egress: ambiguous or forwarded protected headers.",
+                )
+            seen_names.add(protected_name)
+        if allow_prefixed_client_credentials:
+            # Inbound Authorization on explicit client-owned Anthropic adapter
+            # routes is another provider's auth. Other direct+prefixed pairs
+            # of the same protected OpenAI name stay fail-closed.
+            for protected_name in seen_prefixed.intersection(seen_unprefixed):
+                if protected_name == "authorization":
+                    continue
+                raise HTTPException(
+                    status_code=500,
+                    detail="Blocked OpenAI egress: ambiguous or forwarded protected headers.",
+                )
+
+    @staticmethod
+    def install_client_owned_openai_xpass_headers(
+        request_headers: Mapping[str, str],
+        binding_headers: dict[str, str],
+        *,
+        allowed_pass_through_prefixed_headers: Optional[Iterable[str]],
+    ) -> None:
+        """Install allowlisted client-owned x-pass-* credentials into the binding.
+
+        Strips the prefix and never overwrites an already-selected protected name.
+        """
+
+        allowed_names = (
+            {str(name).casefold() for name in allowed_pass_through_prefixed_headers}
+            if allowed_pass_through_prefixed_headers is not None
+            else None
+        )
+        for name, value in request_headers.items():
+            normalized = str(name).casefold()
+            if not normalized.startswith(PASS_THROUGH_HEADER_PREFIX):
+                continue
+            protected_name = normalized[len(PASS_THROUGH_HEADER_PREFIX) :]
+            if protected_name not in _OPENAI_PROTECTED_PASSTHROUGH_HEADERS:
+                continue
+            if (
+                allowed_names is not None
+                and protected_name not in allowed_names
+            ):
+                continue
+            if protected_name in binding_headers:
+                continue
+            binding_headers[protected_name] = str(value)
+
+    @staticmethod
     def canonicalize_openai_protected_headers(
-        headers: dict,
+        headers: Union[Mapping[str, str], httpx.Headers],
         *,
         protected_headers: Mapping[str, str],
     ) -> httpx.Headers:
         """Install server-owned protected headers last on one canonical map."""
 
-        incoming_items: list[tuple[str, str]] = [
-            (str(name), str(value)) for name, value in dict(headers).items()
-        ]
+        incoming_items = (
+            headers.multi_items() if isinstance(headers, httpx.Headers)
+            else list(headers.items())
+        )
+        HttpPassThroughEndpointHelpers.validate_openai_header_duplicates(
+            incoming_items
+        )
         protected_items: list[tuple[str, str]] = [
             (str(name), str(value))
             for name, value in dict(protected_headers).items()
         ]
+        HttpPassThroughEndpointHelpers.validate_openai_header_duplicates(
+            protected_items
+        )
         selected_names = {name.casefold() for name, _value in protected_items}
         protected_names = set(_OPENAI_PROTECTED_PASSTHROUGH_HEADERS)
         protected_names.update(selected_names)
 
         retained: list[tuple[str, str]] = []
         for name, value in incoming_items:
-            normal_name = name.casefold()
-            if normal_name not in protected_names:
+            normal_name = str(name).casefold()
+            prefixed = normal_name.startswith(PASS_THROUGH_HEADER_PREFIX)
+            protected_name = (
+                normal_name[len(PASS_THROUGH_HEADER_PREFIX) :]
+                if prefixed
+                else normal_name
+            )
+            if protected_name not in protected_names:
                 retained.append((name, value))
             elif normal_name in selected_names:
                 selected_names.discard(normal_name)
@@ -5276,57 +5454,6 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         raise HTTPException(status_code=500, detail=safe_detail)
 
     @staticmethod
-    def get_opencode_target_route_family(
-        url: Union[str, httpx.URL],
-    ) -> Optional[str]:
-        """OC-010: resolve only canonical OpenCode Zen/Go targets.
-
-        Returns the Zen-distinct ``opencode_zen`` family for the Zen API
-        host path, the ``opencode_go`` family for the Go path, or ``None``
-        for any configured proxy or unknown host so ordinary family checks
-        stay generic-aware.
-        """
-        parsed_url = urlparse(str(url))
-        hostname = (parsed_url.hostname or "").strip().casefold()
-        if hostname != "opencode.ai" and not hostname.endswith(".opencode.ai"):
-            return None
-        normalized_path = "/" + (parsed_url.path or "").lstrip("/")
-        if normalized_path.startswith("/zen/go/"):
-            return _OPENCODE_GO_TARGET_FAMILY
-        if normalized_path.startswith("/zen/"):
-            return _OPENCODE_ZEN_TARGET_FAMILY
-        return None
-
-    @staticmethod
-    def _is_exact_opencode_egress_family(family: Optional[str]) -> bool:
-        return str(family or "").strip().casefold() in {
-            _OPENCODE_ZEN_CREDENTIAL_FAMILY,
-            _OPENCODE_ZEN_TARGET_FAMILY,
-            _OPENCODE_GO_CREDENTIAL_FAMILY,
-            _OPENCODE_GO_TARGET_FAMILY,
-        }
-
-    @staticmethod
-    def _expected_opencode_route_family(
-        *,
-        credential_family: Optional[str],
-        expected_target_family: Optional[str],
-    ) -> Optional[str]:
-        expected = str(expected_target_family or "").strip().casefold()
-        credential = str(credential_family or "").strip().casefold()
-        if (
-            expected == _OPENCODE_ZEN_TARGET_FAMILY
-            or credential == _OPENCODE_ZEN_CREDENTIAL_FAMILY
-        ):
-            return _OPENCODE_ZEN_TARGET_FAMILY
-        if (
-            expected == _OPENCODE_GO_TARGET_FAMILY
-            or credential == _OPENCODE_GO_CREDENTIAL_FAMILY
-        ):
-            return _OPENCODE_GO_TARGET_FAMILY
-        return None
-
-    @staticmethod
     def get_target_provider_family(url: Union[str, httpx.URL]) -> str:
         parsed_url = urlparse(str(url))
         hostname = (parsed_url.hostname or "").lower()
@@ -5343,10 +5470,6 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         if hostname == "openrouter.ai" or hostname.endswith(".openrouter.ai"):
             return "openrouter"
         if hostname == "opencode.ai" or hostname.endswith(".opencode.ai"):
-            path = (parsed_url.path or "").lower()
-            normalized_path = path if path.endswith("/") else f"{path}/"
-            if "/zen/go/" in normalized_path:
-                return "opencode_go"
             return "opencode"
         if (
             hostname == "api.x.ai"
@@ -5365,6 +5488,13 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         ):
             return "google"
         return "generic"
+
+    @staticmethod
+    def get_openai_target_family(url: Union[str, httpx.URL]) -> str:
+        hostname = httpx.URL(url).host.casefold()
+        if hostname == "chatgpt.com" or hostname.endswith(".chatgpt.com"):
+            return "codex_oauth"
+        return HttpPassThroughEndpointHelpers.get_target_provider_family(url)
 
     @staticmethod
     def get_credential_marker_families(
@@ -5431,6 +5561,12 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         normalized_credential_family = str(
             credential_family or ""
         ).strip().casefold()
+        # The shared guard uses provider families; the OpenAI final-send
+        # binding separately enforces native API-key versus managed OAuth.
+        provider_expected_family = (
+            "openai" if expected_target_family == "codex_oauth"
+            else expected_target_family
+        )
         xai_target_route_family = get_xai_target_route_family(url)
         managed_xai_oauth_egress = (
             HttpPassThroughEndpointHelpers._is_managed_xai_oauth_egress(
@@ -5454,27 +5590,8 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 )
 
         target_family = HttpPassThroughEndpointHelpers.get_target_provider_family(url)
-        opencode_target_route_family = (
-            HttpPassThroughEndpointHelpers.get_opencode_target_route_family(url)
-        )
-        expected_opencode_route_family = (
-            HttpPassThroughEndpointHelpers._expected_opencode_route_family(
-                credential_family=credential_family,
-                expected_target_family=expected_target_family,
-            )
-        )
-        exact_opencode_expected_family = (
-            HttpPassThroughEndpointHelpers._is_exact_opencode_egress_family(
-                expected_target_family
-            )
-        )
-        exact_opencode_credential_family = (
-            HttpPassThroughEndpointHelpers._is_exact_opencode_egress_family(
-                credential_family
-            )
-        )
         telemetry_target_family = (
-            xai_target_route_family or opencode_target_route_family or target_family
+            xai_target_route_family or target_family
         )
         exact_xai_expected_family = expected_target_family in {
             XAI_OAUTH_ROUTE_FAMILY,
@@ -5515,9 +5632,8 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 )
                 or (
                     not exact_xai_expected_family
-                    and not exact_opencode_expected_family
                     and target_family != "generic"
-                    and target_family != expected_target_family
+                    and target_family != provider_expected_family
                 )
             )
         ):
@@ -5529,35 +5645,6 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 url=url,
                 credential_family=credential_family,
                 target_family=telemetry_target_family,
-            )
-
-        # OC-010: Zen/Go egress must bind the exact Zen/Go route family, so
-        # a Zen credential cannot reach a Go target. xAI resolution is
-        # checked first and keeps its existing exact semantics. Generic
-        # proxy hosts stay generic-aware, matching xAI.
-        if expected_opencode_route_family is not None and (
-            (
-                opencode_target_route_family is not None
-                and opencode_target_route_family != expected_opencode_route_family
-            )
-            or (
-                opencode_target_route_family is None
-                and target_family != "generic"
-            )
-        ):
-            HttpPassThroughEndpointHelpers._raise_egress_guard_block(
-                detail=(
-                    "Blocked passthrough egress: OpenCode Zen and OpenCode Go "
-                    "credentials and targets are distinct; expected "
-                    f"{expected_target_family or credential_family}, "
-                    f"got {opencode_target_route_family or target_family}."
-                ),
-                url=url,
-                credential_family=credential_family,
-                target_family=(
-                    opencode_target_route_family
-                    or HttpPassThroughEndpointHelpers.get_target_provider_family(url)
-                ),
             )
 
         if normalized_credential_family == GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY and (
@@ -5585,7 +5672,6 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         if (
             credential_target_family is not None
             and not exact_xai_credential_family
-            and not exact_opencode_credential_family
             and target_family != "generic"
             and target_family != credential_target_family
         ):
@@ -5631,7 +5717,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
 
         HttpPassThroughEndpointHelpers.validate_outgoing_egress(
             url=prepared_request.url,
-            headers=dict(prepared_request.headers),
+            headers=prepared_request.headers,
             credential_family=credential_family,
             expected_target_family=expected_target_family,
         )
@@ -5664,11 +5750,12 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         # selection; the immutable egress binding is the authority/endpoint
         # path, not transport-specific query decoration.
         expected_openai_url = httpx.URL(str(expected_url)).copy_with(query=None)
+        actual_openai_url = prepared_request.url.copy_with(query=None)
         if (
             prepared_request.url.scheme != expected_openai_url.scheme
             or prepared_request.url.host != expected_openai_url.host
             or prepared_request.url.port != expected_openai_url.port
-            or prepared_request.url.raw_path != expected_openai_url.raw_path
+            or actual_openai_url.raw_path != expected_openai_url.raw_path
             or prepared_request.url.fragment != expected_openai_url.fragment
         ):
             HttpPassThroughEndpointHelpers._raise_egress_guard_block(
@@ -5684,6 +5771,38 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                         expected_openai_url
                     )
                 ),
+            )
+
+        actual_family = HttpPassThroughEndpointHelpers.get_openai_target_family(
+            prepared_request.url
+        )
+        expected_family = str(expected_target_family or "").strip().casefold()
+        credential_family = str(egress_credential_family or "").strip().casefold()
+        provider = str(custom_llm_provider or "").strip().casefold()
+        compatible_family = (
+            expected_family in {"openai", "codex_oauth"}
+            and credential_family == expected_family
+            and (
+                actual_family == expected_family
+                or (
+                    actual_family == "generic"
+                    and expected_family == "openai"
+                    and provider == "openai"
+                )
+            )
+        )
+        if (
+            not compatible_family
+            or (
+                actual_family in {"openai", "codex_oauth"}
+                and prepared_request.url.scheme != "https"
+            )
+        ):
+            HttpPassThroughEndpointHelpers._raise_egress_guard_block(
+                detail="Blocked OpenAI egress: target and credential families differ from the binding.",
+                url=prepared_request.url,
+                credential_family=egress_credential_family,
+                target_family=actual_family,
             )
 
         selected_hash = None
@@ -5736,13 +5855,22 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                     ),
                 )
 
-        if selected_openai_headers:
+        HttpPassThroughEndpointHelpers.validate_openai_header_duplicates(
+            prepared_request.headers.multi_items(), reject_prefixed=True
+        )
+        if selected_openai_headers is not None:
             prepared_headers = {
                 str(name).casefold(): str(value)
-                for name, value in prepared_request.headers.items()
+                for name, value in prepared_request.headers.multi_items()
             }
-            for name, value in selected_openai_headers.items():
-                if prepared_headers.get(str(name).casefold()) != str(value):
+            protected_names = set(_OPENAI_PROTECTED_PASSTHROUGH_HEADERS)
+            protected_names.update(str(name).casefold() for name in selected_openai_headers)
+            expected_headers = {
+                str(name).casefold(): str(value)
+                for name, value in selected_openai_headers.items()
+            }
+            for name in protected_names:
+                if prepared_headers.get(name) != expected_headers.get(name):
                     HttpPassThroughEndpointHelpers._raise_egress_guard_block(
                         detail=(
                             "Blocked OpenAI egress: final authentication "
@@ -5757,6 +5885,31 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                             )
                         ),
                     )
+            if egress_credential_family == "codex_oauth":
+                valid_auth = (
+                    prepared_headers.get("authorization", "").startswith("Bearer ")
+                    and bool(prepared_headers.get("chatgpt-account-id"))
+                    and not any(
+                        prepared_headers.get(name)
+                        for name in _OPENAI_MANAGED_FORBIDDEN_HEADERS
+                    )
+                )
+            else:
+                valid_auth = not any(
+                    prepared_headers.get(name)
+                    for name in _OPENAI_NATIVE_FORBIDDEN_HEADERS
+                )
+                if "authorization" in prepared_headers:
+                    valid_auth = valid_auth and prepared_headers[
+                        "authorization"
+                    ].startswith("Bearer ")
+            if not valid_auth:
+                HttpPassThroughEndpointHelpers._raise_egress_guard_block(
+                    detail="Blocked OpenAI egress: credential header form differs from the binding.",
+                    url=expected_openai_url,
+                    credential_family=egress_credential_family,
+                    target_family=expected_target_family,
+                )
 
         validate_credential_family = egress_credential_family
         if validate_credential_family is None:
@@ -6628,6 +6781,304 @@ def _openai_binding_fingerprint(value: Any) -> Optional[str]:
     if value in (None, ""):
         return None
     return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
+
+
+def _current_candidate_context(request: Request) -> dict[str, Any]:
+    state = getattr(request, "state", None)
+    context = getattr(state, "aawm_openai_candidate_context", None)
+    return dict(context) if isinstance(context, Mapping) else {}
+
+
+def _current_openai_account_context(request: Request) -> dict[str, Any]:
+    state = getattr(request, "state", None)
+    context = getattr(
+        state,
+        "aawm_codex_oauth_selected_account",
+        None,
+    )
+    return dict(context) if isinstance(context, Mapping) else {}
+
+
+_selected_openai_model_cache_attr = (
+    "_aawm_openai_selected_server_model"
+)
+
+
+def _resolve_immutable_openai_model(
+    request: Request,
+    *,
+    selected_openai_headers: Optional[Mapping[str, str]],
+    prepared_request: Optional[httpx.Request] = None,
+) -> Optional[str]:
+    """Resolve once from server state, then compare the exact wire model."""
+
+    state = getattr(request, "state", None)
+    if prepared_request is not None:
+        wire_model = (
+            HttpPassThroughEndpointHelpers._get_prepared_openai_model(
+                prepared_request
+            )
+        )
+        if state is not None and wire_model is not None:
+            setattr(state, _selected_openai_model_cache_attr, wire_model)
+        return wire_model
+    if not selected_openai_headers:
+        return None
+    for context in (
+        _current_openai_account_context(request),
+        _current_candidate_context(request),
+    ):
+        model = context.get("model")
+        if isinstance(model, str) and model.strip():
+            model = model.strip()
+            if state is not None:
+                setattr(state, _selected_openai_model_cache_attr, model)
+            return model
+    return None
+
+
+def _build_immutable_openai_binding(
+    *,
+    target_url: httpx.URL,
+    custom_llm_provider: Optional[str],
+    egress_credential_family: Optional[str],
+    expected_target_family: Optional[str],
+    selected_openai_headers: Optional[Mapping[str, str]],
+    request: Request,
+    request_body: Optional[Mapping[str, Any]] = None,
+) -> _OpenAIEgressBinding:
+    target_family = HttpPassThroughEndpointHelpers.get_openai_target_family(
+        target_url
+    )
+    resolved_credential_family = (
+        str(egress_credential_family)
+        if egress_credential_family is not None
+        else None
+    )
+    resolved_target_family = str(
+        expected_target_family or target_family or resolved_credential_family or "openai"
+    )
+    managed = resolved_target_family == "codex_oauth"
+    account_context = _current_openai_account_context(request) if managed else {}
+    account_hash = account_context.get("account_hash")
+    lane_key = account_context.get("lane_key")
+    candidate_context = _current_candidate_context(request)
+    responses = str(target_url.path or "").rstrip("/").endswith("/responses")
+    candidate_route_family = str(candidate_context.get("route_family") or "")
+    if managed:
+        route_family = (
+            candidate_route_family
+            if candidate_route_family
+            else ("codex_responses" if responses else "codex_oauth")
+        )
+    else:
+        route_family = (
+            candidate_route_family
+            if candidate_route_family
+            else ("openai_responses" if responses else "openai")
+        )
+    endpoint_contract = (
+        "codex_responses"
+        if route_family == "codex_responses"
+        else "openai_responses"
+        if responses
+        else "passthrough"
+    )
+    selected_model = account_context.get("model") or candidate_context.get("model")
+    if selected_model in (None, "") and isinstance(request_body, Mapping):
+        selected_model = request_body.get("model")
+    expected_model = (
+        selected_model.strip()
+        if isinstance(selected_model, str) and selected_model.strip()
+        else None
+    )
+    return _OpenAIEgressBinding(
+        custom_llm_provider=(
+            str(custom_llm_provider) if custom_llm_provider is not None else None
+        ),
+        egress_credential_family=resolved_credential_family,
+        route_family=route_family,
+        expected_target_family=resolved_target_family,
+        target_url=str(target_url.copy_with(query=None)),
+        selected_openai_headers=tuple(
+            (str(name), str(value))
+            for name, value in (selected_openai_headers or {}).items()
+        ),
+        expected_account_hash=(
+            str(account_hash) if account_hash not in (None, "") else None
+        ),
+        expected_lane_key=str(lane_key) if lane_key not in (None, "") else None,
+        expected_model=expected_model,
+        account_label=(
+            str(account_context["account_label"])
+            if account_context.get("account_label") else None
+        ),
+        credential_affinity=(
+            str(account_context["credential_affinity"])
+            if account_context.get("credential_affinity") else None
+        ),
+        endpoint_contract=endpoint_contract,
+        state_format=endpoint_contract if responses else route_family,
+    )
+
+
+def _resolve_immutable_openai_credential_family(
+    *,
+    egress_credential_family: Optional[str],
+    expected_target_family: Optional[str],
+    selected_openai_headers: Optional[Mapping[str, str]],
+    target_url: Union[str, httpx.URL],
+    custom_llm_provider: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve native API-key versus managed Codex OAuth from the target URL."""
+
+    target_family = HttpPassThroughEndpointHelpers.get_openai_target_family(
+        target_url
+    )
+    if target_family == "codex_oauth":
+        return "codex_oauth"
+    if egress_credential_family is not None:
+        return egress_credential_family
+    if expected_target_family in {"openai", "codex_oauth"}:
+        return expected_target_family
+    if selected_openai_headers:
+        return "codex_oauth"
+    provider = str(custom_llm_provider or "").strip().casefold()
+    if provider == "openai" or target_family == "openai":
+        return "openai"
+    return target_family if target_family else None
+
+
+def _selected_openai_model(
+    request: Request,
+    *,
+    selected_openai_headers: Optional[Mapping[str, str]],
+) -> Optional[str]:
+    if not selected_openai_headers:
+        return None
+    for context in (
+        _current_openai_account_context(request),
+        _current_candidate_context(request),
+    ):
+        model = context.get("model")
+        if isinstance(model, str) and model.strip():
+            return model.strip()
+    return None
+
+
+def _build_immutable_openai_owner_attributes(
+    request: Request,
+    *,
+    model: str,
+    egress_credential_family: Optional[str],
+    expected_target_family: Optional[str],
+    openai_binding: Optional[_OpenAIEgressBinding] = None,
+) -> dict[str, Any]:
+    """Derive final-send ownership only from the server-selected binding."""
+
+    if openai_binding is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Blocked OpenAI egress: ownership requires the immutable "
+                "server-selected binding."
+            ),
+        )
+    account_context = openai_binding.account_context
+    return _session_affinity_mod().build_session_owner_attributes(
+        provider="openai",
+        model=openai_binding.expected_model or model,
+        route_family=openai_binding.route_family,
+        account_label=account_context.get("account_label"),
+        account_hash=account_context.get("account_hash"),
+        account_lane=account_context.get("lane_key"),
+        endpoint_contract=openai_binding.endpoint_contract,
+        state_format=openai_binding.state_format,
+        ingress="pass_through_request",
+        requested_model=openai_binding.expected_model or model,
+        credential_affinity=account_context.get("credential_affinity"),
+    )
+
+
+def _validate_immutable_openai_binding(
+    prepared_request: httpx.Request,
+    *,
+    request: Request,
+    expected_url: Optional[httpx.URL],
+    custom_llm_provider: Optional[str],
+    egress_credential_family: Optional[str],
+    expected_target_family: Optional[str],
+    selected_openai_headers: Optional[Mapping[str, str]],
+    openai_bound_egress: bool,
+    openai_binding: Optional[_OpenAIEgressBinding] = None,
+) -> tuple[Optional[str], dict[str, Any], Optional[str], bool]:
+    if not openai_bound_egress:
+        return (
+            None,
+            {},
+            None,
+            False,
+        )
+    if openai_binding is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Blocked OpenAI egress: final-send validation requires the "
+                "immutable server-selected binding."
+            ),
+        )
+    current_context = _current_openai_account_context(request)
+    expected_model = openai_binding.expected_model
+    serialized_model = (
+        HttpPassThroughEndpointHelpers._get_prepared_openai_model(
+            prepared_request
+        )
+    )
+    strict_owner_enabled = bool(
+        expected_model
+        and (
+            openai_binding.egress_credential_family == "codex_oauth"
+            or openai_binding.expected_target_family == "codex_oauth"
+        )
+    )
+    if (
+        openai_binding.egress_credential_family == "codex_oauth"
+        and openai_binding.expected_account_hash
+        and (
+            not openai_binding.expected_lane_key
+            or any(
+                (
+                    str(current_context.get(key))
+                    if current_context.get(key)
+                    else None
+                )
+                != value
+                for key, value in openai_binding.account_context.items()
+            )
+        )
+    ):
+        raise HTTPException(
+            status_code=500,
+            detail="Blocked OpenAI egress: selected account differs from the immutable binding.",
+        )
+    HttpPassThroughEndpointHelpers.validate_openai_final_send_binding(
+        prepared_request=prepared_request,
+        expected_url=openai_binding.target_url,
+        custom_llm_provider=openai_binding.custom_llm_provider,
+        egress_credential_family=openai_binding.egress_credential_family,
+        expected_target_family=openai_binding.expected_target_family,
+        expected_account_hash=openai_binding.expected_account_hash,
+        expected_lane_key=openai_binding.expected_lane_key,
+        selected_account_context=openai_binding.account_context,
+        expected_model=expected_model,
+        selected_openai_headers=openai_binding.protected_openai_headers,
+    )
+    return (
+        serialized_model,
+        openai_binding.account_context,
+        expected_model,
+        strict_owner_enabled,
+    )
 
 
 def _canonical_openai_final_send_uuid(value: Any) -> Optional[str]:
@@ -7733,6 +8184,8 @@ async def pass_through_request(  # noqa: PLR0915
         if isinstance(status_code, int)
     }
     openai_call_ledger = None
+    openai_bound_egress = False
+    immutable_openai_binding: Optional[_OpenAIEgressBinding] = None
 
     def _publish_openai_send_telemetry() -> None:
         request_state = getattr(request, "state", None)
@@ -7800,6 +8253,15 @@ async def pass_through_request(  # noqa: PLR0915
         ):
             register_aawm_route_rollup_access_log_replacement(request)
         url = httpx.URL(target)
+        managed_openai_credential_family = (
+            _resolve_immutable_openai_credential_family(
+                egress_credential_family=egress_credential_family,
+                expected_target_family=expected_target_family,
+                selected_openai_headers=selected_openai_headers,
+                target_url=url,
+                custom_llm_provider=custom_llm_provider,
+            )
+        )
         managed_xai_oauth_egress = (
             HttpPassThroughEndpointHelpers._is_managed_xai_oauth_egress(
                 egress_credential_family
@@ -7810,7 +8272,7 @@ async def pass_through_request(  # noqa: PLR0915
         )
         openai_bound_egress = HttpPassThroughEndpointHelpers._is_openai_bound_egress(
             custom_llm_provider=custom_llm_provider,
-            egress_credential_family=egress_credential_family,
+            egress_credential_family=managed_openai_credential_family,
             expected_target_family=expected_target_family,
             url=url,
         )
@@ -7824,22 +8286,55 @@ async def pass_through_request(  # noqa: PLR0915
         validate_prepared_request_fn: Optional[
             Callable[[httpx.Request], None]
         ] = None
-        if (
-            HttpPassThroughEndpointHelpers._is_exact_xai_egress_credential_family(
-                egress_credential_family
-            )
-            or expected_target_family
-            in {XAI_OAUTH_ROUTE_FAMILY, GROK_NATIVE_OAUTH_ROUTE_FAMILY}
-        ):
-
+        if not (openai_bound_egress or managed_xai_oauth_request):
             def _validate_prepared_request(prepared_request: httpx.Request) -> None:
                 HttpPassThroughEndpointHelpers.validate_prepared_request_egress(
                     prepared_request=prepared_request,
                     credential_family=egress_credential_family,
                     expected_target_family=expected_target_family,
                 )
-
-            validate_prepared_request_fn = _validate_prepared_request
+        if openai_bound_egress:
+            def _validate_prepared_openai_request(
+                prepared_request: httpx.Request,
+            ) -> None:
+                _validate_immutable_openai_binding(
+                    prepared_request,
+                    request=request,
+                    expected_url=url,
+                    custom_llm_provider=custom_llm_provider,
+                    egress_credential_family=(
+                        immutable_openai_binding.egress_credential_family
+                    ),
+                    expected_target_family=(
+                        immutable_openai_binding.expected_target_family
+                    ),
+                    selected_openai_headers=(
+                        immutable_openai_binding.protected_openai_headers
+                    ),
+                    openai_bound_egress=openai_bound_egress,
+                    openai_binding=immutable_openai_binding,
+                )
+            validate_prepared_request_fn = _validate_prepared_openai_request
+        elif managed_xai_oauth_request:
+            def _validate_prepared_xai_request(
+                prepared_request: httpx.Request,
+            ) -> None:
+                HttpPassThroughEndpointHelpers.validate_prepared_request_egress(
+                    prepared_request=prepared_request,
+                    credential_family=egress_credential_family,
+                    expected_target_family=expected_target_family,
+                )
+            validate_prepared_request_fn = _validate_prepared_xai_request
+        if not (openai_bound_egress or managed_xai_oauth_request):
+            exact_xai_egress = (
+                HttpPassThroughEndpointHelpers._is_exact_xai_egress_credential_family(
+                    egress_credential_family
+                )
+                or expected_target_family
+                in {XAI_OAUTH_ROUTE_FAMILY, GROK_NATIVE_OAUTH_ROUTE_FAMILY}
+            )
+            if exact_xai_egress:
+                validate_prepared_request_fn = _validate_prepared_request
         effective_blocked_pass_through_prefixed_headers = list(
             blocked_pass_through_prefixed_headers or []
         )
@@ -7848,19 +8343,90 @@ async def pass_through_request(  # noqa: PLR0915
                 _MANAGED_XAI_OAUTH_BLOCKED_PASSTHROUGH_HEADERS
             )
         if openai_bound_egress:
+            if egress_credential_family is None:
+                egress_credential_family = managed_openai_credential_family
             effective_blocked_pass_through_prefixed_headers.extend(
-                [
-                    "authorization",
-                    "api-key",
-                    "x-api-key",
-                    "proxy-authorization",
-                    "chatgpt-account-id",
-                    "openai-organization",
-                    "openai-project",
-                    "session-id",
-                    "session_id",
-                ]
+                list(_OPENAI_PROTECTED_PASSTHROUGH_HEADERS)
             )
+        binding_headers: dict[str, str] = {}
+        allowed_xpass_names = {
+            str(name).casefold()
+            for name in (allowed_pass_through_prefixed_headers or [])
+        }
+        client_owned_openai_xpass = bool(
+            openai_bound_egress
+            and forward_headers
+            and selected_openai_headers is None
+            and "authorization" in allowed_xpass_names
+        )
+        if openai_bound_egress:
+            HttpPassThroughEndpointHelpers.validate_openai_header_duplicates(
+                (
+                    (name.decode("latin-1"), value.decode("latin-1"))
+                    for name, value in request.scope.get("headers", [])
+                ),
+                reject_prefixed=not client_owned_openai_xpass,
+                allow_prefixed_client_credentials=client_owned_openai_xpass,
+                allowed_prefixed_names=(
+                    allowed_pass_through_prefixed_headers
+                    if client_owned_openai_xpass
+                    else None
+                ),
+            )
+            HttpPassThroughEndpointHelpers.validate_openai_header_duplicates(
+                route_custom_headers.items()
+            )
+            binding_headers = {
+                str(name).casefold(): str(value)
+                for name, value in route_custom_headers.items()
+                if str(name).casefold() in _OPENAI_PROTECTED_PASSTHROUGH_HEADERS
+            }
+            if selected_openai_headers is not None:
+                HttpPassThroughEndpointHelpers.validate_openai_header_duplicates(
+                    selected_openai_headers.items()
+                )
+                binding_headers.update({
+                    str(name).casefold(): str(value)
+                    for name, value in selected_openai_headers.items()
+                })
+            elif forward_headers:
+                if client_owned_openai_xpass:
+                    HttpPassThroughEndpointHelpers.install_client_owned_openai_xpass_headers(
+                        _safe_get_request_headers(request),
+                        binding_headers,
+                        allowed_pass_through_prefixed_headers=(
+                            allowed_pass_through_prefixed_headers
+                        ),
+                    )
+                allowed_forward = (
+                    {header.casefold() for header in allowed_forward_headers}
+                    if allowed_forward_headers is not None
+                    else None
+                )
+                for name, value in _safe_get_request_headers(request).items():
+                    normalized = str(name).casefold()
+                    if normalized not in _OPENAI_PROTECTED_PASSTHROUGH_HEADERS:
+                        continue
+                    if (
+                        allowed_forward is not None
+                        and normalized not in allowed_forward
+                    ):
+                        continue
+                    if normalized in binding_headers:
+                        continue
+                    binding_headers[normalized] = str(value)
+            forbidden_names = (
+                _OPENAI_MANAGED_FORBIDDEN_HEADERS
+                if managed_openai_credential_family == "codex_oauth"
+                else _OPENAI_NATIVE_FORBIDDEN_HEADERS
+            )
+            for name in list(binding_headers):
+                if name in forbidden_names:
+                    binding_headers.pop(name, None)
+            for existing in list(headers):
+                if str(existing).casefold() in binding_headers:
+                    headers.pop(existing, None)
+            headers.update(binding_headers)
         headers = HttpPassThroughEndpointHelpers.forward_headers_from_request(
             request_headers=_safe_get_request_headers(request).copy(),
             headers=headers,
@@ -7869,6 +8435,22 @@ async def pass_through_request(  # noqa: PLR0915
             allowed_pass_through_prefixed_headers=allowed_pass_through_prefixed_headers,
             blocked_pass_through_prefixed_headers=effective_blocked_pass_through_prefixed_headers,
         )
+        if openai_bound_egress:
+            for name, value in headers.items():
+                normalized = str(name).casefold()
+                if (
+                    normalized in _OPENAI_PROTECTED_PASSTHROUGH_HEADERS
+                    and str(value) != binding_headers.get(normalized)
+                ):
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Blocked OpenAI egress: forwarded protected header differs from the binding.",
+                    )
+            headers = HttpPassThroughEndpointHelpers.canonicalize_openai_protected_headers(
+                headers, protected_headers=binding_headers
+            )
+
+        # Apply default query parameters if provided, regardless of merge_query_params setting
 
         # Apply default query parameters if provided, regardless of merge_query_params setting
         if default_query_params or merge_query_params:
@@ -7953,6 +8535,31 @@ async def pass_through_request(  # noqa: PLR0915
             }
         else:
             _parsed_body = await _read_request_body(request)
+        immutable_openai_binding = _build_immutable_openai_binding(
+            target_url=url,
+            custom_llm_provider=custom_llm_provider,
+            egress_credential_family=managed_openai_credential_family,
+            expected_target_family=expected_target_family,
+            selected_openai_headers=binding_headers,
+            request=request,
+            request_body=_parsed_body if isinstance(_parsed_body, Mapping) else None,
+        )
+        if openai_bound_egress:
+            if egress_credential_family is None:
+                egress_credential_family = (
+                    immutable_openai_binding.egress_credential_family
+                )
+            if expected_target_family is None:
+                expected_target_family = (
+                    immutable_openai_binding.expected_target_family
+                )
+            request_state = getattr(request, "state", None)
+            if request_state is not None:
+                setattr(
+                    request_state,
+                    "aawm_openai_egress_binding_candidate_context",
+                    immutable_openai_binding.candidate_context,
+                )
         _parsed_body = (
             HttpPassThroughEndpointHelpers._merge_passthrough_logging_metadata(
                 parsed_body=_parsed_body,
@@ -8302,7 +8909,18 @@ async def pass_through_request(  # noqa: PLR0915
 
             _transfer_identity = build_transfer_identity(
                 request=request,
-                request_body=_parsed_body if isinstance(_parsed_body, dict) else None,
+                request_body=(
+                    (
+                        {
+                            **_parsed_body,
+                            "model": immutable_openai_binding.expected_model,
+                        }
+                        if immutable_openai_binding.expected_model is not None
+                        else _parsed_body
+                    )
+                    if isinstance(_parsed_body, dict)
+                    else None
+                ),
                 logging_obj=logging_obj,
                 kwargs=kwargs,
                 litellm_call_id=litellm_call_id,
@@ -8625,38 +9243,21 @@ async def pass_through_request(  # noqa: PLR0915
         if openai_call_ledger is not None:
 
             def _selected_openai_model() -> Optional[str]:
-                for context in (
-                    selected_openai_account_context,
-                    current_candidate_context(request),
-                ):
-                    if not isinstance(context, Mapping):
-                        continue
-                    model = context.get("model")
-                    if isinstance(model, str) and model.strip():
-                        return model.strip()
-                return None
+                return immutable_openai_binding.expected_model
 
-            def _current_openai_account_context() -> dict[str, Any]:
-                context = getattr(
-                    getattr(request, "state", None),
-                    "aawm_codex_oauth_selected_account",
-                    None,
-                )
-                return dict(context) if isinstance(context, Mapping) else {}
+            def current_openai_selected_account() -> dict[str, Any]:
+                return immutable_openai_binding.account_context
 
             def _candidate_scoped_openai_failover_context(
                 expected_model: Optional[str],
             ) -> Optional[dict[str, Any]]:
-                if not selected_openai_headers or not expected_model:
+                if not immutable_openai_binding.protected_openai_headers or not expected_model:
                     return None
                 state = getattr(request, "state", None)
                 if state is None:
                     return None
-                candidate = dict(current_candidate_context(request))
-                candidate.setdefault("provider", "openai")
-                candidate.setdefault("model", expected_model)
-                candidate.setdefault("route_family", "codex_responses")
-                selected_context = _current_openai_account_context()
+                candidate = immutable_openai_binding.candidate_context
+                selected_context = current_openai_selected_account()
                 if selected_context.get("account_hash"):
                     candidate.setdefault(
                         "codex_oauth_account_hash",
@@ -8699,18 +9300,17 @@ async def pass_through_request(  # noqa: PLR0915
                     "_aawm_native_openai_responses_affinity_commitment",
                     None,
                 )
-                transition = (
-                    pending.get("canonical_owner_transition")
-                    if isinstance(pending, Mapping)
-                    else None
-                )
-                selected_context = _current_openai_account_context()
-                if not isinstance(transition, Mapping):
-                    return None
+                transition = pending.get("canonical_owner_transition")
+                selected_context = current_openai_selected_account()
                 if (
                     transition.get("authorization")
                     != "codex_oauth_portable_account_failover"
-                    or type(transition.get("failover_ordinal")) is not int
+                    or not isinstance(
+                        transition.get("failover_ordinal"), int
+                    )
+                    or isinstance(
+                        transition.get("failover_ordinal"), bool
+                    )
                     or transition.get("failover_ordinal") != 1
                 ):
                     return None
@@ -8761,7 +9361,7 @@ async def pass_through_request(  # noqa: PLR0915
             def _strict_managed_openai_owner_enabled(
                 expected_model: Optional[str],
             ) -> bool:
-                if not selected_openai_headers or not expected_model:
+                if not immutable_openai_binding.protected_openai_headers or not expected_model:
                     return False
                 state = getattr(request, "state", None)
                 if state is None:
@@ -8776,85 +9376,43 @@ async def pass_through_request(  # noqa: PLR0915
                 model: str,
                 account_context: Mapping[str, Any],
             ) -> dict[str, Any]:
-                state = getattr(request, "state", None)
-                candidate_context = current_candidate_context(request)
-                direct_inventory = bool(
-                    getattr(
-                        state,
-                        "aawm_direct_codex_oauth_inventory",
-                        False,
+                if account_context != immutable_openai_binding.account_context:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(
+                            "Blocked OpenAI egress: ownership context differs "
+                            "from the immutable server-selected binding."
+                        ),
                     )
-                )
-                route_family = (
-                    "codex_oauth"
-                    if direct_inventory
-                    else str(
-                        candidate_context.get("route_family")
-                        or "codex_responses"
-                    )
-                )
-                if route_family == "codex_oauth":
-                    endpoint_contract = "openai_responses"
-                    state_format = "openai_responses"
-                else:
-                    route_family = "codex_responses"
-                    endpoint_contract = "codex_responses"
-                    state_format = "codex_responses"
-                return _session_affinity_mod().build_session_owner_attributes(
-                    provider="openai",
+                return _build_immutable_openai_owner_attributes(
+                    request,
                     model=model,
-                    route_family=route_family,
-                    account_label=account_context.get("account_label"),
-                    account_hash=account_context.get("account_hash"),
-                    account_lane=account_context.get("lane_key"),
-                    endpoint_contract=endpoint_contract,
-                    state_format=state_format,
-                    ingress="pass_through_request",
-                    requested_model=model,
-                    credential_affinity=account_context.get(
-                        "credential_affinity"
-                    ),
+                    egress_credential_family=egress_credential_family,
+                    expected_target_family=expected_target_family,
+                    openai_binding=immutable_openai_binding,
                 )
 
             def _validate_final_openai_binding(
                 prepared_request: httpx.Request,
             ) -> tuple[Optional[str], dict[str, Any], Optional[str], bool]:
-                current_context = _current_openai_account_context()
-                expected_model = (
-                    _selected_openai_model() if selected_openai_headers else None
-                )
-                serialized_model = (
-                    HttpPassThroughEndpointHelpers._get_prepared_openai_model(
-                        prepared_request
-                    )
-                    if selected_openai_headers
-                    else None
-                )
-                HttpPassThroughEndpointHelpers.validate_openai_final_send_binding(
-                    prepared_request=prepared_request,
+                return _validate_immutable_openai_binding(
+                    prepared_request,
+                    request=request,
                     expected_url=url,
-                    custom_llm_provider=custom_llm_provider,
-                    egress_credential_family=egress_credential_family,
-                    expected_target_family=expected_target_family,
-                    expected_account_hash=(
-                        selected_openai_account_context.get("account_hash")
-                        if isinstance(selected_openai_account_context, Mapping)
-                        else None
+                    custom_llm_provider=(
+                        immutable_openai_binding.custom_llm_provider
                     ),
-                    expected_lane_key=(
-                        selected_openai_account_context.get("lane_key")
-                        if isinstance(selected_openai_account_context, Mapping)
-                        else None
+                    egress_credential_family=(
+                        immutable_openai_binding.egress_credential_family
                     ),
-                    selected_account_context=current_context,
-                    expected_model=expected_model,
-                    selected_openai_headers=selected_openai_headers,
-                )
-                return (
-                    serialized_model,
-                    current_context,
-                    expected_model,
-                    _strict_managed_openai_owner_enabled(expected_model),
+                    expected_target_family=(
+                        immutable_openai_binding.expected_target_family
+                    ),
+                    selected_openai_headers=(
+                        immutable_openai_binding.protected_openai_headers
+                    ),
+                    openai_bound_egress=openai_bound_egress,
+                    openai_binding=immutable_openai_binding,
                 )
 
             def _openai_owner_attributes_exact(
@@ -9121,7 +9679,7 @@ async def pass_through_request(  # noqa: PLR0915
                 )
                 raise AssertionError("unreachable")
 
-            async def _send_prepared_openai_request(  # noqa: PLR0915
+            async def _send_prepared_openai_request(
                 prepared_request: httpx.Request,
                 send_stream: bool,
             ) -> httpx.Response:
@@ -9147,34 +9705,29 @@ async def pass_through_request(  # noqa: PLR0915
                 ledger_calls_before = openai_call_ledger.snapshot().get(
                     "logical_provider_calls"
                 )
-                if openai_bound_egress and selected_openai_headers:
-                    prepared_request.headers = (
-                        HttpPassThroughEndpointHelpers.canonicalize_openai_protected_headers(
-                            dict(prepared_request.headers),
-                            protected_headers=selected_openai_headers,
-                        )
-                    )
                 owner_comparison_mode = (
                     "strict_managed_openai"
-                    if selected_openai_headers
+                    if immutable_openai_binding.protected_openai_headers
                     else "none"
                 )
                 serialized_model: Optional[str] = (
                     HttpPassThroughEndpointHelpers._get_prepared_openai_model(
                         prepared_request
                     )
-                    if selected_openai_headers
+                    if immutable_openai_binding.protected_openai_headers
                     else None
                 )
                 current_selected_account_context: dict[str, Any] = (
-                    _current_openai_account_context()
+                    current_openai_selected_account()
                 )
                 expected_model: Optional[str] = (
-                    _selected_openai_model() if selected_openai_headers else None
+                    _selected_openai_model()
+                    if immutable_openai_binding.protected_openai_headers
+                    else None
                 )
                 owner_comparison_result: Optional[str] = None
                 protected_headers_match: Optional[bool] = None
-                if selected_openai_headers:
+                if immutable_openai_binding.protected_openai_headers:
                     prepared_headers = {
                         str(name).casefold(): str(value)
                         for name, value in prepared_request.headers.items()
@@ -9182,7 +9735,7 @@ async def pass_through_request(  # noqa: PLR0915
                     protected_headers_match = all(
                         prepared_headers.get(str(name).casefold())
                         == str(value)
-                        for name, value in selected_openai_headers.items()
+                        for name, value in immutable_openai_binding.protected_openai_headers.items()
                     )
                 try:
                     (
@@ -9192,11 +9745,13 @@ async def pass_through_request(  # noqa: PLR0915
                         strict_owner_enabled,
                     ) = _validate_final_openai_binding(prepared_request)
                     protected_headers_match = (
-                        True if selected_openai_headers else None
+                        True
+                        if immutable_openai_binding.protected_openai_headers
+                        else None
                     )
                     portable_transition_authority = (
                         _openai_portable_transition_authority(expected_model)
-                        if selected_openai_headers
+                        if immutable_openai_binding.protected_openai_headers
                         else None
                     )
                     if not strict_owner_enabled:
@@ -9205,7 +9760,7 @@ async def pass_through_request(  # noqa: PLR0915
                             if portable_transition_authority is not None
                             else (
                                 "not_applicable"
-                                if selected_openai_headers
+                                if immutable_openai_binding.protected_openai_headers
                                 else "none"
                             )
                         )
@@ -9327,7 +9882,7 @@ async def pass_through_request(  # noqa: PLR0915
                     else:
                         owner_comparison_result = (
                             "not_applicable"
-                            if selected_openai_headers
+                            if immutable_openai_binding.protected_openai_headers
                             else "skipped"
                         )
                 except Exception:
@@ -9365,7 +9920,7 @@ async def pass_through_request(  # noqa: PLR0915
                     reservation = openai_call_ledger.reserve(
                         target=prepared_request.url,
                         reason=reason or "passthrough_provider_request",
-                        candidate_context=current_candidate_context(request),
+                        candidate_context=immutable_openai_binding.candidate_context,
                         prior_response_closed=True,
                         allow_capacity_retry=capacity_retry_coordinator is not None,
                     )
@@ -9407,20 +9962,11 @@ async def pass_through_request(  # noqa: PLR0915
                                 or egress_credential_family
                             ),
                         )
-                    ensure_precommit_send_active()
-                    response = await wait_for(
-                        "upstream_response",
-                        async_client.send(
-                            prepared_request,
-                            stream=send_stream,
-                            follow_redirects=False,
-                        ),
+                    response = await async_client.send(
+                        prepared_request,
+                        stream=send_stream,
+                        follow_redirects=immutable_openai_binding.follow_redirects,
                     )
-                    try:
-                        ensure_precommit_send_active()
-                    except asyncio.CancelledError:
-                        await wait_for("resource_cleanup", response.aclose())
-                        raise
                     _record_openai_final_send_binding_observation(
                         request=request,
                         metadata=passthrough_metadata,
@@ -9716,6 +10262,7 @@ async def pass_through_request(  # noqa: PLR0915
                         request=request,
                         url=url,
                         custom_llm_provider=custom_llm_provider,
+                        immutable_openai_binding=immutable_openai_binding,
                         openai_capacity_coordinator=capacity_retry_coordinator,
                     ),
                 )
@@ -10262,6 +10809,7 @@ async def pass_through_request(  # noqa: PLR0915
                     request=request,
                     url=url,
                     custom_llm_provider=custom_llm_provider,
+                    immutable_openai_binding=immutable_openai_binding,
                     openai_capacity_coordinator=capacity_retry_coordinator,
                 ),
             )
@@ -10614,6 +11162,13 @@ async def pass_through_request(  # noqa: PLR0915
                 egress_credential_family=egress_credential_family,
                 expected_target_family=expected_target_family,
                 request_body=_parsed_body if isinstance(_parsed_body, dict) else None,
+                route_family=immutable_openai_binding.route_family,
+                selected_model=immutable_openai_binding.expected_model,
+            account_label=_current_openai_account_context(request).get(
+                    "account_label"
+                ),
+                account_lane=immutable_openai_binding.expected_lane_key,
+                account_hash=immutable_openai_binding.expected_account_hash,
             )
             stamped_body = stamp_encrypted_reasoning_provenance_in_response(
                 response_body, producer_prov
