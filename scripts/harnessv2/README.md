@@ -70,7 +70,7 @@ a baseline full-suite step.
 |---|---|---|
 | `platform` | forbidden | Health, custom endpoints, error JSONL, Redis prefix SCAN, docker logs |
 | `catalog` | optional | CFG-023/024 HTTP catalog; Ohmypi picker if `--tui ohmypi`; Codex skips live picker |
-| `model` | required | Independent per-alias TUI turn (not baseline). Ohmypi: idle exact PONG or provider 404. Codex: tool-bearing child `date`/`pwd` stdout plus `hv2-codex-child` on `basic`; local `/root/hv2_child_*` or `/root/hv2_codex_child*` chrome is not a pass |
+| `model` | required | Independent per-alias TUI turn (not baseline). Ohmypi: idle exact PONG or provider 404. Codex: tool-bearing child `date`/`pwd` stdout plus `hv2-codex-child` on `basic`; the prompt requires a native `spawn_agent` `message` STRING of serialized exact-three-key JSON (`cfg047`, `encoding`, `text`); local `/root/hv2_child_*` or `/root/hv2_codex_child*` chrome is not a pass |
 | `orchestration` | required | Parent alias spawns children. Ohmypi default is the thirteen mixed aliases; `--orchestration-children provider_coverage` spawns the provider-pinned aliases. Codex defaults to parent `basic` and requires explicit children |
 
 `--test model` and `--test orchestration` launch a dedicated interactive
@@ -110,6 +110,10 @@ defaults to `basic` only.
 Do not treat Ohmypi
 `--model all` as the Codex OC-003 surface. Codex model/orchestration is
 tool-bearing (child `date`/`pwd`); it is not Ohmypi `--no-tools` PONG.
+The Codex model and orchestration prompts require the native outer
+`spawn_agent` `message` to be a string of serialized exact-three-key JSON
+(`{"cfg047":1,"encoding":"text","text":"<actual child assignment>"}`).
+The harness does not decrypt or normalize that assignment.
 `--tui grok` and `--tui muse` are implemented interactive clients.
 Grok model and orchestration defaults are the `latest_grok` sentinel.
 That resolves the greatest integer `grok-4.<N>` among `xai/grok-4.*`
