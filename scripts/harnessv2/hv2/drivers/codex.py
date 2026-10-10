@@ -906,6 +906,16 @@ class CodexDriver:
         pre_pane = self.capture_pane()
         pre_echo = _latest_prompt_echo_index(pre_pane, sent_prompt)
         sent = self.send_keys(sent_prompt)
+        if not sent.get("ok"):
+            pane = self.capture_pane()
+            return {
+                "ok": False,
+                "send": sent,
+                "idle": False,
+                "replied": False,
+                "pane": pane,
+                "after_echo_index": pre_echo,
+            }
         replied = False
         if needles:
             replied = self.wait_for_pane(

@@ -712,6 +712,17 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
         rows[0]["after_echo_index"] = pre_echo
         if not sent.get("ok"):
             failures.append("tmux send-keys failed")
+            return _with_session_history(
+                plan,
+                {
+                    "ok": False,
+                    "failures": failures,
+                    "warnings": [],
+                    "parents": rows,
+                    "evidence_order": _evidence_order(plan),
+                    "soft_fail_matches": [],
+                },
+            )
         session_dir = None
         if grok_orch:
             cwd = None
