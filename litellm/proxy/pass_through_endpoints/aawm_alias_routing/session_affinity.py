@@ -9288,7 +9288,16 @@ async def clear_compatible_non_held_request_session_owner_guard_for_failover(
         )
     if not account_failover_replay_safe:
         return SessionOwnerLeaseRebindResult(False, "replay_unsafe")
-    if has_account_bound_state:
+    portable_failover = False
+    request_state = getattr(request, "state", None)
+    failover_context = getattr(
+        request_state,
+        "aawm_codex_oauth_request_local_failover_context",
+        None,
+    )
+    if isinstance(failover_context, dict):
+        portable_failover = failover_context.get("portable_replay") is True
+    if has_account_bound_state and not portable_failover:
         return SessionOwnerLeaseRebindResult(
             False,
             "account_bound_state_nonportable",

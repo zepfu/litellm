@@ -6829,18 +6829,13 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         and account_failover_context.get("portable_replay")
     ):
         account_identity_pinned = False
-        affinity = None
-        session_owner_record = None
-    elif not account_identity_pinned:
-        affinity = None
-        session_owner_record = None
-        session_owner_guard_meta["decision"] = "unowned"
-        session_owner_guard_meta["provenance"] = sa.build_session_owner_provenance(
-            session_identity=session_owner_identity,
-            decision="unowned",
-            owner_record=session_owner_record,
-            cache_key=_cache_key,
-        )
+        affinity = dict(affinity)
+        for field in (
+            "codex_oauth_account_label",
+            "codex_oauth_account_hash",
+            "codex_oauth_lane_key",
+        ):
+            affinity.pop(field, None)
 
     affinity = _apply_codex_oauth_inventory_affinity_policy(
         affinity,
@@ -7343,10 +7338,9 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 quota_selection.get("selection_reason")
                 if isinstance(quota_selection, dict)
                 and quota_selection.get("selection_reason")
+                and quota_selection.get("balancing_applied") is True
                 else "first_available"
             )
-            if not account_identity_pinned:
-                selection_reason = "first_available"
         return _attach_account_bound_selection_metadata(
             _attach_session_owner_selection_fields(
                 _attach_aawm_alias_routing_state_sources(

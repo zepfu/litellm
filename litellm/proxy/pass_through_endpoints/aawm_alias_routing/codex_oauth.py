@@ -2078,7 +2078,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     selection_state = {
         **selected_state,
         "selection_reason": selection_reason,
-        "has_account_bound_state": not planned_portable_failover,
+        "has_account_bound_state": has_account_bound_state,
         "skipped": skipped,
         "alias_model": model,
         "request_mode": (
