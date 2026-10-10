@@ -1055,9 +1055,8 @@ class PassThroughStreamingHandler:
             )
         ):
             return "server_overloaded", "transient_capacity", True
-        if (
-            error_code in {"server_is_overloaded", "capacity_exhausted"}
-            and error_type not in {
+        if error_code in {"server_is_overloaded", "capacity_exhausted"}:
+            if openai_alpha_capacity_retry_enabled and error_type not in {
                 "authentication_error",
                 "authorization_error",
                 "permission_error",
@@ -1065,9 +1064,9 @@ class PassThroughStreamingHandler:
                 "token_invalidated",
                 "insufficient_quota",
                 "usage_limit_reached",
-            }
-        ):
-            return "server_overloaded", "transient_capacity", True
+            }:
+                return "server_overloaded", "transient_capacity", True
+            return "provider_terminal_error", "provider_terminal_error", False
         if any(
             marker in joined
             for marker in (
@@ -1390,9 +1389,8 @@ class PassThroughStreamingHandler:
                     await _close_precommit_resources()
                     return response, _bound_failure(exc)
                 if decision == "failed":
-                    await _close_precommit_resources()
                     return (
-                        response,
+                        _PrefixedHttpxByteStream(response, prefix, iterator),
                         PassThroughStreamingHandler._build_responses_pre_commit_failure(
                             error_payload=error_payload,
                             event_type=event_type,
@@ -1425,9 +1423,8 @@ class PassThroughStreamingHandler:
                 await _close_precommit_resources()
                 return response, _bound_failure(exc)
             if decision == "failed":
-                await _close_precommit_resources()
                 return (
-                    response,
+                    _PrefixedHttpxByteStream(response, prefix, iterator),
                     PassThroughStreamingHandler._build_responses_pre_commit_failure(
                         error_payload=error_payload,
                         event_type=event_type,

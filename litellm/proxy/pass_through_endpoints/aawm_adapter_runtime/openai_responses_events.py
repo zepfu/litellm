@@ -1298,7 +1298,7 @@ class ResponsesEventSummaryReducer:
         key: str,
         *,
         default_type: str,
-    ) -> tuple[dict[str, Any], dict[str, Any], int]:
+    ) -> tuple[dict[str, Any], int]:
         if (
             key not in self._delta_key_payloads
             and key not in self._output_items
@@ -1306,7 +1306,7 @@ class ResponsesEventSummaryReducer:
         ):
             self._overflow = True
             self._omitted_items += 1
-            return {}, {}, 0
+            return {}, 0
         payload = self._delta_key_payloads.get(key)
         if payload is None:
             base = self._output_items.get(key, {"id": key})
@@ -1493,16 +1493,14 @@ class ResponsesEventSummaryReducer:
             content.append(output_text)
         else:
             output_text["text"] = next_text
-        candidate = {
-            **payload,
-            "content": content,
-        }
-        new_size = _json_size(candidate)
         created = key not in self._output_items
         if created:
+            candidate = {**payload, "content": content}
+            candidate_size = _json_size(candidate)
             if not self._charge_new_output_item(candidate):
                 return
-        elif not self._charge_delta(payload_size, new_size):
+            payload_size = candidate_size or 0
+        elif not self._charge_delta(payload_size, payload_size + len(encoded)):
             return
         if not done:
             payload["content"] = content
@@ -1510,16 +1508,18 @@ class ResponsesEventSummaryReducer:
                 key,
                 payload,
                 created=created,
-                new_size=new_size or 0,
+                new_size=payload_size,
             )
             self._stream_text_bytes += len(encoded)
             self._stream_text_parts.append(value)
+            self._remember_delta_key(key)
         else:
+            candidate = {**payload, "content": content}
             self._commit_delta_item(
                 key,
                 candidate,
                 created=created,
-                new_size=new_size or 0,
+                new_size=payload_size,
             )
             self._stream_text_bytes += len(encoded)
             self._stream_text_parts.append(value)
@@ -1549,16 +1549,15 @@ class ResponsesEventSummaryReducer:
         current = delta_payload.get("arguments")
         if not isinstance(current, str):
             current = ""
-        candidate = {
-            **delta_payload,
-            "arguments": value if done else f"{current or ''}{value}",
-        }
-        new_size = _json_size(candidate)
+        encoded = value.encode("utf-8")
         created = key not in self._output_items
         if created:
+            candidate = {**delta_payload, "arguments": value}
+            candidate_size = _json_size(candidate)
             if not self._charge_new_output_item(candidate):
                 return
-        elif not self._charge_delta(payload_size, new_size):
+            payload_size = candidate_size or 0
+        elif not self._charge_delta(payload_size, payload_size + len(encoded)):
             return
         if not done:
             delta_payload["arguments"] = candidate["arguments"]
@@ -1566,14 +1565,16 @@ class ResponsesEventSummaryReducer:
                 key,
                 delta_payload,
                 created=created,
-                new_size=new_size or 0,
+                new_size=payload_size,
             )
+            self._remember_delta_key(key)
         else:
+            candidate = {**delta_payload, "arguments": value}
             self._commit_delta_item(
                 key,
                 candidate,
                 created=created,
-                new_size=new_size or 0,
+                new_size=payload_size,
             )
             self._forget_delta_key(key)
             self._remember_delta_key(key)

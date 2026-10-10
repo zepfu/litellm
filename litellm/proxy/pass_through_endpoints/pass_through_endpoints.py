@@ -685,6 +685,16 @@ async def _restore_responses_function_names_in_sse_chunks(
                 _restored_payload,
             ), final_payload in emitted:
                 if final_payload is None:
+                    source_event = _original_emission.source_event
+                    substantive_gated_payload = (
+                        source_event is not None
+                        and not source_event.is_done_marker
+                        and not source_event.is_malformed
+                        and source_event.event_type is not None
+                    )
+                    if substantive_gated_payload:
+                        continue
+                    gated_emissions.append(_original_emission)
                     continue
                 gated_emissions.append(_original_emission.transformed(final_payload))
         yield attach_responses_emissions(b"", gated_emissions)
@@ -9898,7 +9908,7 @@ async def pass_through_request(  # noqa: PLR0915
                         event_pipeline=responses_event_pipeline,
                     )
                     wrapper_cleanup_source = processed_chunks
-                    processed_chunks = await maybe_wrap_passthrough_watermark_responses_stream(
+                    processed_chunks = maybe_wrap_passthrough_watermark_responses_stream(
                         processed_chunks,
                         config=_get_runtime_text_watermark_config(),
                         success_handler_kwargs=kwargs,
@@ -9977,7 +9987,7 @@ async def pass_through_request(  # noqa: PLR0915
                     upstream_response=response,
                     event_pipeline=responses_event_pipeline,
                 )
-                processed_chunks = await maybe_wrap_passthrough_watermark_responses_stream(
+                processed_chunks = maybe_wrap_passthrough_watermark_responses_stream(
                     processed_chunks,
                     config=_get_runtime_text_watermark_config(),
                     success_handler_kwargs=kwargs,
@@ -10449,7 +10459,7 @@ async def pass_through_request(  # noqa: PLR0915
                         event_pipeline=responses_event_pipeline,
                     )
                     wrapper_cleanup_source = processed_chunks
-                    processed_chunks = await maybe_wrap_passthrough_watermark_responses_stream(
+                    processed_chunks = maybe_wrap_passthrough_watermark_responses_stream(
                         processed_chunks,
                         config=_get_runtime_text_watermark_config(),
                         success_handler_kwargs=kwargs,
@@ -10528,7 +10538,7 @@ async def pass_through_request(  # noqa: PLR0915
                     upstream_response=response,
                     event_pipeline=responses_event_pipeline,
                 )
-                processed_chunks = await maybe_wrap_passthrough_watermark_responses_stream(
+                processed_chunks = maybe_wrap_passthrough_watermark_responses_stream(
                     processed_chunks,
                     config=_get_runtime_text_watermark_config(),
                     success_handler_kwargs=kwargs,
