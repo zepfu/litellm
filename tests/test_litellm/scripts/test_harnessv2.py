@@ -4731,6 +4731,21 @@ def test_should_accept_standalone_exact_pong_line() -> None:
     assert _pane_exact_pong(pane, prompt) is True
 
 
+def test_should_accept_muse_diamond_pong_after_prompt_echo() -> None:
+    from hv2.kinds.runner import _pane_exact_pong
+
+    prompt = "Reply with exactly the word PONG."
+    pane = (
+        "  Muse Code 1.4.4\n"
+        "  Model set to muse-spark-1.3-contributor\n"
+        f"❯ {prompt}\n"
+        "◆ PONG\n"
+        "❯\n"
+    )
+    assert _pane_exact_pong(pane, prompt, after_echo_index=-1) is True
+    assert _pane_exact_pong("◆ PONG extra\n", prompt) is False
+
+
 def test_should_reject_prompt_echo_and_non_exact_pong() -> None:
     from hv2.kinds.runner import _pane_exact_pong
 
