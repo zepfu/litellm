@@ -430,7 +430,9 @@ class CodexDriver:
         a submit failure, not the model reply deadline.
         """
 
-        if "\n" not in payload.strip():
+        # Codex brackets a paste only above its large-paste threshold.
+        # Shorter multiline text is inserted raw and must not wait.
+        if "\n" not in payload.strip() or len(payload) <= 1000:
             return True
         marker = f"[Pasted Content {len(payload)} chars]"
         return self.wait_for_pane(
@@ -476,6 +478,11 @@ class CodexDriver:
         # ignores C-m until that bracket is visible. A fixed 1s delay
         # submits before the bracket, so the prompt stays in the composer.
         marker = self._wait_for_paste_marker(payload)
+        # Codex 0.162 opens a startup warning when -c overrides force
+        # embedded mode ("f2 to view"). Escape dismisses it. C-m while
+        # that overlay is up does not submit the composer.
+        if "f2 to view" in self.capture_pane():
+            self._run_tmux(["send-keys", "-t", session, "Escape"])
         submitted = self._run_tmux(
             ["send-keys", "-t", session, *submit_keys]
         )
