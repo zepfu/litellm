@@ -29,10 +29,7 @@ from litellm.llms.alibaba_token_plan.chat.transformation import (
     alibaba_token_plan_account_quota_cooldown_key,
     subscription_identity_for_candidate,
 )
-from litellm.secret_managers.codex_oauth_inventory import (
-    CodexOAuthInventory,
-    load_codex_oauth_inventory,
-)
+from litellm.secret_managers.codex_oauth_inventory import CodexOAuthInventory
 from litellm.utils import get_model_info
 
 from . import codex_oauth as _codex_oauth_inventory_loader
@@ -3056,10 +3053,7 @@ def _apply_codex_oauth_inventory_affinity_policy(
         return affinity
     if inventory is None:
         return affinity
-    try:
-        routing = load_codex_oauth_inventory().routing
-    except Exception:  # noqa: BLE001
-        return affinity
+    routing = inventory.routing
     if not routing.accounts_are_interchangeable:
         return affinity
     adjusted = dict(affinity)

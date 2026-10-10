@@ -1272,7 +1272,7 @@ def _get_codex_oauth_affinity_continuation_state(
     """
     if inventory is None:
         peeked_inventory = _peek_request_codex_oauth_inventory(request)
-        if isinstance(peeked_inventory, (CodexOAuthInventory, CodexOAuthInventoryError)):
+        if isinstance(peeked_inventory, CodexOAuthInventory):
             inventory = peeked_inventory
     token, token_declared = _codex_oauth_affinity_token_request_state(body=body)
     _remove_codex_oauth_affinity_token_from_body(body)
