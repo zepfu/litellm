@@ -434,9 +434,10 @@ class CodexDriver:
         # Shorter multiline text is inserted raw and must not wait.
         if "\n" not in payload.strip() or len(payload) <= 1000:
             return True
-        marker = f"[Pasted Content {len(payload)} chars]"
+        # Codex reports its own bracketed length, which is not len(payload).
+        # Any "[Pasted Content N chars]" means the composer has the paste.
         return self.wait_for_pane(
-            marker,
+            "[Pasted Content ",
             timeout_seconds=self._tmux_float("wait_ready_seconds", 25),
         )
 

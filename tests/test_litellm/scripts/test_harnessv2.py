@@ -1938,7 +1938,6 @@ def test_should_submit_codex_multiline_paste_after_the_composer_marker(
     driver = CodexDriver(cfg)
     driver._active_session = "hv2-codex-basic-1"
     prompt = "line one\n" + ("x" * 1000)
-    marker = f"[Pasted Content {len(prompt) + 1} chars]"
     seen: list[str] = []
 
     def fake_run(args: Any, *, timeout: int = 10, stdin_text: str | None = None) -> Any:
@@ -1947,7 +1946,7 @@ def test_should_submit_codex_multiline_paste_after_the_composer_marker(
 
     def fake_wait(needle: Any, timeout_seconds: float | None = None, **kwargs: Any) -> bool:
         seen.append(f"wait:{needle}")
-        return needle == marker
+        return needle == "[Pasted Content "
 
     monkeypatch.setattr(driver, "_run_tmux", fake_run)
     monkeypatch.setattr(driver, "wait_for_pane", fake_wait)
@@ -1955,7 +1954,7 @@ def test_should_submit_codex_multiline_paste_after_the_composer_marker(
     monkeypatch.setattr("hv2.drivers.codex.time.sleep", lambda _seconds: None)
     sent = driver.send_keys(prompt)
     assert sent["ok"] is True
-    assert seen.index(f"wait:{marker}") < seen.index("send-keys")
+    assert seen.index("wait:[Pasted Content ") < seen.index("send-keys")
 
 
 def test_should_fail_codex_submit_when_multiline_paste_marker_never_appears(
