@@ -6831,8 +6831,9 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
     if (
         account_failover_context is not None
         and account_failover_context.get("portable_replay")
-        and token_affinity is None
+        and authenticated_token_affinity
     ):
+        effective_account_bound_state = False
         account_identity_pinned = False
 
     affinity = _apply_codex_oauth_inventory_affinity_policy(

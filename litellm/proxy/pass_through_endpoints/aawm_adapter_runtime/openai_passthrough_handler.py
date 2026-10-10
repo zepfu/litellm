@@ -1179,6 +1179,10 @@ class BaseOpenAIPassThroughHandler:
                         if openai_selected_credential_family == "codex_oauth"
                         else None
                     ),
+                    caller_managed_hidden_retry=(
+                        openai_selected_credential_family == "codex_oauth"
+                        or bound_codex_oauth_identity is not None
+                    ),
                     egress_selected_openai_headers=selected_openai_headers,
                     managed_xai_oauth_request=managed_xai_oauth_request,
                     defer_session_owner_promotion=defer_managed_xai_promotion,

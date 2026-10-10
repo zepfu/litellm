@@ -23,6 +23,7 @@ from typing import (
     List,
     Mapping,
     Optional,
+    NoReturn,
     Tuple,
     Union,
     cast,
@@ -9209,6 +9210,15 @@ async def pass_through_request(  # noqa: PLR0915
         async def _record_retired_openai_precommit_response() -> None:
             """Record authoritative retirement after a real response was closed."""
 
+            if (
+                getattr(
+                    request.state,
+                    "aawm_openai_precommit_retirement_state",
+                    None,
+                )
+                == "failed"
+            ):
+                return
             request.state.aawm_openai_precommit_retirement_failed = False
             request.state.aawm_openai_precommit_retirement_state = "retired"
 
@@ -10327,6 +10337,40 @@ async def pass_through_request(  # noqa: PLR0915
                     )
                 )
 
+            async def _handle_stream_status_error(
+                e: httpx.HTTPStatusError,
+                req: httpx.Request,
+            ) -> NoReturn:
+                error_content = await wait_for(
+                    "upstream_body_read", e.response.aread()
+                )
+                await wait_for("resource_cleanup", e.response.aclose())
+                clear_active_upstream_response(request, response=e.response)
+                await _record_retired_openai_precommit_response()
+                _capture_passthrough_error_shape(
+                    mode="stream_error",
+                    provider=custom_llm_provider or endpoint_type.value,
+                    endpoint_type=endpoint_type,
+                    url_route=str(url),
+                    request_body=_parsed_body,
+                    response=e.response,
+                    upstream_request=getattr(e.response, "request", None) or req,
+                    response_content=error_content,
+                    litellm_call_id=litellm_call_id,
+                    extra_metadata={
+                        "stream": True,
+                        **_xai_oauth_send_auth_shape_metadata(
+                            request
+                        ),
+                    },
+                )
+                provider_exception = _build_http_exception_from_upstream_status_error(
+                    e,
+                    error_content,
+                )
+                _authorize_openai_capacity_retry(provider_exception, e.response)
+                raise provider_exception from e
+
             async def _send_stream_pre_first_byte() -> Tuple[
                 httpx.Response, httpx.Request
             ]:
@@ -10381,36 +10425,8 @@ async def pass_through_request(  # noqa: PLR0915
                     try:
                         response.raise_for_status()
                     except httpx.HTTPStatusError as e:
-                        error_content = await wait_for(
-                            "upstream_body_read", e.response.aread()
-                        )
-                        await wait_for("resource_cleanup", e.response.aclose())
-                        clear_active_upstream_response(request, response=e.response)
                         raw_response = None
-                        await _record_retired_openai_precommit_response()
-                        _capture_passthrough_error_shape(
-                            mode="stream_error",
-                            provider=custom_llm_provider or endpoint_type.value,
-                            endpoint_type=endpoint_type,
-                            url_route=str(url),
-                            request_body=_parsed_body,
-                            response=e.response,
-                            upstream_request=getattr(e.response, "request", None) or req,
-                            response_content=error_content,
-                            litellm_call_id=litellm_call_id,
-                            extra_metadata={
-                                "stream": True,
-                                **_xai_oauth_send_auth_shape_metadata(
-                                    request
-                                ),
-                            },
-                        )
-                        provider_exception = _build_http_exception_from_upstream_status_error(
-                            e,
-                            error_content,
-                        )
-                        _authorize_openai_capacity_retry(provider_exception, e.response)
-                        raise provider_exception from e
+                        await _handle_stream_status_error(e, req)
                     if is_xai_responses_wire_owned_route:
                         extensions = getattr(response, "extensions", None)
                         if isinstance(extensions, dict):

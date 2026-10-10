@@ -1891,6 +1891,17 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
             pinned_model = _clean_codex_auth_value(affinity.get("model"))
             if pinned_model is not None:
                 resolve_template["model"] = pinned_model
+        if portable_replay_failover and affinity is not None:
+            affinity = {
+                key: value
+                for key, value in affinity.items()
+                if key
+                not in {
+                    "codex_oauth_account_label",
+                    "codex_oauth_account_hash",
+                    "codex_oauth_lane_key",
+                }
+            }
         contexts = await _selection._resolve_codex_oauth_account_candidate_contexts(
             request,
             candidate_template=resolve_template,
@@ -2056,6 +2067,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     selection_state = {
         **selected_state,
         "selection_reason": selection_reason,
+        "has_account_bound_state": not planned_portable_failover,
         "skipped": skipped,
         "alias_model": model,
         "request_mode": (
