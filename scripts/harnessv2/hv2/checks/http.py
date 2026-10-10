@@ -11,7 +11,7 @@ from hv2.docker_guard import assert_url_allowed
 from hv2.errors import HarnessError
 from hv2.identity import merge_request_headers
 from hv2.load_config import as_str_list, config_timeouts
-from hv2.plan import compiled_aliases
+from hv2.plan import compiled_aliases, served_concrete_ids
 
 
 def _http_timeout(config: Mapping[str, Any]) -> int:
@@ -163,7 +163,7 @@ def _catalog_assertions_from_results(
     models = config.get("models") if isinstance(config.get("models"), dict) else {}
     required = compiled_aliases(config)
     absent = as_str_list(models.get("absent_catalog_ids"))
-    served = as_str_list(models.get("served_concrete_ids"))
+    served = served_concrete_ids(config)
     failures: list[str] = []
     for outcome in results:
         if not _wants_catalog_assertions(outcome.get("catalog")):

@@ -327,10 +327,10 @@ tuis:
     cwd: /tmp/hv2-grok-workspace
     session_dir: /tmp/hv2-grok-sessions
     default_models:
-      - grok-4.7
-    default_orchestration_parent: grok-4.7
+      - latest_grok
+    default_orchestration_parent: latest_grok
     default_orchestration_children:
-      - grok-4.7
+      - latest_grok
     model_prompt: grok_model
     orchestration_prompt: grok_orchestration
     tmux:

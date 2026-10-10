@@ -111,6 +111,11 @@ Do not treat Ohmypi
 `--model all` as the Codex OC-003 surface. Codex model/orchestration is
 tool-bearing (child `date`/`pwd`); it is not Ohmypi `--no-tools` PONG.
 `--tui grok` and `--tui muse` are implemented interactive clients.
+Grok model and orchestration defaults are the `latest_grok` sentinel.
+That resolves the greatest integer `grok-4.<N>` among `xai/grok-4.*`
+keys in `model_prices_and_context_window.json` and launches
+`--model grok-4.<N>`. It does not pin a Grok minor. Cursor Agent
+`cursor_agent/cursor-grok-4.6-high` stays a separate product route.
 `--tui opencode` remains a stub. `--tui claude` stays out of scope and
 is excluded from current closeout (do not select or run; historical
 mentions are legacy/non-goal).
@@ -289,7 +294,7 @@ Client evidence inventory (frozen contracts; OpenCode has none):
 |---|---|---|
 | Codex | dedicated `hv2-codex-*` tmux, never `codex exec` | `codex_spawn_tool_evidence` or exact `PONG` where the model override says so. A model `tool_command` case passes when the step records command, exit status, and stdout, or when it records a completed `tool_pass`. A missing tool record stays inconclusive. A pane token alone is not a suite pass |
 | Ohmypi | dedicated `hv2-ohmypi-*` tmux, never `-p` | exact `PONG` or an expected provider 404; orchestration uses `child_spawn_evidence` |
-| Grok | dedicated `hv2-grok-*` via `grokla` | `grok_spawn_tool_evidence` |
+| Grok | dedicated `hv2-grok-*` via `grokla`; default model is the latest `grok-4.<N>` from the model cost map | `grok_spawn_tool_evidence` |
 | Muse | dedicated `hv2-muse-*` via `musela` | `muse_spawn_tool_evidence`; a child token alone is not a pass |
 
 Recap, echoed prompts, selector text, idle glyphs, and spawn

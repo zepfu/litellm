@@ -42,6 +42,7 @@ if str(_HV2) not in sys.path:
 def _load() -> Any:
     importlib.invalidate_caches()
     from hv2.cli import build_parser, parse_args, split_csv
+    from hv2.grok_latest import latest_grok_model_id
     from hv2.docker_guard import (
         assert_container_allowed,
         assert_host_port_allowed,
@@ -76,6 +77,7 @@ def _load() -> Any:
         build_plan=build_plan,
         compiled_aliases=compiled_aliases,
         expand_group=expand_group,
+        latest_grok_model_id=latest_grok_model_id,
     )
 
 
@@ -968,7 +970,9 @@ def test_should_plan_grok_tui_against_alpha_not_as_stub(hv, config) -> None:
     )
     assert plan.tui == "grok"
     assert plan.container == "litellm-alpha"
-    assert plan.orchestration_parents == ("grok-4.7",)
+    latest = hv.latest_grok_model_id(_REPO)
+    assert plan.orchestration_parents == (latest,)
+    assert plan.orchestration_children == (latest,)
     artifact = hv.run_plan(plan)
     assert artifact["ok"] is True
     assert artifact["dry_run"] is True
@@ -2956,8 +2960,9 @@ def _catalog_payload(ids: list[str]) -> dict[str, Any]:
 
 
 def _catalog_id_set(hv: Any, config: dict[str, Any], *, drop: set[str], extra: list[str]) -> list[str]:
-    models = config.get("models") if isinstance(config.get("models"), dict) else {}
-    served = [str(item) for item in (models.get("served_concrete_ids") or [])]
+    from hv2.plan import served_concrete_ids
+
+    served = served_concrete_ids(config)
     aliases = [name for name in hv.compiled_aliases(config) if name not in drop]
     out: list[str] = []
     seen: set[str] = set()
@@ -3304,6 +3309,120 @@ def test_should_refuse_protected_url_without_calling_urlopen(hv, config) -> None
                 path="/health/liveliness",
             )
         mocked.assert_not_called()
+
+
+def _write_grok_catalog(root: Path, keys: list[str]) -> None:
+    payload = {key: {"litellm_provider": "xai"} for key in keys}
+    (root / "model_prices_and_context_window.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+
+
+def test_should_resolve_greatest_integer_grok_minor_and_fail_closed(
+    hv, tmp_path: Path
+) -> None:
+    _write_grok_catalog(
+        tmp_path,
+        [
+            "xai/grok-4.7",
+            "xai/grok-4.9",
+            "xai/grok-4.20-0309-reasoning",
+            "xai/grok-4.3",
+            "openai/gpt-5.4",
+        ],
+    )
+    assert hv.latest_grok_model_id(tmp_path) == "grok-4.9"
+    missing = tmp_path / "empty"
+    missing.mkdir()
+    with pytest.raises(hv.PlanError, match="cannot read Grok catalog"):
+        hv.latest_grok_model_id(missing)
+    _write_grok_catalog(tmp_path, ["xai/grok-4.20-0309-reasoning"])
+    with pytest.raises(hv.PlanError, match="no xai/grok-4"):
+        hv.latest_grok_model_id(tmp_path)
+
+
+def test_should_plan_grok_defaults_from_latest_catalog_minor(
+    hv, config, tmp_path: Path
+) -> None:
+    from hv2.plan import served_concrete_ids
+    from hv2.suite.matrix import resolve_matrix
+
+    _write_grok_catalog(
+        tmp_path,
+        ["xai/grok-4.7", "xai/grok-4.9", "xai/grok-4.20-0309-reasoning"],
+    )
+    cfg = _clone_config(config)
+    cfg.setdefault("_meta", {})["repo_root"] = str(tmp_path)
+    model_plan = hv.build_plan(
+        config=cfg,
+        kind="model",
+        instance_token="alpha",
+        tui="grok",
+        models=None,
+        orchestration_parent=None,
+        orchestration_children=None,
+        dry_run=True,
+        write_artifact=None,
+    )
+    orch_plan = hv.build_plan(
+        config=cfg,
+        kind="orchestration",
+        instance_token="alpha",
+        tui="grok",
+        models=None,
+        orchestration_parent=None,
+        orchestration_children=None,
+        dry_run=True,
+        write_artifact=None,
+    )
+    assert model_plan.models == ("grok-4.9",)
+    assert orch_plan.orchestration_parents == ("grok-4.9",)
+    assert orch_plan.orchestration_children == ("grok-4.9",)
+    matrix = resolve_matrix(
+        cfg,
+        {
+            "tuis": ["grok"],
+            "kinds": ["model", "orchestration"],
+            "models": [],
+            "parents": [],
+            "children": None,
+            "include_shared": False,
+        },
+        instance_token="alpha",
+        dry_run=True,
+    )
+    by_kind = {row["kind"]: row for row in matrix["cases"]}
+    assert by_kind["model"]["model"] == "grok-4.9"
+    assert by_kind["orchestration"]["parent"] == "grok-4.9"
+    assert by_kind["orchestration"]["children"] == ["grok-4.9"]
+    served = served_concrete_ids(cfg)
+    assert "xai/grok-4.9" in served
+    assert "oa_xai/grok-4.9" in served
+    assert "latest_grok" not in served
+    assert "xai/grok-4.7" not in served
+    assert "cursor_agent/cursor-grok-4.6-high" in served
+
+
+def test_should_not_name_retired_grok_4_6_served_ids_in_harness_tree() -> None:
+    banned = ("xai/grok-4.6", "oa_xai/grok-4.6")
+    root = _HV2
+    offenders: list[str] = []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        if path == root / "fixtures" / "orch" / "xai.stamped.jsonl":
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for needle in banned:
+            if needle not in text:
+                continue
+            if needle == "xai/grok-4.6" and "cursor_agent/cursor-grok-4.6-high" in text:
+                stripped = text.replace("cursor_agent/cursor-grok-4.6-high", "")
+                if needle not in stripped:
+                    continue
+            offenders.append(f"{path.relative_to(root)}:{needle}")
+    assert offenders == []
 
 
 def test_should_warn_on_sha_drift_without_invalidating(hv) -> None:
