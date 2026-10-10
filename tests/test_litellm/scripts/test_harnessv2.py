@@ -1595,7 +1595,7 @@ def test_should_plan_codex_catalog_model_and_orchestration_as_non_stub(hv, confi
     assert "Do not run the command yourself" in model.extra["pong_prompt"]
     assert "print that exact stdout" in model.extra["pong_prompt"]
     assert "Call spawn_agent" in model.extra["pong_prompt"]
-    assert "non-empty message" in model.extra["pong_prompt"]
+    _assert_codex_cfg047_prompt(model.extra["pong_prompt"], task_name="hv2-child-pwd")
     work = hv.build_plan(
         config=config,
         kind="orchestration",
@@ -1612,6 +1612,10 @@ def test_should_plan_codex_catalog_model_and_orchestration_as_non_stub(hv, confi
     assert "Call spawn_agent" in work.extra["orchestration_prompt_template"]
     assert "model=work" not in work.extra["orchestration_prompt_template"]
     assert "hv2-codex-child" in work.extra["orchestration_prompt_template"]
+    _assert_codex_cfg047_prompt(
+        work.extra["orchestration_prompt_template"],
+        task_name="hv2-child-pwd-uname",
+    )
     assert "agent=sota-xai" not in work.extra["orchestration_prompt_template"]
     assert "agent=work" not in work.extra["orchestration_prompt_template"]
 
@@ -3767,31 +3771,63 @@ def test_should_count_recap_needle_not_in_prompt_as_pass_evidence() -> None:
     assert _pane_has_pass_evidence(pane, ["※ recap:"], prompt=prompt) is True
 
 
+def test_should_require_cfg047_string_on_codex_model_and_orchestration_prompts(
+    hv, config
+) -> None:
+    from hv2.codex_assignment import (
+        CodexAssignmentError,
+        assert_codex_assignment_message,
+        codex_assignment_message,
+    )
+    from hv2.plan import _prompt_text, expand_orchestration_prompt
+
+    _skip_unless_codex_tui_shipped(config)
+    model_prompt = _prompt_text(config, "codex_model", {})
+    orchestration_prompt = expand_orchestration_prompt(
+        _prompt_text(
+            config,
+            "codex_orchestration",
+            {"parent": "{parent}", "home": str(Path.home())},
+        ),
+        parent="basic",
+        children=["work"],
+    )
+    _assert_codex_cfg047_prompt(model_prompt, task_name="hv2-child-pwd")
+    _assert_codex_cfg047_prompt(
+        orchestration_prompt, task_name="hv2-child-pwd-uname"
+    )
+    assert "agent_type=basic" in model_prompt
+    assert "`date` or `pwd`" in model_prompt
+    assert "agent_type=work" in orchestration_prompt
+    assert "`pwd` and `uname -s`" in orchestration_prompt
+    assert "{parent}" not in orchestration_prompt
+    assert "{child}" not in orchestration_prompt
+    assert "basic" in orchestration_prompt
+
+    message = codex_assignment_message(
+        "Execute pwd in this workspace and return only that command stdout."
+    )
+    frame = assert_codex_assignment_message(message)
+    assert frame["cfg047"] == 1
+    assert frame["encoding"] == "text"
+    assert set(frame) == {"cfg047", "encoding", "text"}
+    with pytest.raises(CodexAssignmentError, match="JSON object"):
+        assert_codex_assignment_message(
+            {"cfg047": 1, "encoding": "text", "text": "Execute pwd."}
+        )
+    with pytest.raises(CodexAssignmentError, match="bare prose"):
+        assert_codex_assignment_message(
+            "Execute pwd in this workspace and return only that command stdout."
+        )
+
+
 def test_should_accept_codex_bullet_prefixed_standalone_pass_token() -> None:
     from hv2.kinds.runner import _pane_has_any
     from hv2.load_config import load_config
-    from pathlib import Path
 
-    if not (_HV2 / "config" / "prompts" / "codex_model.txt").is_file():
-        pytest.skip("Codex model prompt is not shipped")
-
-    prompt = (
-        Path(_HV2 / "config" / "prompts" / "codex_model.txt")
-        .read_text(encoding="utf-8")
-        .strip()
-    )
+    prompt = _codex_model_prompt()
     assert "hv2-codex-child" in prompt
-    wrapped_prompt_only = (
-        "› Call spawn_agent now with model=basic and a non-empty message that tells the\n"
-        "  child to execute a harmless local shell command (`date` or `pwd`) in this\n"
-        "  workspace and return only that command's stdout. Do not guess the result. Do\n"
-        "  not skip the child spawn. Do not run the command yourself. Do not spawn qwen,\n"
-        "  kimi, deepseek, grok, moonshot, or any ChatGPT-unsupported model. After the\n"
-        "  child returns stdout, print that exact stdout on its own line, then reply with\n"
-        "  the exact token hv2-codex-child on its own line. Do not print the token until\n"
-        "  the child's stdout is visible.\n"
-        "› Ask Codex to do anything\n"
-    )
+    wrapped_prompt_only = _wrapped_codex_model_prompt_echo()
     assert (
         _pane_has_any(wrapped_prompt_only, ["hv2-codex-child"], prompt=prompt) is False
     )
@@ -3879,25 +3915,52 @@ def test_should_accept_codex_bullet_prefixed_standalone_pass_token() -> None:
     assert "Working (" not in "Do you trust the contents of this directory? Working with untrusted contents"
 
 
+def _assert_codex_cfg047_prompt(prompt: str, *, task_name: str) -> None:
+    """The shipped prompt requires a serialized exact-three-key message string."""
+
+    assert "cfg047" in prompt
+    assert "encoding" in prompt
+    assert '"text"' in prompt or "text" in prompt
+    assert task_name in prompt
+    assert '\\"cfg047\\"' in prompt
+    assert "not a JSON object" in prompt
+    assert "do not retry with bare prose" in prompt
+    assert "Do not run the command" in prompt
+    assert "print that exact stdout" in prompt
+    assert "hv2-codex-child" in prompt
+    assert "Do not print the token until the child's stdout is visible" in prompt
+
+
 def _codex_model_prompt() -> str:
-    prompt_path = _HV2 / "config" / "prompts" / "codex_model.txt"
-    if not prompt_path.is_file():
+    from hv2.load_config import load_config
+    from hv2.plan import _prompt_text
+
+    if not (_HV2 / "config" / "prompts" / "codex_model.txt").is_file():
         pytest.skip("Codex model prompt is not shipped")
-    return prompt_path.read_text(encoding="utf-8").strip()
+    return _prompt_text(load_config(), "codex_model", {}).strip()
+
+
+def _wrap_codex_prompt_echo(prompt: str, *, width: int = 80) -> str:
+    """Paint *prompt* as Codex wrapped composer lines that still match the echo."""
+
+    words = prompt.split()
+    lines: list[str] = []
+    current = "›"
+    for word in words:
+        candidate = f"{current} {word}"
+        if len(candidate) > width and current != "›":
+            lines.append(current)
+            current = f"  {word}"
+        else:
+            current = candidate
+    if current.strip():
+        lines.append(current)
+    lines.append("› Ask Codex to do anything")
+    return "\n".join(lines) + "\n"
 
 
 def _wrapped_codex_model_prompt_echo() -> str:
-    return (
-        "› Call spawn_agent now with model=basic and a non-empty message that tells the\n"
-        "  child to execute a harmless local shell command (`date` or `pwd`) in this\n"
-        "  workspace and return only that command's stdout. Do not guess the result. Do\n"
-        "  not skip the child spawn. Do not run the command yourself. Do not spawn qwen,\n"
-        "  kimi, deepseek, grok, moonshot, or any ChatGPT-unsupported model. After the\n"
-        "  child returns stdout, print that exact stdout on its own line, then reply with\n"
-        "  the exact token hv2-codex-child on its own line. Do not print the token until\n"
-        "  the child's stdout is visible.\n"
-        "› Ask Codex to do anything\n"
-    )
+    return _wrap_codex_prompt_echo(_codex_model_prompt())
 
 
 def _prior_wrapped_codex_echo_proof() -> str:

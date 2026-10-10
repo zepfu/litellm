@@ -221,7 +221,7 @@ skip the logging gate. Independent `--test model` stays available
 |---|---|---|
 | `platform` | forbidden | Health, custom HTTP, error JSONL, Redis prefix SCAN, docker logs |
 | `catalog` | optional | CFG-023/024 HTTP catalog; Ohmypi picker if `--tui ohmypi`; Codex skips live picker |
-| `model` | required | Independent per-alias TUI turn (not baseline). Ohmypi: idle exact PONG or provider 404. Codex: tool-bearing child command on `basic` |
+| `model` | required | Independent per-alias TUI turn (not baseline). Ohmypi: idle exact PONG or provider 404. Codex: tool-bearing child command on `basic`; the prompt requires a serialized exact-three-key `spawn_agent` message string |
 | `orchestration` | required | Ohmypi parent spawns the selected children group (default thirteen mixed aliases, or `provider_coverage`); Codex defaults to parent `basic` and requires explicit children |
 
 `--dry-run` prints the resolved plan and exits 0. No TUI, no HTTP, no
@@ -489,7 +489,7 @@ From `config/tuis.yaml`:
 | Forbid | `-p`, `--print`, `--profile`, `exec` |
 | Model tools | on (not `--no-tools` PONG) |
 | Orchestration tools | on |
-| Model pass | standalone `hv2-codex-child` **and** a current-turn child spawn plus `Ran date` / `Ran pwd` context with compatible stdout after `spawn_agent` with `model=basic` and a non-empty message (Codex may prefix the token with `• `). Local `/root/hv2_child_*` or `/root/hv2_codex_child*` chrome, a workspace path alone, or a token with no stdout, is not a pass. Provider 404 needles do not pass Codex `tool_command`. Do not spawn ChatGPT-unsupported child models (`qwen`/`kimi`/`deepseek`/`grok`/`moonshot`). Leftover trust-nux `Working with untrusted contents` is not a busy needle; in-flight work is `Working (`. `sota-zai` and `provider-zai` override this walk: exact `PONG`, tools off. A `basic` child in that Z.AI session is a session-owner 409, not Z.AI acceptance. |
+| Model pass | standalone `hv2-codex-child` **and** a current-turn child spawn plus `Ran date` / `Ran pwd` context with compatible stdout after `spawn_agent` with `agent_type=basic` (Codex may prefix the token with `• `). The model prompt requires the native `message` argument to be a STRING of serialized exact-three-key JSON (`cfg047`, `encoding`, `text`), not a JSON object and not bare prose. The harness does not decrypt or normalize that assignment. Local `/root/hv2_child_*` or `/root/hv2_codex_child*` chrome, a workspace path alone, a spawn acknowledgement, or a token with no stdout, is not a pass. Provider 404 needles do not pass Codex `tool_command`. Do not spawn ChatGPT-unsupported child models (`qwen`/`kimi`/`deepseek`/`grok`/`moonshot`). Leftover trust-nux `Working with untrusted contents` is not a busy needle; in-flight work is `Working (`. `sota-zai` and `provider-zai` override this walk: exact `PONG`, tools off. A `basic` child in that Z.AI session is a session-owner 409, not Z.AI acceptance. |
 
 `--tui grok` and `--tui muse` are implemented. `--tui opencode` remains
 the only stub. `--tui claude` stays out of scope and is excluded from
@@ -798,10 +798,13 @@ without green post-TUI `docker_logs` is not a full orch pass.
 
 For Codex orchestration, `codex_parallel_child_tools` requires every selected
 child to be tied to a current-turn `spawn_agent` record and a started
-`SubAgentActivity`. Each child transcript must contain exactly adjacent
-`exec_command` calls for `pwd` and `uname -s`, matching successful
-`CommandExecution` and `function_call_output` records, followed by both
-`final_answer` and `task_complete`.
+`SubAgentActivity`. The orchestration prompt requires the native `message`
+argument to be a STRING of serialized exact-three-key JSON (`cfg047`,
+`encoding`, `text`), not a JSON object and not bare prose. The harness does
+not decrypt or normalize that assignment. Each child transcript must contain
+exactly adjacent `exec_command` calls for `pwd` and `uname -s`, matching
+successful `CommandExecution` and `function_call_output` records, followed by
+both `final_answer` and `task_complete`.
 
 ```text
 python scripts/harnessv2/run.py \
