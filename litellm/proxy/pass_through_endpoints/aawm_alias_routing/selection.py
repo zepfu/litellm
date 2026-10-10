@@ -6817,29 +6817,42 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         ),
     )
 
-    account_identity_pinned = has_account_bound_state
     authenticated_token_affinity = token_affinity is not None
+    account_identity_pinned = has_account_bound_state
     effective_account_bound_state = has_account_bound_state
-    account_failover_context = (
-        _get_codex_oauth_request_local_failover_context(
-            request,
-            candidate=affinity,
-        )
-        if isinstance(affinity, dict)
-        else None
+    account_failover_context = _get_codex_oauth_request_local_failover_context(
+        request,
+        candidate=affinity,
     )
     if (
         account_failover_context is not None
         and account_failover_context.get("portable_replay")
-        and authenticated_token_affinity
     ):
-        effective_account_bound_state = False
         account_identity_pinned = False
+        affinity = None
+        session_owner_record = None
+    elif not account_identity_pinned:
+        affinity = None
+        session_owner_record = None
+        session_owner_guard_meta["decision"] = "unowned"
+        session_owner_guard_meta["provenance"] = sa.build_session_owner_provenance(
+            session_identity=session_owner_identity,
+            decision="unowned",
+            owner_record=session_owner_record,
+            cache_key=_cache_key,
+        )
 
     affinity = _apply_codex_oauth_inventory_affinity_policy(
         affinity,
         account_bound=account_identity_pinned,
     )
+    if (
+        not account_identity_pinned
+        and affinity is not None
+        and affinity.get("provider") == _CODEX_AUTO_AGENT_NATIVE_PROVIDER
+        and affinity.get("codex_oauth_credential_affinity") == "interchangeable"
+    ):
+        affinity = None
     affinity_selection_reason = (
         _codex_oauth_mod._codex_oauth_affinity_selection_reason(affinity)
         if affinity is not None
@@ -7332,6 +7345,8 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 and quota_selection.get("selection_reason")
                 else "first_available"
             )
+            if not account_identity_pinned:
+                selection_reason = "first_available"
         return _attach_account_bound_selection_metadata(
             _attach_session_owner_selection_fields(
                 _attach_aawm_alias_routing_state_sources(

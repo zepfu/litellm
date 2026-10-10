@@ -9189,24 +9189,6 @@ async def pass_through_request(  # noqa: PLR0915
                     "not_applicable"
                 )
                 return True
-            closed = True
-            try:
-                await wait_for("resource_cleanup", response.aclose())
-            except BaseException:
-                closed = False
-                request.state.aawm_openai_precommit_retirement_failed = True
-                request.state.aawm_openai_precommit_retirement_state = "failed"
-                verbose_proxy_logger.debug(
-                    "Failed to close OpenAI precommit response",
-                    exc_info=True,
-                )
-            finally:
-                clear_active_upstream_response(request, response=response)
-            if closed:
-                request.state.aawm_openai_precommit_retirement_failed = False
-                request.state.aawm_openai_precommit_retirement_state = "retired"
-            return closed
-
         async def _record_retired_openai_precommit_response() -> None:
             """Record authoritative retirement after a real response was closed."""
 
@@ -10341,11 +10323,10 @@ async def pass_through_request(  # noqa: PLR0915
                 e: httpx.HTTPStatusError,
                 req: httpx.Request,
             ) -> NoReturn:
+                await _retire_openai_precommit_response(e.response)
                 error_content = await wait_for(
                     "upstream_body_read", e.response.aread()
                 )
-                await wait_for("resource_cleanup", e.response.aclose())
-                clear_active_upstream_response(request, response=e.response)
                 await _record_retired_openai_precommit_response()
                 _capture_passthrough_error_shape(
                     mode="stream_error",

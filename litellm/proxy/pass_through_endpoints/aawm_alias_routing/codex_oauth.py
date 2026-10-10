@@ -1892,6 +1892,14 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
             if pinned_model is not None:
                 resolve_template["model"] = pinned_model
         if portable_replay_failover and affinity is not None:
+            routing_fields = {
+                key: resolve_template[key]
+                for key in (
+                    "codex_oauth_credential_affinity",
+                    "codex_oauth_selection_strategy",
+                )
+                if key in resolve_template
+            }
             affinity = {
                 key: value
                 for key, value in affinity.items()
@@ -1900,8 +1908,11 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                     "codex_oauth_account_label",
                     "codex_oauth_account_hash",
                     "codex_oauth_lane_key",
+                    "codex_oauth_credential_affinity",
+                    "codex_oauth_selection_strategy",
                 }
             }
+            affinity.update(routing_fields)
         contexts = await _selection._resolve_codex_oauth_account_candidate_contexts(
             request,
             candidate_template=resolve_template,
