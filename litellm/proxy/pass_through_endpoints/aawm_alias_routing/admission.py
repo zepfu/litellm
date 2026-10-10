@@ -65,6 +65,14 @@ _SUPPORTED_LIMIT_SCOPES = frozenset(
 # Confirmed long-window exhaustion (operator fail-fast constraint).
 _CONFIRMED_USAGE_QUOTA_PERIODS = frozenset({"five_hour", "seven_day"})
 _CONFIRMED_USAGE_WINDOW_MINUTES = frozenset({300, 10080})
+_CONFIRMED_USAGE_EXHAUSTION_KINDS = frozenset(
+    {
+        "account_usage",
+        "quota_exhausted",
+        "usage_limit",
+        "usage_limit_reached",
+    }
+)
 
 
 class AdmissionDenyReason(str, Enum):
@@ -1959,7 +1967,12 @@ def attach_admission_metadata(
 def admission_deny_error_class(decision: AdmissionDecision) -> str:
     """Map admission denial onto existing retry/failover vocabulary."""
     if decision.reason == AdmissionDenyReason.CONFIRMED_EXHAUSTED.value:
-        return "usage_limit_reached"
+        return (
+            "usage_limit_reached"
+            if _clean_str(decision.exhaustion_kind)
+            in _CONFIRMED_USAGE_EXHAUSTION_KINDS
+            else "capacity_exhausted"
+        )
     return "capacity_exhausted"
 
 

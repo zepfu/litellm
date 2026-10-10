@@ -1167,8 +1167,8 @@ class BaseOpenAIPassThroughHandler:
                     expected_target_family=(
                         expected_target_family
                         if expected_target_family is not None
-                        else "codex_oauth"
-                        if openai_selected_credential_family is not None
+                        else openai_selected_credential_family
+                        if openai_selected_credential_family == "codex_oauth"
                         else None
                     ),
                     egress_selected_openai_headers=selected_openai_headers,

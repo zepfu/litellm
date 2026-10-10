@@ -1527,17 +1527,13 @@ def _codex_oauth_account_exhaustion_is_confirmed(
         ):
             return True
     elif attempted_provider_call or provider_returned:
-        # Provider-returned candidate_unavailable may admit a portable replay
-        # only when admission explicitly classified this account as exhausted.
-        # Generic throttle evidence remains a generic lane, not quota proof.
-        if (
-            error_class == "candidate_unavailable"
-            and admission_decision == "confirmed_exhausted"
-            and str(attempt_record.get("admission_account_hash") or "").strip()
-            == account_hash
-        ):
-            return True
-        # Model capacity and generic throttling stay non-portable.
+        # The admission producer maps every confirmed exhaustion to the quota
+        # vocabulary. Treat it as portable here only after the hash was checked
+        # above. Provider-returned model capacity and generic throttling remain
+        # non-portable until capacity has its own confirmed admission contract.
+        if error_class != "usage_limit_reached":
+            return False
+        return True
         return False
 
     def _iter_observations(value: Any) -> Sequence[Mapping[str, Any]]:

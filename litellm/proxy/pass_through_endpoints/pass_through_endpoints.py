@@ -72,6 +72,12 @@ from litellm.integrations.aawm_passthrough_shape_capture import (
 )
 
 _capture_passthrough_error_shape = capture_passthrough_shape
+from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen.constants import (
+    _OPENCODE_GO_CREDENTIAL_FAMILY,
+    _OPENCODE_GO_TARGET_FAMILY,
+    _OPENCODE_ZEN_CREDENTIAL_FAMILY,
+    _OPENCODE_ZEN_TARGET_FAMILY,
+)
 from litellm.llms.xai.route_descriptors import (
     GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
     GROK_NATIVE_OAUTH_ROUTE_FAMILY,
@@ -5454,6 +5460,57 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         raise HTTPException(status_code=500, detail=safe_detail)
 
     @staticmethod
+    def get_opencode_target_route_family(
+        url: Union[str, httpx.URL],
+    ) -> Optional[str]:
+        """OC-010: resolve only canonical OpenCode Zen/Go targets.
+
+        Returns the Zen-distinct ``opencode_zen`` family for the Zen API
+        host path, the ``opencode_go`` family for the Go path, or ``None``
+        for any configured proxy or unknown host so ordinary family checks
+        stay generic-aware.
+        """
+        parsed_url = urlparse(str(url))
+        hostname = (parsed_url.hostname or "").strip().casefold()
+        if hostname != "opencode.ai" and not hostname.endswith(".opencode.ai"):
+            return None
+        normalized_path = "/" + (parsed_url.path or "").lstrip("/")
+        if normalized_path.startswith("/zen/go/"):
+            return _OPENCODE_GO_TARGET_FAMILY
+        if normalized_path.startswith("/zen/"):
+            return _OPENCODE_ZEN_TARGET_FAMILY
+        return None
+
+    @staticmethod
+    def _is_exact_opencode_egress_family(family: Optional[str]) -> bool:
+        return str(family or "").strip().casefold() in {
+            _OPENCODE_ZEN_CREDENTIAL_FAMILY,
+            _OPENCODE_ZEN_TARGET_FAMILY,
+            _OPENCODE_GO_CREDENTIAL_FAMILY,
+            _OPENCODE_GO_TARGET_FAMILY,
+        }
+
+    @staticmethod
+    def _expected_opencode_route_family(
+        *,
+        credential_family: Optional[str],
+        expected_target_family: Optional[str],
+    ) -> Optional[str]:
+        expected = str(expected_target_family or "").strip().casefold()
+        credential = str(credential_family or "").strip().casefold()
+        if (
+            expected == _OPENCODE_ZEN_TARGET_FAMILY
+            or credential == _OPENCODE_ZEN_CREDENTIAL_FAMILY
+        ):
+            return _OPENCODE_ZEN_TARGET_FAMILY
+        if (
+            expected == _OPENCODE_GO_TARGET_FAMILY
+            or credential == _OPENCODE_GO_CREDENTIAL_FAMILY
+        ):
+            return _OPENCODE_GO_TARGET_FAMILY
+        return None
+
+    @staticmethod
     def get_target_provider_family(url: Union[str, httpx.URL]) -> str:
         parsed_url = urlparse(str(url))
         hostname = (parsed_url.hostname or "").lower()
@@ -5470,6 +5527,10 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         if hostname == "openrouter.ai" or hostname.endswith(".openrouter.ai"):
             return "openrouter"
         if hostname == "opencode.ai" or hostname.endswith(".opencode.ai"):
+            path = (parsed_url.path or "").lower()
+            normalized_path = path if path.endswith("/") else f"{path}/"
+            if "/zen/go/" in normalized_path:
+                return "opencode_go"
             return "opencode"
         if (
             hostname == "api.x.ai"
@@ -5568,6 +5629,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             else expected_target_family
         )
         xai_target_route_family = get_xai_target_route_family(url)
+        opencode_target_route_family = (
+            HttpPassThroughEndpointHelpers.get_opencode_target_route_family(url)
+        )
         managed_xai_oauth_egress = (
             HttpPassThroughEndpointHelpers._is_managed_xai_oauth_egress(
                 credential_family
@@ -5591,7 +5655,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
 
         target_family = HttpPassThroughEndpointHelpers.get_target_provider_family(url)
         telemetry_target_family = (
-            xai_target_route_family or target_family
+            xai_target_route_family
+            or opencode_target_route_family
+            or target_family
         )
         exact_xai_expected_family = expected_target_family in {
             XAI_OAUTH_ROUTE_FAMILY,
@@ -5599,6 +5665,18 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         }
         exact_xai_credential_family = (
             HttpPassThroughEndpointHelpers._is_exact_xai_egress_credential_family(
+                credential_family
+            )
+        )
+        expected_opencode_route_family = (
+            HttpPassThroughEndpointHelpers._expected_opencode_route_family(
+                credential_family=credential_family,
+                expected_target_family=expected_target_family,
+            )
+        )
+        exact_opencode_expected_family = expected_opencode_route_family is not None
+        exact_opencode_credential_family = (
+            HttpPassThroughEndpointHelpers._is_exact_opencode_egress_family(
                 credential_family
             )
         )
@@ -5632,6 +5710,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 )
                 or (
                     not exact_xai_expected_family
+                    and not exact_opencode_expected_family
                     and target_family != "generic"
                     and target_family != provider_expected_family
                 )
@@ -5645,6 +5724,35 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 url=url,
                 credential_family=credential_family,
                 target_family=telemetry_target_family,
+            )
+
+        # OC-010: Zen/Go egress must bind the exact Zen/Go route family, so
+        # a Zen credential cannot reach a Go target. xAI resolution is
+        # checked first and keeps its existing exact semantics. Generic
+        # proxy hosts stay generic-aware, matching xAI.
+        if expected_opencode_route_family is not None and (
+            (
+                opencode_target_route_family is not None
+                and opencode_target_route_family != expected_opencode_route_family
+            )
+            or (
+                opencode_target_route_family is None
+                and target_family != "generic"
+            )
+        ):
+            HttpPassThroughEndpointHelpers._raise_egress_guard_block(
+                detail=(
+                    "Blocked passthrough egress: OpenCode Zen and OpenCode Go "
+                    "credentials and targets are distinct; expected "
+                    f"{expected_target_family or credential_family}, "
+                    f"got {opencode_target_route_family or target_family}."
+                ),
+                url=url,
+                credential_family=credential_family,
+                target_family=(
+                    opencode_target_route_family
+                    or HttpPassThroughEndpointHelpers.get_target_provider_family(url)
+                ),
             )
 
         if normalized_credential_family == GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY and (
@@ -5672,6 +5780,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         if (
             credential_target_family is not None
             and not exact_xai_credential_family
+            and not exact_opencode_credential_family
             and target_family != "generic"
             and target_family != credential_target_family
         ):
@@ -6932,13 +7041,11 @@ def _resolve_immutable_openai_credential_family(
 ) -> Optional[str]:
     """Resolve native API-key versus managed Codex OAuth from the target URL."""
 
+    if egress_credential_family is not None:
+        return egress_credential_family
     target_family = HttpPassThroughEndpointHelpers.get_openai_target_family(
         target_url
     )
-    if target_family == "codex_oauth":
-        return "codex_oauth"
-    if egress_credential_family is not None:
-        return egress_credential_family
     if expected_target_family in {"openai", "codex_oauth"}:
         return expected_target_family
     if selected_openai_headers:
@@ -7038,7 +7145,7 @@ def _validate_immutable_openai_binding(
         expected_model
         and (
             openai_binding.egress_credential_family == "codex_oauth"
-            or openai_binding.expected_target_family == "codex_oauth"
+            and openai_binding.expected_target_family == "codex_oauth"
         )
     )
     if (
@@ -9679,7 +9786,7 @@ async def pass_through_request(  # noqa: PLR0915
                 )
                 raise AssertionError("unreachable")
 
-            async def _send_prepared_openai_request(
+            async def _send_prepared_openai_request(  # noqa: PLR0915
                 prepared_request: httpx.Request,
                 send_stream: bool,
             ) -> httpx.Response:
@@ -9962,11 +10069,20 @@ async def pass_through_request(  # noqa: PLR0915
                                 or egress_credential_family
                             ),
                         )
-                    response = await async_client.send(
-                        prepared_request,
-                        stream=send_stream,
-                        follow_redirects=immutable_openai_binding.follow_redirects,
+                    ensure_precommit_send_active()
+                    response = await wait_for(
+                        "upstream_response",
+                        async_client.send(
+                            prepared_request,
+                            stream=send_stream,
+                            follow_redirects=immutable_openai_binding.follow_redirects,
+                        ),
                     )
+                    try:
+                        ensure_precommit_send_active()
+                    except asyncio.CancelledError:
+                        await wait_for("resource_cleanup", response.aclose())
+                        raise
                     _record_openai_final_send_binding_observation(
                         request=request,
                         metadata=passthrough_metadata,
@@ -11163,8 +11279,7 @@ async def pass_through_request(  # noqa: PLR0915
                 expected_target_family=expected_target_family,
                 request_body=_parsed_body if isinstance(_parsed_body, dict) else None,
                 route_family=immutable_openai_binding.route_family,
-                selected_model=immutable_openai_binding.expected_model,
-            account_label=_current_openai_account_context(request).get(
+                account_label=_current_openai_account_context(request).get(
                     "account_label"
                 ),
                 account_lane=immutable_openai_binding.expected_lane_key,
