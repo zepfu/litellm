@@ -3178,6 +3178,19 @@ def _classify_codex_auto_agent_retryable_exhaustion(
     )
     if alibaba_exhaustion_class is not None:
         return alibaba_exhaustion_class
+    # Unconfirmed Alibaba quota text and local 429s stay generic rate limits.
+    # Confirmed five-hour and weekly classes require the provider-returned
+    # marker above; matching text without that marker must not become None.
+    if (
+        isinstance(candidate, dict)
+        and candidate.get("provider") == _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
+        and _extract_adapter_exception_status_code(exc) == 429
+        and not (
+            attempted_provider_call
+            and bool(getattr(exc, "_aawm_provider_returned", False))
+        )
+    ):
+        return "rate_limited"
     provider_attributed_model_unavailable = (
         _match_codex_auto_agent_provider_attributed_model_unavailable(
             exc,

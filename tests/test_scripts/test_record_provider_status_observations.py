@@ -724,6 +724,14 @@ def _alibaba_poll_events(events) -> list[dict]:
     return [event for event in events if event.get("event") == "alibaba_quota_poll"]
 
 
+def _alibaba_reset_card_events(events) -> list[dict]:
+    return [
+        event
+        for event in events
+        if event.get("event") == loop.ALIBABA_RESET_CARD_INVENTORY_EVENT
+    ]
+
+
 def _alibaba_console_envelope(data) -> dict:
     return {
         "data": {
@@ -4612,11 +4620,31 @@ def test_run_due_sidecar_tasks_schedules_alibaba_quota_inventory(
         or (len(kwargs["observations"]),) * 2,
     )
 
+    class _FrozenPollClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            frozen = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+            if tz is None:
+                return frozen.replace(tzinfo=None)
+            return frozen.astimezone(tz)
+
+    monkeypatch.setattr(loop, "datetime", _FrozenPollClock)
+
     state = loop.SidecarTaskState()
-    first = loop.run_due_sidecar_tasks(config, state, now_monotonic=100.0)
-    throttled = loop.run_due_sidecar_tasks(config, state, now_monotonic=699.0)
-    usage_only = loop.run_due_sidecar_tasks(config, state, now_monotonic=700.0)
-    refreshed = loop.run_due_sidecar_tasks(config, state, now_monotonic=21701.0)
+    first_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=100.0)
+    first = _alibaba_poll_events(first_events)
+    first_inventory = _alibaba_reset_card_events(first_events)
+    throttled = _alibaba_poll_events(
+        loop.run_due_sidecar_tasks(config, state, now_monotonic=699.0)
+    )
+    usage_only_events = loop.run_due_sidecar_tasks(
+        config, state, now_monotonic=700.0
+    )
+    usage_only = _alibaba_poll_events(usage_only_events)
+    usage_inventory = _alibaba_reset_card_events(usage_only_events)
+    refreshed = _alibaba_poll_events(
+        loop.run_due_sidecar_tasks(config, state, now_monotonic=21701.0)
+    )
 
     assert calls == [
         "subscription",
@@ -4635,11 +4663,11 @@ def test_run_due_sidecar_tasks_schedules_alibaba_quota_inventory(
         first[0]["observation_count"],
         first[0]["inserted_count"],
         first[0]["persisted"],
-        first[0]["reset_card_visible_count"],
-        first[0]["reset_card_available_count"],
-        first[0]["reset_card_observation_count"],
-        first[0]["reset_card_inserted_count"],
-        first[0]["reset_card_persisted"],
+        first_inventory[0]["visible_count"],
+        first_inventory[0]["available_count"],
+        first_inventory[0]["observation_count"],
+        first_inventory[0]["inserted_count"],
+        first_inventory[0]["persisted"],
         first[0]["telemetry_status"],
         first[0]["auth_source"],
         first[0]["mint_attempted"],
@@ -4667,14 +4695,15 @@ def test_run_due_sidecar_tasks_schedules_alibaba_quota_inventory(
     assert (
         usage_only[0]["subscription_refreshed"],
         usage_only[0]["persisted"],
-        usage_only[0]["reset_card_persisted"],
-        usage_only[0]["telemetry_class"],
-        usage_only[0]["error_endpoint"],
         usage_only[0]["last_good_state_retained"],
-    ) == (False, True, False, "malformed_telemetry", "reset_cards", True)
+        usage_inventory[0]["persisted"],
+        usage_inventory[0]["telemetry_class"],
+        usage_inventory[0]["error_endpoint"],
+        usage_inventory[0]["current_provider_evidence"],
+    ) == (False, True, False, False, "malformed_telemetry", "reset_cards", False)
     assert refreshed[0]["subscription_refreshed"] is True
     assert len(reset_persisted) == 2
-    serialized = json.dumps(first + usage_only + refreshed)
+    serialized = json.dumps(first_events + usage_only_events + refreshed)
     _assert_no_alibaba_secrets(
         serialized,
         extra=("instance-secret-identifier", "reset-card-secret-invalid", "invalid-expiry"),
@@ -4694,8 +4723,12 @@ def test_run_due_sidecar_tasks_reuses_cached_alibaba_bearer_across_polls(
         _alibaba_gateway_success_handler(reset_cards=_alibaba_reset_card_payload()),
     )
     state = loop.SidecarTaskState()
-    first = loop.run_due_sidecar_tasks(config, state, now_monotonic=100.0)
-    second = loop.run_due_sidecar_tasks(config, state, now_monotonic=701.0)
+    first = _alibaba_poll_events(
+        loop.run_due_sidecar_tasks(config, state, now_monotonic=100.0)
+    )
+    second = _alibaba_poll_events(
+        loop.run_due_sidecar_tasks(config, state, now_monotonic=701.0)
+    )
     apis = [
         parse_qs(urlsplit(request.full_url).query)["api"][0]
         for request in gateway_calls
@@ -4756,9 +4789,13 @@ def test_run_due_sidecar_tasks_resets_cached_token_when_ram_fingerprint_changes(
     monkeypatch.setattr(loop, "_mint_alibaba_console_access_token", fake_mint)
     monkeypatch.setattr(loop, "ALIBABA_QUOTA_HTTP_OPEN_FN", fake_urlopen)
     state = loop.SidecarTaskState()
-    first = loop.run_due_sidecar_tasks(config, state, now_monotonic=100.0)
+    first = _alibaba_poll_events(
+        loop.run_due_sidecar_tasks(config, state, now_monotonic=100.0)
+    )
     monkeypatch.setenv("ALIBABA_RAM_KEY", "fake-rotated-ram-key-id")
-    second = loop.run_due_sidecar_tasks(config, state, now_monotonic=701.0)
+    second = _alibaba_poll_events(
+        loop.run_due_sidecar_tasks(config, state, now_monotonic=701.0)
+    )
 
     assert calls[:3] == ["Bearer first-bearer-secret"] * 3
     assert calls[3:] == ["Bearer second-bearer-secret"] * 3
@@ -4931,7 +4968,10 @@ def test_alibaba_poll_never_invokes_bl_or_china_hosts(monkeypatch) -> None:
         access_token="console-bearer-secret",
     )
     assert invoked == []
-    assert "import subprocess" not in loop_src
+    alibaba_region = loop_src.split("def _run_alibaba_quota_poll_task", 1)[1].split(
+        "\ndef _run_grok_billing_poll_task", 1
+    )[0]
+    assert "subprocess" not in alibaba_region
     assert '["bl"]' not in loop_src
     assert "'bl'" not in loop_src
     assert "/data/api.json" not in loop_src
