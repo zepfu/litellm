@@ -9364,9 +9364,7 @@ async def clear_compatible_non_held_request_session_owner_guard_for_failover(
                 "durable_owner_changed_or_missing",
             )
         if owner_record is not None:
-            owner_attributes = _core_owner_attributes(
-                _owner_attributes(owner_record)
-            )
+            owner_attributes = _owner_attributes(owner_record)
             if (
                 incomplete_owner_attribute_reason(
                     owner_attributes, for_promotion=True

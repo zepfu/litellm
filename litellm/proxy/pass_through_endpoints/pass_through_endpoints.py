@@ -9183,12 +9183,9 @@ async def pass_through_request(  # noqa: PLR0915
             """Close and positively record raw-response retirement."""
 
             if response is None:
-                setattr(
-                    request.state,
-                    "aawm_openai_precommit_retirement_failed",
-                    False,
-                    "aawm_openai_precommit_retirement_state",
-                    "not_applicable",
+                request.state.aawm_openai_precommit_retirement_failed = False
+                request.state.aawm_openai_precommit_retirement_state = (
+                    "not_applicable"
                 )
                 return True
             closed = True
@@ -9196,13 +9193,8 @@ async def pass_through_request(  # noqa: PLR0915
                 await wait_for("resource_cleanup", response.aclose())
             except BaseException:
                 closed = False
-                setattr(
-                    request.state,
-                    "aawm_openai_precommit_retirement_failed",
-                    True,
-                    "aawm_openai_precommit_retirement_state",
-                    "failed",
-                )
+                request.state.aawm_openai_precommit_retirement_failed = True
+                request.state.aawm_openai_precommit_retirement_state = "failed"
                 verbose_proxy_logger.debug(
                     "Failed to close OpenAI precommit response",
                     exc_info=True,
@@ -9210,14 +9202,15 @@ async def pass_through_request(  # noqa: PLR0915
             finally:
                 clear_active_upstream_response(request, response=response)
             if closed:
-                setattr(
-                    request.state,
-                    "aawm_openai_precommit_retirement_failed",
-                    False,
-                    "aawm_openai_precommit_retirement_state",
-                    "retired",
-                )
+                request.state.aawm_openai_precommit_retirement_failed = False
+                request.state.aawm_openai_precommit_retirement_state = "retired"
             return closed
+
+        async def _record_retired_openai_precommit_response() -> None:
+            """Record authoritative retirement after a real response was closed."""
+
+            request.state.aawm_openai_precommit_retirement_failed = False
+            request.state.aawm_openai_precommit_retirement_state = "retired"
 
         def _authorize_openai_capacity_retry(
             failure: Exception,
@@ -9872,7 +9865,7 @@ async def pass_through_request(  # noqa: PLR0915
                         "aawm_openai_precommit_retirement_state",
                         None,
                     )
-                    if retirement_state != "retired":
+                    if retirement_state not in {"retired", "not_applicable"}:
                         raise RuntimeError(
                             "OpenAI precommit response retirement is required "
                             "before another provider send"
@@ -9889,7 +9882,7 @@ async def pass_through_request(  # noqa: PLR0915
                 )
                 prior_response_closed = (
                     not has_prior_provider_send
-                    or retirement_state == "retired"
+                    or retirement_state in {"retired", "not_applicable"}
                 )
                 owner_comparison_mode = (
                     "strict_managed_openai"
@@ -10394,6 +10387,7 @@ async def pass_through_request(  # noqa: PLR0915
                         await wait_for("resource_cleanup", e.response.aclose())
                         clear_active_upstream_response(request, response=e.response)
                         raw_response = None
+                        await _record_retired_openai_precommit_response()
                         _capture_passthrough_error_shape(
                             mode="stream_error",
                             provider=custom_llm_provider or endpoint_type.value,
@@ -10453,6 +10447,8 @@ async def pass_through_request(  # noqa: PLR0915
                 except BaseException:
                     if raw_response is not None:
                         await _retire_openai_precommit_response(raw_response)
+                    else:
+                        await _record_retired_openai_precommit_response()
                     raise
 
             try:
@@ -10883,6 +10879,7 @@ async def pass_through_request(  # noqa: PLR0915
                         await wait_for("resource_cleanup", e.response.aclose())
                         clear_active_upstream_response(request, response=e.response)
                         raw_response = None
+                        await _record_retired_openai_precommit_response()
                         _capture_passthrough_error_shape(
                             mode="stream_error",
                             provider=custom_llm_provider or endpoint_type.value,
@@ -10992,6 +10989,7 @@ async def pass_through_request(  # noqa: PLR0915
                             await _retire_openai_precommit_response(raw_response)
                         )
                         raw_response = None
+                        await _record_retired_openai_precommit_response()
                         if response_retired:
                             _authorize_openai_capacity_retry(
                                 pre_commit_failure,
@@ -11003,6 +11001,8 @@ async def pass_through_request(  # noqa: PLR0915
             except BaseException:
                 if raw_response is not None:
                     await _retire_openai_precommit_response(raw_response)
+                else:
+                    await _record_retired_openai_precommit_response()
                 raise
 
         try:

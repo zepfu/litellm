@@ -2014,6 +2014,7 @@ if TYPE_CHECKING:
     async def _collect_responses_response_from_stream(response: Any, **kwargs: Any) -> dict[str, Any]: ...
     def _decode_http_response_body(body: Any) -> str: ...
     async def _dispatch_auto_agent_alias_candidate_request(**kwargs: Any) -> Response: ...
+    def _set_alias_candidate_dispatch_active(request: Request, active: bool) -> None: ...
     def _drop_tool_choice_without_tools_from_request_body(body: Any) -> tuple[Any, Any]: ...
     def _drop_unsupported_codex_hosted_tools_from_request_body(body: Any) -> tuple[Any, Any]: ...
     def _drop_unsupported_codex_input_items_from_request_body(body: Any) -> tuple[Any, Any]: ...
@@ -3369,6 +3370,7 @@ async def _perform_codex_auto_agent_alias_candidate_request(  # noqa: PLR0915
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.alias_candidate_dispatch import (
         _reject_openrouter_alias_route_family,
         _reject_xai_alias_route_family,
+        _set_alias_candidate_dispatch_active,
     )
 
     async def _opencode() -> Response:
@@ -3518,16 +3520,20 @@ async def _perform_codex_auto_agent_alias_candidate_request(  # noqa: PLR0915
         )
 
         selected_auth = await _load_bound_codex_oauth_auth(request)
-        return await _perform_codex_auto_agent_native_openai_request(
-            request=request,
-            fastapi_response=fastapi_response,
-            user_api_key_dict=user_api_key_dict,
-            target_url=_codex_oauth_responses_target_url(),
-            api_key=None,
-            forward_headers=False,
-            request_body=candidate_body,
-            custom_headers=selected_auth.headers,
-        )
+        try:
+            _set_alias_candidate_dispatch_active(request, active=True)
+            return await _perform_codex_auto_agent_native_openai_request(
+                request=request,
+                fastapi_response=fastapi_response,
+                user_api_key_dict=user_api_key_dict,
+                target_url=_codex_oauth_responses_target_url(),
+                api_key=None,
+                forward_headers=False,
+                request_body=candidate_body,
+                custom_headers=selected_auth.headers,
+            )
+        finally:
+            _set_alias_candidate_dispatch_active(request, active=False)
 
     return await _dispatch_auto_agent_alias_candidate_request(
         candidate=candidate,
@@ -8308,16 +8314,17 @@ async def _perform_codex_auto_agent_native_openai_request(
     request_body["stream"] = True
     request_body["store"] = False
     is_streaming_request = True
-    # The candidate loop attaches this coordinator only for eligible alpha
-    # OpenAI capacity-retry requests. Preserve stock hidden transport retries
-    # for every native OpenAI request without that shared owner.
+    # Managed alias candidates arrive through the alias candidate loop. That
+    # owner owns hidden retries; its candidate coordinator supplies the shared
+    # budget when eligible. Tests and other direct callers retain the stock
+    # hidden transport retries used by pass_through_request's default path.
     caller_managed_hidden_retry = (
         getattr(
             getattr(request, "state", None),
-            "aawm_openai_capacity_retry",
-            None,
+            "aawm_alias_candidate_dispatch_active",
+            False,
         )
-        is not None
+        is True
     )
     resolved_headers = (
         dict(custom_headers)

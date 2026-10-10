@@ -602,7 +602,22 @@ _OWNED_SYMBOLS = (
     "_dispatch_auto_agent_alias_candidate_request",
     "_perform_anthropic_auto_agent_alias_candidate_request",
     "AliasCandidateDispatchRuntime",
+    "_set_alias_candidate_dispatch_active",
 )
+
+
+def _set_alias_candidate_dispatch_active(
+    request: "Request",
+    *,
+    active: bool,
+) -> None:
+    request_state = getattr(request, "state", None)
+    if request_state is not None:
+        setattr(
+            request_state,
+            "aawm_alias_candidate_dispatch_active",
+            bool(active),
+        )
 
 
 def install(

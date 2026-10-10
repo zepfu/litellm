@@ -1762,7 +1762,14 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
             )
         )
     token_affinity = continuation.as_affinity()
-    if token_affinity is not None:
+    request_failover_context = (
+        _selection._get_codex_oauth_request_local_failover_context(request)
+    )
+    portable_replay_failover = (
+        request_failover_context is not None
+        and request_failover_context.get("portable_replay") is True
+    )
+    if token_affinity is not None and not portable_replay_failover:
         planned_portable_failover = False
     owner_affinity: Optional[dict[str, Any]] = None
     if session_identity is not None and not planned_portable_failover:
