@@ -1842,6 +1842,7 @@ def test_should_submit_codex_prompt_with_ctrl_m_not_enter(
 
     monkeypatch.setattr(driver, "_run_tmux", fake_run)
     monkeypatch.setattr("hv2.drivers.codex.time.sleep", sleeps.append)
+    monkeypatch.setattr(driver, "wait_for_pane", lambda *a, **k: True)
     prompt = (
         "Spawn one child agent now. The child must execute a harmless local "
         "shell command (`date` or `pwd`)."
@@ -1865,6 +1866,57 @@ def test_should_submit_codex_prompt_with_ctrl_m_not_enter(
     assert "-p" not in joined
 
 
+def test_should_submit_codex_multiline_paste_after_the_composer_marker(
+    hv, config, monkeypatch
+) -> None:
+    _skip_unless_codex_tui_shipped(config)
+    from hv2.drivers.codex import CodexDriver
+
+    cfg = _clone_config(config)
+    cfg["tuis"]["codex"]["submit_delay_seconds"] = 0.25
+    driver = CodexDriver(cfg)
+    driver._active_session = "hv2-codex-basic-1"
+    prompt = "line one\nline two"
+    marker = f"[Pasted Content {len(prompt) + 1} chars]"
+    seen: list[str] = []
+
+    def fake_run(args: Any, *, timeout: int = 10, stdin_text: str | None = None) -> Any:
+        seen.append(str(args[0]) if args else "")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_wait(needle: Any, timeout_seconds: float | None = None, **kwargs: Any) -> bool:
+        seen.append(f"wait:{needle}")
+        return needle == marker
+
+    monkeypatch.setattr(driver, "_run_tmux", fake_run)
+    monkeypatch.setattr(driver, "wait_for_pane", fake_wait)
+    monkeypatch.setattr("hv2.drivers.codex.time.sleep", lambda _seconds: None)
+    sent = driver.send_keys(prompt)
+    assert sent["ok"] is True
+    assert seen.index(f"wait:{marker}") < seen.index("send-keys")
+
+
+def test_should_fail_codex_submit_when_multiline_paste_marker_never_appears(
+    hv, config, monkeypatch
+) -> None:
+    _skip_unless_codex_tui_shipped(config)
+    from hv2.drivers.codex import CodexDriver
+
+    cfg = _clone_config(config)
+    cfg["tuis"]["codex"]["submit_delay_seconds"] = 0
+    driver = CodexDriver(cfg)
+    driver._active_session = "hv2-codex-basic-1"
+    monkeypatch.setattr(
+        driver,
+        "_run_tmux",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(driver, "wait_for_pane", lambda *a, **k: False)
+    sent = driver.send_keys("line one\nline two")
+    assert sent["ok"] is False
+    assert sent["returncode"] == 0
+
+
 def test_should_delay_codex_submit_after_paste_before_ctrl_m(
     hv, config, monkeypatch
 ) -> None:
@@ -1886,6 +1938,7 @@ def test_should_delay_codex_submit_after_paste_before_ctrl_m(
 
     monkeypatch.setattr(driver, "_run_tmux", fake_run)
     monkeypatch.setattr("hv2.drivers.codex.time.sleep", fake_sleep)
+    monkeypatch.setattr(driver, "wait_for_pane", lambda *a, **k: True)
     sent = driver.send_keys("Spawn one child agent now and run date.")
     assert sent["ok"] is True
     assert sent["submit_keys"] == ["C-m"]
@@ -1919,6 +1972,7 @@ def test_should_skip_codex_submit_delay_when_yaml_sets_zero(
 
     monkeypatch.setattr(driver, "_run_tmux", fake_run)
     monkeypatch.setattr("hv2.drivers.codex.time.sleep", sleeps.append)
+    monkeypatch.setattr(driver, "wait_for_pane", lambda *a, **k: True)
     sent = driver.send_keys("Spawn one child agent now.")
     assert sent["ok"] is True
     assert sent["submit_delay_seconds"] == 0.0
@@ -2289,6 +2343,7 @@ def test_should_wait_for_codex_model_chrome_before_paste(
 
     monkeypatch.setattr(driver, "_run_tmux", fake_run)
     monkeypatch.setattr(driver, "capture_pane", fake_capture)
+    monkeypatch.setattr(driver, "wait_for_pane", lambda *a, **k: True)
     sent = driver.send_keys("Spawn one child agent now.")
     assert sent["ok"] is True
     assert captures["n"] >= 4

@@ -423,6 +423,21 @@ class CodexDriver:
             return 1.0
         return delay if delay > 0 else 0.0
 
+    def _wait_for_paste_marker(self, payload: str) -> bool:
+        """True once the composer shows the paste, or immediately for short text.
+
+        The wait is bounded by ``wait_ready_seconds``. A missing marker is
+        a submit failure, not the model reply deadline.
+        """
+
+        if "\n" not in payload.strip():
+            return True
+        marker = f"[Pasted Content {len(payload)} chars]"
+        return self.wait_for_pane(
+            marker,
+            timeout_seconds=self._tmux_float("wait_ready_seconds", 25),
+        )
+
     def send_keys(self, text: str) -> dict[str, Any]:
         """Submit *text* to the active interactive tmux session. Not codex exec -p.
 
@@ -457,6 +472,10 @@ class CodexDriver:
         if delay > 0:
             time.sleep(delay)
         submit_keys = self._submit_keys()
+        # Codex 0.162 brackets a paste as "[Pasted Content N chars]" and
+        # ignores C-m until that bracket is visible. A fixed 1s delay
+        # submits before the bracket, so the prompt stays in the composer.
+        marker = self._wait_for_paste_marker(payload)
         submitted = self._run_tmux(
             ["send-keys", "-t", session, *submit_keys]
         )
@@ -464,6 +483,7 @@ class CodexDriver:
             loaded.returncode == 0
             and pasted.returncode == 0
             and submitted.returncode == 0
+            and marker
         )
         return {
             "ok": ok,
