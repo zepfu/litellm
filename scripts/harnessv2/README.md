@@ -305,7 +305,7 @@ Client evidence inventory (frozen contracts; OpenCode has none):
 | TUI | Launch | Terminal evidence |
 |---|---|---|
 | Codex | dedicated `hv2-codex-*` tmux, never `codex exec` | `codex_spawn_tool_evidence` or exact `PONG` where the model override says so. A model `tool_command` case passes when the step records command, exit status, and stdout, or when it records a completed `tool_pass`. A missing tool record stays inconclusive. A pane token alone is not a suite pass |
-| Ohmypi | dedicated `hv2-ohmypi-*` tmux, never `-p` | exact `PONG` or an expected provider 404; orchestration uses `child_spawn_evidence` |
+| Ohmypi | dedicated `hv2-ohmypi-*` tmux, never `-p`. Launch success requires `ready`, `selected`, and `mcp_ready` separately. A selected alias footer is not acceptance and is not `launch_ok` | exact `PONG` or an expected provider 404; orchestration uses `child_spawn_evidence` |
 | Grok | dedicated `hv2-grok-*` via `grokla`; default model is the latest `grok-4.<N>` from the model cost map | `grok_spawn_tool_evidence` |
 | Muse | dedicated `hv2-muse-*` via `musela` | `muse_spawn_tool_evidence`; a child token alone is not a pass |
 

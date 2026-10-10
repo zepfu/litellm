@@ -424,7 +424,7 @@ From `config/tuis.yaml`:
 | Item | Value |
 |---|---|
 | Binary | `omp` (wrapper `ompla`) |
-| Min version | 17.3.8 (live 18.2.4 may omit MCP chrome; selected idle composer still ready) |
+| Min version | 17.3.8 |
 | Overlay | Identity first, then operator: `PI_CONFIG_FILES=<session_dir>/hv2-ohmypi-identity.yml:$HOME/.omp/agent/litellm-alpha.yml`. Ohmypi `task` children inherit tmux env, not parent `--config`. Identity first so those children inherit `x-aawm-client*` headers; parent still gets `--config`. Do not revert this to operator-only `PI_CONFIG_FILES`. That overlay is what stamps rollup as `litellm#Ohmypi[<version>]@<host>`. |
 | CWD | `/tmp/omp-alpha-workspace` |
 | Session dir | `/tmp/omp-alpha-sessions/hv2-<alias>` (identity overlay stays in `/tmp/omp-alpha-sessions`) |
@@ -461,6 +461,17 @@ full selector or `AAWM alias <id>`. That truncated chrome is selected
 evidence. `ensure_session` waits for selected needles again after MCP
 because Ohmypi can paint the alias chrome after connect. Do not invent
 live greens from truncated chrome alone.
+
+Ohmypi launch success requires `ready`, `selected`, and `mcp_ready`
+separately. `ok` / `launch_ok` is true only when all three are true and
+`rejected` is empty. A selected alias footer (`π · host · AAWM alias
+<selected>`, or the same chrome while idle) is not acceptance and is
+not MCP readiness. When MCP needles are configured, `mcp_ready` stays
+false until one of those needles is present. A genuine init, selection,
+or MCP miss stays a distinct launch failure: `session_identity.startup`
+is `ready`, `selected_only`, `mcp_waiting`, or `rejected`. Selected-only
+is not `launch_ok`. Do not drop model selection, MCP-required scenarios,
+or rejection checks to force a launch.
 
 Unclassified alias-loop provider errors (OpenRouter 422, missing Z.AI
 Coding Plan key) must become `ProxyException` / classified cooldown —

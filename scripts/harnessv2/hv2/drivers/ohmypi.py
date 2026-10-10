@@ -22,6 +22,24 @@ except ImportError as exc:  # pragma: no cover
 _MODEL_ID_CONTINUE = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:+/")
 
 
+def ohmypi_launch_startup(
+    *,
+    ready: bool,
+    selected: bool,
+    mcp_ready: bool,
+    rejected: Sequence[str],
+) -> str:
+    """Native launch note. A selected footer is not MCP readiness or success."""
+
+    if rejected:
+        return "rejected"
+    if ready and selected and mcp_ready:
+        return "ready"
+    if selected and not (ready and mcp_ready):
+        return "selected_only"
+    return "mcp_waiting"
+
+
 def _selected_needle_in_pane(token: str, text: str) -> bool:
     """True when *token* is in *text* without a longer model-id suffix.
 
@@ -636,18 +654,15 @@ class OhmypiDriver:
             timeout_seconds=selected_timeout,
         )
         mcp_needles = as_str_list(select.get("mcp_ready_needles"))
+        # Configured MCP needles stay false until one is present. A selected
+        # footer (including idle "π ·") is not MCP readiness and must not
+        # force mcp_ready.
         mcp_ready = True
         if mcp_needles:
             mcp_ready = self.wait_for_pane(
                 mcp_needles,
                 timeout_seconds=self._tmux_float("wait_mcp_seconds", 30),
             )
-            if not mcp_ready:
-                # Ohmypi 18.2.4 idle composer can omit MCP chrome entirely.
-                # Selected alias plus idle footer is enough to send the prompt.
-                pane_now = self.capture_pane()
-                if self.pane_has_selector(model, pane_now) and self._pane_is_idle(pane_now):
-                    mcp_ready = True
         if not selected:
             # Alias chrome can paint after MCP connect on long model ids.
             selected = self.wait_for_pane(
@@ -660,6 +675,12 @@ class OhmypiDriver:
             for token in as_str_list(select.get("reject_needles"))
             if token and token in pane
         ]
+        startup = ohmypi_launch_startup(
+            ready=ready,
+            selected=selected,
+            mcp_ready=mcp_ready,
+            rejected=rejected,
+        )
         return {
             "ok": bool(ready and selected and mcp_ready and not rejected),
             "session": session,
@@ -669,6 +690,11 @@ class OhmypiDriver:
             "selected": selected,
             "mcp_ready": mcp_ready,
             "rejected": rejected,
+            "session_identity": {
+                "session": session,
+                "selector": selector,
+                "startup": startup,
+            },
             "pane_preview": pane[-800:],
             "staged_agents": staged_agents,
         }
