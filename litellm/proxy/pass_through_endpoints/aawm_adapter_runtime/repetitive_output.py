@@ -338,11 +338,6 @@ class VisibleTextRepetitionDetector:
     ) -> Optional[VisibleTextRepetitionMatch]:
         if self._match is not None:
             return self._match
-        pending_bytes = len(f"{self._pending}{text}".encode("utf-8"))
-        if pending_bytes > self._MAX_PENDING_BYTES:
-            raise ValueError(
-                "Repetitive-output token state exceeded the supported bound"
-            )
         words, self._pending = _normalize_visible_text_with_remainder(
             text, pending=self._pending, flush=flush
         )

@@ -555,6 +555,10 @@ class _ResponsesDeltaField:
     byte_count: int
 
 
+class _ResponsesEventInspectionComplete(Exception):
+    """Internal stop after a caller found the decisive coalesced event."""
+
+
 @dataclass(frozen=True)
 class ResponsesWireEmission:
     """One output frame referring to the shared source event."""
@@ -774,9 +778,6 @@ class ResponsesEventPipeline:
     ) -> None:
         if not self.retain_events:
             return
-        # The first upstream read can coalesce many events. Treat it as one
-        # transaction so a terminal in that batch is discoverable even when
-        # it contains more events than the individual hold capacity.
         batch = [event] if isinstance(event, ParsedResponsesEvent) else list(event)
         batch_bytes = sum(self._held_representation_bytes(item) for item in batch)
         projected_count = len(self._held_events) + len(batch)
@@ -797,14 +798,32 @@ class ResponsesEventPipeline:
                 self._held_event_bytes = 0
                 self.retain_events = False
                 return
-            else:
-                self.omitted_held_event_count += len(batch)
-                raise ResponsesEventRetentionTooLarge(
-                    "Responses typed-event replay retention exceeded configured bound"
-                )
-        else:
-            self._held_events.extend(batch)
-            self._held_event_bytes = projected_bytes
+            self.omitted_held_event_count += len(batch)
+            raise ResponsesEventRetentionTooLarge(
+                "Responses typed-event replay retention exceeded configured bound"
+            )
+        self._held_events.extend(batch)
+        self._held_event_bytes = projected_bytes
+
+    def _accept_parsed_event(
+        self,
+        event: ParsedResponsesEvent,
+        *,
+        accepted_events: List[ParsedResponsesEvent],
+        admitted_bytes: int,
+        inspect_event: Optional[Callable[[ParsedResponsesEvent], bool]] = None,
+    ) -> None:
+        try:
+            self._hold_event(event)
+        except ResponsesEventRetentionTooLarge as exception:
+            raise ResponsesBoundFailure(
+                exception,
+                accepted_events=accepted_events,
+                accepted_bytes=admitted_bytes,
+            ) from exception
+        accepted_events.append(event)
+        if inspect_event is not None and inspect_event(event):
+            raise _ResponsesEventInspectionComplete
 
     def _emit(self, event: ParsedResponsesEvent) -> None:
         for observer in tuple(self._observers):
@@ -941,6 +960,7 @@ class ResponsesEventPipeline:
         chunk: bytes,
         *,
         count_stream_bytes: bool,
+        inspect_event: Optional[Callable[[ParsedResponsesEvent], bool]] = None,
     ) -> list[ParsedResponsesEvent]:
         if not chunk:
             self._last_feed_admitted_bytes = 0
@@ -948,7 +968,6 @@ class ResponsesEventPipeline:
         events: list[ParsedResponsesEvent] = []
         admitted_bytes = 0
         self._last_feed_admitted_bytes = 0
-        batch: list[ParsedResponsesEvent] = []
         try:
             for value in chunk:
                 if self._pending_cr and value == 10:
@@ -957,13 +976,23 @@ class ResponsesEventPipeline:
                     self._pending_cr = False
                     completed = self._emit_if_separator_at_end()
                     if completed is not None:
-                        batch.append(completed)
+                        self._accept_parsed_event(
+                            completed,
+                            accepted_events=events,
+                            admitted_bytes=admitted_bytes,
+                            inspect_event=inspect_event,
+                        )
                     continue
                 if self._pending_cr:
                     self._pending_cr = False
                     completed = self._emit_if_separator_at_end()
                     if completed is not None:
-                        batch.append(completed)
+                        self._accept_parsed_event(
+                            completed,
+                            accepted_events=events,
+                            admitted_bytes=admitted_bytes,
+                            inspect_event=inspect_event,
+                        )
                 self._admit_byte(value, count_stream_bytes=count_stream_bytes)
                 admitted_bytes += 1
                 self._pending_cr = value == 13
@@ -971,27 +1000,24 @@ class ResponsesEventPipeline:
                     continue
                 completed = self._emit_if_separator_at_end()
                 if completed is not None:
-                    batch.append(completed)
-            if batch:
-                try:
-                    self._hold_event(batch)
-                except ResponsesEventRetentionTooLarge as exception:
-                    raise ResponsesBoundFailure(
-                        exception,
-                        accepted_events=batch,
-                        accepted_bytes=admitted_bytes,
-                    ) from exception
-                events.extend(batch)
+                    self._accept_parsed_event(
+                        completed,
+                        accepted_events=events,
+                        admitted_bytes=admitted_bytes,
+                        inspect_event=inspect_event,
+                    )
+        except _ResponsesEventInspectionComplete:
+            self._last_feed_admitted_bytes = admitted_bytes
+            return events
         except (
             ResponsesBoundFailure,
             ResponsesEventTooLarge,
             ResponsesStreamTooLarge,
         ) as exception:
-            # Callers can still deliver the valid prefix of a transport batch
+            # Callers can still deliver the parsed prefix of a transport read
             # before constructing a terminal for the rejected suffix.
             bound_failure = ResponsesBoundFailure.from_exception(exception)
-            if not bound_failure.accepted_events:
-                bound_failure.accepted_events = events
+            bound_failure.accepted_events = events
             if not bound_failure.accepted_bytes:
                 bound_failure.accepted_bytes = admitted_bytes
             self._last_feed_admitted_bytes = admitted_bytes
@@ -1003,6 +1029,33 @@ class ResponsesEventPipeline:
         """Admit bytes incrementally and emit each complete event once."""
         data = _coerce_bytes(chunk)
         return self._consume_buffered_bytes(data, count_stream_bytes=True)
+
+    def feed_until(
+        self,
+        chunk: bytes,
+        *,
+        inspect_event: Callable[[ParsedResponsesEvent], bool],
+    ) -> tuple[list[ParsedResponsesEvent], bool]:
+        """Admit bytes until ``inspect_event`` asks to stop at a typed event.
+
+        A coalesced transport read is not a replay transaction. Stopping at the
+        first decisive event prevents an arbitrary later suffix from changing
+        precommit or exhausting the replay-hold budget before it is inspected.
+        """
+        data = _coerce_bytes(chunk)
+        stopped = False
+
+        def consumer(event: ParsedResponsesEvent) -> bool:
+            nonlocal stopped
+            stopped = bool(inspect_event(event))
+            return stopped
+
+        events = self._consume_buffered_bytes(
+            data,
+            count_stream_bytes=True,
+            inspect_event=consumer,
+        )
+        return events, stopped
 
     def finish(self) -> list[ParsedResponsesEvent]:
         """Return an unterminated UTF-8-complete tail as one malformed event.
@@ -1062,9 +1115,7 @@ class ResponsesEventPipeline:
         if control:
             if self.control_event_count >= self.max_control_events:
                 raise ResponsesStreamTooLarge("Responses generated control-event capacity exceeded")
-            if self.control_event_bytes + len(data) > self.max_control_bytes or (
-                data and len(data) > self.max_event_bytes
-            ):
+            if self.control_event_bytes + len(data) > self.max_control_bytes:
                 raise ResponsesEventTooLarge("Responses generated control event exceeded configured bound")
         else:
             if data and len(data) > self.max_event_bytes:
@@ -1544,14 +1595,13 @@ class ResponsesEventSummaryReducer:
         key: str,
         payload: dict[str, Any],
         *,
-        created: bool,
         new_size: int,
     ) -> None:
+        if key not in self._output_items:
+            self._ordered_keys.append(key)
         self._output_items[key] = payload
         self._delta_key_base_sizes[key] = new_size
         self._delta_key_payload_sizes[key] = new_size
-        if created:
-            self._ordered_keys.append(key)
 
     def _merge_item(self, payload: dict[str, Any]) -> None:
         item = payload.get("item")
@@ -1607,6 +1657,7 @@ class ResponsesEventSummaryReducer:
             payload_size = _json_size(payload) or 0
             self._delta_key_payload_sizes[key] = payload_size
         state = fields["text"]
+        first_delta = key not in self._output_items and key not in self._delta_keys_seen
         created = key not in self._output_items
         old_bytes = state.byte_count
         encoded = value.encode("utf-8")
@@ -1619,16 +1670,18 @@ class ResponsesEventSummaryReducer:
             return
         materialized_text: Optional[str] = None
         if done:
-            materialized_text = "".join(state.parts)
+            materialized_text = (
+                "".join(state.parts) + value if state.parts else value
+            )
             state.parts.clear()
         else:
             state.parts.append(value)
         state.byte_count = next_bytes
         payload_size = max(0, new_size)
         self._delta_key_payload_sizes[key] = payload_size
+        if first_delta and not done:
+            self._ordered_keys.append(key)
         if not done:
-            if created:
-                self._ordered_keys.append(key)
             self._stream_text_bytes += len(encoded)
             self._stream_text_parts.append(value)
             self._remember_delta_key(key)
@@ -1638,7 +1691,6 @@ class ResponsesEventSummaryReducer:
             self._commit_delta_item(
                 key,
                 copy.deepcopy(payload),
-                created=created,
                 new_size=payload_size,
             )
             self._stream_text_bytes += len(encoded)
@@ -1676,6 +1728,7 @@ class ResponsesEventSummaryReducer:
             payload_size = _json_size(delta_payload) or 0
             self._delta_key_payload_sizes[key] = payload_size
         state = fields["arguments"]
+        first_delta = key not in self._output_items and key not in self._delta_keys_seen
         created = key not in self._output_items
         old_bytes = state.byte_count
         encoded = value.encode("utf-8")
@@ -1688,23 +1741,24 @@ class ResponsesEventSummaryReducer:
             return
         materialized_arguments: Optional[str] = None
         if done:
-            materialized_arguments = "".join(state.parts)
+            materialized_arguments = (
+                "".join(state.parts) + value if state.parts else value
+            )
             state.parts.clear()
         else:
             state.parts.append(value)
         state.byte_count = next_bytes
         payload_size = max(0, new_size)
         self._delta_key_payload_sizes[key] = payload_size
+        if first_delta and not done:
+            self._ordered_keys.append(key)
         if not done:
-            if created:
-                self._ordered_keys.append(key)
             self._remember_delta_key(key)
         else:
             delta_payload["arguments"] = materialized_arguments or ""
             self._commit_delta_item(
                 key,
                 copy.deepcopy(delta_payload),
-                created=created,
                 new_size=payload_size,
             )
             self._forget_delta_key(key)
@@ -1785,10 +1839,7 @@ class ResponsesEventSummaryReducer:
 
     def snapshot(self) -> dict[str, Any]:
         output = [
-            self._output_items[key]
-            if key not in self._delta_key_payloads
-            and key in self._output_items
-            else self._materialize_delta_payload(key) or self._output_items[key]
+            self._materialize_delta_payload(key) or self._output_items[key]
             for key in self._ordered_keys
             if key in self._delta_key_payloads or key in self._output_items
         ]

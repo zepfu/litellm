@@ -259,7 +259,14 @@ class _PrefixedHttpxByteStream:
             prepare_replay = getattr(event_pipeline, "prepare_replay", None)
             prefix_bytes = getattr(prefix, "byte_count", 0)
             if callable(prepare_replay):
-                prepare_replay(int(prefix_bytes))
+                # feed_until may stop in the middle of a coalesced HTTPX
+                # read. Replay only the bytes the parser has already admitted;
+                # feed_replayed restores its framing buffer and then consumes
+                # the stored suffix as the beginning of the live remainder.
+                admitted_bytes = int(
+                    getattr(event_pipeline, "total_stream_bytes", prefix_bytes)
+                )
+                prepare_replay(min(int(prefix_bytes), admitted_bytes))
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._response, name)
@@ -458,9 +465,19 @@ class _ResponsesPreCommitSSEParser:
     ) -> tuple[str, Optional[Dict[str, Any]], Optional[str]]:
         if not chunk:
             return self.decision()
-        for parsed_event in self._pipeline.feed(chunk):
+        events, _stopped = self._pipeline.feed_until(
+            chunk,
+            inspect_event=self._inspect_event_is_decisive,
+        )
+        for parsed_event in events:
             self._consume_event(parsed_event)
         return self.decision()
+
+    def _inspect_event_is_decisive(self, parsed_event: ParsedResponsesEvent) -> bool:
+        decision, _error_payload, _event_type = (
+            PassThroughStreamingHandler._inspect_responses_events(parsed_event)
+        )
+        return decision in {"failed", "substantive"}
 
     def finish(self) -> tuple[str, Optional[Dict[str, Any]], Optional[str]]:
         for parsed_event in self._pipeline.finish():
