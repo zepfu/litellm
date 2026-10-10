@@ -547,6 +547,14 @@ class ResponsesBoundFailure(Exception):
         )
 
 
+@dataclass
+class _ResponsesDeltaField:
+    """Bounded fragments for one not-yet-committed streamed string field."""
+
+    parts: Deque[str]
+    byte_count: int
+
+
 @dataclass(frozen=True)
 class ResponsesWireEmission:
     """One output frame referring to the shared source event."""
@@ -842,7 +850,17 @@ class ResponsesEventPipeline:
                 if isinstance(decoded, dict):
                     payload = decoded
                     payload_type = decoded.get("type")
-                    if isinstance(payload_type, str) and payload_type.strip():
+                    if event_type is not None and (
+                        not isinstance(payload_type, str)
+                        or event_type != payload_type.strip()
+                    ):
+                        is_malformed = True
+                    if event_type is None:
+                        if not isinstance(payload_type, str) or not payload_type.strip():
+                            is_malformed = True
+                        else:
+                            event_type = payload_type.strip()
+                    elif isinstance(payload_type, str) and payload_type.strip():
                         event_type = payload_type.strip()
                 else:
                     is_malformed = True
@@ -1233,6 +1251,7 @@ class ResponsesEventSummaryReducer:
         self._delta_key_payloads: dict[str, dict[str, Any]] = {}
         self._delta_key_base_sizes: dict[str, int] = {}
         self._delta_key_payload_sizes: dict[str, int] = {}
+        self._delta_key_fields: dict[str, dict[str, _ResponsesDeltaField]] = {}
         self._stream_text_parts: list[str] = []
         self._stream_text_bytes = 0
         self._output_bytes = 0
@@ -1322,6 +1341,99 @@ class ResponsesEventSummaryReducer:
         self._delta_key_payloads.pop(key, None)
         self._delta_key_base_sizes.pop(key, None)
         self._delta_key_payload_sizes.pop(key, None)
+        self._delta_key_fields.pop(key, None)
+
+    @staticmethod
+    def _output_text_target(payload: dict[str, Any]) -> dict[str, Any]:
+        content = payload.get("content")
+        if not isinstance(content, list):
+            content = []
+            payload["content"] = content
+        output_text = next(
+            (
+                part
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "output_text"
+            ),
+            None,
+        )
+        if output_text is None:
+            output_text = {"type": "output_text", "text": ""}
+            content.append(output_text)
+        if not isinstance(output_text.get("text"), str):
+            output_text["text"] = ""
+        return output_text
+
+    @classmethod
+    def _delta_field(
+        cls,
+        payload: dict[str, Any],
+        *,
+        field: str,
+        create_target: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
+    ) -> tuple[dict[str, Any], _ResponsesDeltaField]:
+        template = copy.deepcopy(payload)
+        if create_target is not None:
+            target = create_target(template)
+        else:
+            if not isinstance(template.get(field), str):
+                template[field] = ""
+            target = template
+        current = target.get(field, "")
+        current = current if isinstance(current, str) else ""
+        return target, _ResponsesDeltaField(
+            parts=deque((current,) if current else ()),
+            byte_count=len(current.encode("utf-8")),
+        )
+
+    def _materialize_delta_payload(self, key: str) -> Optional[dict[str, Any]]:
+        payload = self._delta_key_payloads.get(key)
+        if payload is None:
+            return None
+        materialized = copy.deepcopy(payload)
+        for field, state in self._delta_key_fields.get(key, {}).items():
+            if field == "text":
+                target = self._output_text_target(materialized)
+            else:
+                if not isinstance(materialized.get(field), str):
+                    materialized[field] = ""
+                target = materialized
+            target[field] = "".join(state.parts)
+        return materialized
+
+    def _merge_item_into_active_delta(
+        self,
+        key: str,
+        item: dict[str, Any],
+    ) -> None:
+        payload = self._materialize_delta_payload(key)
+        if payload is None:
+            return
+        created = key not in self._output_items
+        previous_size = _json_size(payload) or 0
+        candidate = {**payload, **copy.deepcopy(item)}
+        candidate_size = _json_size(candidate)
+        if not self._charge_delta(previous_size, candidate_size):
+            return
+        self._delta_key_payloads[key] = copy.deepcopy(candidate)
+        candidate_size = candidate_size or 0
+        self._delta_key_base_sizes[key] = candidate_size
+        self._delta_key_payload_sizes[key] = candidate_size
+        for field, state in self._delta_key_fields.get(key, {}).items():
+            if field == "text":
+                target = self._output_text_target(candidate)
+            else:
+                if not isinstance(candidate.get(field), str):
+                    candidate[field] = ""
+                target = candidate
+            current = target.get(field, "")
+            current = current if isinstance(current, str) else ""
+            state.parts.clear()
+            if current:
+                state.parts.append(current)
+            state.byte_count = len(current.encode("utf-8"))
+        if created:
+            self._ordered_keys.append(key)
 
     def _record_event_type(self, event_type: Optional[str]) -> None:
         if not event_type:
@@ -1420,6 +1532,13 @@ class ResponsesEventSummaryReducer:
             return False
         return self._charge_delta(0, _json_size(candidate))
 
+    def _charge_new_output_item_size(self, new_size: Optional[int]) -> bool:
+        if len(self._output_items) >= self.max_output_items:
+            self._overflow = True
+            self._omitted_items += 1
+            return False
+        return self._charge_delta(0, new_size)
+
     def _commit_delta_item(
         self,
         key: str,
@@ -1453,6 +1572,9 @@ class ResponsesEventSummaryReducer:
         ):
             if alias and (alias in self._aliases or len(self._aliases) < self._ALIAS_LIMIT):
                 self._aliases[alias] = key
+        if key in self._delta_key_payloads:
+            self._merge_item_into_active_delta(key, item)
+            return
         slot = self._item_slot(key)
         if slot is None:
             return
@@ -1468,56 +1590,52 @@ class ResponsesEventSummaryReducer:
             return
         if done and key in self._delta_keys_seen:
             return
-        encoded = value.encode("utf-8")
         payload, payload_size = self._delta_key_slots(
             key,
             default_type="message",
         )
         if not payload:
             return
-        content = copy.deepcopy(payload.get("content")) or []
-        output_text = next(
-            (
-                part
-                for part in content
-                if isinstance(part, dict) and part.get("type") == "output_text"
-            ),
-            None,
-        )
-        current_text = (
-            output_text.get("text", "") if output_text is not None else ""
-        )
-        next_text = value if done else f"{current_text}{value}"
-        if output_text is None:
-            output_text = {"type": "output_text", "text": next_text}
-            content.append(output_text)
-        else:
-            output_text["text"] = next_text
-        created = key not in self._output_items
-        if created:
-            candidate = {**payload, "content": content}
-            candidate_size = _json_size(candidate)
-            if not self._charge_new_output_item(candidate):
-                return
-            payload_size = candidate_size or 0
-        elif not self._charge_delta(payload_size, payload_size + len(encoded)):
-            return
-        if not done:
-            payload["content"] = content
-            self._commit_delta_item(
-                key,
+        fields = self._delta_key_fields.setdefault(key, {})
+        if "text" not in fields:
+            _output_text, state = self._delta_field(
                 payload,
-                created=created,
-                new_size=payload_size,
+                field="text",
+                create_target=self._output_text_target,
             )
+            fields["text"] = state
+            payload_size = _json_size(payload) or 0
+            self._delta_key_payload_sizes[key] = payload_size
+        state = fields["text"]
+        created = key not in self._output_items
+        old_bytes = state.byte_count
+        encoded = value.encode("utf-8")
+        next_bytes = len(encoded) if done else old_bytes + len(encoded)
+        new_size = payload_size - old_bytes + next_bytes
+        if created:
+            if not self._charge_new_output_item_size(new_size):
+                return
+        elif not self._charge_delta(payload_size, new_size):
+            return
+        if done:
+            state.parts.clear()
+        else:
+            state.parts.append(value)
+        state.byte_count = next_bytes
+        payload_size = max(0, new_size)
+        self._delta_key_payload_sizes[key] = payload_size
+        if not done:
+            if created:
+                self._ordered_keys.append(key)
             self._stream_text_bytes += len(encoded)
             self._stream_text_parts.append(value)
             self._remember_delta_key(key)
         else:
-            candidate = {**payload, "content": content}
+            output_text = self._output_text_target(payload)
+            output_text["text"] = "".join(state.parts)
             self._commit_delta_item(
                 key,
-                candidate,
+                copy.deepcopy(payload),
                 created=created,
                 new_size=payload_size,
             )
@@ -1546,32 +1664,42 @@ class ResponsesEventSummaryReducer:
         )
         if not delta_payload:
             return
-        current = delta_payload.get("arguments")
-        if not isinstance(current, str):
-            current = ""
-        next_arguments = value if done else current + value
-        candidate = {**delta_payload, "arguments": next_arguments}
-        candidate_size = _json_size(candidate)
-        created = key not in self._output_items
-        if created:
-            if not self._charge_new_output_item(candidate):
-                return
-        elif not self._charge_delta(payload_size, candidate_size):
-            return
-        payload_size = candidate_size or 0
-        if not done:
-            delta_payload["arguments"] = next_arguments
-            self._commit_delta_item(
-                key,
+        fields = self._delta_key_fields.setdefault(key, {})
+        if "arguments" not in fields:
+            _arguments_target, state = self._delta_field(
                 delta_payload,
-                created=created,
-                new_size=payload_size,
+                field="arguments",
             )
+            fields["arguments"] = state
+            payload_size = _json_size(delta_payload) or 0
+            self._delta_key_payload_sizes[key] = payload_size
+        state = fields["arguments"]
+        created = key not in self._output_items
+        old_bytes = state.byte_count
+        encoded = value.encode("utf-8")
+        next_bytes = len(encoded) if done else old_bytes + len(encoded)
+        new_size = payload_size - old_bytes + next_bytes
+        if created:
+            if not self._charge_new_output_item_size(new_size):
+                return
+        elif not self._charge_delta(payload_size, new_size):
+            return
+        if done:
+            state.parts.clear()
+        else:
+            state.parts.append(value)
+        state.byte_count = next_bytes
+        payload_size = max(0, new_size)
+        self._delta_key_payload_sizes[key] = payload_size
+        if not done:
+            if created:
+                self._ordered_keys.append(key)
             self._remember_delta_key(key)
         else:
+            delta_payload["arguments"] = "".join(state.parts)
             self._commit_delta_item(
                 key,
-                candidate,
+                copy.deepcopy(delta_payload),
                 created=created,
                 new_size=payload_size,
             )
@@ -1652,7 +1780,11 @@ class ResponsesEventSummaryReducer:
         return self._failed_error_payload
 
     def snapshot(self) -> dict[str, Any]:
-        output = [self._output_items[key] for key in self._ordered_keys if key in self._output_items]
+        output = [
+            self._materialize_delta_payload(key) or self._output_items[key]
+            for key in self._ordered_keys
+            if key in self._delta_key_payloads or key in self._output_items
+        ]
         return {
             "event_count": self._event_count,
             "event_types": list(self._event_types),

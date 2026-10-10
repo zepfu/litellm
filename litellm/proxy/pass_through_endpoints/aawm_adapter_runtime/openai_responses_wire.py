@@ -27,7 +27,7 @@ from starlette.responses import Response, StreamingResponse
 
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
     PARSED_RESPONSES_EVENTS_ATTR,
-    render_responses_event_wire,
+    responses_emissions_from_chunk,
 )
 
 
@@ -925,7 +925,7 @@ class OpenAIResponsesWireCoordinator:
                             self.trace.upstream_done_suppressed += 1
                         continue
                     wire_bytes = (
-                        render_responses_event_wire(event)
+                        responses_emissions_from_chunk(raw_chunk)[event_index].wire_bytes
                         if event is not None
                         else block
                     )
