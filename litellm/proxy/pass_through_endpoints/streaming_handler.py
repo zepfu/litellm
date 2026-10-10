@@ -1404,6 +1404,33 @@ class PassThroughStreamingHandler:
                     ResponsesEventTooLarge,
                     ResponsesStreamTooLarge,
                 ) as exc:
+                    # A decisive event earlier in this stored read is already
+                    # accepted and observed. Save only the parser-admitted
+                    # prefix so replay can forward it; never reconstruct the
+                    # rejected suffix or turn every fatal rejection into
+                    # recoverable output.
+                    if parser._first_terminal_decision == "substantive":
+                        admitted_bytes = max(
+                            0,
+                            int(getattr(pipeline, "last_feed_admitted_bytes", 0)),
+                        )
+                        try:
+                            prefix.append(chunk[:admitted_bytes])
+                        except (
+                            ResponsesBoundFailure,
+                            ResponsesEventTooLarge,
+                            ResponsesStreamTooLarge,
+                        ):
+                            await _close_precommit_resources()
+                            return response, _bound_failure(exc)
+                        prefixed = _PrefixedHttpxByteStream(
+                            response,
+                            prefix,
+                            iterator,
+                            event_pipeline=pipeline,
+                        )
+                        pipeline.attach_to_response(prefixed)
+                        return prefixed, None
                     await _close_precommit_resources()
                     return response, _bound_failure(exc)
                 if decision == "failed":

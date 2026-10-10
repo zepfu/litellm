@@ -1356,6 +1356,13 @@ class ResponsesEventSummaryReducer:
         return f"fallback:{fallback}"
 
     def _remember_delta_key(self, key: str) -> None:
+        # Keep the active representation at the newest lifecycle position.  A
+        # repeated key is not a second item: appending it again could evict the
+        # key that is still accepting deltas.
+        try:
+            self._delta_key_order.remove(key)
+        except ValueError:
+            pass
         while len(self._delta_key_order) >= self._DELTA_KEY_LIMIT:
             evicted = self._delta_key_order.popleft()
             self._delta_keys_seen.discard(evicted)
@@ -1658,12 +1665,11 @@ class ResponsesEventSummaryReducer:
             self._delta_key_payload_sizes[key] = payload_size
         state = fields["text"]
         first_delta = key not in self._output_items and key not in self._delta_keys_seen
-        created = key not in self._output_items
         old_bytes = state.byte_count
         encoded = value.encode("utf-8")
         next_bytes = len(encoded) if done else old_bytes + len(encoded)
         new_size = payload_size - old_bytes + next_bytes
-        if created:
+        if first_delta:
             if not self._charge_new_output_item_size(new_size):
                 return
         elif not self._charge_delta(payload_size, new_size):
@@ -1729,12 +1735,11 @@ class ResponsesEventSummaryReducer:
             self._delta_key_payload_sizes[key] = payload_size
         state = fields["arguments"]
         first_delta = key not in self._output_items and key not in self._delta_keys_seen
-        created = key not in self._output_items
         old_bytes = state.byte_count
         encoded = value.encode("utf-8")
         next_bytes = len(encoded) if done else old_bytes + len(encoded)
         new_size = payload_size - old_bytes + next_bytes
-        if created:
+        if first_delta:
             if not self._charge_new_output_item_size(new_size):
                 return
         elif not self._charge_delta(payload_size, new_size):
