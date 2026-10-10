@@ -12,6 +12,8 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from pathlib import Path
 from typing import Any, Optional
 from unittest.mock import patch
@@ -30,6 +32,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_WEEKLY_EXHAUSTED_ERROR_CLASS,
+    CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
     CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS,
     CODEX_AUTO_AGENT_NVIDIA_PROVIDER,
     normalize_nvidia_completion_adapter_model_name,
@@ -75,6 +78,8 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.error_signals impor
     _parse_json_payloads_from_text_candidates,
     _parse_rate_limit_reset_wait_seconds_from_headers,
     _parse_retry_after_seconds_from_headers,
+    resolve_alibaba_token_plan_exhaustion_cooldown_seconds,
+    ALIBABA_TOKEN_PLAN_EXHAUSTION_MAX_COOLDOWN_SECONDS,
     _extract_codex_auto_agent_usage_limit_raw_quota_resets,
     _plan_codex_auto_agent_native_grok_continuation_transient_retry,
     configure_error_signals_runtime,
@@ -592,52 +597,221 @@ class TestAlibabaTokenPlanExhaustion:
         "error_class",
         sorted(CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES),
     )
-    def test_confirmed_exhaustion_ttl_ignores_provider_reset(
+    def test_confirmed_exhaustion_ttl_follows_provider_reset(
         self,
-        monkeypatch: pytest.MonkeyPatch,
         error_class: str,
     ) -> None:
+        now_epoch = 1_800_000_000.0
         exc = _alibaba_quota_error(
             "weekly quota is exhausted",
-            resets_at=999_999.0,
+            resets_at=now_epoch + 9_999.0,
         )
         exc.upstream_headers = {
-            "Retry-After": "100000",
-            "x-ratelimit-reset": "999999",
+            "Retry-After": "120",
+            "x-ratelimit-reset": str(now_epoch + 9_000.0),
         }
         candidate = {"provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER}
 
-        monkeypatch.setattr(
-            error_signals,
-            "_resolve_alibaba_token_plan_exhaustion_cooldown_seconds",
-            lambda: 8434.5,
+        assert (
+            resolve_alibaba_token_plan_exhaustion_cooldown_seconds(
+                exc,
+                now_epoch=now_epoch,
+            )
+            == 120.0
         )
-
-        assert _get_codex_auto_agent_cooldown_seconds(exc, candidate=candidate) == 8434.5
+        with patch(
+            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.error_signals.time.time",
+            return_value=now_epoch,
+        ):
+            assert (
+                _get_codex_auto_agent_cooldown_seconds(exc, candidate=candidate)
+                == 120.0
+            )
         assert CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTION_JITTER_SECONDS == 3600.0
 
-    @pytest.mark.parametrize(
-        "jitter",
-        [0.0, 1799.5, 3600.0],
-    )
-    def test_confirmed_exhaustion_ttl_is_base_plus_bounded_jitter(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        jitter: float,
-    ) -> None:
-        exc = _alibaba_quota_error("five-hour quota is exhausted")
+    def test_confirmed_exhaustion_ttl_is_deterministic_fallback(self) -> None:
+        now_epoch = 1_800_000_000.0
         candidate = {"provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER}
-        monkeypatch.setattr(
-            error_signals,
-            "_resolve_alibaba_token_plan_exhaustion_cooldown_seconds",
-            lambda: CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTION_BASE_COOLDOWN_SECONDS
-            + jitter,
+        absent = _alibaba_quota_error("five-hour quota is exhausted")
+        past_header = _alibaba_quota_error("five-hour quota is exhausted")
+        past_header.upstream_headers = {
+            "Retry-After": format_datetime(
+                datetime.fromtimestamp(now_epoch - 10.0, tz=timezone.utc),
+                usegmt=True,
+            ),
+            "x-ratelimit-reset": str(now_epoch - 10.0),
+        }
+        past_header.resets_at = now_epoch - 10.0
+        negative = _alibaba_quota_error("five-hour quota is exhausted")
+        negative.upstream_headers = {"Retry-After": "-5"}
+        over_limit = _alibaba_quota_error("five-hour quota is exhausted")
+        over_limit.upstream_headers = {"Retry-After": "10000000"}
+        skewed = _alibaba_quota_error("five-hour quota is exhausted")
+        skewed.upstream_headers = {
+            "x-ratelimit-reset": str(now_epoch + 10_000_000.0),
+        }
+
+        assert (
+            resolve_alibaba_token_plan_exhaustion_cooldown_seconds(
+                absent,
+                now_epoch=now_epoch,
+            )
+            == CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTION_BASE_COOLDOWN_SECONDS
+        )
+        assert (
+            resolve_alibaba_token_plan_exhaustion_cooldown_seconds(
+                past_header,
+                now_epoch=now_epoch,
+            )
+            == 7200.0
+        )
+        assert (
+            resolve_alibaba_token_plan_exhaustion_cooldown_seconds(
+                negative,
+                now_epoch=now_epoch,
+            )
+            == 7200.0
+        )
+        assert (
+            resolve_alibaba_token_plan_exhaustion_cooldown_seconds(
+                over_limit,
+                now_epoch=now_epoch,
+            )
+            == ALIBABA_TOKEN_PLAN_EXHAUSTION_MAX_COOLDOWN_SECONDS
+        )
+        assert (
+            resolve_alibaba_token_plan_exhaustion_cooldown_seconds(
+                skewed,
+                now_epoch=now_epoch,
+            )
+            == 604800.0
+        )
+        with patch(
+            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.error_signals.time.time",
+            return_value=now_epoch,
+        ):
+            assert (
+                _get_codex_auto_agent_cooldown_seconds(absent, candidate=candidate)
+                == 7200.0
+            )
+            assert (
+                _get_codex_auto_agent_cooldown_seconds(
+                    over_limit,
+                    candidate=candidate,
+                )
+                == 604800.0
+            )
+
+    def test_exhaustion_cooldown_uses_validated_reset_evidence(self) -> None:
+        now_epoch = 1_800_000_000.0
+        http_date = format_datetime(
+            datetime.fromtimestamp(now_epoch, tz=timezone.utc) + timedelta(seconds=300),
+            usegmt=True,
+        )
+        delta = _FakeExc(upstream_headers={"Retry-After": "120"})
+        dated = _FakeExc(upstream_headers={"Retry-After": http_date})
+        epoch_seconds = _FakeExc(
+            upstream_headers={"x-ratelimit-reset": str(now_epoch + 1000.0)}
+        )
+        epoch_millis = _FakeExc(
+            upstream_headers={"X-RateLimit-Reset": str((now_epoch + 1000.0) * 1000.0)}
+        )
+        observed = _FakeExc(resets_at=now_epoch + 500.0)
+        sub_second = _FakeExc(upstream_headers={"Retry-After": "0.4"})
+        zero = _FakeExc(upstream_headers={"Retry-After": "0"})
+
+        assert (
+            resolve_alibaba_token_plan_exhaustion_cooldown_seconds(
+                delta,
+                now_epoch=now_epoch,
+            )
+            == 120.0
+        )
+        assert (
+            resolve_alibaba_token_plan_exhaustion_cooldown_seconds(
+                dated,
+                now_epoch=now_epoch,
+            )
+            == 300.0
+        )
+        assert (
+            resolve_alibaba_token_plan_exhaustion_cooldown_seconds(
+                epoch_seconds,
+                now_epoch=now_epoch,
+            )
+            == 1000.0
+        )
+        assert (
+            resolve_alibaba_token_plan_exhaustion_cooldown_seconds(
+                epoch_millis,
+                now_epoch=now_epoch,
+            )
+            == 1000.0
+        )
+        assert (
+            resolve_alibaba_token_plan_exhaustion_cooldown_seconds(
+                observed,
+                now_epoch=now_epoch,
+            )
+            == 500.0
+        )
+        assert (
+            resolve_alibaba_token_plan_exhaustion_cooldown_seconds(
+                None,
+                now_epoch=now_epoch,
+                observation_reset_epoch=now_epoch + 500.0,
+            )
+            == 500.0
+        )
+        assert (
+            resolve_alibaba_token_plan_exhaustion_cooldown_seconds(
+                sub_second,
+                now_epoch=now_epoch,
+            )
+            == 1.0
+        )
+        assert (
+            resolve_alibaba_token_plan_exhaustion_cooldown_seconds(
+                zero,
+                now_epoch=now_epoch,
+            )
+            == 7200.0
+        )
+        assert (
+            resolve_alibaba_token_plan_exhaustion_cooldown_seconds(
+                delta,
+                now_epoch=now_epoch,
+            )
+            == resolve_alibaba_token_plan_exhaustion_cooldown_seconds(
+                delta,
+                now_epoch=now_epoch,
+            )
         )
 
-        ttl = _get_codex_auto_agent_cooldown_seconds(exc, candidate=candidate)
+    def test_ambiguous_alibaba_429_cooldown_stays_generic_rate_limit(self) -> None:
+        exc = _alibaba_quota_error("Too many requests")
+        exc.upstream_headers = {"Retry-After": "120"}
+        candidate = {
+            "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+            "model": "alibaba_token_plan/qwen3.8-max",
+        }
 
-        assert ttl == CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTION_BASE_COOLDOWN_SECONDS + jitter
-        assert 7200.0 <= ttl <= 10800.0
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(exc, candidate=candidate)
+            == "rate_limited"
+        )
+        assert _classify_codex_auto_agent_retryable_exhaustion(
+            exc,
+            candidate=candidate,
+        ) not in CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES
+        assert (
+            _get_codex_auto_agent_cooldown_seconds(exc, candidate=candidate)
+            == CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+        )
+        assert (
+            _get_codex_auto_agent_cooldown_seconds(exc, candidate=candidate)
+            != CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTION_BASE_COOLDOWN_SECONDS
+        )
 
 
 class TestNvidiaModelUnavailable:

@@ -155,6 +155,8 @@ _ALIBABA_TOKEN_PLAN_QUOTA_CLIENT = "qwen-cloud-console"
 _ALIBABA_TOKEN_PLAN_QUOTA_SOURCE = "alibaba_token_plan_usage"
 _ALIBABA_TOKEN_PLAN_QUOTA_PARSER_VERSION = "alibaba_token_plan_usage_v3"
 _ALIBABA_TOKEN_PLAN_QUOTA_WINDOWS = frozenset({"5h", "7d", "monthly"})
+_ALIBABA_TOKEN_PLAN_QUOTA_TYPE = "credits"
+_ALIBABA_TOKEN_PLAN_QUOTA_UNIT = "credits"
 _ALIBABA_TOKEN_PLAN_QUOTA_CACHE_TTL_SECONDS = _SHARED_ACCOUNT_QUOTA_CACHE_TTL_SECONDS
 _ALIBABA_TOKEN_PLAN_QUOTA_FAILURE_RETRY_SECONDS = (
     _SHARED_ACCOUNT_QUOTA_FAILURE_RETRY_SECONDS
@@ -2123,11 +2125,61 @@ async def _apply_codex_auto_agent_zai_coding_plan_account_cooldown(
     return cooldown_seconds, cooldown_state_source, skip_reason
 
 
+def alibaba_token_plan_quota_legacy_omission_allowed(field: str) -> bool:
+    """Legacy omission policy for Alibaba Token Plan quota rows.
+
+    Omitted ``quota_unit``, evidence ``subscription_identity``, and evidence
+    ``subscription_identity_source`` stay compatible: historical rows written
+    before those stamps existed remain valid when ``quota_type`` is
+    ``credits`` and ``account_hash`` is present. A stamped unit or identity
+    that is present must still match the contract. Missing ``quota_type``,
+    parser version, window, source, client, environment, or account hash is
+    not a compatible omission.
+    """
+
+    return field in {
+        "quota_unit",
+        "subscription_identity",
+        "subscription_identity_source",
+    }
+
+
+def _alibaba_token_plan_quota_unit_matches_contract(
+    *,
+    raw_provider_fields: Any,
+    evidence: Mapping[str, Any],
+) -> bool:
+    """Require the canonical credits unit when a unit stamp is present.
+
+    Check ``raw_provider_fields.quota_unit`` first, then ``evidence.quota_unit``.
+    An omitted unit is the one compatible legacy case; any other unit rejects.
+    """
+
+    raw_fields = _codex_oauth_quota_json_mapping(raw_provider_fields)
+    if "quota_unit" in raw_fields:
+        return raw_fields.get("quota_unit") == _ALIBABA_TOKEN_PLAN_QUOTA_UNIT
+    if "quota_unit" in evidence:
+        return evidence.get("quota_unit") == _ALIBABA_TOKEN_PLAN_QUOTA_UNIT
+    return alibaba_token_plan_quota_legacy_omission_allowed("quota_unit")
+
+
 def _alibaba_token_plan_quota_observation_from_row(
     row: Any,
     *,
     expected_environment: str,
 ) -> Optional[dict[str, Any]]:
+    """Accept a row only when it matches the Token Plan credits contract.
+
+    Required and not legacy-omissible: ``quota_type`` exactly ``credits``,
+    parser version ``alibaba_token_plan_usage_v3``, source
+    ``alibaba_token_plan_usage``, client ``qwen-cloud-console``, environment
+    equal to ``expected_environment``, a non-empty ``account_hash``, and a
+    window in ``{5h, 7d, monthly}`` that agrees across evidence, quota period,
+    and quota key. A present ``quota_unit`` must be ``credits``. A present
+    subscription identity must equal ``account_hash``. Rows that fail never
+    become observations that replace normalized state.
+    """
+
     try:
         values = dict(row)
     except Exception:
@@ -2149,12 +2201,21 @@ def _alibaba_token_plan_quota_observation_from_row(
         or evidence.get("telemetry_status") != "valid"
     ):
         return None
-    account_hash = str(values.get("account_hash") or "").strip()
+    if values.get("quota_type") != _ALIBABA_TOKEN_PLAN_QUOTA_TYPE:
+        return None
+    if not _alibaba_token_plan_quota_unit_matches_contract(
+        raw_provider_fields=values.get("raw_provider_fields"),
+        evidence=evidence,
+    ):
+        return None
+    account_hash = values.get("account_hash")
+    if not isinstance(account_hash, str) or not account_hash.strip():
+        return None
+    account_hash = account_hash.strip()
     stamped_identity = str(evidence.get("subscription_identity") or "").strip()
     identity_source = evidence.get("subscription_identity_source")
     if (
-        not account_hash
-        or (stamped_identity and stamped_identity != account_hash)
+        (stamped_identity and stamped_identity != account_hash)
         or (
             identity_source not in (None, "")
             and identity_source != _ALIBABA_TOKEN_PLAN_SUBSCRIPTION_IDENTITY_SOURCE
@@ -2167,7 +2228,7 @@ def _alibaba_token_plan_quota_observation_from_row(
     if window not in _ALIBABA_TOKEN_PLAN_QUOTA_WINDOWS:
         return None
     expected_quota_key = (
-        f"alibaba_token_plan_{window}:credits"
+        f"alibaba_token_plan_{window}:{_ALIBABA_TOKEN_PLAN_QUOTA_TYPE}"
     )
     if (
         evidence_window != row_window
@@ -2197,7 +2258,7 @@ def _alibaba_token_plan_quota_observation_from_row(
         "environment": environment,
         "quota_key": values.get("quota_key"),
         "quota_period": window,
-        "quota_type": values.get("quota_type"),
+        "quota_type": _ALIBABA_TOKEN_PLAN_QUOTA_TYPE,
         "remaining_pct": float(remaining_pct),
         "observed_at": observed_at,
         "expected_reset_at": expected_reset_at,
@@ -2255,8 +2316,15 @@ async def _hydrate_shared_account_quota_observations(
     observation_from_row: Callable[..., Optional[dict[str, Any]]],
     label: str,
     state_manager: Optional[Any] = None,
+    replace_only_accepted_accounts: bool = False,
 ) -> None:
-    """Hydrate one shared-account source through the common durable query."""
+    """Hydrate one shared-account source through the common durable query.
+
+    ``replace_only_accepted_accounts`` defaults off so other providers still
+    replace every identity-matching account, including accounts whose rows
+    fail telemetry. Alibaba sets it so a contract miss leaves the last-good
+    snapshot in place.
+    """
     state_manager = state_manager or alias_routing_state
     if (
         _get_codex_quota_observation_pool is None
@@ -2328,24 +2396,29 @@ async def _hydrate_shared_account_quota_observations(
                 )
             )
         ]
-        replacement_account_hashes = {
-            row_account_hash
-            for row in rows
-            if (
-                row_account_hash := _shared_account_quota_row_account_hash(
-                    row,
-                    provider=provider,
-                    client=client,
-                    source=source,
-                    expected_environment=environment,
-                )
-            )
-        }
-        replacement_account_hashes.update(
+        accepted_account_hashes = {
             str(observation.get("account_hash") or "").strip()
             for observation in observations
-        )
-        replacement_account_hashes.discard("")
+        }
+        accepted_account_hashes.discard("")
+        if replace_only_accepted_accounts:
+            replacement_account_hashes = accepted_account_hashes
+        else:
+            replacement_account_hashes = {
+                row_account_hash
+                for row in rows
+                if (
+                    row_account_hash := _shared_account_quota_row_account_hash(
+                        row,
+                        provider=provider,
+                        client=client,
+                        source=source,
+                        expected_environment=environment,
+                    )
+                )
+            }
+            replacement_account_hashes.update(accepted_account_hashes)
+            replacement_account_hashes.discard("")
         if replacement_account_hashes:
             state_manager.replace_normalized_quota_observations(
                 observations,
@@ -2361,7 +2434,13 @@ async def _hydrate_shared_account_quota_observations(
 
 
 async def _hydrate_alibaba_token_plan_quota_observations() -> None:
-    """Hydrate exact-identity Alibaba rows for the configured environment."""
+    """Hydrate exact-identity Alibaba rows for the configured environment.
+
+    Replacement is limited to accounts with at least one contract-accepted
+    observation. An all-invalid batch for an account does not erase its
+    last-good snapshot.
+    """
+
     await _hydrate_shared_account_quota_observations(
         provider=_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
         client=_ALIBABA_TOKEN_PLAN_QUOTA_CLIENT,
@@ -2369,6 +2448,7 @@ async def _hydrate_alibaba_token_plan_quota_observations() -> None:
         hydration_slot=_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY,
         observation_from_row=_alibaba_token_plan_quota_observation_from_row,
         label="Alibaba Token Plan",
+        replace_only_accepted_accounts=True,
     )
 
 
@@ -2467,8 +2547,42 @@ def _alibaba_token_plan_quota_evidence(
             or (not current_exhausted and observation["observed_at"] >= current["observed_at"])
         ):
             fresh_windows[window] = observation
-    if set(fresh_windows) not in ({"5h", "7d"}, {"monthly"}):
+    present = set(fresh_windows)
+    if "5h" in present or "7d" in present:
+        required = ("5h", "7d")
+    elif "monthly" in present:
+        required = ("monthly",)
+    else:
         return None, []
+    visible_periods = required
+    if "monthly" in present and "monthly" not in required:
+        visible_periods = (*required, "monthly")
+    window_ages: list[dict[str, Any]] = []
+    required_ages: list[float] = []
+    missing_required_windows: list[str] = []
+    for period in visible_periods:
+        observation = fresh_windows.get(period)
+        if observation is None:
+            window_ages.append(
+                {
+                    "quota_period": period,
+                    "observation_age_seconds": None,
+                    "status": "missing",
+                }
+            )
+            if period in required:
+                missing_required_windows.append(period)
+            continue
+        age = max(0.0, now - float(observation["observed_at"]))
+        window_ages.append(
+            {
+                "quota_period": period,
+                "observation_age_seconds": age,
+                "status": "fresh",
+            }
+        )
+        if period in required:
+            required_ages.append(age)
     windows = [fresh_windows[window] for window in sorted(fresh_windows)]
     evidence: dict[str, Any] = {
         "provider": _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
@@ -2478,10 +2592,14 @@ def _alibaba_token_plan_quota_evidence(
         "telemetry_status": "valid",
         "account_hash": identity,
         "subscription_identity": identity,
-        "observation_age_seconds": max(
-            0.0,
-            now - max(observation["observed_at"] for observation in windows),
+        "observation_age_seconds": (
+            None if missing_required_windows else max(required_ages)
         ),
+        "freshness_status": (
+            "missing_required_window" if missing_required_windows else "fresh"
+        ),
+        "missing_required_windows": missing_required_windows,
+        "window_ages": window_ages,
         "windows": windows,
     }
     return evidence, windows
@@ -2516,10 +2634,18 @@ def _attach_alibaba_token_plan_quota_state(
         return state
     state["alibaba_token_plan_quota_observation"] = observation
     state["quota_windows"] = windows
-    state["quota_snapshot_age_seconds"] = round(
-        float(observation["observation_age_seconds"]),
-        3,
-    )
+    window_ages = observation.get("window_ages")
+    if isinstance(window_ages, list):
+        state["quota_window_ages"] = window_ages
+    freshness_status = observation.get("freshness_status")
+    if isinstance(freshness_status, str):
+        state["quota_freshness_status"] = freshness_status
+    missing_required_windows = observation.get("missing_required_windows")
+    if isinstance(missing_required_windows, list):
+        state["quota_missing_required_windows"] = missing_required_windows
+    aggregate_age = observation.get("observation_age_seconds")
+    if isinstance(aggregate_age, (int, float)) and not isinstance(aggregate_age, bool):
+        state["quota_snapshot_age_seconds"] = round(float(aggregate_age), 3)
     state["quota_remaining_pct"] = min(
         float(window["remaining_pct"]) for window in windows
     )
@@ -2531,6 +2657,39 @@ def _attach_alibaba_token_plan_quota_state(
     return state
 
 
+def _alibaba_token_plan_positive_windows_can_clear_account_cooldown(
+    evidence: Mapping[str, Any],
+    *,
+    now_epoch: float,
+) -> bool:
+    """A lone positive window does not clear the account cooldown.
+
+    Required siblings that are missing or not fresh keep the cooldown. Callers
+    that only see the present `windows` list would otherwise treat that partial
+    snapshot as a complete positive family.
+    """
+    if evidence.get("freshness_status") != "fresh":
+        return False
+    missing_required_windows = evidence.get("missing_required_windows")
+    if isinstance(missing_required_windows, list) and missing_required_windows:
+        return False
+    windows = evidence.get("windows")
+    if not isinstance(windows, list) or not windows:
+        return False
+    return all(
+        isinstance(window, dict)
+        and not window.get("exhausted")
+        and isinstance(window.get("remaining_pct"), (int, float))
+        and not isinstance(window.get("remaining_pct"), bool)
+        and float(window["remaining_pct"]) > 0.0
+        and isinstance(window.get("expected_reset_at"), (int, float))
+        and not isinstance(window.get("expected_reset_at"), bool)
+        and math.isfinite(float(window["expected_reset_at"]))
+        and float(window["expected_reset_at"]) > now_epoch
+        for window in windows
+    )
+
+
 async def _clear_alibaba_token_plan_account_quota_cooldown(
     evidence: Mapping[str, Any],
     *,
@@ -2538,6 +2697,14 @@ async def _clear_alibaba_token_plan_account_quota_cooldown(
 ) -> bool:
     windows = evidence.get("windows")
     if not isinstance(windows, list) or not windows:
+        return False
+    # Callers that only inspect `windows` can mistake one positive window for
+    # a complete family. A missing required window keeps the cooldown.
+    freshness_status = evidence.get("freshness_status")
+    if freshness_status not in (None, "fresh"):
+        return False
+    missing_required_windows = evidence.get("missing_required_windows")
+    if isinstance(missing_required_windows, list) and missing_required_windows:
         return False
     if any(
         window.get("exhausted")
@@ -7270,21 +7437,10 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         )
         if alibaba_evidence is None:
             continue
-        windows = alibaba_evidence["windows"]
-        now_epoch = time.time()
-        valid_positive_windows = all(
-            isinstance(window, dict)
-            and not window.get("exhausted")
-            and isinstance(window.get("remaining_pct"), (int, float))
-            and not isinstance(window.get("remaining_pct"), bool)
-            and float(window["remaining_pct"]) > 0.0
-            and isinstance(window.get("expected_reset_at"), (int, float))
-            and not isinstance(window.get("expected_reset_at"), bool)
-            and math.isfinite(float(window["expected_reset_at"]))
-            and float(window["expected_reset_at"]) > now_epoch
-            for window in windows
-        )
-        if valid_positive_windows:
+        if _alibaba_token_plan_positive_windows_can_clear_account_cooldown(
+            alibaba_evidence,
+            now_epoch=time.time(),
+        ):
             await _clear_alibaba_token_plan_account_quota_cooldown(
                 alibaba_evidence
             )
@@ -8180,6 +8336,14 @@ def install(host_globals: dict) -> None:
         "_ALIBABA_TOKEN_PLAN_QUOTA_PARSER_VERSION": (
             _ALIBABA_TOKEN_PLAN_QUOTA_PARSER_VERSION
         ),
+        "_ALIBABA_TOKEN_PLAN_QUOTA_TYPE": _ALIBABA_TOKEN_PLAN_QUOTA_TYPE,
+        "_ALIBABA_TOKEN_PLAN_QUOTA_UNIT": _ALIBABA_TOKEN_PLAN_QUOTA_UNIT,
+        "alibaba_token_plan_quota_legacy_omission_allowed": (
+            alibaba_token_plan_quota_legacy_omission_allowed
+        ),
+        "_alibaba_token_plan_quota_unit_matches_contract": (
+            _alibaba_token_plan_quota_unit_matches_contract
+        ),
         "_ALIBABA_TOKEN_PLAN_QUOTA_WINDOWS": _ALIBABA_TOKEN_PLAN_QUOTA_WINDOWS,
         "_ALIBABA_TOKEN_PLAN_QUOTA_CURRENT_ROWS_SQL": (
             _ALIBABA_TOKEN_PLAN_QUOTA_CURRENT_ROWS_SQL
@@ -8230,6 +8394,9 @@ def install(host_globals: dict) -> None:
         ),
         "_clear_alibaba_token_plan_account_quota_cooldown": (
             _clear_alibaba_token_plan_account_quota_cooldown
+        ),
+        "_alibaba_token_plan_positive_windows_can_clear_account_cooldown": (
+            _alibaba_token_plan_positive_windows_can_clear_account_cooldown
         ),
         "_ZAI_CODING_PLAN_QUOTA_CLIENT": _ZAI_CODING_PLAN_QUOTA_CLIENT,
         "_ZAI_CODING_PLAN_QUOTA_SOURCE": _ZAI_CODING_PLAN_QUOTA_SOURCE,
