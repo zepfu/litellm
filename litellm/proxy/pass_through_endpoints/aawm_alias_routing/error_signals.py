@@ -56,7 +56,6 @@ from .policy import (
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER as _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES as _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTION_BASE_COOLDOWN_SECONDS as _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTION_BASE_COOLDOWN_SECONDS,
-    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTION_JITTER_SECONDS as _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTION_JITTER_SECONDS,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_FIVE_HOUR_EXHAUSTED_ERROR_CLASS as _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_FIVE_HOUR_EXHAUSTED_ERROR_CLASS,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_WEEKLY_EXHAUSTED_ERROR_CLASS as _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_WEEKLY_EXHAUSTED_ERROR_CLASS,
     CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS as _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS,
@@ -722,11 +721,208 @@ _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_MAX_SECONDS: float 
 _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_JITTER_SECONDS: float = 0.05
 
 
-def _default_resolve_alibaba_token_plan_exhaustion_cooldown_seconds() -> float:
-    return _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTION_BASE_COOLDOWN_SECONDS + random.uniform(
-        0.0,
-        _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTION_JITTER_SECONDS,
+# Epoch values above this threshold are milliseconds; smaller values are seconds.
+_ALIBABA_TOKEN_PLAN_RESET_EPOCH_MILLISECONDS_THRESHOLD = 1_000_000_000_000
+# Over-limit and skewed far-future deadlines clamp here. Never unbounded.
+ALIBABA_TOKEN_PLAN_EXHAUSTION_MAX_COOLDOWN_SECONDS = 604800.0
+_ALIBABA_TOKEN_PLAN_RESET_HEADER_NAMES = (
+    "X-RateLimit-Reset",
+    "x-ratelimit-reset",
+    "x-codex-primary-reset-at",
+    "x-codex-secondary-reset-at",
+    "x-codex-bengalfox-primary-reset-at",
+    "x-codex-bengalfox-secondary-reset-at",
+    "x-alibaba-token-plan-reset",
+    "x-quota-reset",
+)
+_ALIBABA_TOKEN_PLAN_OBSERVATION_RESET_ATTRIBUTES = (
+    "expected_reset_at",
+    "resets_at",
+)
+
+
+def _alibaba_token_plan_epoch_seconds(value: float) -> Optional[float]:
+    """Normalize an epoch number. Values above the threshold are milliseconds."""
+    if not math.isfinite(value):
+        return None
+    if value > _ALIBABA_TOKEN_PLAN_RESET_EPOCH_MILLISECONDS_THRESHOLD:
+        return value / 1000.0
+    return value
+
+
+def _alibaba_token_plan_positive_wait_seconds(
+    wait_seconds: float,
+    *,
+    max_cooldown_seconds: float,
+) -> Optional[float]:
+    """Accept a future wait, clamp over-limit, and reject past or zero waits.
+
+    A sub-second positive delta is raised to 1.0 so it does not collapse to
+    zero. Exactly zero, negative, and non-finite waits are not a cooldown.
+    """
+    if not math.isfinite(wait_seconds) or wait_seconds <= 0.0:
+        return None
+    if wait_seconds < 1.0:
+        wait_seconds = 1.0
+    if not math.isfinite(max_cooldown_seconds) or max_cooldown_seconds <= 0.0:
+        max_cooldown_seconds = ALIBABA_TOKEN_PLAN_EXHAUSTION_MAX_COOLDOWN_SECONDS
+    return min(wait_seconds, max_cooldown_seconds)
+
+
+def _alibaba_token_plan_wait_until_epoch(
+    reset_epoch: float,
+    *,
+    now_epoch: float,
+    max_cooldown_seconds: float,
+) -> Optional[float]:
+    epoch_seconds = _alibaba_token_plan_epoch_seconds(reset_epoch)
+    if epoch_seconds is None:
+        return None
+    return _alibaba_token_plan_positive_wait_seconds(
+        epoch_seconds - now_epoch,
+        max_cooldown_seconds=max_cooldown_seconds,
     )
+
+
+def _parse_alibaba_token_plan_retry_after_wait_seconds(
+    headers: dict[str, Any],
+    *,
+    now_epoch: float,
+    max_cooldown_seconds: float,
+) -> Optional[float]:
+    """Parse Retry-After as delta seconds or an RFC 7231 HTTP-date.
+
+    Naive HTTP-dates are treated as UTC. A missing or unparseable value is
+    not evidence. Zero and negative deltas fall through to the next source.
+    """
+    retry_after_value = _get_adapter_header_value(headers, "Retry-After")
+    if retry_after_value is None:
+        return None
+    try:
+        delta_seconds = float(retry_after_value)
+    except (TypeError, ValueError):
+        delta_seconds = None
+    if delta_seconds is not None and math.isfinite(delta_seconds):
+        return _alibaba_token_plan_positive_wait_seconds(
+            delta_seconds,
+            max_cooldown_seconds=max_cooldown_seconds,
+        )
+    try:
+        parsed = parsedate_to_datetime(retry_after_value)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return _alibaba_token_plan_positive_wait_seconds(
+        parsed.timestamp() - now_epoch,
+        max_cooldown_seconds=max_cooldown_seconds,
+    )
+
+
+def _parse_alibaba_token_plan_header_reset_wait_seconds(
+    headers: dict[str, Any],
+    *,
+    now_epoch: float,
+    max_cooldown_seconds: float,
+) -> Optional[float]:
+    """Return the earliest valid future reset among known epoch headers."""
+    wait_candidates: list[float] = []
+    for header_name in _ALIBABA_TOKEN_PLAN_RESET_HEADER_NAMES:
+        reset_value = _get_adapter_header_value(headers, header_name)
+        if reset_value is None:
+            continue
+        try:
+            reset_number = float(reset_value)
+        except (TypeError, ValueError):
+            continue
+        wait_seconds = _alibaba_token_plan_wait_until_epoch(
+            reset_number,
+            now_epoch=now_epoch,
+            max_cooldown_seconds=max_cooldown_seconds,
+        )
+        if wait_seconds is not None:
+            wait_candidates.append(wait_seconds)
+    if not wait_candidates:
+        return None
+    return min(wait_candidates)
+
+
+def _alibaba_token_plan_observation_reset_epoch(exc: Any) -> Optional[float]:
+    """Read a normalized window reset carried on the exception, if present."""
+    for attribute_name in _ALIBABA_TOKEN_PLAN_OBSERVATION_RESET_ATTRIBUTES:
+        raw_value = getattr(exc, attribute_name, None)
+        if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+            continue
+        epoch_seconds = _alibaba_token_plan_epoch_seconds(float(raw_value))
+        if epoch_seconds is not None:
+            return epoch_seconds
+    return None
+
+
+def resolve_alibaba_token_plan_exhaustion_cooldown_seconds(
+    exc: Any = None,
+    *,
+    now_epoch: Optional[float] = None,
+    observation_reset_epoch: Optional[float] = None,
+    max_cooldown_seconds: float = ALIBABA_TOKEN_PLAN_EXHAUSTION_MAX_COOLDOWN_SECONDS,
+) -> float:
+    """Resolve a deterministic Alibaba exhaustion cooldown from reset evidence.
+
+    Accepted evidence, first valid future deadline wins:
+
+    1. ``Retry-After`` as delta seconds or an RFC 7231 HTTP-date (naive dates
+       are UTC).
+    2. The earliest valid future epoch reset header (seconds, or milliseconds
+       when the value is greater than 1e12).
+    3. ``observation_reset_epoch``, or ``expected_reset_at`` / ``resets_at``
+       on ``exc`` when that argument is omitted. Same epoch-or-milliseconds
+       rule.
+
+    A past, zero, negative, or unparseable candidate falls through to the
+    next source. When none remain, the documented fallback is
+    ``CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTION_BASE_COOLDOWN_SECONDS``
+    (7200). Over-limit evidence and a skewed clock that yields a wait above
+    the maximum are clamped to 604800 seconds. The result is never negative
+    and never unbounded. The same inputs and ``now_epoch`` always yield the
+    same float; this function does not draw jitter.
+    """
+    resolved_now = time.time() if now_epoch is None else float(now_epoch)
+    if not math.isfinite(resolved_now):
+        resolved_now = time.time()
+    headers = _extract_adapter_upstream_headers(exc)
+    retry_after_wait = _parse_alibaba_token_plan_retry_after_wait_seconds(
+        headers,
+        now_epoch=resolved_now,
+        max_cooldown_seconds=max_cooldown_seconds,
+    )
+    if retry_after_wait is not None:
+        return retry_after_wait
+    header_reset_wait = _parse_alibaba_token_plan_header_reset_wait_seconds(
+        headers,
+        now_epoch=resolved_now,
+        max_cooldown_seconds=max_cooldown_seconds,
+    )
+    if header_reset_wait is not None:
+        return header_reset_wait
+    observed_reset = observation_reset_epoch
+    if observed_reset is None and exc is not None:
+        observed_reset = _alibaba_token_plan_observation_reset_epoch(exc)
+    if isinstance(observed_reset, (int, float)) and not isinstance(observed_reset, bool):
+        observation_wait = _alibaba_token_plan_wait_until_epoch(
+            float(observed_reset),
+            now_epoch=resolved_now,
+            max_cooldown_seconds=max_cooldown_seconds,
+        )
+        if observation_wait is not None:
+            return observation_wait
+    return _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTION_BASE_COOLDOWN_SECONDS
+
+
+def _default_resolve_alibaba_token_plan_exhaustion_cooldown_seconds() -> float:
+    """No-evidence fallback. Existing no-arg call sites stay deterministic."""
+    return resolve_alibaba_token_plan_exhaustion_cooldown_seconds()
 
 
 _resolve_alibaba_token_plan_exhaustion_cooldown_seconds: Callable[
@@ -3407,6 +3603,16 @@ def _get_codex_auto_agent_cooldown_seconds(
     if error_class == _CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS:
         return 0.0
     if error_class in _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES:
+        # Hosts may still replace the no-arg seam. The shipped default uses
+        # validated reset evidence; a replaced callable keeps its contract.
+        if (
+            _resolve_alibaba_token_plan_exhaustion_cooldown_seconds
+            is _default_resolve_alibaba_token_plan_exhaustion_cooldown_seconds
+        ):
+            return resolve_alibaba_token_plan_exhaustion_cooldown_seconds(
+                exc,
+                now_epoch=time.time(),
+            )
         return _resolve_alibaba_token_plan_exhaustion_cooldown_seconds()
     tokens = _extract_codex_auto_agent_error_tokens(exc)
     if error_class in {"usage_limit_reached", OPENROUTER_CREDIT_EXHAUSTED, "auth"}:

@@ -3511,6 +3511,10 @@ def test_alibaba_quota_payloads_map_consumed_fractions_and_hash_identity() -> No
     ]
     assert all(payload[11:14] == (None, None, None) for payload in payloads)
     assert all(payload[4] == loop.ALIBABA_TOKEN_PLAN_PROVIDER for payload in payloads)
+    assert all(payload[8] == "credits" for payload in payloads)
+    assert all(
+        json.loads(payload[16])["quota_unit"] == "credits" for payload in payloads
+    )
     assert all(payload[18] == loop.ALIBABA_TOKEN_PLAN_SOURCE for payload in payloads)
     assert payloads[0][3] == hashlib.sha256(b"alibaba-token-plan|instanceCode=instance-secret-identifier").hexdigest()
     assert all(json.loads(payload[17])["environment"] == "dev" for payload in payloads)
