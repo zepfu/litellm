@@ -3468,6 +3468,204 @@ def test_should_expand_ohmypi_catalog_find_argv(hv, config) -> None:
     assert "-p" not in argv
 
 
+def _muse_intent_event(session_id: str, prompt: str) -> dict[str, Any]:
+    return {
+        "payload_type": "runtime.user_intent.accepted",
+        "payload": {
+            "source_session_id": session_id,
+            "model_messages": [
+                {"content": [{"kind": "text", "text": prompt}]}
+            ],
+        },
+    }
+
+
+def _write_muse_intent(
+    root: Path, session_id: str, prompt: str, *, name: str = "session.jsonl"
+) -> None:
+    session = root / session_id
+    session.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(_muse_intent_event(session_id, prompt))
+    (session / name).write_text(line + "\n", encoding="utf-8")
+
+
+def test_should_paste_single_line_muse_prompt_after_submit_delay(
+    hv, config, monkeypatch, tmp_path: Path
+) -> None:
+    from hv2.drivers.muse import MuseDriver
+
+    cfg = _clone_config(config)
+    cfg["tuis"]["muse"]["session_dir"] = str(tmp_path)
+    cfg["tuis"]["muse"]["submit_delay_seconds"] = 0.25
+    driver = MuseDriver(cfg)
+    model = "muse-spark-1.3-contributor"
+    driver._active_model = model
+    driver._active_session = "hv2-muse-muse-spark-1-3-contributor-1"
+    session_id = driver.alias_session_dir(model).name
+    prompt = "Reply with exactly the word PONG."
+    _write_muse_intent(tmp_path, session_id, prompt)
+    events: list[tuple[str, Any]] = []
+
+    def fake_run(args: Any, *, timeout: int = 10, stdin_text: str | None = None) -> Any:
+        events.append(("tmux", [str(item) for item in args], stdin_text))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_sleep(seconds: float) -> None:
+        events.append(("sleep", float(seconds)))
+
+    monkeypatch.setattr(driver, "_run_tmux", fake_run)
+    monkeypatch.setattr("hv2.drivers.muse.time.sleep", fake_sleep)
+    sent = driver.send_keys(prompt)
+    assert sent["ok"] is True
+    assert sent["accepted"] is True
+    assert sent["intent"] == prompt
+    assert sent["method"] == "paste-buffer"
+    assert sent["submit_keys"] == ["C-m"]
+    assert sent["submit_delay_seconds"] == 0.25
+    assert events[0][1][:1] == ["load-buffer"]
+    assert prompt in (events[0][2] or "")
+    assert events[1][1][:1] == ["paste-buffer"]
+    assert events[2] == ("sleep", 0.25)
+    assert events[3][1] == [
+        "send-keys",
+        "-t",
+        driver._active_session,
+        "C-m",
+    ]
+    assert not any(
+        row[0] == "tmux" and row[1][:1] == ["send-keys"] and prompt in row[1]
+        for row in events
+    )
+
+
+def test_should_accept_muse_intent_from_matching_session_jsonl(
+    hv, config, monkeypatch, tmp_path: Path
+) -> None:
+    from hv2.drivers.muse import MuseDriver
+
+    cfg = _clone_config(config)
+    cfg["tuis"]["muse"]["session_dir"] = str(tmp_path)
+    driver = MuseDriver(cfg)
+    model = "muse-spark-1.3-contributor"
+    driver._active_model = model
+    driver._active_session = "hv2-muse-dedicated"
+    session_id = driver.alias_session_dir(model).name
+    prompt = "Reply with exactly the word PONG."
+    _write_muse_intent(tmp_path, session_id, f"  {prompt}\n")
+    monkeypatch.setattr(
+        driver,
+        "_run_tmux",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr("hv2.drivers.muse.time.sleep", lambda _seconds: None)
+    sent = driver.send_keys(prompt)
+    assert sent["accepted"] is True
+    assert sent["intent"] == prompt
+    assert sent["ok"] is True
+
+
+def test_should_fail_muse_submit_without_intent_acceptance(
+    hv, config, monkeypatch, tmp_path: Path
+) -> None:
+    from hv2.drivers.muse import MuseDriver
+
+    cfg = _clone_config(config)
+    cfg["tuis"]["muse"]["session_dir"] = str(tmp_path)
+    cfg["tuis"]["muse"]["tmux"]["wait_ready_seconds"] = 0.05
+    cfg["tuis"]["muse"]["tmux"]["poll_interval_seconds"] = 0.01
+    driver = MuseDriver(cfg)
+    driver._active_model = "muse-spark-1.3-contributor"
+    driver._active_session = "hv2-muse-dedicated"
+    driver.alias_session_dir(driver._active_model)
+    prompt = "Reply with exactly the word PONG."
+    echo = f"{prompt}\n"
+    waits: list[Any] = []
+
+    monkeypatch.setattr(
+        driver,
+        "_run_tmux",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout=echo, stderr=""),
+    )
+    monkeypatch.setattr(driver, "capture_pane", lambda: echo)
+    monkeypatch.setattr(
+        driver,
+        "wait_for_pane",
+        lambda *a, **k: waits.append("wait_for_pane") or True,
+    )
+    monkeypatch.setattr("hv2.drivers.muse.time.sleep", lambda _seconds: None)
+    sent = driver.send_keys(prompt)
+    assert sent["ok"] is False
+    assert sent["accepted"] is False
+    assert sent["returncode"] == 0
+    assert "runtime.user_intent.accepted" in str(sent.get("submission_error"))
+    waited = driver.send_prompt_and_wait(prompt, reply_needles=["PONG"])
+    assert waited["ok"] is False
+    assert waited["replied"] is False
+    assert waits == []
+    assert "runtime.user_intent.accepted" in str(waited.get("submission_error"))
+
+
+def test_should_reject_muse_intent_from_another_session(
+    hv, config, monkeypatch, tmp_path: Path
+) -> None:
+    from hv2.drivers.muse import MuseDriver
+
+    cfg = _clone_config(config)
+    cfg["tuis"]["muse"]["session_dir"] = str(tmp_path)
+    cfg["tuis"]["muse"]["tmux"]["wait_ready_seconds"] = 0.01
+    cfg["tuis"]["muse"]["tmux"]["poll_interval_seconds"] = 0.01
+    driver = MuseDriver(cfg)
+    driver._active_model = "muse-spark-1.3-contributor"
+    driver._active_session = "hv2-muse-dedicated"
+    prompt = "Reply with exactly the word PONG."
+    _write_muse_intent(tmp_path, "hv2-other-session", prompt)
+    monkeypatch.setattr(
+        driver,
+        "_run_tmux",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr("hv2.drivers.muse.time.sleep", lambda _seconds: None)
+    sent = driver.send_keys(prompt)
+    assert sent["accepted"] is False
+    assert sent["ok"] is False
+
+
+def test_should_paste_multiline_muse_prompt_after_submit_delay(
+    hv, config, monkeypatch, tmp_path: Path
+) -> None:
+    from hv2.drivers.muse import MuseDriver
+
+    cfg = _clone_config(config)
+    cfg["tuis"]["muse"]["session_dir"] = str(tmp_path)
+    cfg["tuis"]["muse"]["submit_delay_seconds"] = 0.4
+    driver = MuseDriver(cfg)
+    model = "muse-spark-1.3-contributor"
+    driver._active_model = model
+    driver._active_session = "hv2-muse-dedicated"
+    prompt = "line one\nline two"
+    _write_muse_intent(tmp_path, driver.alias_session_dir(model).name, prompt)
+    events: list[tuple[str, Any]] = []
+
+    def fake_run(args: Any, *, timeout: int = 10, stdin_text: str | None = None) -> Any:
+        events.append(("tmux", [str(item) for item in args]))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_sleep(seconds: float) -> None:
+        events.append(("sleep", float(seconds)))
+
+    monkeypatch.setattr(driver, "_run_tmux", fake_run)
+    monkeypatch.setattr("hv2.drivers.muse.time.sleep", fake_sleep)
+    sent = driver.send_keys(prompt)
+    assert sent["ok"] is True
+    assert sent["accepted"] is True
+    assert sent["method"] == "paste-buffer"
+    assert [row[0] for row in events[:4]] == ["tmux", "tmux", "sleep", "tmux"]
+    assert events[2] == ("sleep", 0.4)
+    assert events[0][1][:1] == ["load-buffer"]
+    assert events[1][1][:1] == ["paste-buffer"]
+    assert events[3][1][-1:] == ["C-m"]
+
+
 def test_should_paste_multiline_ohmypi_prompt_instead_of_send_keys(
     hv, config, monkeypatch
 ) -> None:

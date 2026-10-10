@@ -111,6 +111,14 @@ Do not treat Ohmypi
 `--model all` as the Codex OC-003 surface. Codex model/orchestration is
 tool-bearing (child `date`/`pwd`); it is not Ohmypi `--no-tools` PONG.
 `--tui grok` and `--tui muse` are implemented interactive clients.
+Muse single-line and multiline prompts both paste, wait
+`submit_delay_seconds` (default `1.0`), then send `submit_keys`
+(`C-m`). A prompt counts as started only after the dedicated session
+JSONL records `runtime.user_intent.accepted` for that session and the
+exact submitted text. A pane echo or tmux return code of 0 is not
+acceptance. A missing acknowledgement is a submission failure bounded
+by `wait_ready_seconds` (default 25), not the model reply wait.
+
 `--tui opencode` remains a stub. `--tui claude` stays out of scope and
 is excluded from current closeout (do not select or run; historical
 mentions are legacy/non-goal).
