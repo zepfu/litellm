@@ -2921,6 +2921,43 @@ def _is_openrouter_account_auth_failure(
     return _extract_adapter_exception_status_code(exc) in {401, 403}
 
 
+def _is_codex_responses_capacity_returned(
+    candidate: Optional[dict[str, Any]],
+    status_code: Optional[int],
+    tokens: set[str],
+    attempted_provider_call: bool,
+    provider_returned: bool,
+) -> bool:
+    return (
+        isinstance(candidate, dict)
+        and candidate.get("route_family") == "codex_responses"
+        and candidate.get("codex_oauth_account_hash")
+        and attempted_provider_call
+        and provider_returned
+        and (
+            status_code == 429
+            or status_code in {500, 502, 503, 529}
+            or "server_overloaded" in tokens
+        )
+    )
+
+
+def _is_codex_responses_token_invalidated(
+    exc: Any,
+    candidate: Optional[dict[str, Any]],
+) -> bool:
+    if not (
+        isinstance(candidate, dict)
+        and candidate.get("route_family") == "codex_responses"
+        and candidate.get("codex_oauth_account_hash")
+    ):
+        return False
+
+    from . import codex_oauth
+
+    return codex_oauth.is_direct_codex_token_invalidated_error(exc)
+
+
 def _classify_codex_auto_agent_retryable_exhaustion(
     exc: Any,
     *,
@@ -2997,15 +3034,8 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         attempted_provider_call=attempted_provider_call,
     ):
         return "provider_terminal_error"
-    if (
-        isinstance(candidate, dict)
-        and candidate.get("route_family") == "codex_responses"
-        and candidate.get("codex_oauth_account_hash")
-    ):
-        from . import codex_oauth
-
-        if codex_oauth.is_direct_codex_token_invalidated_error(exc):
-            return "token_invalidated"
+    if _is_codex_responses_token_invalidated(exc, candidate):
+        return "token_invalidated"
     if (
         "free-models-per-day-high-balance" in tokens
         and isinstance(candidate, dict)
@@ -3036,10 +3066,15 @@ def _classify_codex_auto_agent_retryable_exhaustion(
     )
     if openai_alpha_capacity_error_class is not None:
         return openai_alpha_capacity_error_class
-    provider_returned = (
-        getattr(exc, "_aawm_provider_returned", False) is True
-        or getattr(exc, "provider_returned", False) is True
-    )
+    provider_returned = _exception_provider_returned(exc)
+    if _is_codex_responses_capacity_returned(
+        candidate=candidate,
+        status_code=status_code,
+        tokens=tokens,
+        attempted_provider_call=attempted_provider_call,
+        provider_returned=provider_returned,
+    ):
+        return "capacity_exhausted"
     if (
         attempted_provider_call
         and provider_returned

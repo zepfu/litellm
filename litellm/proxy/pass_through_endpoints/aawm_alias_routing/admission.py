@@ -1968,7 +1968,7 @@ def admission_deny_error_class(decision: AdmissionDecision) -> str:
     """Map admission denial onto existing retry/failover vocabulary."""
     if decision.reason == AdmissionDenyReason.CONFIRMED_EXHAUSTED.value:
         return "usage_limit_reached"
-    return "capacity_exhausted"
+    return "capacity_unavailable"
 
 
 async def admit_selected_candidate(

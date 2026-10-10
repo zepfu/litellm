@@ -2444,7 +2444,8 @@ async def handle_alias_route(  # noqa: PLR0915
                 )
             )
         provider_capacity_returned = (
-            error_class == "capacity_exhausted"
+            error_class
+            in {"capacity_exhausted", "server_overloaded"}
             and attempt_record.get("attempted_provider_call") is True
             and attempt_record.get("provider_returned") is True
         )
@@ -5946,6 +5947,7 @@ async def handle_alias_route(  # noqa: PLR0915
                 account_failover_planned = (
                     False
                     if authenticated_token_pin
+                    and not account_failover_replay_safe
                     else _plan_codex_oauth_account_failover(
                         request,
                         candidate=candidate,

@@ -8338,8 +8338,8 @@ async def _perform_codex_auto_agent_native_openai_request(
             custom_body=request_body,
             custom_llm_provider=litellm.LlmProviders.OPENAI.value,
             egress_credential_family=(
-                "openai"
-                if custom_headers is not None or forward_headers
+                "codex_oauth"
+                if custom_headers is not None
                 else None
             ),
             expected_target_family=(

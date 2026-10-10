@@ -5905,6 +5905,8 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         expected_family = str(expected_target_family or "").strip().casefold()
         credential_family = str(egress_credential_family or "").strip().casefold()
         provider = str(custom_llm_provider or "").strip().casefold()
+        if provider == "" and credential_family == "openai":
+            provider = "openai"
         compatible_family = (
             expected_family in {"openai", "codex_oauth"}
             and credential_family == expected_family
@@ -9181,18 +9183,34 @@ async def pass_through_request(  # noqa: PLR0915
             """Close and clear the exact raw response registered by the send."""
 
             if response is None:
+                setattr(
+                    request.state,
+                    "aawm_openai_precommit_retirement_failed",
+                    False,
+                )
                 return True
             closed = True
             try:
                 await wait_for("resource_cleanup", response.aclose())
             except BaseException:
                 closed = False
+                setattr(
+                    request.state,
+                    "aawm_openai_precommit_retirement_failed",
+                    True,
+                )
                 verbose_proxy_logger.debug(
                     "Failed to close OpenAI precommit response",
                     exc_info=True,
                 )
             finally:
                 clear_active_upstream_response(request, response=response)
+            if closed:
+                setattr(
+                    request.state,
+                    "aawm_openai_precommit_retirement_failed",
+                    False,
+                )
             return closed
 
         def _authorize_openai_capacity_retry(
@@ -9877,6 +9895,9 @@ async def pass_through_request(  # noqa: PLR0915
                         expected_model,
                         strict_owner_enabled,
                     ) = _validate_final_openai_binding(prepared_request)
+                    strict_owner_enabled = (
+                        _strict_managed_openai_owner_enabled(expected_model)
+                    )
                     protected_headers_match = (
                         True
                         if immutable_openai_binding.protected_openai_headers
@@ -10054,7 +10075,13 @@ async def pass_through_request(  # noqa: PLR0915
                         target=prepared_request.url,
                         reason=reason or "passthrough_provider_request",
                         candidate_context=immutable_openai_binding.candidate_context,
-                        prior_response_closed=True,
+                        prior_response_closed=(
+                            not getattr(
+                                request.state,
+                                "aawm_openai_precommit_retirement_failed",
+                                False,
+                            )
+                        ),
                         allow_capacity_retry=capacity_retry_coordinator is not None,
                     )
                     publish_reservation_metadata(

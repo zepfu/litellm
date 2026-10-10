@@ -3862,9 +3862,17 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             has_previous_response_id=bool(
                 request_body.get("previous_response_id")
             ),
-            has_account_bound_state=authenticated_token_pin,
+            has_account_bound_state=bool(
+                authenticated_token_pin
+                and not account_failover_replay_safe
+            ),
             account_failover_replay_safe=(
-                False if authenticated_token_pin else account_failover_replay_safe
+                (
+                    False
+                    if authenticated_token_pin
+                    and not account_failover_replay_safe
+                    else account_failover_replay_safe
+                )
             ),
             provider_status_code=retry_attempt_record["error_status_code"],
         )
@@ -3885,7 +3893,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             or "account_failover_exhausted"
         )
     if not retry_planned:
-        if authenticated_token_pin:
+        if authenticated_token_pin and not account_failover_replay_safe:
             _raise_authenticated_continuation_unavailable()
         return None
 
