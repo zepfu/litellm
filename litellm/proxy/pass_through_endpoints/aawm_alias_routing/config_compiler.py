@@ -65,9 +65,39 @@ _PROVIDER_ID_ALIAS_NAMES = {
 def _provider_alias_id(name: str) -> str:
     return _PROVIDER_ALIAS_IDS.get(name[len(PROVIDER_ALIAS_PREFIX):], name[len(PROVIDER_ALIAS_PREFIX):])
 
-# Closed route-family vocabulary per registered provider. Provider-pinned
-# aliases may only use families from this map; a newly registered provider
-# stays uncovered until both an alias and an allowed-family entry exist.
+
+def _assert_provider_route_family_compatibility(
+    *,
+    provider: str,
+    model: str,
+    route_family: Optional[str],
+) -> None:
+    """Enforce the universal concrete-candidate provider/route contract.
+
+    ``route_family`` is the effective primary-family value after typed
+    inheritance. ``None`` is supported only for a provider in the
+    authoritative map; such candidates are excluded from the provider-alias
+    inventory and fail closed at Anthropic ingress when they lack an explicit
+    projection.
+    """
+
+    allowed = _PROVIDER_ALLOWED_ROUTE_FAMILIES.get(provider)
+    if allowed is None:
+        raise ConfigCompileError(
+            f"candidate model {model!r}: registered provider {provider!r} has "
+            "no allowed route-family vocabulary"
+        )
+    if route_family is not None and route_family not in allowed:
+        raise ConfigCompileError(
+            f"candidate model {model!r}: provider {provider!r} is incompatible "
+            f"with route family {route_family!r}"
+        )
+
+
+# Closed route-family vocabulary per registered provider. Every concrete
+# candidate must use an allowed primary family; provider-pinned aliases retain
+# the stricter closed-candidate rules below. A newly registered provider stays
+# uncovered until both an alias and an allowed-family entry exist.
 _PROVIDER_ALLOWED_ROUTE_FAMILIES: dict[str, frozenset[str]] = {
     "openai": frozenset(
         {
@@ -117,6 +147,7 @@ _PROVIDER_ALLOWED_ROUTE_FAMILIES: dict[str, frozenset[str]] = {
         }
     ),
     "nvidia": frozenset({"codex_nvidia_completion_adapter"}),
+    "muse_code": frozenset({"muse_code"}),
     "opencode_zen": frozenset(
         {
             "codex_opencode_zen_adapter",
@@ -720,6 +751,11 @@ def _compile_candidate(candidate: schema.CandidateConfig, weight: float) -> Rout
         model=candidate.model,
         route_family=candidate.route_family,
         anthropic_route_family=anthropic_rf,
+    )
+    _assert_provider_route_family_compatibility(
+        provider=candidate.provider,
+        model=candidate.model,
+        route_family=candidate.route_family,
     )
     compiled_model = candidate.model
     if candidate.provider == OPENCODE_GO_PROVIDER:

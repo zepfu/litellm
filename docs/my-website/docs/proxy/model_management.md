@@ -98,6 +98,12 @@ Config-driven AAWM aliases and candidates come only from the compiled YAML
 snapshot. Missing or failed config fails closed; there is no built-in candidate
 table and no startup or no-snapshot fallback. Every configured YAML alias is an
 ordinary exact-name route with no public/internal routing distinction.
+Each concrete candidate must name a route family allowed for its provider after
+inheritance from document, alias, and candidate settings. This check applies to
+ordinary aliases, alias references, and TUI targets before a snapshot can be
+built or published. A provider without route-family vocabulary, or an
+incompatible pairing, is rejected before activation; provider-pinned aliases
+retain their stricter closed-candidate rules.
 
 Non-Codex-native `GET /openai_passthrough/v1/models` lists compiled YAML
 aliases. That local catalog GET registers the AAWM access-log
