@@ -1893,6 +1893,199 @@ def _openai_raw_retry_console_should_emit(event: Mapping[str, Any]) -> bool:
     return False
 
 
+def _openai_raw_retry_request_context(
+    request: Optional[Request],
+    kwargs: Optional[dict],
+) -> tuple[Optional[Any], Mapping[str, Any]]:
+    """Resolve observable request metadata, state, and selected-route context."""
+    try:
+        request_metadata = _ensure_passthrough_metadata(kwargs)
+    except Exception:
+        request_metadata = None
+
+    candidate_context = current_candidate_context(request) if request is not None else {}
+    if not isinstance(candidate_context, Mapping):
+        candidate_context = {}
+    return request_metadata, candidate_context
+
+
+def _openai_raw_retry_correlation_id(
+    litellm_call_id: Optional[str],
+    request_state: Optional[Any],
+    kwargs: Optional[dict],
+) -> Optional[str]:
+    """Use the explicit call ID, then kwargs, then request-local aliases."""
+    correlation_id = litellm_call_id
+    if correlation_id is None and isinstance(kwargs, dict):
+        candidate_call_id = kwargs.get("litellm_call_id")
+        if candidate_call_id is not None:
+            correlation_id = str(candidate_call_id)
+    if correlation_id is None and request_state is not None:
+        for state_key in (
+            "aawm_alias_request_litellm_call_id",
+            "litellm_call_id",
+            "call_id",
+            "request_id",
+        ):
+            candidate_call_id = getattr(request_state, state_key, None)
+            if candidate_call_id is not None:
+                correlation_id = str(candidate_call_id)
+                break
+    return correlation_id
+
+
+def _openai_raw_retry_failure_origin(
+    failure: Optional[Exception],
+    failure_origin: Optional[Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    """Prefer explicit origin, otherwise use origin attached to the failure."""
+    if isinstance(failure_origin, Mapping):
+        return failure_origin
+    if failure is None:
+        return {}
+    attached_origin = getattr(
+        failure,
+        _AAWM_OPENAI_RAW_RETRY_FAILURE_ORIGIN_ATTR,
+        None,
+    )
+    return attached_origin if isinstance(attached_origin, Mapping) else {}
+
+
+def _openai_raw_retry_status_code(
+    value: Any,
+) -> Optional[int]:
+    """Retain real HTTP ordinal values while rejecting booleans."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _openai_raw_retry_provider_provenance(
+    provider_returned: Optional[bool],
+) -> str:
+    if provider_returned is True:
+        return "provider_returned"
+    if provider_returned is False:
+        return "not_returned"
+    return "unknown"
+
+
+def _build_openai_raw_retry_event(
+    *,
+    event_type: str,
+    event_stage: str,
+    correlation_id: Optional[str],
+    candidate_context: Mapping[str, Any],
+    custom_llm_provider: Optional[str],
+    origin: Mapping[str, Any],
+    observed_classification_status_code: Optional[int],
+    provider_returned: Optional[bool],
+    provider_provenance_source: Optional[str],
+    error_class: Optional[str],
+    classification: Optional[str],
+    retryable: Optional[bool],
+    classification_reason: Optional[str],
+    authorization_result: Optional[str],
+    authorization_denial_reason: Optional[str],
+    ledger: Any,
+    provider_error_code: Optional[str],
+    provider_error_type: Optional[str],
+    provider_error_message: Optional[str],
+    failure_origin_label: Optional[str],
+) -> Dict[str, Any]:
+    """Build the redacted, schema-stable raw-retry observability payload."""
+    return {
+        "event_source": _AAWM_OPENAI_RAW_RETRY_EVENT_SOURCE,
+        "event_type": _clean_passthrough_error_context_value(event_type),
+        "event_stage": _clean_passthrough_error_context_value(event_stage),
+        "litellm_call_id": _clean_passthrough_error_context_value(correlation_id),
+        "provider": _clean_passthrough_error_context_value(
+            candidate_context.get("provider") or custom_llm_provider
+        ),
+        "model": _clean_passthrough_error_context_value(candidate_context.get("model")),
+        "route": _AAWM_OPENAI_RAW_RETRY_ROUTE,
+        "route_family": _clean_passthrough_error_context_value(
+            candidate_context.get("route_family")
+        ),
+        "selected_account_hash": _clean_passthrough_error_context_value(
+            candidate_context.get("account_hash")
+        ),
+        "selected_account_lane": _clean_passthrough_error_context_value(
+            candidate_context.get("lane_key")
+        ),
+        "selected_account_context_source": "server_selected_account_context",
+        "observed_http_status_code": _openai_raw_retry_status_code(
+            origin.get("observed_http_status_code")
+        ),
+        "classification_status_code": _openai_raw_retry_status_code(
+            observed_classification_status_code
+        ),
+        "provider_returned": provider_returned,
+        "provider_provenance": _openai_raw_retry_provider_provenance(
+            provider_returned
+        ),
+        "provider_provenance_source": provider_provenance_source,
+        "error_class": _clean_passthrough_error_context_value(error_class),
+        "classification": _clean_passthrough_error_context_value(classification),
+        "retryable": retryable if isinstance(retryable, bool) else None,
+        "classification_reason": _clean_passthrough_error_context_value(
+            classification_reason
+        ),
+        "authorization_result": _clean_passthrough_error_context_value(
+            authorization_result
+        ),
+        "authorization_denial_reason": _clean_passthrough_error_context_value(
+            authorization_denial_reason
+        ),
+        "ledger": ledger,
+        "provider_error_code": _clean_passthrough_error_context_value(
+            provider_error_code
+        ),
+        "provider_error_type": _clean_passthrough_error_context_value(
+            provider_error_type
+        ),
+        "provider_error_message": _bounded_redacted_retry_message(
+            provider_error_message
+        ),
+        "failure_origin_label": _clean_passthrough_error_context_value(
+            failure_origin_label
+        ),
+    }
+
+
+def _merge_openai_raw_retry_authorization_fields(
+    event: Dict[str, Any],
+    ledger: Mapping[str, Any],
+) -> None:
+    """Add ledger ordinals and authorization fingerprints when present."""
+    ledger_current_ordinal = ledger.get("ledger_current_ordinal")
+    if (
+        isinstance(ledger_current_ordinal, int)
+        and not isinstance(ledger_current_ordinal, bool)
+        and ledger_current_ordinal > 0
+    ):
+        event["ledger_current_ordinal"] = ledger_current_ordinal
+    authorization = ledger.get("capacity_retry_authorization")
+    if not isinstance(authorization, Mapping):
+        return
+    prior_ordinal = authorization.get("prior_ordinal")
+    if (
+        isinstance(prior_ordinal, int)
+        and not isinstance(prior_ordinal, bool)
+        and prior_ordinal > 0
+    ):
+        event["authorization_prior_ordinal"] = prior_ordinal
+    authorization_fingerprints = {
+        key: authorization[key]
+        for key in (
+            "target_fingerprint",
+            "model_fingerprint",
+            "account_fingerprint",
+        )
+        if authorization.get(key) is not None
+    }
+    if authorization_fingerprints:
+        event["authorization_fingerprints"] = authorization_fingerprints
+
+
 def _record_openai_raw_retry_event(
     *,
     event_type: str,
@@ -1930,126 +2123,43 @@ def _record_openai_raw_retry_event(
             except Exception:
                 observed_classification_status_code = None
 
-        request_metadata: Optional[Dict[str, Any]] = None
-        try:
-            request_metadata = _ensure_passthrough_metadata(kwargs)
-        except Exception:
-            request_metadata = None
-
+        request_metadata, candidate_context = _openai_raw_retry_request_context(
+            request,
+            kwargs,
+        )
         request_state = getattr(request, "state", None) if request is not None else None
-        candidate_context = current_candidate_context(request) if request is not None else {}
-        if not isinstance(candidate_context, Mapping):
-            candidate_context = {}
-
-        correlation_id = litellm_call_id
-        if correlation_id is None and isinstance(kwargs, dict):
-            candidate_call_id = kwargs.get("litellm_call_id")
-            if candidate_call_id is not None:
-                correlation_id = str(candidate_call_id)
-        if correlation_id is None and request_state is not None:
-            for state_key in (
-                "aawm_alias_request_litellm_call_id",
-                "litellm_call_id",
-                "call_id",
-                "request_id",
-            ):
-                candidate_call_id = getattr(request_state, state_key, None)
-                if candidate_call_id is not None:
-                    correlation_id = str(candidate_call_id)
-                    break
-
-        origin: Mapping[str, Any] = {}
-        if isinstance(failure_origin, Mapping):
-            origin = failure_origin
-        elif failure is not None:
-            attached_origin = getattr(
-                failure,
-                _AAWM_OPENAI_RAW_RETRY_FAILURE_ORIGIN_ATTR,
-                None,
-            )
-            if isinstance(attached_origin, Mapping):
-                origin = attached_origin
+        correlation_id = _openai_raw_retry_correlation_id(
+            litellm_call_id,
+            request_state,
+            kwargs,
+        )
+        origin = _openai_raw_retry_failure_origin(failure, failure_origin)
         ledger = _build_openai_raw_retry_ledger_snapshot(request)
         provider_returned, provider_provenance_source = (
             _openai_raw_retry_provider_returned(failure, origin)
         )
-        event: Dict[str, Any] = {
-            "event_source": _AAWM_OPENAI_RAW_RETRY_EVENT_SOURCE,
-            "event_type": _clean_passthrough_error_context_value(event_type),
-            "event_stage": _clean_passthrough_error_context_value(event_stage),
-            "litellm_call_id": _clean_passthrough_error_context_value(
-                correlation_id
-            ),
-            "provider": _clean_passthrough_error_context_value(
-                candidate_context.get("provider") or custom_llm_provider
-            ),
-            "model": _clean_passthrough_error_context_value(
-                candidate_context.get("model")
-            ),
-            "route": _AAWM_OPENAI_RAW_RETRY_ROUTE,
-            "route_family": _clean_passthrough_error_context_value(
-                candidate_context.get("route_family")
-            ),
-            "selected_account_hash": _clean_passthrough_error_context_value(
-                candidate_context.get("account_hash")
-            ),
-            "selected_account_lane": _clean_passthrough_error_context_value(
-                candidate_context.get("lane_key")
-            ),
-            "selected_account_context_source": (
-                "server_selected_account_context"
-            ),
-            "observed_http_status_code": (
-                origin.get("observed_http_status_code")
-                if isinstance(origin.get("observed_http_status_code"), int)
-                and not isinstance(origin.get("observed_http_status_code"), bool)
-                else None
-            ),
-            "classification_status_code": (
-                observed_classification_status_code
-                if isinstance(observed_classification_status_code, int)
-                and not isinstance(observed_classification_status_code, bool)
-                else None
-            ),
-            "provider_returned": provider_returned,
-            "provider_provenance": (
-                "provider_returned"
-                if provider_returned is True
-                else (
-                    "not_returned"
-                    if provider_returned is False
-                    else "unknown"
-                )
-            ),
-            "provider_provenance_source": provider_provenance_source,
-            "error_class": _clean_passthrough_error_context_value(error_class),
-            "classification": _clean_passthrough_error_context_value(
-                classification
-            ),
-            "retryable": retryable if isinstance(retryable, bool) else None,
-            "classification_reason": _clean_passthrough_error_context_value(
-                classification_reason
-            ),
-            "authorization_result": _clean_passthrough_error_context_value(
-                authorization_result
-            ),
-            "authorization_denial_reason": _clean_passthrough_error_context_value(
-                authorization_denial_reason
-            ),
-            "ledger": ledger,
-            "provider_error_code": _clean_passthrough_error_context_value(
-                provider_error_code
-            ),
-            "provider_error_type": _clean_passthrough_error_context_value(
-                provider_error_type
-            ),
-            "provider_error_message": _bounded_redacted_retry_message(
-                provider_error_message
-            ),
-            "failure_origin_label": _clean_passthrough_error_context_value(
-                failure_origin_label
-            ),
-        }
+        event: Dict[str, Any] = _build_openai_raw_retry_event(
+            event_type=event_type,
+            event_stage=event_stage,
+            correlation_id=correlation_id,
+            candidate_context=candidate_context,
+            custom_llm_provider=custom_llm_provider,
+            origin=origin,
+            observed_classification_status_code=observed_classification_status_code,
+            provider_returned=provider_returned,
+            provider_provenance_source=provider_provenance_source,
+            error_class=error_class,
+            classification=classification,
+            retryable=retryable,
+            classification_reason=classification_reason,
+            authorization_result=authorization_result,
+            authorization_denial_reason=authorization_denial_reason,
+            ledger=ledger,
+            provider_error_code=provider_error_code,
+            provider_error_type=provider_error_type,
+            provider_error_message=provider_error_message,
+            failure_origin_label=failure_origin_label,
+        )
         origin_field_map = {
             "failure_source_request_fingerprint": "request_fingerprint",
             "failure_source_send_ordinal": "send_ordinal",
@@ -2073,35 +2183,7 @@ def _record_openai_raw_retry_event(
                     event[event_key] = cleaned_value
 
         if isinstance(ledger, Mapping):
-            ledger_current_ordinal = ledger.get("ledger_current_ordinal")
-            if (
-                isinstance(ledger_current_ordinal, int)
-                and not isinstance(ledger_current_ordinal, bool)
-                and ledger_current_ordinal > 0
-            ):
-                event["ledger_current_ordinal"] = ledger_current_ordinal
-            authorization = ledger.get("capacity_retry_authorization")
-            if isinstance(authorization, Mapping):
-                prior_ordinal = authorization.get("prior_ordinal")
-                if (
-                    isinstance(prior_ordinal, int)
-                    and not isinstance(prior_ordinal, bool)
-                    and prior_ordinal > 0
-                ):
-                    event["authorization_prior_ordinal"] = prior_ordinal
-                authorization_fingerprints = {
-                    key: authorization[key]
-                    for key in (
-                        "target_fingerprint",
-                        "model_fingerprint",
-                        "account_fingerprint",
-                    )
-                    if authorization.get(key) is not None
-                }
-                if authorization_fingerprints:
-                    event["authorization_fingerprints"] = (
-                        authorization_fingerprints
-                    )
+            _merge_openai_raw_retry_authorization_fields(event, ledger)
 
         checked_event = _copy_openai_raw_retry_event(event)
         if checked_event is None:
@@ -8751,11 +8833,13 @@ async def pass_through_request(  # noqa: PLR0915
                 selected_context = _current_openai_account_context()
                 if not isinstance(transition, Mapping):
                     return None
+                failover_ordinal = transition.get("failover_ordinal")
                 if (
                     transition.get("authorization")
                     != "codex_oauth_portable_account_failover"
-                    or type(transition.get("failover_ordinal")) is not int
-                    or transition.get("failover_ordinal") != 1
+                    or isinstance(failover_ordinal, bool)
+                    or not isinstance(failover_ordinal, int)
+                    or failover_ordinal != 1
                 ):
                     return None
                 source_owner_id = transition.get("source_owner_id")
@@ -9625,6 +9709,27 @@ async def pass_through_request(  # noqa: PLR0915
                     )
                 )
 
+            def _prepare_stream_pre_first_byte_json_headers() -> Any:
+                stream_headers, removed_content_type = (
+                    _headers_for_json_passthrough_egress(headers)
+                )
+                if not removed_content_type:
+                    return stream_headers
+                _merge_passthrough_request_shape_metadata(
+                    passthrough_metadata,
+                    request=request,
+                    parsed_body=_parsed_body,
+                    provider_bound_body=provider_bound_body,
+                    json_egress_content_type_removed=removed_content_type,
+                )
+                if error_log_context is not None:
+                    error_log_context.update(
+                        _build_passthrough_error_log_request_shape_context(
+                            passthrough_metadata
+                        )
+                    )
+                return stream_headers
+
             async def _send_stream_pre_first_byte() -> Tuple[
                 httpx.Response, httpx.Request
             ]:
@@ -9641,26 +9746,11 @@ async def pass_through_request(  # noqa: PLR0915
                 )
                 raw_response: Optional[httpx.Response] = None
                 try:
-                    stream_headers = headers
-                    if use_json_egress:
-                        (
-                            stream_headers,
-                            removed_content_type,
-                        ) = _headers_for_json_passthrough_egress(headers)
-                        if removed_content_type:
-                            _merge_passthrough_request_shape_metadata(
-                                passthrough_metadata,
-                                request=request,
-                                parsed_body=_parsed_body,
-                                provider_bound_body=provider_bound_body,
-                                json_egress_content_type_removed=removed_content_type,
-                            )
-                            if error_log_context is not None:
-                                error_log_context.update(
-                                    _build_passthrough_error_log_request_shape_context(
-                                        passthrough_metadata
-                                    )
-                                )
+                    stream_headers = (
+                        _prepare_stream_pre_first_byte_json_headers()
+                        if use_json_egress
+                        else headers
+                    )
                     req = async_client.build_request(
                         "POST",
                         url,
