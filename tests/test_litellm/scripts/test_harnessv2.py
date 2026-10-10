@@ -1870,6 +1870,86 @@ def test_should_submit_codex_prompt_with_ctrl_m_not_enter(
     assert "-p" not in joined
 
 
+def test_should_skip_codex_orchestration_reply_poll_when_submit_fails(
+    hv, config, monkeypatch
+) -> None:
+    _skip_unless_codex_tui_shipped(config)
+    from hv2.drivers.codex import CodexDriver
+    from hv2.kinds.runner import _step_tui_orchestration
+
+    driver = CodexDriver(config)
+    sleeps: list[float] = []
+    monkeypatch.setattr("hv2.kinds.runner.driver_for", lambda tui, _config: driver)
+    monkeypatch.setattr(
+        driver, "launch_argv", lambda model, **k: ["codex", "--model", model]
+    )
+    monkeypatch.setattr(driver, "assert_no_print_flags", lambda argv: None)
+    monkeypatch.setattr(
+        driver,
+        "ensure_session",
+        lambda model, tools=True, **_kwargs: {
+            "ok": True,
+            "session": "hv2-codex-basic-1",
+            "selector": driver.model_selector(model),
+            "selected": True,
+            "ready": True,
+            "mcp_ready": True,
+            "rejected": [],
+        },
+    )
+    monkeypatch.setattr(
+        driver,
+        "send_keys",
+        lambda text: {"ok": False, "method": "paste-buffer", "returncode": 0},
+    )
+    monkeypatch.setattr(driver, "capture_pane", lambda: "composer")
+    monkeypatch.setattr("hv2.kinds.runner.time.sleep", sleeps.append)
+    plan = hv.build_plan(
+        config=config,
+        kind="orchestration",
+        instance_token="alpha",
+        tui="codex",
+        models=None,
+        orchestration_parent="basic",
+        orchestration_children=None,
+        dry_run=True,
+        write_artifact=None,
+    )
+    payload = _step_tui_orchestration(plan)
+    assert payload["ok"] is False
+    assert "tmux send-keys failed" in payload["failures"]
+    assert sleeps == []
+    assert "child_evidence" not in payload["parents"][0]
+
+
+def test_should_not_enter_codex_reply_wait_when_submit_fails(
+    hv, config, monkeypatch
+) -> None:
+    _skip_unless_codex_tui_shipped(config)
+    from hv2.drivers.codex import CodexDriver
+
+    driver = CodexDriver(config)
+    driver._active_session = "hv2-codex-basic-1"
+    waits: list[Any] = []
+    monkeypatch.setattr(
+        driver,
+        "send_keys",
+        lambda text: {"ok": False, "method": "paste-buffer", "returncode": 0},
+    )
+    monkeypatch.setattr(driver, "capture_pane", lambda: "composer")
+    monkeypatch.setattr(
+        driver,
+        "wait_for_pane",
+        lambda *a, **k: waits.append("wait_for_pane") or True,
+    )
+    waited = driver.send_prompt_and_wait(
+        "line one\nline two", reply_needles=["hv2-codex-child"]
+    )
+    assert waited["ok"] is False
+    assert waited["replied"] is False
+    assert waits == []
+
+
 def test_should_dismiss_codex_startup_warning_before_submit(
     hv, config, monkeypatch
 ) -> None:
