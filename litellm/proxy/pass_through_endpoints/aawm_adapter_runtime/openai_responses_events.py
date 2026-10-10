@@ -1617,7 +1617,9 @@ class ResponsesEventSummaryReducer:
                 return
         elif not self._charge_delta(payload_size, new_size):
             return
+        materialized_text: Optional[str] = None
         if done:
+            materialized_text = "".join(state.parts)
             state.parts.clear()
         else:
             state.parts.append(value)
@@ -1632,7 +1634,7 @@ class ResponsesEventSummaryReducer:
             self._remember_delta_key(key)
         else:
             output_text = self._output_text_target(payload)
-            output_text["text"] = "".join(state.parts)
+            output_text["text"] = materialized_text or ""
             self._commit_delta_item(
                 key,
                 copy.deepcopy(payload),
@@ -1684,7 +1686,9 @@ class ResponsesEventSummaryReducer:
                 return
         elif not self._charge_delta(payload_size, new_size):
             return
+        materialized_arguments: Optional[str] = None
         if done:
+            materialized_arguments = "".join(state.parts)
             state.parts.clear()
         else:
             state.parts.append(value)
@@ -1696,7 +1700,7 @@ class ResponsesEventSummaryReducer:
                 self._ordered_keys.append(key)
             self._remember_delta_key(key)
         else:
-            delta_payload["arguments"] = "".join(state.parts)
+            delta_payload["arguments"] = materialized_arguments or ""
             self._commit_delta_item(
                 key,
                 copy.deepcopy(delta_payload),
@@ -1781,7 +1785,10 @@ class ResponsesEventSummaryReducer:
 
     def snapshot(self) -> dict[str, Any]:
         output = [
-            self._materialize_delta_payload(key) or self._output_items[key]
+            self._output_items[key]
+            if key not in self._delta_key_payloads
+            and key in self._output_items
+            else self._materialize_delta_payload(key) or self._output_items[key]
             for key in self._ordered_keys
             if key in self._delta_key_payloads or key in self._output_items
         ]

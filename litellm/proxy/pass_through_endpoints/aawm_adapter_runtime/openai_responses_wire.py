@@ -905,9 +905,20 @@ class OpenAIResponsesWireCoordinator:
                         if typed_events
                         else None
                     )
+                    emission = None
                     if event is not None:
+                        emissions = responses_emissions_from_chunk(raw_chunk)
+                        emission = (
+                            emissions[event_index]
+                            if emissions is not None and event_index < len(emissions)
+                            else None
+                        )
                         event_type = event.event_type
-                        payload = event.payload
+                        payload = (
+                            emission.effective_payload
+                            if emission is not None
+                            else event.payload
+                        )
                         saw_done = event.is_done_marker
                         malformed = event.is_malformed
                     else:
@@ -925,8 +936,8 @@ class OpenAIResponsesWireCoordinator:
                             self.trace.upstream_done_suppressed += 1
                         continue
                     wire_bytes = (
-                        responses_emissions_from_chunk(raw_chunk)[event_index].wire_bytes
-                        if event is not None
+                        emission.wire_bytes
+                        if emission is not None
                         else block
                     )
                     if malformed:
