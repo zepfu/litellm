@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import inspect
 from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Any, Optional
 
@@ -588,7 +589,7 @@ async def _wrap_passthrough_watermark_responses_stream_buffer_response(
         yield _encode_sse_block(emitted, had_separator)
 
 
-def maybe_wrap_passthrough_watermark_responses_stream(
+async def maybe_wrap_passthrough_watermark_responses_stream(
     iterator: Any,
     config: Any = None,
     success_handler_kwargs: Any = None,
@@ -621,12 +622,13 @@ def maybe_wrap_passthrough_watermark_responses_stream(
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
         _iter_sse_event_blocks_with_separator,
     )
+    if inspect.iscoroutine(iterator):
+        iterator = await iterator()
     if mutating and stream_policy == "buffer_response":
         iterator = _associate_unassociated_watermark_iterator(
             iterator,
             event_pipeline=event_pipeline,
         )
-        iterator = iterator()
         return _wrap_passthrough_watermark_responses_stream_buffer_response(
             iterator,
             config=loaded,

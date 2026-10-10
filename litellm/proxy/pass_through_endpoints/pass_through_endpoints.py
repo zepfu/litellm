@@ -206,8 +206,8 @@ from .aawm_adapter_runtime.deferred_success import (
     bind_deferred_success_holder,
 )
 from .aawm_adapter_runtime.openai_responses_events import (
-    ParsedResponsesEvent,
     ResponsesEventPipeline,
+    ResponsesWireEmission,
     attach_responses_emissions,
     create_responses_event_pipeline,
     responses_emissions_from_chunk,
@@ -664,7 +664,30 @@ async def _restore_responses_function_names_in_sse_chunks(
                 restored_emissions.append(emission)
                 continue
             restored_emissions.append(emission.transformed(restored_payload))
-        yield attach_responses_emissions(b"", restored_emissions)
+        if output_gate is None:
+            yield attach_responses_emissions(b"", restored_emissions)
+            continue
+
+        gated_emissions: list[ResponsesWireEmission] = []
+        for emission in restored_emissions:
+            context = (
+                emission,
+                emission.effective_payload,
+                emission.effective_payload,
+            )
+            emitted = output_gate.process_event(
+                emission.effective_payload,
+                context,
+            )
+            for (
+                _original_emission,
+                _original_payload,
+                _restored_payload,
+            ), final_payload in emitted:
+                if final_payload is None:
+                    continue
+                gated_emissions.append(_original_emission.transformed(final_payload))
+        yield attach_responses_emissions(b"", gated_emissions)
     if output_gate is not None:
         output_gate.finish()
 
@@ -9875,17 +9898,15 @@ async def pass_through_request(  # noqa: PLR0915
                         event_pipeline=responses_event_pipeline,
                     )
                     wrapper_cleanup_source = processed_chunks
-                    processed_chunks = (
-                        maybe_wrap_passthrough_watermark_responses_stream(
-                            processed_chunks,
-                            config=_get_runtime_text_watermark_config(),
-                            success_handler_kwargs=kwargs,
-                            endpoint=_watermark_endpoint_from_path(
-                                url,
-                                getattr(getattr(request, "url", None), "path", None),
-                            ),
-                            event_pipeline=responses_event_pipeline,
-                        )
+                    processed_chunks = await maybe_wrap_passthrough_watermark_responses_stream(
+                        processed_chunks,
+                        config=_get_runtime_text_watermark_config(),
+                        success_handler_kwargs=kwargs,
+                        endpoint=_watermark_endpoint_from_path(
+                            url,
+                            getattr(getattr(request, "url", None), "path", None),
+                        ),
+                        event_pipeline=responses_event_pipeline,
                     )
                     wrapper_cleanup_source = processed_chunks
                     prefixed_source = _PrefixedNativeResponsesAsyncIterator(
@@ -9956,7 +9977,7 @@ async def pass_through_request(  # noqa: PLR0915
                     upstream_response=response,
                     event_pipeline=responses_event_pipeline,
                 )
-                processed_chunks = maybe_wrap_passthrough_watermark_responses_stream(
+                processed_chunks = await maybe_wrap_passthrough_watermark_responses_stream(
                     processed_chunks,
                     config=_get_runtime_text_watermark_config(),
                     success_handler_kwargs=kwargs,
@@ -10428,17 +10449,15 @@ async def pass_through_request(  # noqa: PLR0915
                         event_pipeline=responses_event_pipeline,
                     )
                     wrapper_cleanup_source = processed_chunks
-                    processed_chunks = (
-                        maybe_wrap_passthrough_watermark_responses_stream(
-                            processed_chunks,
-                            config=_get_runtime_text_watermark_config(),
-                            success_handler_kwargs=kwargs,
-                            endpoint=_watermark_endpoint_from_path(
-                                url,
-                                getattr(getattr(request, "url", None), "path", None),
-                            ),
-                            event_pipeline=responses_event_pipeline,
-                        )
+                    processed_chunks = await maybe_wrap_passthrough_watermark_responses_stream(
+                        processed_chunks,
+                        config=_get_runtime_text_watermark_config(),
+                        success_handler_kwargs=kwargs,
+                        endpoint=_watermark_endpoint_from_path(
+                            url,
+                            getattr(getattr(request, "url", None), "path", None),
+                        ),
+                        event_pipeline=responses_event_pipeline,
                     )
                     wrapper_cleanup_source = processed_chunks
                     prefixed_source = _PrefixedNativeResponsesAsyncIterator(
@@ -10509,7 +10528,7 @@ async def pass_through_request(  # noqa: PLR0915
                     upstream_response=response,
                     event_pipeline=responses_event_pipeline,
                 )
-                processed_chunks = maybe_wrap_passthrough_watermark_responses_stream(
+                processed_chunks = await maybe_wrap_passthrough_watermark_responses_stream(
                     processed_chunks,
                     config=_get_runtime_text_watermark_config(),
                     success_handler_kwargs=kwargs,
