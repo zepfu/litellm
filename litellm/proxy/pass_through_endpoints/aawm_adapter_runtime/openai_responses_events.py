@@ -1549,18 +1549,18 @@ class ResponsesEventSummaryReducer:
         current = delta_payload.get("arguments")
         if not isinstance(current, str):
             current = ""
-        encoded = value.encode("utf-8")
+        next_arguments = value if done else current + value
+        candidate = {**delta_payload, "arguments": next_arguments}
+        candidate_size = _json_size(candidate)
         created = key not in self._output_items
         if created:
-            candidate = {**delta_payload, "arguments": value}
-            candidate_size = _json_size(candidate)
             if not self._charge_new_output_item(candidate):
                 return
-            payload_size = candidate_size or 0
-        elif not self._charge_delta(payload_size, payload_size + len(encoded)):
+        elif not self._charge_delta(payload_size, candidate_size):
             return
+        payload_size = candidate_size or 0
         if not done:
-            delta_payload["arguments"] = candidate["arguments"]
+            delta_payload["arguments"] = next_arguments
             self._commit_delta_item(
                 key,
                 delta_payload,
@@ -1569,7 +1569,6 @@ class ResponsesEventSummaryReducer:
             )
             self._remember_delta_key(key)
         else:
-            candidate = {**delta_payload, "arguments": value}
             self._commit_delta_item(
                 key,
                 candidate,
