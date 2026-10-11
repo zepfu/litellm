@@ -44,7 +44,8 @@ name when the client provides structured `agent_name` metadata or the
 `x-aawm-agent-name` header. Structured metadata retains precedence. LiteLLM
 rejects unsafe or oversized labels and preserves the existing header when no
 explicit name is supplied; a role declaration alone is not treated as a
-dispatched agent name.
+dispatched agent name. All route-rollup producers apply this attribution when
+present; absent-name behavior is unchanged.
 
 The final delivered disposition is also published for logging, rollup, and
 session-transfer consumers. Consumers must use this disposition rather than

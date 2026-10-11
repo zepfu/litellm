@@ -1354,6 +1354,7 @@ _AAWM_ROUTE_LOG_AGENT_METADATA_KEYS = (
     "agent_name",
     "aawm_agent_name",
     "aawm_claude_agent_name",
+    "codex_agent_name",
 )
 _AAWM_ROUTE_LOG_AGENT_ID_METADATA_KEYS = (
     "agent_id",
@@ -3099,6 +3100,10 @@ def build_aawm_route_rollup_context(
         repository=repository,
         client_product_label=client_product_label,
         host_name=host_attribution.get("host_name"),
+        agent_name=_get_aawm_route_rollup_agent_name(
+            *identity_sources,
+            headers=headers,
+        ),
     )
     model_label = _get_aawm_route_rollup_model_label(
         model_label=_get_aawm_route_log_model_label(
@@ -4171,6 +4176,21 @@ def _get_aawm_route_log_trace_user_repository(
         headers,
         ("langfuse_trace_user_id",),
         normalizer=_normalize_aawm_route_log_repository_label,
+    )
+
+
+def _get_aawm_route_rollup_agent_name(
+    *identity_sources: dict[str, Any],
+    headers: dict[str, Any],
+) -> Optional[str]:
+    return _first_aawm_route_log_value(
+        *identity_sources,
+        keys=_AAWM_ROUTE_LOG_AGENT_METADATA_KEYS,
+        normalizer=_normalize_aawm_route_log_agent_label,
+    ) or _get_case_insensitive_header_value(
+        headers,
+        _AAWM_ROUTE_LOG_AGENT_HEADER_KEYS,
+        normalizer=_normalize_aawm_route_log_agent_label,
     )
 
 

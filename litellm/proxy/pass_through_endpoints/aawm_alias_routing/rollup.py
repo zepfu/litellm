@@ -289,11 +289,12 @@ def _build_auto_agent_alias_rollup_group_header_label(
     host_name: Optional[str],
     agent_name: Optional[str] = None,
 ) -> Optional[str]:
+    agent_name_kwarg = {"agent_name": agent_name} if agent_name is not None else {}
     return build_aawm_route_rollup_group_header_label(
         repository=repository,
         client_product_label=client_product_label,
         host_name=host_name,
-        agent_name=agent_name,
+        **agent_name_kwarg,
     )
 
 
