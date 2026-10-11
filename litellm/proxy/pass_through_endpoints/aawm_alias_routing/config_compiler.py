@@ -871,6 +871,11 @@ def compile_yaml(raw_yaml: str) -> RoutingSnapshot:
     if cycles:
         raise ConfigCompileError(f"alias delegation cycle detected: {'; '.join(cycles)}")
 
+    try:
+        schema.validate_alias_graph_bounds(resolved)
+    except ValueError as exc:
+        raise ConfigCompileError(str(exc)) from exc
+
     available_aliases = {alias.name for alias in resolved.aliases}
     aliases = {alias.name: _compile_alias(alias, available_aliases=available_aliases) for alias in resolved.aliases}
     _assert_provider_alias_coverage(aliases)

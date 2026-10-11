@@ -16,8 +16,10 @@ and are never checked against a closed registry.
 from __future__ import annotations
 
 import re
+from collections import defaultdict
 from collections.abc import Sequence
 from datetime import date, datetime, time, timedelta
+from heapq import heappop, heappush
 from typing import Literal, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -146,6 +148,13 @@ REGISTERED_REASONING_EFFORTS: frozenset[str] = frozenset({"none", "minimal", "lo
 # `ohmypi` is a first-class origin (Oh My Pi / ompla / omp). It is not a
 # `sota.yaml` by_tui target; logical `sota` still uses `default` for it.
 REGISTERED_TUI_FAMILIES: frozenset[str] = frozenset({"codex", "claude", "grok", "qwen", "kimi", "ohmypi", "unknown"})
+
+# Bounds for the supported alias graph. References and dispatch both count
+# as an alias hop. Expansion counts retain repeated occurrences because a
+# reference is a weighted/fallback branch, not a semantic deduplication point.
+MAX_ALIAS_GRAPH_DEPTH = 64
+MAX_ALIAS_EXPANDED_CANDIDATES = 4096
+MAX_ALIAS_EXPANSION_WORK = 32768
 
 
 def _require_registered_provider(value: str) -> str:
@@ -653,14 +662,8 @@ def detect_alias_reference_cycles(document: RoutingConfigDocument) -> list[str]:
     missing-target references or dispatch targets.
     """
     alias_map = {alias.name: alias for alias in document.aliases}
-
-    def _walk(name: str, path: list[str]) -> Optional[str]:
-        if name in path:
-            return " -> ".join(path + [name])
-        alias = alias_map.get(name)
-        if alias is None:
-            raise ValueError(f"alias_reference {name!r} not found in config document")
-        path = path + [name]
+    edges: dict[str, list[str]] = {}
+    for alias_name, alias in alias_map.items():
         targets = [
             candidate.alias_reference
             for candidate in alias.candidates
@@ -670,20 +673,199 @@ def detect_alias_reference_cycles(document: RoutingConfigDocument) -> list[str]:
             targets.extend(rule.target_alias for rule in alias.dispatch.by_tui)
             if alias.dispatch.default is not None:
                 targets.append(alias.dispatch.default)
-        for target in targets:
-            result = _walk(target, path)
-            if result is not None:
-                return result
-        return None
+        edges[alias_name] = targets
 
-    cycles: list[str] = []
-    seen_roots: set[str] = set()
+    active: set[str] = set()
+    completed: set[str] = set()
+
     for alias_name in alias_map:
-        cycle = _walk(alias_name, [])
-        if cycle is not None:
-            # Deduplicate: only report once per cycle set
-            cycle_members = set(cycle.split(" -> "))
-            if not cycle_members & seen_roots:
-                cycles.append(cycle)
-                seen_roots.update(cycle_members)
-    return cycles
+        if alias_name in completed:
+            continue
+
+        # Each frame is [node, next-edge-index]. The explicit path is popped
+        # when its frame completes, while ``completed`` records descendants
+        # that have already been checked and need no second traversal.
+        path: list[str] = []
+        stack: list[list] = [[alias_name, 0]]
+        active.add(alias_name)
+        while stack:
+            frame = stack[-1]
+            node = frame[0]
+            if node in active and node not in path:
+                alias = alias_map.get(node)
+                if alias is None:
+                    raise ValueError(
+                        f"alias_reference {node!r} not found in config document"
+                    )
+                path.append(node)
+
+            if frame[1] >= len(edges[node]):
+                active.discard(node)
+                completed.add(node)
+                path.pop()
+                stack.pop()
+                continue
+
+            target = edges[node][frame[1]]
+            frame[1] += 1
+            if target in active:
+                cycle_start = path.index(target)
+                return [" -> ".join(path[cycle_start:] + [target])]
+            if target in completed:
+                continue
+            if target not in edges:
+                raise ValueError(
+                    f"alias_reference {target!r} not found in config document"
+                )
+            active.add(target)
+            stack.append([target, 0])
+
+    return []
+
+
+def _alias_graph_edges(
+    document: RoutingConfigDocument,
+) -> tuple[
+    dict[str, "AliasConfig"],
+    dict[str, list[str]],
+    dict[str, int],
+    dict[str, set[str]],
+]:
+    """Build direct-reference, candidate, and unique-target graph inputs."""
+    alias_map = {alias.name: alias for alias in document.aliases}
+    references: dict[str, list[str]] = {}
+    direct_candidates: dict[str, int] = {}
+    dependencies: dict[str, set[str]] = defaultdict(set)
+
+    for alias_name, alias in alias_map.items():
+        references[alias_name] = [
+            candidate.alias_reference
+            for candidate in alias.candidates
+            if isinstance(candidate, AliasReferenceCandidateConfig)
+        ]
+        direct_candidates[alias_name] = sum(
+            isinstance(candidate, CandidateConfig) for candidate in alias.candidates
+        )
+        dependencies[alias_name].update(references[alias_name])
+        if alias.dispatch is not None:
+            dependencies[alias_name].update(
+                rule.target_alias for rule in alias.dispatch.by_tui
+            )
+            if alias.dispatch.default is not None:
+                dependencies[alias_name].add(alias.dispatch.default)
+    return alias_map, references, direct_candidates, dependencies
+
+
+def _count_alias_graph_expansion(
+    alias_map: dict[str, "AliasConfig"],
+    references: dict[str, list[str]],
+    direct_candidates: dict[str, int],
+    dependencies: dict[str, set[str]],
+) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+    """Count each alias expansion in bounded dependency order.
+
+    Shared DAG descendants are counted once, while repeated branch occurrences
+    remain represented in the expansion total. Dispatch has one selected
+    target at runtime, so its branch metrics use the largest target.
+    """
+    dependents: dict[str, set[str]] = defaultdict(set)
+    remaining = {alias_name: len(targets) for alias_name, targets in dependencies.items()}
+    for alias_name, targets in dependencies.items():
+        for target in targets:
+            dependents[target].add(alias_name)
+
+    candidate_count: dict[str, int] = {}
+    work_count: dict[str, int] = {}
+    depth_count: dict[str, int] = {}
+    output_cap = MAX_ALIAS_EXPANDED_CANDIDATES + 1
+    work_cap = MAX_ALIAS_EXPANSION_WORK + 1
+    depth_cap = MAX_ALIAS_GRAPH_DEPTH + 1
+    pending = [alias_name for alias_name, count in remaining.items() if count == 0]
+    ready = set(pending)
+
+    # Heap by document order keeps rejection deterministic without recursion.
+    while pending:
+        alias_name = heappop(pending)
+        ready.discard(alias_name)
+        alias = alias_map[alias_name]
+        is_dispatch = alias.dispatch is not None
+        # Dependencies are unique for topological ordering, but reference
+        # occurrences must remain distinct in the expanded output and work
+        # budgets.
+        targets = dependencies[alias_name] if is_dispatch else references[alias_name]
+
+        output = direct_candidates[alias_name]
+        work = 1
+        depth = 1
+        for target in targets:
+            if is_dispatch:
+                output = max(output, candidate_count[target])
+                work = max(work, 1 + work_count[target])
+                depth = max(depth, 1 + depth_count[target])
+            else:
+                output += candidate_count[target]
+                work += work_count[target]
+                depth = max(depth, depth_count[target])
+
+        candidate_count[alias_name] = min(output, output_cap)
+        work_count[alias_name] = min(work, work_cap)
+        depth_count[alias_name] = min(depth, depth_cap)
+
+        for parent in dependents[alias_name]:
+            remaining[parent] -= 1
+            if remaining[parent] == 0 and parent not in ready:
+                heappush(pending, parent)
+                ready.add(parent)
+
+    return candidate_count, work_count, depth_count
+
+
+def _first_alias_budget_overflow(
+    alias_map: dict[str, "AliasConfig"],
+    candidate_count: dict[str, int],
+    work_count: dict[str, int],
+    depth_count: dict[str, int],
+) -> Optional[tuple[str, str, int, int]]:
+    for alias_name in alias_map:
+        if depth_count[alias_name] > MAX_ALIAS_GRAPH_DEPTH:
+            return (
+                alias_name,
+                "depth",
+                depth_count[alias_name],
+                MAX_ALIAS_GRAPH_DEPTH,
+            )
+        if candidate_count[alias_name] > MAX_ALIAS_EXPANDED_CANDIDATES:
+            return (
+                alias_name,
+                "expanded-candidate",
+                candidate_count[alias_name],
+                MAX_ALIAS_EXPANDED_CANDIDATES,
+            )
+        if work_count[alias_name] > MAX_ALIAS_EXPANSION_WORK:
+            return (
+                alias_name,
+                "expansion-work",
+                work_count[alias_name],
+                MAX_ALIAS_EXPANSION_WORK,
+            )
+    return None
+
+
+def validate_alias_graph_bounds(document: RoutingConfigDocument) -> None:
+    """Reject alias graphs beyond the documented publication budget.
+
+    Counting is bounded and does not materialize the expansion. Shared DAG
+    descendants are counted once in dependency order, while their repeated
+    occurrences remain represented in the expansion total.
+    """
+    alias_map, references, direct_candidates, dependencies = _alias_graph_edges(document)
+    counts = _count_alias_graph_expansion(
+        alias_map, references, direct_candidates, dependencies
+    )
+    overflow = _first_alias_budget_overflow(alias_map, *counts)
+    if overflow is not None:
+        alias_name, budget, actual, maximum = overflow
+        raise ValueError(
+            f"alias graph {alias_name!r} exceeds maximum {budget} budget: "
+            f"{actual} > {maximum}"
+        )

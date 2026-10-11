@@ -45,6 +45,26 @@ _SnapshotSelectionReceipt = Tuple[
     Optional[str],
 ]
 
+# A snapshot built by the compiler is already graph-bounded. Other supported
+# construction paths can install a hand-built snapshot, so selection remains
+# fail-closed below the same documented graph budgets.
+_MAX_ALIAS_GRAPH_DEPTH = 64
+_MAX_ALIAS_EXPANDED_CANDIDATES = 4096
+_MAX_ALIAS_EXPANSION_WORK = 32768
+
+
+def _raise_alias_snapshot_budget(budget: str, actual: int, maximum: int) -> None:
+    raise ValueError(
+        f"routing snapshot alias graph exceeds maximum {budget} budget: "
+        f"{actual} > {maximum}"
+    )
+
+
+def _check_alias_snapshot_budget(budget: str, actual: int, maximum: int) -> None:
+    if actual > maximum:
+        _raise_alias_snapshot_budget(budget, actual, maximum)
+
+
 # ---------------------------------------------------------------------------
 # Injected runtime state
 # ---------------------------------------------------------------------------
@@ -556,6 +576,10 @@ def _resolve_snapshot_alias_candidates(
     if alias is None:
         return []
 
+    _check_alias_snapshot_budget(
+        "depth", len(path) + 1, _MAX_ALIAS_GRAPH_DEPTH
+    )
+
     next_path = (*path, alias_name)
     if alias.dispatch is not None:
         target = _resolve_dispatch_target(
@@ -576,7 +600,11 @@ def _resolve_snapshot_alias_candidates(
         )
 
     resolved: list[dict[str, Any]] = []
+    work = 1
     for entry in _order_snapshot_entries_by_priority(alias.candidates):
+        _check_alias_snapshot_budget(
+            "expansion-work", work, _MAX_ALIAS_EXPANSION_WORK
+        )
         if not _is_tui_attached_candidate_eligible(
             entry, client_product_label=client_product_label
         ) or not _is_tui_excluded_candidate_eligible(entry, client_product_label=client_product_label):
@@ -593,6 +621,7 @@ def _resolve_snapshot_alias_candidates(
                 include_out_of_schedule=include_out_of_schedule,
                 path=next_path,
             )
+            work += max(1, len(children))
             for child in children:
                 shaped = dict(child)
                 shaped["selection_priority"] = entry.priority
@@ -624,6 +653,7 @@ def _resolve_snapshot_alias_candidates(
             # cooldown_identity_tag below for cooldown/evidence/probe keys.
             epoch_tag=snapshot.config_hash,
         )
+        work += 1
         if shaped_candidate is None:
             continue
         shaped_candidate["cooldown_identity_tag"] = _snapshot_cooldown_identity_tag(
@@ -642,6 +672,9 @@ def _resolve_snapshot_alias_candidates(
             shaped_candidate
         )
         resolved.append(shaped_candidate)
+    _check_alias_snapshot_budget(
+        "expanded-candidate", len(resolved), _MAX_ALIAS_EXPANDED_CANDIDATES
+    )
     return resolved
 
 

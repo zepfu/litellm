@@ -136,6 +136,18 @@ visibility routing distinction in YAML or Python. Codex and Claude TUI
 selection catalogs are separate client model-definition lists; they are not
 generated from every snapshot alias and do not invent a denylist.
 
+Compilation checks `alias_reference` and dispatch targets as one graph using
+active/completed traversal, so a shared acyclic subgraph is validated once.
+The graph is bounded before publication: at most **64** alias hops in depth,
+**4,096** candidate occurrences in a branch's expanded output, and
+**32,768** expansion calls. Dispatch contributes one selected target to a
+request; compilation includes that dispatch hop and uses its largest supported
+target branch for the depth, output, and expansion-work budget. Repeated
+occurrences remain distinct because references preserve branch ordering,
+weighting, and fallback semantics. A graph beyond a budget raises a compile
+error; startup and refresh reject it without creating or replacing the
+oversized snapshot.
+
 ## Provider-pinned aliases (CFG-029)
 
 Provider-pinned aliases are configured acceptance surfaces, not a required
