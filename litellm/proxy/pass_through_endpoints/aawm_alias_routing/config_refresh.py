@@ -13,6 +13,8 @@ sibling imports for backward compatibility with existing callers.
 
 from __future__ import annotations
 
+import asyncio
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +22,7 @@ from typing import Any, Callable, Optional
 
 from fastapi import HTTPException, Request
 from pydantic import ValidationError
+from starlette.concurrency import run_in_threadpool
 
 from .config_compiler import (
     ConfigCompileError as _AawmAliasConfigCompileError,
@@ -103,8 +106,10 @@ class ConfigRefreshRuntime:
     """Injected dependencies for the config-refresh handler.
 
     All callables mirror the signatures of the sibling-module functions they
-    replace.  ``compile_error_types`` is the tuple of exception classes that
-    indicate a compilation failure (caught and turned into a 400 response).
+    replace. Refresh calls are serialized per process and invoke these
+    synchronous callables on a worker thread. ``compile_error_types`` is the
+    tuple of exception classes that indicate a compilation failure (caught and
+    turned into a 400 response).
     """
 
     compile_yaml: Callable[[str], Any]
@@ -115,6 +120,7 @@ class ConfigRefreshRuntime:
 
 
 _runtime: Optional[ConfigRefreshRuntime] = None
+_refresh_transaction_lock = asyncio.Lock()
 
 
 def configure_config_refresh_runtime(*, runtime: ConfigRefreshRuntime) -> None:
@@ -161,12 +167,25 @@ async def aawm_alias_config_refresh_route(request: Request) -> dict[str, Any]:
     A no-op re-post (identical content hash) is a successful 200 with
     ``changed: False``.
     """
-    try:
-        request_body = await request.json()
-    except Exception:
+    raw_body = await request.body()
+    if raw_body:
+        try:
+            request_body = json.loads(raw_body)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "AAWM alias-routing refresh body must be valid JSON"},
+            ) from exc
+        if not isinstance(request_body, dict):
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "AAWM alias-routing refresh body must be a JSON object"},
+            )
+    else:
         request_body = {}
-    inline_yaml = request_body.get("yaml") if isinstance(request_body, dict) else None
-    if inline_yaml is not None and not isinstance(inline_yaml, str):
+
+    inline_yaml = request_body.get("yaml")
+    if "yaml" in request_body and not isinstance(inline_yaml, str):
         raise HTTPException(
             status_code=400,
             detail={"error": "AAWM alias-routing config 'yaml' field must be a string"},
@@ -201,6 +220,10 @@ def _load_full_default_directory_snapshot() -> tuple[_RoutingSnapshot, tuple[str
 
 async def _refresh_default_via_direct_imports() -> dict[str, Any]:
     """Compile and activate using startup directory semantics."""
+    return await _run_serialized_refresh(_refresh_default_via_direct_imports_sync)
+
+
+def _refresh_default_via_direct_imports_sync() -> dict[str, Any]:
     try:
         attempted_snapshot, files_loaded = _load_full_default_directory_snapshot()
     except (
@@ -250,6 +273,17 @@ async def _refresh_via_runtime(
     source_yaml: str,
 ) -> dict[str, Any]:
     """DI path: compile and activate using injected dependencies."""
+    return await _run_serialized_refresh(
+        _refresh_via_runtime_sync,
+        runtime,
+        source_yaml,
+    )
+
+
+def _refresh_via_runtime_sync(
+    runtime: ConfigRefreshRuntime,
+    source_yaml: str,
+) -> dict[str, Any]:
     try:
         attempted_snapshot = runtime.compile_yaml(source_yaml)
     except (*runtime.compile_error_types, ValidationError):
@@ -288,6 +322,15 @@ async def _refresh_default_via_runtime(
     runtime: ConfigRefreshRuntime,
 ) -> dict[str, Any]:
     """Runtime path: compile the canonical directory and activate it."""
+    return await _run_serialized_refresh(
+        _refresh_default_via_runtime_sync,
+        runtime,
+    )
+
+
+def _refresh_default_via_runtime_sync(
+    runtime: ConfigRefreshRuntime,
+) -> dict[str, Any]:
     try:
         attempted_snapshot, files_loaded = _load_full_default_directory_snapshot()
     except (
@@ -334,6 +377,13 @@ async def _refresh_default_via_runtime(
 
 async def _refresh_via_direct_imports(source_yaml: str) -> dict[str, Any]:
     """Fallback path: compile and activate using direct sibling imports."""
+    return await _run_serialized_refresh(
+        _refresh_via_direct_imports_sync,
+        source_yaml,
+    )
+
+
+def _refresh_via_direct_imports_sync(source_yaml: str) -> dict[str, Any]:
     try:
         attempted_snapshot = _compile_aawm_alias_routing_yaml(source_yaml)
     except (_AawmAliasConfigCompileError, ValidationError):
@@ -370,3 +420,12 @@ async def _refresh_via_direct_imports(source_yaml: str) -> dict[str, Any]:
         "activated_at": datetime.now(timezone.utc).isoformat(),
         "active_candidate_order": _snapshot_candidate_order(active_snapshot),
     }
+
+
+async def _run_serialized_refresh(
+    operation: Callable[..., dict[str, Any]],
+    *args: Any,
+) -> dict[str, Any]:
+    """Run one complete synchronous refresh transaction off the event loop."""
+    async with _refresh_transaction_lock:
+        return await run_in_threadpool(operation, *args)
