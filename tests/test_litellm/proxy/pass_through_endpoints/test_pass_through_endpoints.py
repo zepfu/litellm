@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from io import BytesIO
 from types import SimpleNamespace
-from typing import Optional
+from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -36,6 +36,7 @@ from litellm._logging import (
     verbose_proxy_logger,
 )
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
+from litellm.integrations.custom_logger import CustomLogger
 from litellm.proxy.aawm_route_logging import (
     clear_aawm_route_rollups,
     flush_aawm_route_rollups,
@@ -10040,3 +10041,148 @@ def test_passthrough_alias_managed_safety_denial_is_deferred_to_alias_terminal()
         status_code=403,
         error_log_context={"model_alias": "work"},
     )
+
+
+@pytest.mark.asyncio
+async def test_pass_through_request_public_observability_sentinels_are_masked():  # noqa: PLR0915
+    """
+    Public passthrough diagnostics must mask credential sentinels while keeping
+    non-secret request metadata and preserving exact upstream transport values.
+    """
+    secrets = {
+        "authorization": "Bearer super-secret-authorization-value",
+        "cookie": "super-secret-cookie-value",
+        "x-xai-token-auth": "super-secret-xai-token-value",
+    }
+    authorization_sentinel = secrets["authorization"]
+    cookie_sentinel = secrets["cookie"]
+    xai_sentinel = secrets["x-xai-token-auth"]
+    user_agent = "sentinel-test-user-agent"
+    observed_call_details: list[dict[str, Any]] = []
+    observed_debug_args: list[dict[str, Any]] = []
+    captured_transport_kwargs: dict[str, Any] = {}
+
+    class RecordingCallback(CustomLogger):
+        def log_pre_api_call(self, model, messages, kwargs):
+            observed_call_details.append(kwargs)
+
+    target_url = "https://cli-chat-proxy.grok.com/v1/responses"
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.url = "http://localhost:4001/openai_passthrough/v1/responses"
+    mock_request.headers = Headers({**secrets, "user-agent": user_agent})
+    mock_request.query_params = QueryParams("")
+
+    upstream_request = httpx.Request(
+        "POST",
+        target_url,
+        content=b'{"model":"sentinel-model","input":"visible input"}',
+    )
+    mock_response = httpx.Response(
+        status_code=200,
+        headers={"content-type": "application/json"},
+        content=b'{"id":"resp_sentinel","model":"sentinel-model"}',
+        request=upstream_request,
+    )
+    mock_client = MagicMock()
+
+    def capture_build_request(**kwargs):
+        captured_transport_kwargs.update(kwargs)
+        return httpx.Request(
+            kwargs["method"],
+            kwargs["url"],
+            headers=kwargs["headers"],
+        )
+
+    mock_client.build_request = MagicMock(side_effect=capture_build_request)
+    # RR-056 #6: the nonstream passthrough path builds then sends stream=True.
+    mock_client.send = AsyncMock(return_value=mock_response)
+    mock_client.request = AsyncMock(return_value=mock_response)
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client",
+        return_value=MagicMock(client=mock_client),
+    ), patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj"
+    ) as mock_logging_obj, patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.pass_through_endpoint_logging.pass_through_async_success_handler",
+        new_callable=AsyncMock,
+    ), patch.object(
+        verbose_proxy_logger,
+        "debug",
+        side_effect=lambda message, *args, **kwargs: observed_debug_args.append(
+            {"message": message, "args": args, "kwargs": kwargs}
+        ),
+    ), patch(
+        "litellm.litellm_core_utils.litellm_logging.log_raw_request_response",
+        True,
+    ), patch.object(
+        litellm,
+        "input_callback",
+        [RecordingCallback()],
+    ):
+        mock_logging_obj.pre_call_hook = AsyncMock(
+            side_effect=lambda **kwargs: kwargs["data"]
+        )
+        mock_logging_obj.post_call_success_hook = AsyncMock()
+        mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+        response = await pass_through_request(
+            request=mock_request,
+            target=target_url,
+            custom_headers={
+                "authorization": authorization_sentinel,
+                "cookie": cookie_sentinel,
+                "x-xai-token-auth": xai_sentinel,
+            },
+            user_api_key_dict=MagicMock(),
+            custom_body={
+                "model": "sentinel-model",
+                "input": "visible input",
+            },
+            stream=False,
+            custom_llm_provider="xai",
+        )
+
+    assert response.status_code == 200
+    assert observed_call_details, "pre-call callback did not observe kwargs"
+    assert observed_debug_args, "debug sink was not called"
+
+    serialized_call_details = [
+        json.dumps(item, default=str) for item in observed_call_details
+    ]
+    serialized_debug_messages = [
+        json.dumps(item["message"], default=str) for item in observed_debug_args
+    ]
+    for serialized in [*serialized_call_details, *serialized_debug_messages]:
+        assert authorization_sentinel not in serialized
+        assert cookie_sentinel not in serialized
+        assert xai_sentinel not in serialized
+    call_details = next(
+        item
+        for item in observed_call_details
+        if "additional_args" in item and "raw_request_typed_dict" in item
+    )
+    pre_call_headers = call_details["additional_args"]["headers"]
+    assert set(map(str.lower, pre_call_headers)) == set(secrets)
+
+    raw_request = call_details["raw_request_typed_dict"]
+    assert authorization_sentinel not in raw_request["raw_request_headers"].values()
+    assert set(map(str.lower, raw_request["raw_request_headers"])) == set(secrets)
+
+    passthrough_payload = call_details["passthrough_logging_payload"]
+    assert cookie_sentinel not in passthrough_payload["request_headers"].values()
+    assert xai_sentinel not in passthrough_payload["request_headers"].values()
+    assert passthrough_payload["request_headers"]["user-agent"] == user_agent
+
+    metadata = call_details["litellm_params"]["metadata"]
+    assert metadata["raw_request"].find("curl -X POST") >= 0
+
+    sent_transport_headers = {
+        str(key).lower(): value
+        for key, value in captured_transport_kwargs["headers"].items()
+    }
+    assert sent_transport_headers["authorization"] == authorization_sentinel
+    assert sent_transport_headers["cookie"] == cookie_sentinel
+    assert sent_transport_headers["x-xai-token-auth"] == xai_sentinel
+    assert set(secrets).issubset(sent_transport_headers)
