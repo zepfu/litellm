@@ -1,13 +1,18 @@
 import atexit
 import asyncio
 import concurrent.futures
+import hashlib
+import importlib
 import ipaddress
 import json
 import logging
 import os
 import socket
+import sys
 import threading
 import time
+import types
+import weakref
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -46,6 +51,22 @@ _AAWM_ROUTE_ROLLUP_MAX_SUBLINES = 16
 _AAWM_ROUTE_ROLLUP_MAX_ORIGIN_IDENTITIES = 256
 _AAWM_ROUTE_ROLLUP_MAX_REVIEW_RATIONALES = 8
 _AAWM_ROUTE_ROLLUP_CONTEXT_METADATA_KEY = "aawm_route_rollup_context"
+_AAWM_ROUTE_ROLLUP_OBSERVATION_SETTING_KEY = (
+    "aawm_route_rollup_provenance_observation"
+)
+_AAWM_ROUTE_ROLLUP_OBSERVATION_EVENT = "aawm_route_rollup_provenance"
+_AAWM_ROUTE_ROLLUP_OBSERVATION_SCHEMA = 2
+_AAWM_ROUTE_ROLLUP_OBSERVATION_CODE_DIGEST_ALGORITHM = (
+    "aawm-code-object-sha256-v1"
+)
+_AAWM_ROUTE_ROLLUP_OBSERVATION_CALL_ID_DIGEST_DOMAIN = (
+    "aawm-litellm-call-id-v1:"
+)
+_AAWM_ROUTE_ROLLUP_OBSERVATION_SCOPE_KEYS = (
+    "litellm_call_id",
+    "trace_id",
+    "session_id",
+)
 _AAWM_ROUTE_HOST_ATTRIBUTION_STATE_KEY = "aawm_route_host_attribution"
 _AAWM_PARSED_CODEX_REVIEW_DECISIONS_KWARGS_KEY = (
     "_aawm_parsed_codex_review_decisions"
@@ -1342,6 +1363,15 @@ _aawm_route_rollup_monotonic_now: Callable[[], float] = time.monotonic
 _aawm_route_log_dedup_lock = threading.Lock()
 _aawm_route_log_dedup_seen: dict[tuple[str, ...], float] = {}
 _aawm_route_log_dedup_order: deque[tuple[str, ...]] = deque()
+_aawm_route_observation_lock = threading.Lock()
+_aawm_route_observation_digest_cache: "weakref.WeakKeyDictionary[Any, str]" = (
+    weakref.WeakKeyDictionary()
+)
+_aawm_route_observation_logger_name = "litellm.proxy.aawm_route_rollup_observation"
+_aawm_route_rollup_pending_companions: list[dict[str, Any]] = []
+_AAWM_ROUTE_OBSERVATION_MAX_ENDPOINT_CHARS = 96
+_AAWM_ROUTE_OBSERVATION_MAX_GROUP_HEADER_CHARS = 256
+_AAWM_ROUTE_OBSERVATION_MAX_MODEL_CHARS = 128
 _AAWM_ROUTE_LOG_SAFE_QUERY_KEYS = frozenset(
     {
         "alt",
@@ -1538,6 +1568,21 @@ _AAWM_ROUTE_LOG_TENANT_REPOSITORY_FRAGMENTS = (
     "harness",
     "validation",
 )
+_AAWM_ROUTE_ROLLUP_AGENT_NAME_PROVENANCE_VALUES = frozenset(
+    {
+        "absent",
+        "codex_turn",
+        "header",
+        "agent_dispatch",
+        "client_metadata",
+        "structured",
+        "structured_nested",
+    }
+)
+_AAWM_ROUTE_ROLLUP_IDENTITY_SOURCE_KIND_KEY = (
+    "_aawm_route_rollup_identity_source_kind"
+)
+_AAWM_ROUTE_ROLLUP_PROVENANCE_SOURCE_KEY = "aawm_agent_name_source"
 _AAWM_ROUTE_LOG_REPOSITORY_PLACEHOLDER_VALUES = {
     ".analysis",
     ".codex",
@@ -2064,6 +2109,13 @@ class _AawmRouteRollupSubline:
 class _AawmRouteRollupGroup:
     group_header_label: str
     incoming_endpoint: str
+    provenance_snapshot: Optional[dict[str, Any]] = None
+    provenance_contributing_origin_ids: set[str] = field(default_factory=set)
+    provenance_nonmatching_contributing_origin_ids: set[str] = field(
+        default_factory=set
+    )
+    provenance_unknown_origin_event_count: int = 0
+    provenance_untracked_origin_events_count: int = 0
     sublines: dict[
         tuple[str, str, str, Optional[str]], _AawmRouteRollupSubline
     ] = field(
@@ -2104,6 +2156,32 @@ class _AawmRouteRollupGroup:
             and self.unscoped_terminal_state.status in {"Failed", "Exhausted"}
         ):
             self.unscoped_terminal_state = state
+
+    def record_provenance_snapshot(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        matches_observation_scope: bool,
+    ) -> None:
+        if self.provenance_snapshot is None:
+            self.provenance_snapshot = dict(snapshot)
+        origin_id = str(snapshot.get("litellm_call_id") or "")
+        if not origin_id:
+            self.provenance_unknown_origin_event_count += 1
+        elif origin_id not in self.provenance_contributing_origin_ids:
+            if not matches_observation_scope:
+                self.provenance_nonmatching_contributing_origin_ids.add(
+                    origin_id
+                )
+            if (
+                len(self.provenance_contributing_origin_ids)
+                >= _AAWM_ROUTE_ROLLUP_MAX_ORIGIN_IDENTITIES
+            ):
+                self.provenance_untracked_origin_events_count += 1
+                return
+            self.provenance_contributing_origin_ids.add(origin_id)
+        if matches_observation_scope:
+            self.provenance_snapshot.update(snapshot)
 
     def effective_request_terminal_state(
         self,
@@ -2196,7 +2274,7 @@ class AawmRouteRollupAccumulator:
         self._groups.clear()
         self._last_flush_monotonic = time.monotonic()
 
-    def record(
+    def record(  # noqa: PLR0915 - inherited statement growth
         self,
         *,
         group_header_label: str,
@@ -2208,6 +2286,7 @@ class AawmRouteRollupAccumulator:
         status: Optional[str] = None,
         message: Optional[str] = None,
         request_status: Optional[str] = None,
+        provenance_snapshot: Optional[dict[str, Any]] = None,
         request_only: bool = False,
         origin_identity: Optional[_AawmRouteRollupOriginIdentity] = None,
         review_decision: Optional[AawmReviewDecision] = None,
@@ -2258,7 +2337,9 @@ class AawmRouteRollupAccumulator:
         cleaned_effort = _normalize_aawm_route_log_reasoning_effort(effort)
         group = self._groups.get(group_key)
         if group is None and len(self._groups) >= self._max_groups:
-            emitted_lines.extend(self.flush(force=True, now=now, early=True))
+            emitted_lines.extend(
+                self.flush(force=True, now=now, early=True)
+            )
             group = None
         if group is None:
             group = _AawmRouteRollupGroup(
@@ -2266,6 +2347,17 @@ class AawmRouteRollupAccumulator:
                 incoming_endpoint=cleaned_incoming_endpoint,
             )
             self._groups[group_key] = group
+
+        if provenance_snapshot is not None:
+            group.record_provenance_snapshot(
+                provenance_snapshot,
+                matches_observation_scope=(
+                    _aawm_route_rollup_observation_scope_matches(
+                        provenance_snapshot.get("context"),
+                        origin_identity=provenance_snapshot.get("origin_identity"),
+                    )
+                ),
+            )
 
         if request_only:
             assert normalized_request_status is not None
@@ -2389,7 +2481,12 @@ class AawmRouteRollupAccumulator:
         if subline is None:
             if len(group.subline_order) >= self._max_sublines:
                 emitted_lines.extend(
-                    self._flush_group(group, now=now, early=True, remove=True)
+                    self._flush_group(
+                        group,
+                        now=now,
+                        early=True,
+                        remove=True,
+                    )
                 )
                 group = _AawmRouteRollupGroup(
                     group_header_label=cleaned_group_header,
@@ -2599,12 +2696,35 @@ class AawmRouteRollupAccumulator:
             now=now,
             early=early,
         )
+        companion_snapshot: Optional[dict[str, Any]] = None
+        if lines:
+            snapshot = group.provenance_snapshot
+            if snapshot is not None:
+                snapshot["matching_origin_count"] = len(
+                    group.provenance_contributing_origin_ids
+                    - group.provenance_nonmatching_contributing_origin_ids
+                )
+                snapshot["nonmatching_origin_count"] = (
+                    len(group.provenance_nonmatching_contributing_origin_ids)
+                )
+                snapshot["origin_tracking_complete"] = (
+                    group.provenance_untracked_origin_events_count == 0
+                )
+                snapshot["unknown_origin_event_count"] = (
+                    group.provenance_unknown_origin_event_count
+                )
+                snapshot["untracked_origin_events_count"] = (
+                    group.provenance_untracked_origin_events_count
+                )
+                companion_snapshot = snapshot
         if remove:
             group_key = (
                 group.group_header_label,
                 group.incoming_endpoint,
             )
             self._groups.pop(group_key, None)
+        if companion_snapshot is not None:
+            _aawm_route_rollup_pending_companions.append(companion_snapshot)
         return lines
 
 
@@ -2659,6 +2779,7 @@ def _tick_aawm_route_rollup_interval_flush() -> None:
             return
         lines = accumulator.flush_due(monotonic_now=_aawm_route_rollup_monotonic_now())
     _emit_aawm_route_rollup_lines(lines)
+    _drain_aawm_route_rollup_companions()
 
 
 def _aawm_route_rollup_flush_worker_main() -> None:
@@ -2804,6 +2925,7 @@ def emit_flush_aawm_route_rollups(
     _emit_aawm_route_rollup_lines(
         flush_aawm_route_rollups(force=force, now=now, early=early)
     )
+    _drain_aawm_route_rollup_companions()
 
 
 def _get_aawm_route_rollup_metadata(kwargs: Optional[dict]) -> Optional[dict[str, Any]]:
@@ -2893,6 +3015,415 @@ def _prepare_aawm_route_rollup_memory_workload(
     )
 
 
+def _aawm_route_rollup_observation_enabled() -> bool:
+    """Gate observation to the supported alpha runtime signal.
+
+    Exact-request scope is intentionally separate: an absent, malformed, or
+    empty ``aawm_route_rollup_provenance_observation`` mapping remains off.
+    """
+    if os.getenv("AAWM_LITELLM_ENVIRONMENT", "").strip() != "litellm-alpha":
+        return False
+    return True
+
+
+def _get_aawm_route_rollup_observation_logger() -> logging.Logger:
+    return logging.getLogger(_aawm_route_observation_logger_name)
+
+
+def _clean_aawm_route_rollup_observation_label(
+    value: Any,
+    *,
+    max_chars: int,
+) -> Optional[str]:
+    cleaned = _clean_aawm_route_log_field(value)
+    if not cleaned:
+        return None
+    return cleaned[:max_chars]
+
+
+def _digest_aawm_route_rollup_observation_identity(value: Any) -> Optional[str]:
+    normalized_value = _normalize_aawm_route_rollup_identity(value)
+    if not normalized_value:
+        return None
+    digest = hashlib.sha256(
+        _AAWM_ROUTE_ROLLUP_OBSERVATION_CALL_ID_DIGEST_DOMAIN.encode("utf-8")
+        + normalized_value.encode("utf-8")
+    ).hexdigest()
+    return f"sha256:{digest}"
+
+
+def _get_aawm_route_rollup_observation_settings() -> dict[str, Any]:
+    try:
+        from litellm.proxy.proxy_server import general_settings
+    except (ImportError, AttributeError):
+        return {}
+    if not isinstance(general_settings, dict):
+        return {}
+    value = general_settings.get(_AAWM_ROUTE_ROLLUP_OBSERVATION_SETTING_KEY)
+    if not isinstance(value, dict):
+        return {}
+    return value
+
+
+def _get_aawm_route_rollup_observation_scope() -> dict[str, str]:
+    """Return exact trusted-scope filters required to observe.
+
+    A present but invalid selector rejects the entire mapping, rather than
+    retaining its valid selectors and broadening the requested request scope.
+    """
+    settings = _get_aawm_route_rollup_observation_settings()
+    filters: dict[str, str] = {}
+    for key in _AAWM_ROUTE_ROLLUP_OBSERVATION_SCOPE_KEYS:
+        if key not in settings:
+            continue
+        value = _normalize_aawm_route_rollup_identity(settings.get(key))
+        if value:
+            filters[key] = value
+        else:
+            return {}
+    return filters
+
+
+def _hash_aawm_route_observation_code_object(function: Any) -> Optional[str]:
+    """Hash one in-memory function and directly referenced loaded code.
+
+    The digest starts with the function's own code metadata and bytecode, then
+    walks only code-object constants. It does not read source or bytecode from
+    disk, hashes in-memory modules, or attest loaded imports beyond referenced
+    direct constants. Cached by code object so repeated observations do no
+    per-event graph hashing or I/O.
+    """
+    code_object = getattr(function, "__code__", None)
+    if not isinstance(code_object, types.CodeType):
+        return None
+    with _aawm_route_observation_lock:
+        cached_digest = _aawm_route_observation_digest_cache.get(code_object)
+    if cached_digest:
+        return cached_digest
+
+    digest = hashlib.sha256()
+    visited: set[int] = set()
+
+    def update_code(current: types.CodeType) -> None:
+        if id(current) in visited:
+            return
+        visited.add(id(current))
+        digest.update(
+            _AAWM_ROUTE_ROLLUP_OBSERVATION_CODE_DIGEST_ALGORITHM.encode("ascii")
+            + b"\x00"
+            + str(current.co_argcount).encode("ascii")
+            + b"\x00"
+            + str(current.co_kwonlyargcount).encode("ascii")
+            + b"\x00"
+            + str(current.co_posonlyargcount).encode("ascii")
+            + b"\x00"
+            + str(current.co_flags).encode("ascii")
+            + b"\x00"
+            + str(current.co_names).encode("utf-8")
+            + b"\x00"
+            + str(current.co_varnames).encode("utf-8")
+            + b"\x00"
+            + str(current.co_freevars).encode("utf-8")
+            + b"\x00"
+            + str(current.co_cellvars).encode("utf-8")
+            + b"\x00"
+        )
+        digest.update(current.co_code)
+        digest.update(b"\x00aawm-code-object-constants\x00")
+        for constant in current.co_consts:
+            if isinstance(constant, types.CodeType):
+                update_code(constant)
+            else:
+                digest.update(
+                    repr(constant).encode("utf-8", errors="backslashreplace")
+                )
+                digest.update(b"\x00")
+
+    update_code(code_object)
+    result = (
+        f"{_AAWM_ROUTE_ROLLUP_OBSERVATION_CODE_DIGEST_ALGORITHM}:"
+        f"python={sys.version_info.major}.{sys.version_info.minor}."
+        f"{sys.version_info.micro}:sha256={digest.hexdigest()}"
+    )
+    with _aawm_route_observation_lock:
+        _aawm_route_observation_digest_cache[code_object] = result
+    return result
+
+
+def _get_aawm_route_rollup_observation_code_provenance() -> dict[str, Any]:
+    def describe_function(function_name: str) -> dict[str, str]:
+        function = getattr(sys.modules.get(__name__), function_name, None)
+        digest = _hash_aawm_route_observation_code_object(function)
+        return {"symbol": function_name, "digest": digest}
+
+    function_names = (
+        "_resolve_aawm_route_rollup_agent_name_with_provenance",
+        "_get_aawm_route_rollup_agent_name",
+        "record_aawm_route_rollup",
+    )
+    return {
+        "algorithm": _AAWM_ROUTE_ROLLUP_OBSERVATION_CODE_DIGEST_ALGORITHM,
+        "input": "loaded_code_objects_and_referenced_code_constants",
+        "python": ".".join(map(str, sys.version_info[:3])),
+        "functions": [describe_function(name) for name in function_names],
+    }
+
+
+def _load_aawm_route_observation_module(
+    module_name: str,
+) -> Optional[types.ModuleType]:
+    try:
+        return importlib.import_module(module_name)
+    except Exception:
+        return None
+
+
+def _get_aawm_route_rollup_observation_module_provenance() -> dict[str, Any]:
+    current_module = sys.modules.get(__name__)
+    entries: list[dict[str, str]] = []
+    module_names = (
+        __name__,
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup",
+    )
+    for module_name in module_names:
+        module = (
+            current_module
+            if module_name == __name__
+            else _load_aawm_route_observation_module(module_name)
+        )
+        digest = _hash_aawm_route_observation_code_object(
+            getattr(module, "record_aawm_route_rollup", None)
+        )
+        if digest:
+            entries.append(
+                {
+                    "symbol": f"{module_name}.record_aawm_route_rollup",
+                    "digest": digest,
+                }
+            )
+    return {
+        "loaded_module_symbols": entries,
+        "limits": "per-symbol loaded-code digest only; not a module-wide or import-graph attestation",
+    }
+
+
+def _aawm_route_rollup_observation_scope_matches(
+    context: Optional[dict[str, Any]],
+    *,
+    origin_identity: Optional[_AawmRouteRollupOriginIdentity],
+) -> bool:
+    filters = _get_aawm_route_rollup_observation_scope()
+    if not filters:
+        return False
+    context_trace_id = _normalize_aawm_route_rollup_identity(
+        context.get("trace_id") if context else None
+    )
+    context_session_id = _normalize_aawm_route_rollup_identity(
+        context.get("session_id") if context else None
+    )
+    context_call_id = _normalize_aawm_route_rollup_identity(
+        context.get("litellm_call_id") if isinstance(context, dict) else None
+    ) or _normalize_aawm_route_rollup_identity(
+        origin_identity.litellm_call_id
+        if origin_identity is not None
+        else None
+    )
+    checks = {
+        "litellm_call_id": context_call_id,
+        "trace_id": context_trace_id,
+    }
+    if "session_id" in filters:
+        checks["session_id"] = context_session_id
+    return all(filters.get(key) == checks.get(key) for key in filters)
+
+
+def _drain_aawm_route_rollup_companions() -> None:
+    while _aawm_route_rollup_pending_companions:
+        with _aawm_route_rollup_lock:
+            if not _aawm_route_rollup_pending_companions:
+                break
+            snapshot = _aawm_route_rollup_pending_companions.pop(0)
+        _record_aawm_route_rollup_provenance_observation(snapshot=snapshot)
+
+
+def _build_aawm_route_rollup_provenance_snapshot(
+    *,
+    group_header_label: str,
+    incoming_endpoint: str,
+    outgoing_target: str,
+    model_label: str,
+    effort: str,
+    turns: int,
+    request_status: Optional[str],
+    request_only: bool,
+    origin_identity: Optional[_AawmRouteRollupOriginIdentity],
+    context: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    context_map = context if isinstance(context, dict) else {}
+    cleaned_context: dict[str, Any] = {
+        key: _normalize_aawm_route_rollup_identity(context_map.get(key))
+        for key in _AAWM_ROUTE_ROLLUP_OBSERVATION_SCOPE_KEYS
+        if key in context_map
+    }
+    normalized_call_id = cleaned_context.get(
+        "litellm_call_id"
+    ) or _normalize_aawm_route_rollup_identity(
+        origin_identity.litellm_call_id if origin_identity is not None else None
+    )
+    source_value = _normalize_aawm_route_rollup_identity(
+        context_map.get(_AAWM_ROUTE_ROLLUP_PROVENANCE_SOURCE_KEY)
+    )
+    turn_count = (
+        turns
+        if isinstance(turns, int) and not isinstance(turns, bool) and turns >= 0
+        else 0
+    )
+    return {
+        _AAWM_ROUTE_ROLLUP_PROVENANCE_SOURCE_KEY: source_value,
+        "litellm_call_id": normalized_call_id,
+        "origin_identity": origin_identity,
+        "context": cleaned_context,
+        "context_cached": isinstance(context, dict),
+        "group_header_label": _clean_aawm_route_rollup_observation_label(
+            group_header_label,
+            max_chars=_AAWM_ROUTE_OBSERVATION_MAX_GROUP_HEADER_CHARS,
+        ),
+        "incoming_endpoint": _clean_aawm_route_rollup_observation_label(
+            incoming_endpoint,
+            max_chars=_AAWM_ROUTE_OBSERVATION_MAX_ENDPOINT_CHARS,
+        ),
+        "outgoing_target": _clean_aawm_route_rollup_observation_target(
+            outgoing_target,
+        ),
+        "model_label": _clean_aawm_route_rollup_observation_label(
+            model_label,
+            max_chars=_AAWM_ROUTE_OBSERVATION_MAX_MODEL_CHARS,
+        ),
+        "effort": _clean_aawm_route_rollup_observation_label(
+            effort,
+            max_chars=_AAWM_ROUTE_ROLLUP_REASONING_EFFORT_MAX_CHARS,
+        ),
+        "turns": turn_count,
+        "request_status": _normalize_aawm_route_rollup_status(request_status),
+        "request_only": bool(request_only),
+        "matching_origin_count": 0,
+        "nonmatching_origin_count": 0,
+        "origin_tracking_complete": False,
+        "unknown_origin_event_count": 0,
+        "untracked_origin_events_count": 0,
+        "sample_scope": "held_first",
+    }
+
+
+def _get_aawm_route_rollup_observation_group(
+    accumulator: AawmRouteRollupAccumulator,
+    *,
+    group_header_label: str,
+    incoming_endpoint: str,
+) -> Optional[_AawmRouteRollupGroup]:
+    cleaned_group_header = _clean_aawm_route_log_field(group_header_label)
+    cleaned_incoming_endpoint = _clean_aawm_route_log_field(incoming_endpoint)
+    if not cleaned_group_header or not cleaned_incoming_endpoint:
+        return None
+    return accumulator._groups.get(
+        (cleaned_group_header, cleaned_incoming_endpoint)
+    )
+
+
+def _clean_aawm_route_rollup_observation_target(value: Any) -> Optional[str]:
+    cleaned = _clean_aawm_route_log_field(value)
+    if not cleaned:
+        return None
+    return urlparse(cleaned)._replace(query=None, fragment=None).geturl()[
+        :_AAWM_ROUTE_OBSERVATION_MAX_ENDPOINT_CHARS
+    ]
+
+
+def _record_aawm_route_rollup_provenance_observation(
+    *,
+    snapshot: dict[str, Any],
+) -> None:
+    try:
+        if not _aawm_route_rollup_observation_enabled():
+            return
+        snapshot_context = snapshot.get("context")
+        if not _aawm_route_rollup_observation_scope_matches(
+            snapshot_context,
+            origin_identity=snapshot.get("origin_identity"),
+        ):
+            return
+        origin = snapshot.get("origin_identity")
+        agent_name_source = _normalize_aawm_route_rollup_identity(
+            snapshot.get(_AAWM_ROUTE_ROLLUP_PROVENANCE_SOURCE_KEY)
+        )
+        if agent_name_source not in _AAWM_ROUTE_ROLLUP_AGENT_NAME_PROVENANCE_VALUES:
+            agent_name_source = "unknown"
+        payload: dict[str, Any] = {
+            "event": _AAWM_ROUTE_ROLLUP_OBSERVATION_EVENT,
+            "schema": _AAWM_ROUTE_ROLLUP_OBSERVATION_SCHEMA,
+            "agent_name_source": agent_name_source,
+            "rollup_emission": {
+                "group_header_label": snapshot.get("group_header_label"),
+                "incoming_endpoint": snapshot.get("incoming_endpoint"),
+                "outgoing_target": snapshot.get("outgoing_target"),
+                "model_label": snapshot.get("model_label"),
+                "effort": snapshot.get("effort"),
+                "turn_count": snapshot.get("turns", 0),
+                "request_only": snapshot.get("request_only", False),
+            },
+            "context_cached": snapshot.get("context_cached", False),
+            "matching_origin_count": snapshot.get("matching_origin_count", 0),
+            "nonmatching_origin_count": snapshot.get(
+                "nonmatching_origin_count",
+                0,
+            ),
+            "origin_tracking_complete": bool(
+                snapshot.get("origin_tracking_complete", False)
+            ),
+            "unknown_origin_event_count": max(
+                0,
+                snapshot.get("unknown_origin_event_count", 0)
+                if isinstance(snapshot.get("unknown_origin_event_count"), int)
+                else 0,
+            ),
+            "untracked_origin_events_count": max(
+                0,
+                snapshot.get("untracked_origin_events_count", 0)
+                if isinstance(snapshot.get("untracked_origin_events_count"), int)
+                else 0,
+            ),
+            "call_id_digest": _digest_aawm_route_rollup_observation_identity(
+                (
+                    snapshot_context.get("litellm_call_id")
+                    if isinstance(snapshot_context, dict)
+                    else None
+                )
+                or (
+                    origin.litellm_call_id
+                    if isinstance(origin, _AawmRouteRollupOriginIdentity)
+                    else None
+                )
+            ),
+            "code_provenance": _get_aawm_route_rollup_observation_code_provenance(),
+            "loaded_module_provenance": (
+                _get_aawm_route_rollup_observation_module_provenance()
+            ),
+        }
+        payload["sample_scope"] = snapshot.get("sample_scope", "held_first")
+        _get_aawm_route_rollup_observation_logger().info(
+            "%s",
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ),
+        )
+    except Exception:
+        return
+
+
 def _normalize_aawm_route_rollup_identity(value: Any) -> Optional[str]:
     cleaned = _clean_aawm_route_log_field(value)
     if not cleaned or len(cleaned) > _AAWM_ROUTE_LOG_MAX_IDENTITY_CHARS:
@@ -2912,21 +3443,34 @@ def _iter_aawm_route_rollup_identity_sources(
 ) -> list[dict[str, Any]]:
     sources: list[dict[str, Any]] = []
 
-    def append_source(candidate: Any) -> None:
+    def append_source(candidate: Any, source_kind: Optional[str] = None) -> None:
         if not isinstance(candidate, dict):
             return
-        sources.append(candidate)
+        tagged_candidate = dict(candidate)
+        if source_kind is not None:
+            tagged_candidate[_AAWM_ROUTE_ROLLUP_IDENTITY_SOURCE_KIND_KEY] = (
+                source_kind
+            )
+        sources.append(tagged_candidate)
         for nested_key in ("client_metadata", "source"):
             nested = candidate.get(nested_key)
             if isinstance(nested, dict):
-                sources.append(nested)
+                nested_kind = (
+                    nested_key if nested_key == "source" else "client_metadata"
+                )
+                if source_kind == "codex_turn":
+                    nested_kind = source_kind
+                append_source(nested, source_kind=nested_kind)
 
-    append_source(metadata)
-    append_source(request_body)
+    append_source(metadata, source_kind="client_metadata")
+    append_source(request_body, source_kind="client_metadata")
     if isinstance(request_body, dict):
         append_source(request_body.get("litellm_metadata"))
         append_source(request_body.get("metadata"))
-        append_source(request_body.get("client_metadata"))
+        append_source(
+            request_body.get("client_metadata"),
+            source_kind="client_metadata",
+        )
 
     request_state = getattr(request, "state", None)
     audit_context = (
@@ -2934,7 +3478,7 @@ def _iter_aawm_route_rollup_identity_sources(
         if request_state is not None
         else None
     )
-    append_source(audit_context)
+    append_source(audit_context, source_kind="client_metadata")
     if isinstance(audit_context, dict):
         append_source(audit_context.get("agent_dispatch"))
     request_call_id = (
@@ -2943,7 +3487,12 @@ def _iter_aawm_route_rollup_identity_sources(
         else None
     )
     if isinstance(request_call_id, str):
-        sources.append({"litellm_call_id": request_call_id})
+        sources.append(
+            {
+                "litellm_call_id": request_call_id,
+                _AAWM_ROUTE_ROLLUP_IDENTITY_SOURCE_KIND_KEY: "client_metadata",
+            }
+        )
     return sources
 
 
@@ -2968,10 +3517,6 @@ def _get_aawm_route_rollup_canonical_session_identity(
     headers: dict[str, Any],
 ) -> Optional[str]:
     return _first_aawm_route_log_value(
-        *identity_sources,
-        keys=("canonical_thread_id",),
-        normalizer=_normalize_aawm_route_rollup_identity,
-    ) or _first_aawm_route_log_value(
         *identity_sources,
         keys=("canonical_session_identity",),
         normalizer=_normalize_aawm_route_rollup_identity,
@@ -3097,16 +3642,19 @@ def build_aawm_route_rollup_context(
                 metadata.get("client_ip_source")
             ),
         )
-    group_header_label = build_aawm_route_rollup_group_header_label(
-        repository=repository,
-        client_product_label=client_product_label,
-        host_name=host_attribution.get("host_name"),
-        agent_name=_get_aawm_route_rollup_agent_name(
+    agent_name, agent_name_source = (
+        _resolve_aawm_route_rollup_agent_name_with_provenance(
             *identity_sources,
             headers=headers,
             metadata=metadata,
             request_body=request_body,
-        ),
+        )
+    )
+    group_header_label = build_aawm_route_rollup_group_header_label(
+        repository=repository,
+        client_product_label=client_product_label,
+        host_name=host_attribution.get("host_name"),
+        agent_name=agent_name,
     )
     model_label = _get_aawm_route_rollup_model_label(
         model_label=_get_aawm_route_log_model_label(
@@ -3124,6 +3672,20 @@ def build_aawm_route_rollup_context(
     log_type = _normalize_aawm_route_log_type(route_type, incoming_endpoint)
     if not group_header_label or not model_label:
         return None
+    trace_id = _first_aawm_route_log_value(
+        *identity_sources,
+        keys=("trace_id", "langfuse_trace_id", "aawm_trace_id"),
+        normalizer=_normalize_aawm_route_rollup_identity,
+    )
+    session_id = _first_aawm_route_log_value(
+        *identity_sources,
+        keys=_AAWM_ROUTE_ROLLUP_SESSION_METADATA_KEYS,
+        normalizer=_normalize_aawm_route_rollup_identity,
+    ) or _get_case_insensitive_header_value(
+        headers,
+        _AAWM_ROUTE_ROLLUP_SESSION_HEADER_KEYS,
+        normalizer=_normalize_aawm_route_rollup_identity,
+    )
     origin_actor_id = _first_aawm_route_log_value(
         *identity_sources,
         keys=_AAWM_ROUTE_LOG_AGENT_ID_METADATA_KEYS,
@@ -3148,6 +3710,9 @@ def build_aawm_route_rollup_context(
     )
     return {
         "group_header_label": group_header_label,
+        "aawm_agent_name_source": agent_name_source,
+        "trace_id": trace_id,
+        "session_id": session_id,
         "incoming_endpoint": incoming_endpoint,
         "outgoing_target": outgoing_target,
         "model_label": model_label,
@@ -3249,6 +3814,7 @@ def record_aawm_route_rollup(
     review_correlation: Optional[_AawmRouteRollupReviewCorrelation] = None,
     retry_facts: Optional[dict[str, Any]] = None,
     now: Optional[datetime] = None,
+    observation_context: Optional[dict[str, Any]] = None,
 ) -> None:
     with _aawm_route_rollup_lock:
         # Get-or-replace and record under one continuous critical section so an
@@ -3265,6 +3831,23 @@ def record_aawm_route_rollup(
             message=message,
             request_status=request_status,
             request_only=request_only,
+            provenance_snapshot=(
+                _build_aawm_route_rollup_provenance_snapshot(
+                    group_header_label=group_header_label,
+                    incoming_endpoint=incoming_endpoint,
+                    outgoing_target=outgoing_target,
+                    model_label=model_label,
+                    effort=effort,
+                    turns=turns,
+                    request_status=request_status,
+                    request_only=request_only,
+                    origin_identity=origin_identity,
+                    context=observation_context,
+                )
+                if observation_context is not None
+                and _get_aawm_route_rollup_observation_scope()
+                else None
+            ),
             origin_identity=origin_identity,
             review_decision=review_decision,
             review_correlation=review_correlation,
@@ -3273,6 +3856,7 @@ def record_aawm_route_rollup(
         )
     _ensure_aawm_route_rollup_flush_worker()
     _emit_aawm_route_rollup_lines(lines)
+    _drain_aawm_route_rollup_companions()
 
 
 def _attach_codex_review_decision_event(
@@ -3482,6 +4066,7 @@ def record_aawm_route_rollup_turn(
         review_correlation=review_correlation,
         retry_facts=_openai_retry_facts_from_metadata(metadata),
         now=now,
+        observation_context=context,
     )
 
 
@@ -3515,6 +4100,7 @@ def record_aawm_route_rollup_failure(
         ),
         retry_facts=_openai_retry_facts_from_metadata(metadata),
         now=now,
+        observation_context=context,
     )
     return True
 
@@ -4207,7 +4793,29 @@ def _get_aawm_route_rollup_agent_name(
     metadata: dict[str, Any],
     request_body: Optional[dict[str, Any]] = None,
 ) -> Optional[str]:
+    agent_name, _ = _resolve_aawm_route_rollup_agent_name_with_provenance(
+        *identity_sources,
+        headers=headers,
+        metadata=metadata,
+        request_body=request_body,
+    )
+    return agent_name
+
+
+def _resolve_aawm_route_rollup_agent_name_with_provenance(
+    *identity_sources: dict[str, Any],
+    headers: dict[str, Any],
+    metadata: dict[str, Any],
+    request_body: Optional[dict[str, Any]] = None,
+) -> tuple[Optional[str], str]:
+    """Resolve one agent label and classify its winning source.
+
+    Each source is classified where it is constructed. The first winning value
+    carries that trusted source kind; no winning value is re-inferred from raw
+    field presence afterward.
+    """
     structured_sources: list[dict[str, Any]] = []
+    structured_source_kinds: list[str] = []
     if isinstance(request_body, dict):
         for candidate in (
             request_body.get("litellm_metadata"),
@@ -4216,25 +4824,74 @@ def _get_aawm_route_rollup_agent_name(
         ):
             if isinstance(candidate, dict):
                 structured_sources.append(candidate)
+                structured_source_kinds.append("structured")
                 nested_source = candidate.get("source")
                 if isinstance(nested_source, dict):
                     structured_sources.append(nested_source)
+                    structured_source_kinds.append("structured_nested")
     structured_sources.append(metadata)
-    structured_agent_name = _first_aawm_route_log_value(
+    structured_source_kinds.append("structured")
+    structured_agent_name, source_kind = _first_aawm_route_rollup_agent_name_and_source(
         *structured_sources,
-        keys=_AAWM_ROUTE_LOG_AGENT_METADATA_KEYS,
-        normalizer=_normalize_aawm_route_log_agent_label,
+        source_kinds=tuple(structured_source_kinds),
     )
-    native_agent_name = _first_aawm_route_log_value(
+    if structured_agent_name:
+        return structured_agent_name, source_kind
+
+    native_agent_name, source_kind = _first_aawm_route_rollup_agent_name_and_source(
         *identity_sources,
-        keys=_AAWM_ROUTE_LOG_AGENT_METADATA_KEYS,
-        normalizer=_normalize_aawm_route_log_agent_label,
+        source_kinds=tuple(
+            source.get(
+                _AAWM_ROUTE_ROLLUP_IDENTITY_SOURCE_KIND_KEY,
+                "codex_turn",
+            )
+            if isinstance(source, dict)
+            else "unknown"
+            for source in identity_sources
+        ),
     )
-    return structured_agent_name or native_agent_name or _get_case_insensitive_header_value(
+    if native_agent_name:
+        return native_agent_name, _classify_aawm_route_rollup_identity_source(
+            source_kind
+        )
+
+    header_agent_name = _get_case_insensitive_header_value(
         headers,
         _AAWM_ROUTE_LOG_AGENT_HEADER_KEYS,
         normalizer=_normalize_aawm_route_log_agent_label,
     )
+    if header_agent_name:
+        return header_agent_name, "header"
+    return None, "absent"
+
+
+def _first_aawm_route_rollup_agent_name_and_source(
+    *sources: Optional[dict[str, Any]],
+    source_kinds: tuple[str, ...],
+) -> tuple[Optional[str], str]:
+    """Return the first winning value and the source kind from one iteration."""
+    for source_index, source in enumerate(sources):
+        if not isinstance(source, dict):
+            continue
+        for key in _AAWM_ROUTE_LOG_AGENT_METADATA_KEYS:
+            value = _normalize_aawm_route_log_agent_label(source.get(key))
+            if value:
+                return value, source_kinds[source_index]
+    return None, "absent"
+
+
+def _classify_aawm_route_rollup_identity_source(
+    source_kind: Any,
+) -> str:
+    """Return the trusted provenance label for a constructed carrier."""
+    normalized_source_kind = _normalize_aawm_route_rollup_identity(source_kind)
+    if normalized_source_kind == "header":
+        return "header"
+    if normalized_source_kind == "agent_dispatch":
+        return "agent_dispatch"
+    if normalized_source_kind in {"codex_turn", "structured", "structured_nested"}:
+        return normalized_source_kind
+    return "unknown"
 
 
 def _build_aawm_route_access_log_line_and_key(

@@ -48,6 +48,33 @@ header when no explicit name is supplied; a role declaration alone is not
 treated as a dispatched agent name. All route-rollup producers apply this
 attribution when present; absent-name behavior is unchanged.
 
+Alpha can emit a bounded provenance companion for a matching emitted rollup
+group. Observation is off unless
+`general_settings.aawm_route_rollup_provenance_observation` is a mapping with
+at least one exact `litellm_call_id`, `trace_id`, or `session_id`
+selector. All configured selectors must match one cached request origin; any
+invalid selector disables the mapping. A boolean setting or an empty mapping
+does not enable observation. Select a known call ID, for example:
+
+```yaml
+general_settings:
+  aawm_route_rollup_provenance_observation:
+    litellm_call_id: "known-call-id"
+```
+
+`trace_id` matches an existing trace carrier. `session_id` is the cached logging
+correlation field, with its existing client-field, header, and thread fallback
+semantics; it does not create a session-owner identity. A missing configured
+identity does not match.
+
+Companions describe actual nonempty group emissions, including timer and manual
+flushes. They record the cached winning name carrier, hashed request identity,
+and rendered group attributes. Multiple or unknown request origins prevent a
+claim of exclusive request attribution. Code fingerprints identify the listed
+loaded functions and their embedded code constants; they do not attest
+closures, globals, imported callees, or the complete deployment. Observation
+does not change visible rollups, grouping, provider identity, or name precedence.
+
 The final delivered disposition is also published for logging, rollup, and
 session-transfer consumers. Consumers must use this disposition rather than
 the upstream HTTP status: `completed` is the only successful outcome;

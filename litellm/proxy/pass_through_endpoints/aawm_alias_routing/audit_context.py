@@ -19,7 +19,10 @@ from fastapi import Request
 from typing_extensions import NotRequired, TypedDict
 
 from litellm.proxy.common_utils.http_parsing_utils import _safe_get_request_headers
-from litellm.proxy.aawm_route_logging import _get_aawm_route_log_codex_turn_metadata
+from litellm.proxy.aawm_route_logging import (
+    _classify_aawm_route_rollup_identity_source,
+    _get_aawm_route_log_codex_turn_metadata,
+)
 
 from ..aawm_request_policy.observability_metadata import _extract_passthrough_repository
 from .codex_oauth import _clean_codex_auth_value
@@ -116,6 +119,10 @@ _AUTO_AGENT_FILE_EDIT_TOOL_NAMES = frozenset(
 )
 _AUTO_AGENT_REQUEST_CALL_ID_STATE_KEY = "aawm_alias_request_litellm_call_id"
 _AUTO_AGENT_REQUEST_CONTEXT_STATE_KEY = "aawm_alias_request_context"
+_AAWM_ROUTE_ROLLUP_IDENTITY_SOURCE_KIND_KEY = (
+    "_aawm_route_rollup_identity_source_kind"
+)
+_AAWM_ROUTE_ROLLUP_PROVENANCE_SOURCE_KEY = "aawm_agent_name_source"
 
 
 # ---------------------------------------------------------------------------
@@ -199,17 +206,34 @@ def _iter_auto_agent_alias_metadata_dicts(
         request_body.get("source"),
     ):
         if isinstance(candidate, dict):
-            sources.append(candidate)
+            sources.append(
+                {
+                    **candidate,
+                    _AAWM_ROUTE_ROLLUP_IDENTITY_SOURCE_KIND_KEY: "structured",
+                }
+            )
             nested_source = candidate.get("source")
             if isinstance(nested_source, dict):
-                sources.append(nested_source)
+                sources.append(
+                    {
+                        **nested_source,
+                        _AAWM_ROUTE_ROLLUP_IDENTITY_SOURCE_KIND_KEY: (
+                            "structured_nested"
+                        ),
+                    }
+                )
     codex_turn_metadata = _get_aawm_route_log_codex_turn_metadata(
         headers=_safe_get_request_headers(request),
         request_body=request_body,
         preserve_agent_name=True,
     )
     if codex_turn_metadata:
-        sources.append(codex_turn_metadata)
+        sources.append(
+            {
+                **codex_turn_metadata,
+                _AAWM_ROUTE_ROLLUP_IDENTITY_SOURCE_KIND_KEY: "codex_turn",
+            }
+        )
     headers = _safe_get_request_headers(request)
     if isinstance(headers, dict) and headers:
         # RR-054 #56: only trusted/low-cardinality header keys may influence identity fields.
@@ -226,8 +250,25 @@ def _iter_auto_agent_alias_metadata_dicts(
         }
         filtered = {key: value for key, value in headers.items() if isinstance(key, str) and key.lower() in allowed}
         if filtered:
-            sources.append(filtered)
+            sources.append(
+                {
+                    **filtered,
+                    _AAWM_ROUTE_ROLLUP_IDENTITY_SOURCE_KIND_KEY: "header",
+                }
+            )
     return sources
+
+
+def _classify_auto_agent_alias_agent_name_source(
+    winning_source: Optional[dict[str, Any]],
+) -> str:
+    """Return the trusted kind assigned when the source was constructed."""
+    tagged_kind = (
+        winning_source.get(_AAWM_ROUTE_ROLLUP_IDENTITY_SOURCE_KIND_KEY)
+        if winning_source is not None
+        else None
+    )
+    return _classify_aawm_route_rollup_identity_source(tagged_kind)
 
 
 def _extract_auto_agent_alias_explicit_agent_name(
@@ -247,7 +288,7 @@ def _extract_auto_agent_alias_explicit_agent_name(
     return None
 
 
-def _extract_auto_agent_alias_agent_dispatch_fields(
+def _extract_auto_agent_alias_agent_dispatch_fields(  # noqa: PLR0915
     request: Request,
     request_body: dict[str, Any],
 ) -> dict[str, Any]:
@@ -257,6 +298,7 @@ def _extract_auto_agent_alias_agent_dispatch_fields(
     profile sentence form: ``You are a '<role>' agent.`` for explorer/worker/default.
     """
     fields: dict[str, Any] = {}
+    agent_name: Optional[str] = None
     sources = _iter_auto_agent_alias_metadata_dicts(request, request_body)
 
     def _first_from_sources(*keys: str) -> Optional[str]:
@@ -267,7 +309,16 @@ def _extract_auto_agent_alias_agent_dispatch_fields(
                     return value
         return None
 
-    agent_name = _extract_auto_agent_alias_explicit_agent_name(sources)
+    def _first_from_sources_with_source(
+        *keys: str,
+    ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+        for source in sources:
+            for key in keys:
+                value = _clean_codex_auth_value(source.get(key))
+                if value is not None:
+                    return value, source
+        return None, None
+
     agent_role = _first_from_sources(
         "agent_role",
         "aawm_agent_role",
@@ -318,6 +369,21 @@ def _extract_auto_agent_alias_agent_dispatch_fields(
         "codex_agent_profile",
     )
 
+    if agent_name is None:
+        agent_name, agent_name_winning_source = (
+            _first_from_sources_with_source(
+                "agent_name",
+                "aawm_agent_name",
+                "aawm_claude_agent_name",
+                "codex_agent_name",
+                "x-aawm-agent-name",
+            )
+        )
+    if agent_name is not None:
+        source_kind = _classify_auto_agent_alias_agent_name_source(
+            agent_name_winning_source
+        )
+
     inferred_role = (
         _infer_auto_agent_alias_role_from_request_body(request_body)
         if agent_name is None or agent_role is None
@@ -332,6 +398,9 @@ def _extract_auto_agent_alias_agent_dispatch_fields(
             agent_profile = inferred_role
     if thread_source is None and inferred_role is not None:
         thread_source = "subagent"
+
+    if agent_name is not None:
+        fields[_AAWM_ROUTE_ROLLUP_PROVENANCE_SOURCE_KEY] = source_kind
 
     if agent_name is not None:
         fields["agent_name"] = agent_name
@@ -562,6 +631,7 @@ def _get_or_create_auto_agent_alias_request_call_id(
 
 class _AutoAgentAliasRequestContext(TypedDict):
     agent_dispatch: dict[str, Any]
+    aawm_agent_name_source: NotRequired[Optional[str]]
     session_id: Optional[str]
     canonical_thread_id: Optional[str]
     parent_thread_id: Optional[str]
@@ -584,6 +654,7 @@ def _normalize_auto_agent_alias_request_context(
     host_attribution_value = value.get("host_attribution")
     context: _AutoAgentAliasRequestContext = {
         "agent_dispatch": (dict(agent_dispatch_value) if isinstance(agent_dispatch_value, dict) else {}),
+        "aawm_agent_name_source": _clean_optional_string(value.get("aawm_agent_name_source")),
         "session_id": _clean_optional_string(value.get("session_id")),
         "canonical_thread_id": _clean_optional_string(value.get("canonical_thread_id")),
         "parent_thread_id": _clean_optional_string(value.get("parent_thread_id")),
@@ -696,6 +767,9 @@ def _get_auto_agent_alias_request_context(
                     **rollup_label_kwargs,
                 )
             ),
+            "aawm_agent_name_source": agent_dispatch.get(
+                "aawm_agent_name_source"
+            ),
         }
         if request_state is not None:
             setattr(request_state, _AUTO_AGENT_REQUEST_CONTEXT_STATE_KEY, cached)
@@ -733,6 +807,12 @@ def _attach_auto_agent_alias_terminal_context_fields(
     for key, value in agent_dispatch.items():
         if value is not None and event.get(key) is None:
             event[key] = value
+
+    agent_name_source = context.get(_AAWM_ROUTE_ROLLUP_PROVENANCE_SOURCE_KEY)
+    if agent_name_source is not None and event.get(
+        _AAWM_ROUTE_ROLLUP_PROVENANCE_SOURCE_KEY,
+    ) is None:
+        event[_AAWM_ROUTE_ROLLUP_PROVENANCE_SOURCE_KEY] = agent_name_source
 
     # Prefer existing agent_id extraction when structured fields omit it.
     if event.get("agent_id") is None:
