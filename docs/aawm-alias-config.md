@@ -142,11 +142,14 @@ The graph is bounded before publication: at most **64** alias hops in depth,
 **4,096** candidate occurrences in a branch's expanded output, and
 **32,768** expansion calls. Dispatch contributes one selected target to a
 request; compilation includes that dispatch hop and uses its largest supported
-target branch for the depth, output, and expansion-work budget. Repeated
-occurrences remain distinct because references preserve branch ordering,
-weighting, and fallback semantics. A graph beyond a budget raises a compile
-error; startup and refresh reject it without creating or replacing the
-oversized snapshot.
+target branch for the depth and output budgets and its expansion work total.
+Repeated occurrences remain distinct because references preserve branch
+ordering, weighting, and fallback semantics. Runtime selection independently
+bounds one top-level resolution to the same depth, output, and total traversal
+work, including filtered references and shared subgraphs. A graph beyond a
+budget raises an error; startup and refresh reject it without creating or
+replacing the oversized snapshot, and unsupported hand-built snapshots fail
+closed during selection.
 
 ## Provider-pinned aliases (CFG-029)
 

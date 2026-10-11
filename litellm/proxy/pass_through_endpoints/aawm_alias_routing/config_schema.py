@@ -805,7 +805,7 @@ def _count_alias_graph_expansion(
             else:
                 output += candidate_count[target]
                 work += work_count[target]
-                depth = max(depth, depth_count[target])
+                depth = max(depth, 1 + depth_count[target])
 
         candidate_count[alias_name] = min(output, output_cap)
         work_count[alias_name] = min(work, work_cap)

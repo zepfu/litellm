@@ -65,6 +65,21 @@ def _check_alias_snapshot_budget(budget: str, actual: int, maximum: int) -> None
         _raise_alias_snapshot_budget(budget, actual, maximum)
 
 
+def _charge_snapshot_traversal_work(traversal_work: list[int]) -> None:
+    """Charge one alias visit to the total resolution-wide traversal budget."""
+    traversal_work[0] += 1
+    if traversal_work[0] > _MAX_ALIAS_EXPANSION_WORK:
+        _raise_alias_snapshot_budget(
+            "expansion-work", traversal_work[0], _MAX_ALIAS_EXPANSION_WORK
+        )
+
+
+def _raise_snapshot_expanded_candidates(actual: int) -> None:
+    _raise_alias_snapshot_budget(
+        "expanded-candidate", actual, _MAX_ALIAS_EXPANDED_CANDIDATES
+    )
+
+
 # ---------------------------------------------------------------------------
 # Injected runtime state
 # ---------------------------------------------------------------------------
@@ -559,6 +574,38 @@ def _snapshot_cooldown_identity_tag(
     )
 
 
+def _append_snapshot_alias_reference_candidates(
+    resolved: list[dict[str, Any]],
+    children: Sequence[dict[str, Any]],
+    *,
+    entry: _AliasReference,
+    alias_name: str,
+    distribution_strategy: Optional[str],
+) -> None:
+    for child in children:
+        if len(resolved) >= _MAX_ALIAS_EXPANDED_CANDIDATES:
+            _raise_snapshot_expanded_candidates(len(resolved) + 1)
+        shaped = dict(child)
+        shaped["selection_priority"] = entry.priority
+        # A delegated alias may be promoted as a group without promoting a
+        # nested priority-zero tail. Preserve the child's terminal last-resort
+        # boundary while applying the reference's outer ordering priority.
+        shaped["last_resort"] = bool(child.get("last_resort")) or (
+            entry.priority == 0
+        )
+        shaped["alias_reference"] = entry.alias_name
+        # A recursive child already carries the complete graph path, including
+        # both the reference and dispatch edges above it.
+        shaped["alias_path"] = list(child["alias_path"])
+        if distribution_strategy is not None:
+            shaped["selection_group"] = alias_name
+            shaped["selection_strategy"] = distribution_strategy
+            shaped["selection_choice"] = entry.alias_name
+            shaped["selection_weight"] = entry.weight
+        shaped["selection_receipt"] = _build_snapshot_selection_receipt(shaped)
+        resolved.append(shaped)
+
+
 def _resolve_snapshot_alias_candidates(
     alias_name: str,
     *,
@@ -568,8 +615,13 @@ def _resolve_snapshot_alias_candidates(
     snapshot: _RoutingSnapshot,
     include_out_of_schedule: bool = False,
     path: tuple[str, ...] = (),
+    traversal_work: Optional[list[int]] = None,
 ) -> list[dict[str, Any]]:
     """Resolve one config alias to concrete candidates without nested loops."""
+    if traversal_work is None:
+        traversal_work = [0]
+    _charge_snapshot_traversal_work(traversal_work)
+
     if alias_name in path:
         return []
     alias = snapshot.aliases.get(alias_name)
@@ -597,14 +649,11 @@ def _resolve_snapshot_alias_candidates(
             snapshot=snapshot,
             include_out_of_schedule=include_out_of_schedule,
             path=next_path,
+            traversal_work=traversal_work,
         )
 
     resolved: list[dict[str, Any]] = []
-    work = 1
     for entry in _order_snapshot_entries_by_priority(alias.candidates):
-        _check_alias_snapshot_budget(
-            "expansion-work", work, _MAX_ALIAS_EXPANSION_WORK
-        )
         if not _is_tui_attached_candidate_eligible(
             entry, client_product_label=client_product_label
         ) or not _is_tui_excluded_candidate_eligible(entry, client_product_label=client_product_label):
@@ -620,27 +669,15 @@ def _resolve_snapshot_alias_candidates(
                 snapshot=snapshot,
                 include_out_of_schedule=include_out_of_schedule,
                 path=next_path,
+                traversal_work=traversal_work,
             )
-            work += max(1, len(children))
-            for child in children:
-                shaped = dict(child)
-                shaped["selection_priority"] = entry.priority
-                # A delegated alias may be promoted as a group without
-                # promoting a nested priority-zero tail. Preserve the
-                # child's terminal last-resort boundary while applying the
-                # reference's outer ordering priority.
-                shaped["last_resort"] = bool(child.get("last_resort")) or (entry.priority == 0)
-                shaped["alias_reference"] = entry.alias_name
-                # A recursive child already carries the complete graph path,
-                # including both the reference and dispatch edges above it.
-                shaped["alias_path"] = list(child["alias_path"])
-                if alias.distribution_strategy is not None:
-                    shaped["selection_group"] = alias.name
-                    shaped["selection_strategy"] = alias.distribution_strategy
-                    shaped["selection_choice"] = entry.alias_name
-                    shaped["selection_weight"] = entry.weight
-                shaped["selection_receipt"] = _build_snapshot_selection_receipt(shaped)
-                resolved.append(shaped)
+            _append_snapshot_alias_reference_candidates(
+                resolved,
+                children,
+                entry=entry,
+                alias_name=alias.name,
+                distribution_strategy=alias.distribution_strategy,
+            )
             continue
 
         if not include_out_of_schedule and not _is_snapshot_candidate_in_schedule_window(entry, now_utc=now_utc):
@@ -653,9 +690,10 @@ def _resolve_snapshot_alias_candidates(
             # cooldown_identity_tag below for cooldown/evidence/probe keys.
             epoch_tag=snapshot.config_hash,
         )
-        work += 1
         if shaped_candidate is None:
             continue
+        if len(resolved) >= _MAX_ALIAS_EXPANDED_CANDIDATES:
+            _raise_snapshot_expanded_candidates(len(resolved) + 1)
         shaped_candidate["cooldown_identity_tag"] = _snapshot_cooldown_identity_tag(
             owning_alias=alias.name,
             candidate=shaped_candidate,
@@ -672,9 +710,6 @@ def _resolve_snapshot_alias_candidates(
             shaped_candidate
         )
         resolved.append(shaped_candidate)
-    _check_alias_snapshot_budget(
-        "expanded-candidate", len(resolved), _MAX_ALIAS_EXPANDED_CANDIDATES
-    )
     return resolved
 
 
