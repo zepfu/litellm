@@ -7735,6 +7735,8 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
         )
         raise proxy_exc from exc
     if getattr(exc, _CURSOR_REPLAY_STATE_BOUND_EXCEEDED_MARKER, False):
+        from fastapi import HTTPException
+
         fresh_dispatch_exc = HTTPException(
             status_code=409,
             detail={
