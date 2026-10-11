@@ -5307,6 +5307,126 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         }
 
     @staticmethod
+    def _provider_family_for_egress_family(
+        family: Optional[str],
+    ) -> Optional[str]:
+        normalized = str(family or "").strip().casefold()
+        if not normalized or normalized == "generic":
+            return None
+        if normalized == "codex_oauth":
+            return "openai"
+        if normalized in {
+            XAI_OAUTH_CREDENTIAL_FAMILY,
+            GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
+            XAI_OAUTH_ROUTE_FAMILY,
+            GROK_NATIVE_OAUTH_ROUTE_FAMILY,
+        }:
+            return "xai"
+        if normalized in {
+            _OPENCODE_ZEN_CREDENTIAL_FAMILY,
+            _OPENCODE_ZEN_TARGET_FAMILY,
+            _OPENCODE_GO_CREDENTIAL_FAMILY,
+            _OPENCODE_GO_TARGET_FAMILY,
+        }:
+            return "opencode"
+        return normalized
+
+    @staticmethod
+    def _validate_generic_target_egress(
+        *,
+        url: Union[str, httpx.URL],
+        credential_family: Optional[str],
+        expected_target_family: Optional[str],
+        marker_families: set[str],
+    ) -> None:
+        normalized_credential_family = str(
+            credential_family or ""
+        ).strip().casefold()
+        normalized_expected_family = str(
+            expected_target_family or ""
+        ).strip().casefold()
+        expected_provider_family = (
+            HttpPassThroughEndpointHelpers._provider_family_for_egress_family(
+                normalized_expected_family
+            )
+        )
+        credential_provider_family = (
+            HttpPassThroughEndpointHelpers._provider_family_for_egress_family(
+                normalized_credential_family
+            )
+        )
+        provider_scoped_egress = bool(
+            normalized_credential_family
+            or normalized_expected_family
+            or marker_families
+        )
+        openai_bound_egress = HttpPassThroughEndpointHelpers._is_openai_bound_egress(
+            custom_llm_provider=None,
+            egress_credential_family=credential_family,
+            expected_target_family=expected_target_family,
+            url=url,
+        )
+        detail: Optional[str] = None
+        if normalized_expected_family and expected_provider_family is None:
+            detail = (
+                "Blocked passthrough egress: the expected family is not a "
+                "recognized provider family for an unknown target."
+            )
+        elif (
+            credential_provider_family is not None
+            and expected_provider_family is not None
+            and credential_provider_family != expected_provider_family
+        ):
+            detail = (
+                "Blocked passthrough egress: the expected provider family "
+                "does not match the credential family for an unknown target."
+            )
+        exact_credential_route_families = {
+            XAI_OAUTH_CREDENTIAL_FAMILY: XAI_OAUTH_ROUTE_FAMILY,
+            GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY: GROK_NATIVE_OAUTH_ROUTE_FAMILY,
+            _OPENCODE_ZEN_CREDENTIAL_FAMILY: _OPENCODE_ZEN_TARGET_FAMILY,
+            _OPENCODE_GO_CREDENTIAL_FAMILY: _OPENCODE_GO_TARGET_FAMILY,
+        }
+        required_route_family = exact_credential_route_families.get(
+            normalized_credential_family
+        )
+        if (
+            detail is None
+            and required_route_family is not None
+            and normalized_expected_family != required_route_family
+        ):
+            detail = (
+                "Blocked passthrough egress: the expected route family does "
+                "not match the credential family for an unknown target."
+            )
+        marker_provider_family = expected_provider_family or credential_provider_family
+        if detail is None and marker_provider_family is not None:
+            cross_provider_markers = {
+                marker for marker in marker_families if marker != marker_provider_family
+            }
+            if cross_provider_markers:
+                detail = (
+                    "Blocked passthrough egress due to cross-provider "
+                    "credential/header markers: target=generic, "
+                    f"expected={marker_provider_family}, "
+                    f"markers={sorted(cross_provider_markers)}."
+                )
+        if detail is None and provider_scoped_egress and not openai_bound_egress:
+            detail = (
+                "Blocked passthrough egress: provider-scoped credentials or "
+                "markers cannot be sent to an unknown target without "
+                "independent provider proof."
+            )
+        if detail is not None:
+            HttpPassThroughEndpointHelpers._raise_egress_guard_block(
+                detail=detail,
+                url=url,
+                credential_family=credential_family,
+                target_family="generic",
+                marker_families=marker_families,
+            )
+
+    @staticmethod
     def _expected_opencode_route_family(
         *,
         credential_family: Optional[str],
@@ -5357,6 +5477,27 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             return "xai"
         if hostname in {"integrate.api.nvidia.com", "ai.api.nvidia.com"}:
             return "nvidia"
+        # These canonical adapter targets have source-defined host contracts;
+        # custom proxy domains remain generic and require independent proof.
+        if hostname in {"api.cohere.com", "api.cohere.ai"}:
+            return "cohere"
+        if hostname == "api.kimi.com":
+            return "kimi_code"
+        if hostname == "token-plan.ap-southeast-1.maas.aliyuncs.com":
+            return "alibaba_token_plan"
+        target_path = (parsed_url.path or "").rstrip("/")
+        if hostname == "api.z.ai" and (
+            target_path == "/api/coding/paas/v4"
+            or target_path.startswith("/api/coding/paas/v4/")
+        ):
+            return "zai_coding_plan"
+        if hostname == "inference-api.nousresearch.com":
+            return "nous"
+        if (
+            hostname == "agentn.global.api5.cursor.sh"
+            and target_path == "/agent.v1.AgentService/Run"
+        ):
+            return "cursor_agent"
         if (
             hostname == "generativelanguage.googleapis.com"
             or hostname.endswith(".googleapis.com")
@@ -5533,8 +5674,8 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
 
         # OC-010: Zen/Go egress must bind the exact Zen/Go route family, so
         # a Zen credential cannot reach a Go target. xAI resolution is
-        # checked first and keeps its existing exact semantics. Generic
-        # proxy hosts stay generic-aware, matching xAI.
+        # checked first and keeps its existing exact semantics. Unknown proxy
+        # hosts remain generic here and are subject to the proof guard below.
         if expected_opencode_route_family is not None and (
             (
                 opencode_target_route_family is not None
@@ -5603,16 +5744,27 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             headers=headers,
             url=url,
         )
+        if target_family == "generic":
+            # This returns only after generic proof and marker checks;
+            # OpenAI-bound egress remains separately bound at final send.
+            HttpPassThroughEndpointHelpers._validate_generic_target_egress(
+                url=url,
+                credential_family=credential_family,
+                expected_target_family=expected_target_family,
+                marker_families=marker_families,
+            )
+            return
         cross_provider_markers = {
             marker
             for marker in marker_families
-            if target_family != "generic" and marker != target_family
+            if marker != target_family
         }
         if cross_provider_markers:
             HttpPassThroughEndpointHelpers._raise_egress_guard_block(
                 detail=(
                     "Blocked passthrough egress due to cross-provider credential/header "
-                    f"markers: target={target_family}, markers={sorted(cross_provider_markers)}."
+                    f"markers: target={target_family}, "
+                    f"markers={sorted(cross_provider_markers)}."
                 ),
                 url=url,
                 credential_family=credential_family,

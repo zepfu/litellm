@@ -199,6 +199,12 @@ general_settings:
 - **LANGFUSE_PUBLIC_KEY/SECRET_KEY**: For Langfuse integration
 - **Custom headers**: Any additional key-value pairs
 
+When a target uses an unrecognized host, any provider-scoped request is
+rejected: expected-family labels, credential-family labels, and forwarded
+provider markers do not independently prove that the host belongs to that
+provider. Requests without those signals remain unscoped. OpenAI-bound requests
+retain their separate final-send binding.
+
 ### Default Query Parameters
 - **Parameter precedence**: Client params > URL params > default params
 - **Use cases**: API versioning, authentication tokens, format control, feature flags
