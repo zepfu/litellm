@@ -1051,10 +1051,25 @@ def _cursor_observation_code_provenance() -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             digest = None
         functions.append({"symbol": symbol, "digest": digest})
+    connector_provenance: dict[str, Any] = {
+        "algorithm": "aawm-code-object-sha256-v1",
+        "available": False,
+        "functions": [],
+        "reason": "connector_provenance_collector_unavailable",
+    }
+    try:
+        from litellm.llms.cursor_agent.connect import (
+            _cursor_observation_code_provenance as collect_connector_provenance,
+        )
+
+        connector_provenance = collect_connector_provenance()
+    except Exception:  # noqa: BLE001
+        pass
     return {
         "algorithm": "aawm-code-object-sha256-v1",
         "available": True,
         "functions": functions,
+        "connector_provenance": connector_provenance,
     }
 
 
