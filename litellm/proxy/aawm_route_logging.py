@@ -1576,6 +1576,7 @@ _AAWM_ROUTE_ROLLUP_AGENT_NAME_PROVENANCE_VALUES = frozenset(
         "client_metadata",
         "structured",
         "structured_nested",
+        "inferred_role",
     }
 )
 _AAWM_ROUTE_ROLLUP_IDENTITY_SOURCE_KIND_KEY = (
