@@ -569,14 +569,28 @@ def compile_directory(config_dir: Path) -> RoutingSnapshot:
 def compile_directory_with_file_names(
     config_dir: Path,
 ) -> tuple[RoutingSnapshot, tuple[str, ...]]:
-    """Compile the full config directory and return its file names.
+    """Compile and revalidate the full directory; return captured file names.
 
-    This helper preserves startup scanner semantics (`_scan_inventory`) while
-    exposing the deterministic file-name inventory for readout paths that need
-    to report complete source metadata without recompiling the directory.
+    The snapshot is built only from captured bytes. The complete directory is
+    scanned again before returning, and any inventory drift rejects the
+    candidate.
     """
+    snapshot, inventory = _compile_revalidated_inventory(config_dir)
+    return snapshot, inventory.file_names
+
+
+def _compile_revalidated_inventory(
+    config_dir: Path,
+) -> tuple[RoutingSnapshot, _ConfigInventory]:
+    """Compile one captured inventory and reject changes before activation."""
     inventory = _scan_inventory(config_dir)
-    return _compile_inventory(inventory), inventory.file_names
+    snapshot = _compile_inventory(inventory)
+    revalidation = _scan_inventory(config_dir)
+    if inventory.identity_key() != revalidation.identity_key():
+        raise InventoryDriftError(
+            "config directory changed between scan and activation"
+        )
+    return snapshot, inventory
 
 
 # ---------------------------------------------------------------------------
@@ -620,16 +634,7 @@ def activate_alias_config_directory(
     """
     resolved_dir = config_dir if config_dir is not None else DEFAULT_CONFIG_DIR
     try:
-        # First scan: capture immutable inventory.
-        inventory = _scan_inventory(resolved_dir)
-        # Compile from captured bytes only.
-        snapshot = _compile_inventory(inventory)
-        # Second scan: revalidate immediately before activation.
-        revalidation = _scan_inventory(resolved_dir)
-        if inventory.identity_key() != revalidation.identity_key():
-            raise InventoryDriftError(
-                "config directory changed between scan and activation"
-            )
+        snapshot, inventory = _compile_revalidated_inventory(resolved_dir)
         # Atomic install.
         set_active_routing_snapshot(snapshot)
         with _state_lock:

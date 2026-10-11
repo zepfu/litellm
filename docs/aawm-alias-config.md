@@ -92,7 +92,10 @@ filesystem transaction. Changes that land **after** the final revalidation
 are not observed by this activation and load on the **next restart** (or the
 next successful refresh). The read-only container mount (below) is the
 primary guarantee against in-container mutation; the rescan is a bounded
-defense against host-side races on the bind-mounted source.
+defense against host-side races on the bind-mounted source. Startup and
+directory refresh share this check; request and failure behavior are
+documented in
+[refresh semantics](#restart-refresh-and-recovery-semantics).
 
 ## Readiness and failure behavior
 
@@ -540,11 +543,21 @@ retries, cooldown recovery, probes, and acceptance harnesses.
 - **Routing snapshot lifetime**: once activated, the routing snapshot lasts
   until a **successful refresh** replaces it or the worker **restarts**. A
   failed refresh preserves the last-known-good snapshot.
+- **Refresh request**: an empty body or JSON object without `yaml` reloads
+  the canonical directory. An object with a string `yaml` field compiles that
+  inline configuration. Malformed nonempty JSON, non-object JSON, and a
+  present non-string `yaml` field return a sanitized 400 before source
+  loading or compilation.
+- **Directory refresh**: re-scans and compiles the complete canonical
+  directory, so host-side file additions, removals, and edits can take effect
+  without a restart. It uses the startup inventory revalidation check and
+  preserves the active snapshot and prior startup source-file metadata if
+  drift is detected. Synchronous loading and compilation run on a worker
+  thread. Transactions are serialized within each process; there is no
+  cross-worker consensus (see
+  [Multi-worker refresh consensus](#multi-worker-refresh-consensus)).
 - **Restart**: the startup loader re-scans and compiles the complete canonical
-  directory. A successful empty-body/default refresh performs the same full
-  re-scan and compile, so host-side file additions, removals, and edits can
-  take effect without a restart. Recovery from a failed startup still requires
-  a worker restart.
+  directory. Recovery from a failed startup still requires a worker restart.
 - **Invalid hot refresh**: if a runtime refresh attempt encounters invalid
   config, the active last-known-good snapshot is preserved. No restart is
   needed; routing continues on the prior valid definition.
@@ -559,8 +572,7 @@ retries, cooldown recovery, probes, and acceptance harnesses.
 (`./litellm/proxy/aawm_alias_config:/app/litellm/proxy/aawm_alias_config:ro`).
 This blocks **container-side** writes to the config tree. It does **not**
 prevent host-side edits to the bind-mounted source. A successful
-empty-body/default refresh re-scans and compiles the complete canonical
-directory, including those host-side additions, removals, and edits; otherwise
+default refresh observes host-side additions, removals, and edits; otherwise
 they load on the next restart.
 
 ## CFG-017 source identity and parity contract
