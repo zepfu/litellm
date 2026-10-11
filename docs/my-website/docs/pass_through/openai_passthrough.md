@@ -69,8 +69,9 @@ identity does not match.
 
 Companions describe actual nonempty group emissions, including timer and manual
 flushes. They record the cached winning name carrier, hashed request identity,
-and rendered group attributes. Multiple or unknown request origins prevent a
-claim of exclusive request attribution. Code fingerprints identify the listed
+and rendered group attributes, including aggregated turns and each rendered
+subline's model, target, and effort. Multiple or unknown request origins prevent
+a claim of exclusive request attribution. Code fingerprints identify the listed
 loaded functions and their embedded code constants; they do not attest
 closures, globals, imported callees, or the complete deployment. Observation
 does not change visible rollups, grouping, provider identity, or name precedence.
