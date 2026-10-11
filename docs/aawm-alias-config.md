@@ -585,8 +585,11 @@ retries, cooldown recovery, probes, and acceptance harnesses.
   without a restart. It uses the startup inventory revalidation check and
   preserves the active snapshot and prior startup source-file metadata if
   drift is detected. Synchronous loading and compilation run on a worker
-  thread. Transactions are serialized within each process; there is no
-  cross-worker consensus (see
+  thread. After work is scheduled, request cancellation is propagated only
+  after the worker finishes, while the per-process refresh lock remains held.
+  This prevents a later refresh from publishing ahead of an earlier worker.
+  Transactions are serialized within each process; there is no cross-worker
+  consensus (see
   [Multi-worker refresh consensus](#multi-worker-refresh-consensus)).
 - **Restart**: the startup loader re-scans and compiles the complete canonical
   directory. Recovery from a failed startup still requires a worker restart.
