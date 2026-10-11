@@ -3526,6 +3526,7 @@ class PassThroughStreamingHandler:
             effort=str(context.get("reasoning_effort") or "none"),
             turns=0,
             status="Failed",
+            observation_context=context,
         )
 
     @staticmethod
@@ -4412,6 +4413,7 @@ class PassThroughStreamingHandler:
                         turns=0,
                         status="Incomplete",
                         message=message,
+                        observation_context=context,
                     )
             elif not (
                 metadata.get("aawm_stream_interrupted")

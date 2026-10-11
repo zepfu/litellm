@@ -1368,7 +1368,6 @@ _aawm_route_observation_digest_cache: "weakref.WeakKeyDictionary[Any, str]" = (
     weakref.WeakKeyDictionary()
 )
 _aawm_route_observation_logger_name = "litellm.proxy.aawm_route_rollup_observation"
-_aawm_route_rollup_pending_companions: list[dict[str, Any]] = []
 _AAWM_ROUTE_OBSERVATION_MAX_ENDPOINT_CHARS = 96
 _AAWM_ROUTE_OBSERVATION_MAX_GROUP_HEADER_CHARS = 256
 _AAWM_ROUTE_OBSERVATION_MAX_MODEL_CHARS = 128
@@ -2295,6 +2294,9 @@ class AawmRouteRollupAccumulator:
         review_correlation: Optional[_AawmRouteRollupReviewCorrelation] = None,
         retry_facts: Optional[dict[str, Any]] = None,
         now: Optional[datetime] = None,
+        _companion_collector: Optional[
+            list[tuple[list[str], dict[str, Any]]]
+        ] = None,
     ) -> list[str]:
         if not self.enabled():
             return []
@@ -2329,7 +2331,12 @@ class AawmRouteRollupAccumulator:
                 correlation=review_correlation,
             )
         ):
-            emitted_lines.extend(self.flush_due(now=now))
+            emitted_lines.extend(
+                self.flush_due(
+                    now=now,
+                    _companion_collector=_companion_collector,
+                )
+            )
             return emitted_lines
 
         group_key = (
@@ -2340,7 +2347,12 @@ class AawmRouteRollupAccumulator:
         group = self._groups.get(group_key)
         if group is None and len(self._groups) >= self._max_groups:
             emitted_lines.extend(
-                self.flush(force=True, now=now, early=True)
+                self.flush(
+                    force=True,
+                    now=now,
+                    early=True,
+                    _companion_collector=_companion_collector,
+                )
             )
             group = None
         if group is None:
@@ -2350,8 +2362,12 @@ class AawmRouteRollupAccumulator:
             )
             self._groups[group_key] = group
 
-        if provenance_snapshot is not None:
-            group.record_provenance_snapshot(
+        def register_provenance_snapshot(
+            target_group: _AawmRouteRollupGroup,
+        ) -> None:
+            if provenance_snapshot is None:
+                return
+            target_group.record_provenance_snapshot(
                 provenance_snapshot,
                 matches_observation_scope=(
                     _aawm_route_rollup_observation_scope_matches(
@@ -2374,7 +2390,13 @@ class AawmRouteRollupAccumulator:
                     else None
                 ),
             )
-            emitted_lines.extend(self.flush_due(now=now))
+            register_provenance_snapshot(group)
+            emitted_lines.extend(
+                self.flush_due(
+                    now=now,
+                    _companion_collector=_companion_collector,
+                )
+            )
             return emitted_lines
 
         account_identity = (
@@ -2423,12 +2445,18 @@ class AawmRouteRollupAccumulator:
                         else None
                     ),
                 )
+                register_provenance_snapshot(group)
             elif (
                 not group.sublines
                 and group.effective_request_terminal_state() is None
             ):
                 self._groups.pop(group_key, None)
-            emitted_lines.extend(self.flush_due(now=now))
+            emitted_lines.extend(
+                self.flush_due(
+                    now=now,
+                    _companion_collector=_companion_collector,
+                )
+            )
             return emitted_lines
         if (
             subline is not None
@@ -2488,6 +2516,7 @@ class AawmRouteRollupAccumulator:
                         now=now,
                         early=True,
                         remove=True,
+                        _companion_collector=_companion_collector,
                     )
                 )
                 group = _AawmRouteRollupGroup(
@@ -2502,6 +2531,7 @@ class AawmRouteRollupAccumulator:
             group.sublines[subline_key] = subline
             group.subline_order.append(subline_key)
 
+        register_provenance_snapshot(group)
         self._record_subline_activity(
             group=group,
             subline=subline,
@@ -2526,7 +2556,12 @@ class AawmRouteRollupAccumulator:
                 ),
             )
 
-        emitted_lines.extend(self.flush_due(now=now))
+        emitted_lines.extend(
+            self.flush_due(
+                now=now,
+                _companion_collector=_companion_collector,
+            )
+        )
         return emitted_lines
 
     @staticmethod
@@ -2643,6 +2678,9 @@ class AawmRouteRollupAccumulator:
         *,
         now: Optional[datetime] = None,
         monotonic_now: Optional[float] = None,
+        _companion_collector: Optional[
+            list[tuple[list[str], dict[str, Any]]]
+        ] = None,
     ) -> list[str]:
         if not self.enabled() or not self._groups:
             return []
@@ -2651,7 +2689,11 @@ class AawmRouteRollupAccumulator:
         )
         if current_monotonic - self._last_flush_monotonic < self._interval_seconds:
             return []
-        return self.flush(force=True, now=now)
+        return self.flush(
+            force=True,
+            now=now,
+            _companion_collector=_companion_collector,
+        )
 
     def flush(
         self,
@@ -2659,6 +2701,9 @@ class AawmRouteRollupAccumulator:
         force: bool = False,
         now: Optional[datetime] = None,
         early: bool = False,
+        _companion_collector: Optional[
+            list[tuple[list[str], dict[str, Any]]]
+        ] = None,
     ) -> list[str]:
         if not self._groups:
             return []
@@ -2668,7 +2713,13 @@ class AawmRouteRollupAccumulator:
         emitted_lines: list[str] = []
         for group_key, group in list(self._groups.items()):
             emitted_lines.extend(
-                self._flush_group(group, now=now, early=early, remove=True)
+                self._flush_group(
+                    group,
+                    now=now,
+                    early=early,
+                    remove=True,
+                    _companion_collector=_companion_collector,
+                )
             )
             self._groups.pop(group_key, None)
         self._last_flush_monotonic = time.monotonic()
@@ -2681,6 +2732,9 @@ class AawmRouteRollupAccumulator:
         now: Optional[datetime] = None,
         early: bool = False,
         remove: bool,
+        _companion_collector: Optional[
+            list[tuple[list[str], dict[str, Any]]]
+        ] = None,
     ) -> list[str]:
         request_terminal_state = group.effective_request_terminal_state()
         sublines = group.ordered_sublines()
@@ -2698,35 +2752,85 @@ class AawmRouteRollupAccumulator:
             now=now,
             early=early,
         )
-        companion_snapshot: Optional[dict[str, Any]] = None
-        if lines:
+        if lines and _companion_collector is not None:
             snapshot = group.provenance_snapshot
             if snapshot is not None:
-                snapshot["matching_origin_count"] = len(
+                companion_snapshot = dict(snapshot)
+                companion_snapshot["matching_origin_count"] = len(
                     group.provenance_contributing_origin_ids
                     - group.provenance_nonmatching_contributing_origin_ids
                 )
-                snapshot["nonmatching_origin_count"] = (
+                companion_snapshot["nonmatching_origin_count"] = (
                     len(group.provenance_nonmatching_contributing_origin_ids)
                 )
-                snapshot["origin_tracking_complete"] = (
+                companion_snapshot["origin_tracking_complete"] = (
                     group.provenance_untracked_origin_events_count == 0
                 )
-                snapshot["unknown_origin_event_count"] = (
+                companion_snapshot["unknown_origin_event_count"] = (
                     group.provenance_unknown_origin_event_count
                 )
-                snapshot["untracked_origin_events_count"] = (
+                companion_snapshot["untracked_origin_events_count"] = (
                     group.provenance_untracked_origin_events_count
                 )
-                companion_snapshot = snapshot
+                companion_snapshot["rollup_emission"] = {
+                    "group_header_label": group.group_header_label,
+                    "incoming_endpoint": group.incoming_endpoint,
+                    "outgoing_target": (
+                        sublines[0][4]
+                        if sublines
+                        and all(
+                            subline[4] == sublines[0][4]
+                            for subline in sublines
+                        )
+                        else None
+                    ),
+                    "model_label": (
+                        sublines[0][0]
+                        if sublines
+                        and all(
+                            subline[0] == sublines[0][0]
+                            for subline in sublines
+                        )
+                        else None
+                    ),
+                    "effort": (
+                        sublines[0][1]
+                        if sublines
+                        and all(
+                            subline[1] == sublines[0][1]
+                            for subline in sublines
+                        )
+                        else None
+                    ),
+                    "turn_count": sum(subline[2] for subline in sublines),
+                    "request_outcome": (
+                        request_terminal_state.status
+                        if request_terminal_state is not None
+                        else None
+                    ),
+                    "request_only": not sublines
+                    and request_terminal_state is not None,
+                    "sublines": [
+                        {
+                            "model_label": subline[0],
+                            "effort": subline[1],
+                            "turn_count": subline[2],
+                            "status": subline[3],
+                            "outgoing_target": subline[4],
+                            "approved_reviews": subline[6],
+                            "denied_reviews": subline[8],
+                            "retry_count": subline[11],
+                        }
+                        for subline in sublines
+                    ],
+                }
+                _companion_collector.append((lines, companion_snapshot))
         if remove:
             group_key = (
                 group.group_header_label,
                 group.incoming_endpoint,
             )
             self._groups.pop(group_key, None)
-        if companion_snapshot is not None:
-            _aawm_route_rollup_pending_companions.append(companion_snapshot)
         return lines
 
 
@@ -2773,15 +2877,19 @@ def _set_aawm_route_rollup_monotonic_now_for_tests(
 def _tick_aawm_route_rollup_interval_flush() -> None:
     if not aawm_route_rollups_enabled():
         return
+    companions: list[tuple[list[str], dict[str, Any]]] = []
     with _aawm_route_rollup_lock:
         # Obtain/replace under the same critical section as flush_due so a
         # concurrent interval change cannot leave this tick mutating an orphan.
         accumulator = _get_or_replace_aawm_route_rollup_accumulator_locked()
         if not accumulator.enabled():
             return
-        lines = accumulator.flush_due(monotonic_now=_aawm_route_rollup_monotonic_now())
+        lines = accumulator.flush_due(
+            monotonic_now=_aawm_route_rollup_monotonic_now(),
+            _companion_collector=companions,
+        )
     _emit_aawm_route_rollup_lines(lines)
-    _drain_aawm_route_rollup_companions()
+    _emit_aawm_route_rollup_companions(companions)
 
 
 def _aawm_route_rollup_flush_worker_main() -> None:
@@ -2833,10 +2941,18 @@ def flush_aawm_route_rollups(
     force: bool = True,
     now: Optional[datetime] = None,
     early: bool = False,
+    _companion_collector: Optional[
+        list[tuple[list[str], dict[str, Any]]]
+    ] = None,
 ) -> list[str]:
     with _aawm_route_rollup_lock:
         accumulator = _get_or_replace_aawm_route_rollup_accumulator_locked()
-        lines = accumulator.flush(force=force, now=now, early=early)
+        lines = accumulator.flush(
+            force=force,
+            now=now,
+            early=early,
+            _companion_collector=_companion_collector,
+        )
     # Ensure the background flush worker tracks the current interval without
     # holding the rollup lock (worker stop may re-enter that lock).
     _ensure_aawm_route_rollup_flush_worker()
@@ -2918,16 +3034,30 @@ def _emit_aawm_route_rollup_lines(lines: list[str]) -> None:
     )
 
 
+def _emit_aawm_route_rollup_companions(
+    companions: list[tuple[list[str], dict[str, Any]]],
+) -> None:
+    for emitted_lines, snapshot in companions:
+        if not emitted_lines:
+            continue
+        _record_aawm_route_rollup_provenance_observation(snapshot=snapshot)
+
+
 def emit_flush_aawm_route_rollups(
     *,
     force: bool = True,
     now: Optional[datetime] = None,
     early: bool = False,
 ) -> None:
-    _emit_aawm_route_rollup_lines(
-        flush_aawm_route_rollups(force=force, now=now, early=early)
+    companions: list[tuple[list[str], dict[str, Any]]] = []
+    lines = flush_aawm_route_rollups(
+        force=force,
+        now=now,
+        early=early,
+        _companion_collector=companions,
     )
-    _drain_aawm_route_rollup_companions()
+    _emit_aawm_route_rollup_lines(lines)
+    _emit_aawm_route_rollup_companions(companions)
 
 
 def _get_aawm_route_rollup_metadata(kwargs: Optional[dict]) -> Optional[dict[str, Any]]:
@@ -3239,15 +3369,6 @@ def _aawm_route_rollup_observation_scope_matches(
     return all(filters.get(key) == checks.get(key) for key in filters)
 
 
-def _drain_aawm_route_rollup_companions() -> None:
-    while _aawm_route_rollup_pending_companions:
-        with _aawm_route_rollup_lock:
-            if not _aawm_route_rollup_pending_companions:
-                break
-            snapshot = _aawm_route_rollup_pending_companions.pop(0)
-        _record_aawm_route_rollup_provenance_observation(snapshot=snapshot)
-
-
 def _build_aawm_route_rollup_provenance_snapshot(
     *,
     group_header_label: str,
@@ -3364,15 +3485,7 @@ def _record_aawm_route_rollup_provenance_observation(
             "event": _AAWM_ROUTE_ROLLUP_OBSERVATION_EVENT,
             "schema": _AAWM_ROUTE_ROLLUP_OBSERVATION_SCHEMA,
             "agent_name_source": agent_name_source,
-            "rollup_emission": {
-                "group_header_label": snapshot.get("group_header_label"),
-                "incoming_endpoint": snapshot.get("incoming_endpoint"),
-                "outgoing_target": snapshot.get("outgoing_target"),
-                "model_label": snapshot.get("model_label"),
-                "effort": snapshot.get("effort"),
-                "turn_count": snapshot.get("turns", 0),
-                "request_only": snapshot.get("request_only", False),
-            },
+            "rollup_emission": snapshot.get("rollup_emission", {}),
             "context_cached": snapshot.get("context_cached", False),
             "matching_origin_count": snapshot.get("matching_origin_count", 0),
             "nonmatching_origin_count": snapshot.get(
@@ -3835,6 +3948,7 @@ def record_aawm_route_rollup(
     now: Optional[datetime] = None,
     observation_context: Optional[dict[str, Any]] = None,
 ) -> None:
+    companions: list[tuple[list[str], dict[str, Any]]] = []
     with _aawm_route_rollup_lock:
         # Get-or-replace and record under one continuous critical section so an
         # interval-driven singleton swap cannot orphan this mutation.
@@ -3872,10 +3986,11 @@ def record_aawm_route_rollup(
             review_correlation=review_correlation,
             retry_facts=retry_facts,
             now=now,
+            _companion_collector=companions,
         )
     _ensure_aawm_route_rollup_flush_worker()
     _emit_aawm_route_rollup_lines(lines)
-    _drain_aawm_route_rollup_companions()
+    _emit_aawm_route_rollup_companions(companions)
 
 
 def _attach_codex_review_decision_event(
