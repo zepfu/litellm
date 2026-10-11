@@ -27,6 +27,7 @@ from litellm._logging import verbose_proxy_logger
 from litellm.llms.alibaba_token_plan.chat.transformation import (
     ALIBABA_TOKEN_PLAN_SUBSCRIPTION_IDENTITY_SOURCE as _ALIBABA_TOKEN_PLAN_SUBSCRIPTION_IDENTITY_SOURCE,
     alibaba_token_plan_account_quota_cooldown_key,
+    resolve_alibaba_token_plan_subscription_identity,
     subscription_identity_for_candidate,
 )
 from litellm.utils import get_model_info
@@ -2568,6 +2569,113 @@ def _alibaba_token_plan_quota_evidence(
         "windows": windows,
     }
     return evidence, windows
+
+
+def _alibaba_direct_route_subscription_identity(identity: Optional[str]) -> Optional[str]:
+    """Keep only a 64-hex sha256. Missing or mismatched values stay unknown."""
+
+    normalized = str(identity or "").strip().lower()
+    if len(normalized) != 64 or any(
+        character not in "0123456789abcdef" for character in normalized
+    ):
+        return None
+    return normalized
+
+
+def _alibaba_direct_route_decision(
+    *,
+    model: str,
+    subscription_identity: Optional[str],
+    exhausted: bool,
+    cooldown_seconds: float,
+) -> dict[str, Any]:
+    """Prefer fresh exhaustion over an active account cooldown."""
+
+    reason: Optional[str] = None
+    if exhausted:
+        reason = "quota_exhausted"
+    elif cooldown_seconds > 0:
+        reason = "account_quota_cooldown"
+    return {
+        "admit": reason is None,
+        "reason": reason,
+        "provider": "alibaba_token_plan",
+        "model": model,
+        "subscription_identity": subscription_identity,
+    }
+
+
+async def _alibaba_direct_route_account_cooldown_seconds(
+    subscription_identity: str,
+) -> float:
+    """Read remaining account-cooldown seconds for one hashed identity.
+
+    An unconfigured cooldown manager is not an active cooldown. Exhaustion is
+    decided separately and is not swallowed here.
+    """
+
+    cooldown_key = alibaba_token_plan_account_quota_cooldown_key(
+        subscription_identity
+    )
+    if cooldown_key is None:
+        return 0.0
+    try:
+        _cooldown_seconds, _cooldown_source, _skip_reason = (
+            await _apply_codex_auto_agent_alibaba_token_plan_account_cooldown(
+                candidate={
+                    "provider": _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+                    "subscription_identity": subscription_identity,
+                },
+                cooldown_seconds=0.0,
+                cooldown_state_source=None,
+                skip_reason=None,
+                get_active_cooldown_state=_cooldown_state._get_codex_auto_agent_active_cooldown_state,
+            )
+        )
+    except Exception:
+        return 0.0
+    if not isinstance(_cooldown_seconds, (int, float)) or isinstance(
+        _cooldown_seconds, bool
+    ):
+        return 0.0
+    if not math.isfinite(float(_cooldown_seconds)) or float(_cooldown_seconds) <= 0:
+        return 0.0
+    return float(_cooldown_seconds)
+
+
+async def alibaba_token_plan_direct_route_admission(
+    model: str,
+) -> dict[str, Any]:
+    """Admit or block one explicit ``alibaba_token_plan/<model>`` Codex route.
+
+    Block only on fresh exact-account exhaustion or an active hashed-account
+    cooldown. Unknown, stale, missing, or mismatched identity still calls the
+    named model. Never reroute to another provider.
+    """
+
+    identity = _alibaba_direct_route_subscription_identity(
+        resolve_alibaba_token_plan_subscription_identity()
+    )
+    if identity is None:
+        return _alibaba_direct_route_decision(
+            model=model,
+            subscription_identity=None,
+            exhausted=False,
+            cooldown_seconds=0.0,
+        )
+    observation, windows = _alibaba_token_plan_quota_evidence(
+        subscription_identity=identity,
+    )
+    exhausted = observation is None and bool(windows)
+    cooldown_seconds = await _alibaba_direct_route_account_cooldown_seconds(
+        identity
+    )
+    return _alibaba_direct_route_decision(
+        model=model,
+        subscription_identity=identity,
+        exhausted=exhausted,
+        cooldown_seconds=cooldown_seconds,
+    )
 
 
 def _attach_alibaba_token_plan_quota_state(
@@ -8097,6 +8205,7 @@ _HOST_FUNCTION_NAMES = (
     "_alibaba_token_plan_quota_observation_from_row",
     "_hydrate_alibaba_token_plan_quota_observations",
     "_alibaba_token_plan_quota_evidence",
+    "alibaba_token_plan_direct_route_admission",
     "_attach_alibaba_token_plan_quota_state",
     "_clear_alibaba_token_plan_account_quota_cooldown",
     "_zai_coding_plan_quota_observation_from_row",
@@ -8280,6 +8389,19 @@ def install(host_globals: dict) -> None:
         ),
         "subscription_identity_for_candidate": (
             subscription_identity_for_candidate
+        ),
+        "resolve_alibaba_token_plan_subscription_identity": (
+            resolve_alibaba_token_plan_subscription_identity
+        ),
+        "_alibaba_direct_route_subscription_identity": (
+            _alibaba_direct_route_subscription_identity
+        ),
+        "_alibaba_direct_route_decision": _alibaba_direct_route_decision,
+        "_alibaba_direct_route_account_cooldown_seconds": (
+            _alibaba_direct_route_account_cooldown_seconds
+        ),
+        "alibaba_token_plan_direct_route_admission": (
+            alibaba_token_plan_direct_route_admission
         ),
         "_alibaba_observation_matches_subscription": (
             _alibaba_observation_matches_subscription
