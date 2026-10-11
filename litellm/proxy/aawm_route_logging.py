@@ -3458,17 +3458,27 @@ def _iter_aawm_route_rollup_identity_sources(
             nested = candidate.get(nested_key)
             if isinstance(nested, dict):
                 nested_kind = (
-                    nested_key if nested_key == "source" else "client_metadata"
+                    "structured_nested"
+                    if nested_key == "source"
+                    else "client_metadata"
                 )
-                if source_kind == "codex_turn":
-                    nested_kind = source_kind
-                append_source(nested, source_kind=nested_kind)
+                tagged_nested = dict(nested)
+                tagged_nested[_AAWM_ROUTE_ROLLUP_IDENTITY_SOURCE_KIND_KEY] = (
+                    nested_kind
+                )
+                sources.append(tagged_nested)
 
     append_source(metadata, source_kind="client_metadata")
     append_source(request_body, source_kind="client_metadata")
     if isinstance(request_body, dict):
-        append_source(request_body.get("litellm_metadata"))
-        append_source(request_body.get("metadata"))
+        append_source(
+            request_body.get("litellm_metadata"),
+            source_kind="structured",
+        )
+        append_source(
+            request_body.get("metadata"),
+            source_kind="structured",
+        )
         append_source(
             request_body.get("client_metadata"),
             source_kind="client_metadata",
@@ -3482,7 +3492,10 @@ def _iter_aawm_route_rollup_identity_sources(
     )
     append_source(audit_context, source_kind="client_metadata")
     if isinstance(audit_context, dict):
-        append_source(audit_context.get("agent_dispatch"))
+        append_source(
+            audit_context.get("agent_dispatch"),
+            source_kind="agent_dispatch",
+        )
     request_call_id = (
         getattr(request_state, "aawm_alias_request_litellm_call_id", None)
         if request_state is not None
@@ -3519,6 +3532,10 @@ def _get_aawm_route_rollup_canonical_session_identity(
     headers: dict[str, Any],
 ) -> Optional[str]:
     return _first_aawm_route_log_value(
+        *identity_sources,
+        keys=("canonical_thread_id",),
+        normalizer=_normalize_aawm_route_rollup_identity,
+    ) or _first_aawm_route_log_value(
         *identity_sources,
         keys=("canonical_session_identity",),
         normalizer=_normalize_aawm_route_rollup_identity,
@@ -4845,7 +4862,7 @@ def _resolve_aawm_route_rollup_agent_name_with_provenance(
         source_kinds=tuple(
             source.get(
                 _AAWM_ROUTE_ROLLUP_IDENTITY_SOURCE_KIND_KEY,
-                "codex_turn",
+                "unknown",
             )
             if isinstance(source, dict)
             else "unknown"

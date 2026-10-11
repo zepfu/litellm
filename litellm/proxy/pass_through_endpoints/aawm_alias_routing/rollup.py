@@ -715,6 +715,10 @@ def install(host_globals: dict) -> None:
         _resolve_aawm_route_rollup_reasoning_effort,
     )
     host_globals.setdefault(
+        "_auto_agent_alias_route_rollup_observation_context",
+        _auto_agent_alias_route_rollup_observation_context,
+    )
+    host_globals.setdefault(
         "_safe_aawm_route_target_label",
         _safe_aawm_route_target_label,
     )

@@ -368,6 +368,7 @@ def _extract_auto_agent_alias_agent_dispatch_fields(  # noqa: PLR0915
         "aawm_agent_profile",
         "codex_agent_profile",
     )
+    source_kind = "codex_turn"
 
     if agent_name is None:
         agent_name, agent_name_winning_source = (
@@ -941,6 +942,22 @@ def install(host_globals: dict) -> None:
             "_get_aawm_route_log_codex_turn_metadata",
             _get_aawm_route_log_codex_turn_metadata,
         ),
+        (
+            "_AAWM_ROUTE_ROLLUP_IDENTITY_SOURCE_KIND_KEY",
+            _AAWM_ROUTE_ROLLUP_IDENTITY_SOURCE_KIND_KEY,
+        ),
+        (
+            "_AAWM_ROUTE_ROLLUP_PROVENANCE_SOURCE_KEY",
+            _AAWM_ROUTE_ROLLUP_PROVENANCE_SOURCE_KEY,
+        ),
+        (
+            "_classify_aawm_route_rollup_identity_source",
+            _classify_aawm_route_rollup_identity_source,
+        ),
+        (
+            "_classify_auto_agent_alias_agent_name_source",
+            _classify_auto_agent_alias_agent_name_source,
+        ),
     ):
         host_globals.setdefault(_sk, _sv)
 
@@ -964,6 +981,10 @@ _SEAM_NAMES = frozenset({
     "_build_auto_agent_alias_rollup_group_header_label",
     "_codex_auto_agent_request_has_continuation_state",
     "_get_aawm_route_log_codex_turn_metadata",
+    "_AAWM_ROUTE_ROLLUP_IDENTITY_SOURCE_KIND_KEY",
+    "_AAWM_ROUTE_ROLLUP_PROVENANCE_SOURCE_KEY",
+    "_classify_aawm_route_rollup_identity_source",
+    "_classify_auto_agent_alias_agent_name_source",
 })
 
 
