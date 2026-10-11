@@ -290,7 +290,9 @@ content, malformed parts, and unsupported fields fail closed before egress.
 Ordinary external-tool continuations retain the Cursor session assignment while
 the provider-owned session is live. Generic MCP/function calls (operation field
 11) return their actual output through Cursor's `McpResult` on the same open
-Run. Passive tool-progress notifications do not authorize another execution.
+Run. Native reads (field 7) bridge through an advertised `read` tool with `path`
+and `i`; field 2 and field 14 remain command-only shell bridges. Passive
+tool-progress notifications do not authorize another execution.
 Each bounded HTTP/2 read is fully consumed before pausing at a tool call, with
 later Connect frames retained in order and data acknowledged once. Received
 terminal or abort evidence prevents continuation result writes. Per-continuation

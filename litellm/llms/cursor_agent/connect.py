@@ -1272,6 +1272,7 @@ _LOCAL_EXEC_TOOL_NAMES = (
     "bash",
     "run_shell_command",
 )
+_LOCAL_READ_TOOL_NAMES = ("read",)
 _SPAWN_AGENT_TOOL_NAME = "spawn_agent"
 _SUBAGENT_PROHIBITED_FIELD_NAMES = {
     6: "resume_agent_id",
@@ -1809,10 +1810,22 @@ def _encode_read_terminal_result(
     output: Any,
 ) -> List[bytes]:
     expected_path = str(exec_request["path"])
-    envelope = _decode_cursor_read_envelope(
-        output,
-        expected_path=expected_path,
-    )
+    if exec_request.get("native_read"):
+        content = output if isinstance(output, str) else str(output or "")
+        envelope = {
+            "status": "ok",
+            "path": expected_path,
+            "content": content,
+            "total_lines": 0,
+            "file_size": len(content.encode("utf-8")),
+            "truncated": False,
+            "range_applied": False,
+        }
+    else:
+        envelope = _decode_cursor_read_envelope(
+            output,
+            expected_path=expected_path,
+        )
     read_result = _encode_read_result(**envelope)
     exec_fields = cast(List[tuple[int, int, Any]], exec_request["exec_fields"])
     return [
@@ -2260,6 +2273,38 @@ def _advertised_local_exec_tool_name(
     return None
 
 
+def _advertised_read_tool_name(
+    request_payload: Mapping[str, Any],
+) -> Optional[str]:
+    run_request = _proto_mapping_value(
+        request_payload,
+        "runRequest",
+        "run_request",
+    )
+    if not isinstance(run_request, Mapping):
+        return None
+    mcp_tools = _proto_mapping_value(run_request, "mcpTools", "mcp_tools")
+    if not isinstance(mcp_tools, Mapping):
+        return None
+    definitions = _proto_mapping_value(mcp_tools, "mcpTools", "mcp_tools")
+    if not isinstance(definitions, list):
+        return None
+
+    for preferred_name in _LOCAL_READ_TOOL_NAMES:
+        for definition in definitions:
+            if not isinstance(definition, Mapping):
+                continue
+            name = _proto_mapping_value(
+                definition,
+                "name",
+                "toolName",
+                "tool_name",
+            )
+            if isinstance(name, str) and name.casefold() == preferred_name:
+                return name
+    return None
+
+
 def _advertised_spawn_agent_tool_definition(
     request_payload: Mapping[str, Any],
 ) -> Optional[Mapping[str, Any]]:
@@ -2663,6 +2708,7 @@ def _decode_read_tool_call(
     exec_fields: List[tuple[int, int, Any]],
     *,
     tool_name: str,
+    native_read: bool,
 ) -> Dict[str, Any]:
     read_args = _decode_read_args(exec_fields)
     request_id = int(read_args["request_id"])
@@ -2672,14 +2718,22 @@ def _decode_read_tool_call(
         raise CursorConnectProtocolError(
             "Cursor Agent read operation does not contain a replayable request identity."
         )
-    command = _read_command(str(read_args["path"]))
+    path = str(read_args["path"])
+    arguments: Dict[str, Any]
+    if native_read:
+        arguments = {
+            "i": "Read local file.",
+            "path": path,
+        }
+    else:
+        arguments = {"cmd": _read_command(path)}
     normalized = {
         "interactionUpdate": {
             "toolCallCompleted": {
                 "callId": call_id,
                 "toolName": tool_name,
                 "argsJson": json.dumps(
-                    {"cmd": command},
+                    arguments,
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ),
@@ -2693,7 +2747,8 @@ def _decode_read_tool_call(
             "call_id": call_id,
             "message_field": 7,
             "exec_fields": exec_fields,
-            "path": str(read_args["path"]),
+            "path": path,
+            "native_read": native_read,
         },
     }
 
@@ -2739,6 +2794,7 @@ def _process_agent_server_message(
     blobs: Dict[bytes, bytes],
     *,
     local_exec_tool_name: Optional[str] = None,
+    read_tool_name: Optional[str] = None,
     spawn_agent_tool_definition: Optional[Mapping[str, Any]] = None,
     external_exec_requests: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[Dict[str, Any], List[bytes]]:
@@ -2813,10 +2869,20 @@ def _process_agent_server_message(
                     local_exec_request["normalized"],
                     [],
                 )
+            if message_field == 7 and read_tool_name:
+                read_tool_call = _decode_read_tool_call(
+                    exec_fields,
+                    tool_name=read_tool_name,
+                    native_read=True,
+                )
+                if external_exec_requests is not None:
+                    external_exec_requests.append(read_tool_call["exec_request"])
+                return read_tool_call["normalized"], []
             if message_field == 7 and local_exec_tool_name:
                 read_tool_call = _decode_read_tool_call(
                     exec_fields,
                     tool_name=local_exec_tool_name,
+                    native_read=False,
                 )
                 if external_exec_requests is not None:
                     external_exec_requests.append(read_tool_call["exec_request"])
@@ -2874,6 +2940,7 @@ class CursorAgentRetainedSession:
         decoder: _ProtoConnectFrameDecoder,
         blobs: Dict[bytes, bytes],
         local_exec_tool_name: Optional[str],
+        read_tool_name: Optional[str],
         spawn_agent_tool_definition: Optional[Mapping[str, Any]],
         saw_response_headers: bool,
         retain_on_tool_call: bool = False,
@@ -2885,6 +2952,7 @@ class CursorAgentRetainedSession:
         self.decoder = decoder
         self.blobs = blobs
         self.local_exec_tool_name = local_exec_tool_name
+        self.read_tool_name = read_tool_name
         self.spawn_agent_tool_definition = spawn_agent_tool_definition
         self.saw_response_headers = saw_response_headers
         self.retain_on_tool_call = retain_on_tool_call
@@ -3104,6 +3172,7 @@ class CursorAgentRetainedSession:
             frame.payload,
             self.blobs,
             local_exec_tool_name=self.local_exec_tool_name,
+            read_tool_name=self.read_tool_name,
             spawn_agent_tool_definition=self.spawn_agent_tool_definition,
             external_exec_requests=external_exec_requests,
         )
@@ -4214,6 +4283,7 @@ class CursorAgentConnectClient:
         stop_on_tool_call: bool,
         timeout: Optional[float],
         local_exec_tool_name: Optional[str],
+        read_tool_name: Optional[str],
         spawn_agent_tool_definition: Optional[Mapping[str, Any]],
         retain_on_tool_call: bool,
     ) -> CursorAgentRunResult:
@@ -4304,6 +4374,7 @@ class CursorAgentConnectClient:
                 decoder=_ProtoConnectFrameDecoder(),
                 blobs={},
                 local_exec_tool_name=local_exec_tool_name,
+                read_tool_name=read_tool_name,
                 spawn_agent_tool_definition=spawn_agent_tool_definition,
                 saw_response_headers=False,
                 retain_on_tool_call=retain_on_tool_call,
@@ -4355,6 +4426,7 @@ class CursorAgentConnectClient:
         *,
         stop_on_tool_call: bool,
         local_exec_tool_name: Optional[str],
+        read_tool_name: Optional[str],
         spawn_agent_tool_definition: Optional[Mapping[str, Any]],
     ) -> CursorAgentRunResult:
         self._require_http2(response)
@@ -4388,6 +4460,7 @@ class CursorAgentConnectClient:
                 frame.payload,
                 blobs,
                 local_exec_tool_name=local_exec_tool_name,
+                read_tool_name=read_tool_name,
                 spawn_agent_tool_definition=spawn_agent_tool_definition,
             )
             if client_messages:
@@ -4410,6 +4483,7 @@ class CursorAgentConnectClient:
         stop_on_tool_call: bool,
         timeout: Optional[float],
         local_exec_tool_name: Optional[str],
+        read_tool_name: Optional[str],
         spawn_agent_tool_definition: Optional[Mapping[str, Any]],
         retain_on_tool_call: bool,
     ) -> CursorAgentRunResult:
@@ -4422,6 +4496,7 @@ class CursorAgentConnectClient:
                 stop_on_tool_call=stop_on_tool_call,
                 timeout=timeout,
                 local_exec_tool_name=local_exec_tool_name,
+                read_tool_name=read_tool_name,
                 spawn_agent_tool_definition=spawn_agent_tool_definition,
                 retain_on_tool_call=retain_on_tool_call,
             )
@@ -4463,6 +4538,7 @@ class CursorAgentConnectClient:
                             response,
                             stop_on_tool_call=stop_on_tool_call,
                             local_exec_tool_name=local_exec_tool_name,
+                            read_tool_name=read_tool_name,
                             spawn_agent_tool_definition=spawn_agent_tool_definition,
                         )
                 response = context
@@ -4471,6 +4547,7 @@ class CursorAgentConnectClient:
                         response,
                         stop_on_tool_call=stop_on_tool_call,
                         local_exec_tool_name=local_exec_tool_name,
+                        read_tool_name=read_tool_name,
                         spawn_agent_tool_definition=spawn_agent_tool_definition,
                     )
                 finally:
@@ -4482,6 +4559,7 @@ class CursorAgentConnectClient:
                 response,
                 stop_on_tool_call=stop_on_tool_call,
                 local_exec_tool_name=local_exec_tool_name,
+                read_tool_name=read_tool_name,
                 spawn_agent_tool_definition=spawn_agent_tool_definition,
             )
         except CursorConnectError:
@@ -4521,6 +4599,7 @@ class CursorAgentConnectClient:
         run_request = request_payload.get("runRequest")
         run_id = str(run_request.get("runId") or "").strip() if isinstance(run_request, Mapping) else ""
         local_exec_tool_name = _advertised_local_exec_tool_name(request_payload)
+        read_tool_name = _advertised_read_tool_name(request_payload)
         spawn_agent_tool_definition = _advertised_spawn_agent_tool_definition(
             request_payload
         )
@@ -4549,6 +4628,7 @@ class CursorAgentConnectClient:
                 stop_on_tool_call=stop_on_tool_call,
                 timeout=timeout,
                 local_exec_tool_name=local_exec_tool_name,
+                read_tool_name=read_tool_name,
                 spawn_agent_tool_definition=spawn_agent_tool_definition,
                 retain_on_tool_call=retain_on_tool_call,
             )
@@ -4576,6 +4656,7 @@ class CursorAgentConnectClient:
                 stop_on_tool_call=stop_on_tool_call,
                 timeout=timeout,
                 local_exec_tool_name=local_exec_tool_name,
+                read_tool_name=read_tool_name,
                 spawn_agent_tool_definition=spawn_agent_tool_definition,
                 retain_on_tool_call=retain_on_tool_call,
             )
