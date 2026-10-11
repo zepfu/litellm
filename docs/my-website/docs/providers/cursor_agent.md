@@ -326,6 +326,12 @@ ownerless provider state fail closed before egress. A valid replay may then
 traverse native `xai` and managed `oa_xai` candidates without migrating the
 owned Cursor session.
 
+During cooldown recovery, an in-flight non-replay Codex session cannot use a
+last-resort Cursor or xAI candidate with its existing identity. LiteLLM returns
+`aawm_session_owner_redispatch_required`; start a fresh subagent session before
+trying that route. Fresh eligible requests and server-validated replay keep
+their existing candidate selection.
+
 Replay validation preserves function namespaces even when the installed OpenAI
 SDK predates namespace tools. The compatibility path validates the namespace
 shape and each function schema rather than restricting namespace or function

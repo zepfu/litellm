@@ -7480,6 +7480,34 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         request_mode=request_mode,
     )
     if state is not None:
+        if (
+            in_flight_session
+            and request_mode != "fresh_redispatch"
+            and state["candidate"].get("provider") in {"cursor_agent", "xai"}
+        ):
+            mismatch_reason = (
+                "session_owner: last-resort provider selection would reuse "
+                "an in-flight session identity"
+            )
+            sa.raise_session_owner_redispatch_required(
+                session_identity=session_owner_identity,
+                alias_model=alias_model,
+                candidate=state["candidate"],
+                failure_phase="session_owner_last_resort_in_flight_session",
+                guard=sa.SessionOwnerGuardResult(
+                    decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                    session_identity=session_owner_identity,
+                    cache_key=_cache_key,
+                    owner_record=(
+                        session_owner_record
+                        if isinstance(session_owner_record, dict)
+                        else None
+                    ),
+                    mismatch_reason=mismatch_reason,
+                ),
+                request=request,
+                attempted_provider_call=False,
+            )
         if _candidate_uses_codex_oauth(state["candidate"]):
             skipped[:] = [
                 entry for entry in skipped
