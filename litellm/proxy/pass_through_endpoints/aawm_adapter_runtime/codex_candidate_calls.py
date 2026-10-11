@@ -741,22 +741,11 @@ def _cursor_observation_enabled(
     request: Any,
     request_body: Mapping[str, Any],
 ) -> bool:
-    """Gate observation to alpha Cursor traffic in the configured rollup scope."""
+    """Gate bounded Cursor observation to alpha traffic in the rollup scope."""
     if (
         os.getenv("AAWM_LITELLM_ENVIRONMENT", "").strip()
         != _CURSOR_OBSERVATION_ENVIRONMENT
     ):
-        return False
-    try:
-        from litellm.integrations.aawm_passthrough_shape_capture import (
-            diagnostic_payload_capture_enabled,
-        )
-    except Exception:  # noqa: BLE001
-        return False
-    try:
-        if not diagnostic_payload_capture_enabled():
-            return False
-    except Exception:  # noqa: BLE001
         return False
     metadata = request_body.get("litellm_metadata")
     if not isinstance(metadata, Mapping):
