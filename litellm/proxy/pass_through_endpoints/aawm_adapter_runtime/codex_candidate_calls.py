@@ -6292,8 +6292,8 @@ def _responses_input_to_cursor_messages(  # noqa: PLR0915
 
     # A tool result is a continuation of the interrupted Cursor turn.
     if saw_function_call_output and not last_item_was_user:
-        has_original_user_text = _cursor_messages_have_user_text(messages)
-        if not has_original_user_text:
+        original_user_text = _cursor_original_user_text(messages)
+        if not original_user_text:
             if str(request_body.get("previous_response_id") or "").strip():
                 _raise_cursor_session_continuation_unavailable(
                     previous_response_id=str(
@@ -6301,7 +6301,11 @@ def _responses_input_to_cursor_messages(  # noqa: PLR0915
                     ),
                 )
             _raise_cursor_session_continuation_unavailable()
-        continuation_message = {"role": "user", "content": ""}
+        continuation_message = {
+            "role": "user",
+            "content": original_user_text,
+            _CURSOR_TOOL_CONTINUATION_CUE_MARKER: True,
+        }
         messages.append(continuation_message)
     if not messages:
         messages.append({"role": "user", "content": ""})
@@ -6345,12 +6349,14 @@ def _cursor_messages_with_result_tool_calls(
     return replay_messages
 
 
-def _cursor_messages_have_user_text(messages: list[dict[str, Any]]) -> bool:
-    return any(
-        message.get("role") == "user"
-        and bool(_cursor_response_content_text(message.get("content")).strip())
-        for message in messages
-    )
+def _cursor_original_user_text(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        text = _cursor_response_content_text(message.get("content")).strip()
+        if text:
+            return text
+    return ""
 
 
 def _cursor_responses_response_body(

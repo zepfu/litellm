@@ -298,6 +298,9 @@ later Connect frames retained in order and data acknowledged once. Received
 terminal or abort evidence prevents continuation result writes. Per-continuation
 transport evidence distinguishes result bytes handed to the writer from
 subsequent provider data; it contains no tool payloads or credentials.
+Tool continuations restore the original readable user assignment as encoded
+`userMessage.text`, retain the completed tool result in history, and fail
+closed before dispatch if no original user text is available.
 
 For stock full-history requests without `previous_response_id`, lookup requires
 the existing guarded owner identity, unchanged assignment and tools, and exact
