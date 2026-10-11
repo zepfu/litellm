@@ -126,10 +126,12 @@ _CURSOR_TOOL_CONTINUATION_CUE = (
     "Do not repeat completed tool calls."
 )
 _CURSOR_TOOL_CONTINUATION_CUE_MARKER = "_cursor_tool_continuation_cue"
+
 _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER = (
     "_cursor_session_continuation_failure"
 )
 _CURSOR_RETAINED_TRANSPORT_FAILURE_MARKER = "_cursor_retained_transport_failure"
+_CURSOR_REPLAY_STATE_BOUND_EXCEEDED_MARKER = "_cursor_replay_state_bound_exceeded"
 _CURSOR_CONTINUATION_EVIDENCE_FIELD = "cursor_continuation_evidence"
 _CURSOR_REPLAY_STATE_FIELD = "_cursor_replay_state"
 _CURSOR_SANITIZED_PROTO_STRUCTURE_FIELD = "cursor_sanitized_proto_structure"
@@ -1460,10 +1462,25 @@ def _store_cursor_replay_state(
             retained_session=retained_session,
             previous=previous if isinstance(previous, dict) else None,
         )
-        raise CursorConnectError(
+        exc = CursorConnectError(
             "Cursor Agent continuation state exceeds the per-entry replay bound.",
             status_code=409,
         )
+        setattr(
+            exc,
+            _CURSOR_REPLAY_STATE_BOUND_EXCEEDED_MARKER,
+            True,
+        )
+        setattr(
+            exc,
+            _CURSOR_REPLAY_STATE_FIELD,
+            {
+                "messages": copied_messages,
+                "tools": copied_tools,
+                "continuation_outcome": continuation_outcome,
+            },
+        )
+        raise exc
     previous_bytes = (
         int(previous.get("payload_bytes") or 0)
         if isinstance(previous, dict)
@@ -1501,10 +1518,11 @@ def _store_cursor_replay_state(
                 retained_session=retained_session,
                 previous=previous if isinstance(previous, dict) else None,
             )
-            raise CursorConnectError(
+            exc = CursorConnectError(
                 "Cursor Agent continuation registry is at capacity.",
                 status_code=409,
             )
+            raise exc
     except CursorConnectError:
         raise
     except Exception:
@@ -1521,10 +1539,6 @@ def _store_cursor_replay_state(
             else:
                 _CURSOR_REPLAY_REGISTRY.pop(response_id, None)
             _cancel_cursor_replay_expiry(state)
-        _cursor_replay_reject_uncommitted_session(
-            retained_session=retained_session,
-            previous=previous if isinstance(previous, dict) else None,
-        )
         raise
     if previous is not None:
         previous["payload_bytes"] = 0
@@ -6200,7 +6214,6 @@ def _responses_input_to_cursor_messages(  # noqa: PLR0915
             )
     saw_function_call_output = False
     last_item_was_user = False
-    function_call_output_ends_input = False
     input_items = _cursor_response_input_items(request_body)
 
     for item_index, raw_item in enumerate(input_items):
@@ -6241,10 +6254,6 @@ def _responses_input_to_cursor_messages(  # noqa: PLR0915
                 )
             )
             saw_function_call_output = True
-            function_call_output_ends_input = (
-                item_type == "function_call_output"
-                and item_index == len(input_items) - 1
-            )
             last_item_was_user = False
             continue
 
@@ -6283,13 +6292,16 @@ def _responses_input_to_cursor_messages(  # noqa: PLR0915
 
     # A tool result is a continuation of the interrupted Cursor turn.
     if saw_function_call_output and not last_item_was_user:
-        continuation_message: dict[str, Any] = {"role": "user", "content": ""}
-        if function_call_output_ends_input:
-            continuation_message = {
-                "role": "user",
-                "content": _CURSOR_TOOL_CONTINUATION_CUE,
-                _CURSOR_TOOL_CONTINUATION_CUE_MARKER: True,
-            }
+        has_original_user_text = _cursor_messages_have_user_text(messages)
+        if not has_original_user_text:
+            if str(request_body.get("previous_response_id") or "").strip():
+                _raise_cursor_session_continuation_unavailable(
+                    previous_response_id=str(
+                        request_body.get("previous_response_id")
+                    ),
+                )
+            _raise_cursor_session_continuation_unavailable()
+        continuation_message = {"role": "user", "content": ""}
         messages.append(continuation_message)
     if not messages:
         messages.append({"role": "user", "content": ""})
@@ -6331,6 +6343,14 @@ def _cursor_messages_with_result_tool_calls(
             _cursor_function_call_message(tool_call, function_calls)
         )
     return replay_messages
+
+
+def _cursor_messages_have_user_text(messages: list[dict[str, Any]]) -> bool:
+    return any(
+        message.get("role") == "user"
+        and bool(_cursor_response_content_text(message.get("content")).strip())
+        for message in messages
+    )
 
 
 def _cursor_responses_response_body(
@@ -7085,9 +7105,11 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
     def _set_mapped_detail(
         proxy_exc: ProxyException,
         error: dict[str, Any],
+        *,
+        preserve_provider_fields: bool = True,
     ) -> None:
         mapped_error = dict(error)
-        if provider_error_fields:
+        if preserve_provider_fields and provider_error_fields:
             mapped_error.update(copy.deepcopy(provider_error_fields))
         mapped_detail: dict[str, Any] = {"error": mapped_error}
         if cursor_sanitized_provider_error is not None:
@@ -7169,9 +7191,42 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
             {
                 "message": detail_message,
                 "code": "aawm_codex_auto_agent_candidate_ineligible",
+                "attempted_provider_call": False,
             },
         )
         raise proxy_exc from exc
+    if getattr(exc, _CURSOR_REPLAY_STATE_BOUND_EXCEEDED_MARKER, False):
+        fresh_dispatch_exc = HTTPException(
+            status_code=409,
+            detail={
+                "error": {
+                    "message": (
+                        "Cursor Agent continuation state exceeds the replay "
+                        "bound; fresh dispatch required."
+                    ),
+                    "type": "invalid_request_error",
+                    "code": "cursor_replay_state_bound_exceeded",
+                    "attempted_provider_call": False,
+                },
+                "failure_phase": "cursor_session_continuation",
+                "redispatch_model": model,
+                "redispatch_reason": "cursor_replay_state_bound_exceeded",
+                "redispatch_required": True,
+            },
+        )
+        setattr(fresh_dispatch_exc, "attempted_provider_call", False)
+        setattr(fresh_dispatch_exc, "failure_phase", "cursor_session_continuation")
+        setattr(fresh_dispatch_exc, "redispatch_model", model)
+        setattr(
+            fresh_dispatch_exc,
+            "redispatch_reason",
+            "cursor_replay_state_bound_exceeded",
+        )
+        setattr(fresh_dispatch_exc, "redispatch_required", True)
+        replay_state = getattr(exc, _CURSOR_REPLAY_STATE_FIELD, None)
+        if isinstance(replay_state, dict):
+            setattr(fresh_dispatch_exc, _CURSOR_REPLAY_STATE_FIELD, replay_state)
+        raise fresh_dispatch_exc from exc
     if isinstance(exc, CursorConnectProtocolError) and message.startswith(
         (
             "Cursor Agent requested unsupported external exec field ",

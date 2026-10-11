@@ -302,10 +302,11 @@ the existing guarded owner identity, unchanged assignment and tools, and exact
 pending call IDs and qualified namespace/name identities. The trusted history
 prefix may contain earlier completed call/result pairs; only the newly
 completed pending outputs are sent back. Historical outputs are not executed
-again. A mismatched or ambiguous live session fails closed. Claimed and consumed
-generations remain non-replayable within the process-local registry's existing
-600-second/256-entry retention bounds. This is not durable deduplication across
-worker replacement or eviction.
+again. The derived Cursor history must preserve the original readable user
+assignment; a tool result cannot replace it. A mismatched or ambiguous live
+session fails closed. Claimed and consumed generations remain non-replayable
+within the process-local registry's existing 600-second/256-entry retention
+bounds. This is not durable deduplication across worker replacement or eviction.
 
 Missing retained state and recoverable failure of one live transport do not
 enter shared cooldown evidence or publication. Socket EOF after complete frames
@@ -325,6 +326,11 @@ opaque Cursor state, unresolved tool calls, nested Cursor identifiers, and
 ownerless provider state fail closed before egress. A valid replay may then
 traverse native `xai` and managed `oa_xai` candidates without migrating the
 owned Cursor session.
+
+Oversized stored continuation state receives the distinct
+`cursor_replay_state_bound_exceeded` failure with `candidate_status: ineligible`,
+no cooldown publication, and no provider call. It terminates the alias with a
+fresh-owner redispatch signal rather than continuing to another candidate.
 
 During cooldown recovery, an in-flight non-replay Codex session cannot use a
 last-resort Cursor or xAI candidate with its existing identity. LiteLLM returns

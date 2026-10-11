@@ -776,6 +776,7 @@ _TYPED_REDISPATCH_ERROR_CODES = frozenset(
         "aawm_codex_auto_agent_redispatch_required",
         "aawm_anthropic_auto_agent_redispatch_required",
         "aawm_session_owner_redispatch_required",
+        "cursor_replay_state_bound_exceeded",
     }
 )
 _SUPPORTED_REDISPATCH_ERROR_CODES = (

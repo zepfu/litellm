@@ -384,6 +384,12 @@ providers, accounts, and route families remain eligible. An unmarked local
 replay or tool-schema validation defect remains
 `candidate_deterministically_ineligible` with `cooldown_scope: none`.
 
+An explicit Cursor replay-state bound rejection is separately attributable as
+`cursor_replay_state_bound_exceeded`. It records `candidate_status: ineligible`
+and `attempted_provider_call: false`, marks the continuation phase, and does not
+publish cooldown. The candidate loop terminates the alias with the typed
+fresh-owner redispatch signal instead of continuing to another candidate.
+
 Upstream-origin evidence authorization is separate from provider-derived
 duration and monotonic TTL handling. Only evidence attributable to the upstream
 provider may advance provider evidence; client-origin, deterministic,
