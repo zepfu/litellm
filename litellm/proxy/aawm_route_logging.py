@@ -2169,16 +2169,18 @@ class _AawmRouteRollupGroup:
         if not origin_id:
             self.provenance_unknown_origin_event_count += 1
         elif origin_id not in self.provenance_contributing_origin_ids:
-            if not matches_observation_scope:
-                self.provenance_nonmatching_contributing_origin_ids.add(
-                    origin_id
-                )
             if (
                 len(self.provenance_contributing_origin_ids)
                 >= _AAWM_ROUTE_ROLLUP_MAX_ORIGIN_IDENTITIES
             ):
                 self.provenance_untracked_origin_events_count += 1
+                if matches_observation_scope:
+                    self.provenance_snapshot.update(snapshot)
                 return
+            if not matches_observation_scope:
+                self.provenance_nonmatching_contributing_origin_ids.add(
+                    origin_id
+                )
             self.provenance_contributing_origin_ids.add(origin_id)
         if matches_observation_scope:
             self.provenance_snapshot.update(snapshot)
