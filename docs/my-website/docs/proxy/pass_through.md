@@ -207,9 +207,22 @@ retain their separate final-send binding.
 
 ### Default Query Parameters
 - **Parameter precedence**: Client params > URL params > default params
+- **Final binding**: An omitted selected query mapping keeps the target query as already constructed. An explicitly empty mapping clears it, and a nonempty mapping replaces it. The final URL is validated before send.
 - **Use cases**: API versioning, authentication tokens, format control, feature flags
 - **Override capability**: Clients can override any default parameter
 - **Examples**: `version: "v1"`, `format: "json"`, `timeout: "30"`
+
+### Request Body Handling
+
+Streaming and non-streaming requests preserve the HTTP method and select the
+same body representation. GET requests have no body; raw requests retain their
+bytes and content type. Multipart requests retain their form fields and files,
+with a boundary generated for the outgoing body.
+
+An explicitly supplied JSON body, including `{}`, overrides multipart input.
+Pre-call hooks can replace that body, including with `{}`, or supply JSON for
+multipart input. In-place logging-only metadata changes retain the multipart body.
+LiteLLM parameters are removed before the JSON body is sent upstream.
 
 ### Sub-path Routing
 

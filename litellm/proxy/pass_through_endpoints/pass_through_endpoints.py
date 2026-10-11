@@ -1328,6 +1328,55 @@ def _provider_bound_body_from_kwargs(kwargs: Optional[dict]) -> Optional[dict]:
     return None
 
 
+def _bind_final_transport_query(
+    *,
+    url: httpx.URL,
+    requested_query_params: Optional[dict],
+) -> httpx.URL:
+    """Bind the selected query parameters to the exact transport URL."""
+    if requested_query_params is None:
+        return url
+    query_params = httpx.QueryParams(requested_query_params)
+    return url.copy_with(query=str(query_params).encode("ascii"))
+
+
+def _headers_for_multipart_passthrough_egress(headers: dict) -> dict:
+    # HTTPX must generate a boundary matching the reconstructed form.
+    return {key: value for key, value in headers.items() if key.lower() != "content-type"}
+
+
+async def _build_passthrough_transport_kwargs(
+    *,
+    request: Request,
+    headers: dict,
+    raw_body: Optional[bytes],
+    json_egress_body: Optional[dict],
+) -> Dict[str, Any]:
+    """Select method, headers, and body representation for both send paths."""
+    transport_kwargs: Dict[str, Any] = {
+        "method": request.method,
+        "headers": headers,
+    }
+    if request.method == "GET":
+        return transport_kwargs
+    if raw_body is not None:
+        transport_kwargs["content"] = raw_body
+    elif (
+        json_egress_body is None
+        and HttpPassThroughEndpointHelpers.is_multipart(request)
+    ):
+        transport_kwargs["headers"] = _headers_for_multipart_passthrough_egress(headers)
+        transport_kwargs.update(
+            await HttpPassThroughEndpointHelpers._build_multipart_transport_kwargs(
+                request
+            )
+        )
+    else:
+        transport_kwargs["headers"], _ = _headers_for_json_passthrough_egress(headers)
+        transport_kwargs["json"] = json_egress_body
+    return transport_kwargs
+
+
 def _get_case_insensitive_mapping_value(
     values: Optional[dict],
     key_name: str,
@@ -4612,7 +4661,7 @@ def _is_json_passthrough_egress(
         return False
     return not (
         HttpPassThroughEndpointHelpers.is_multipart(request) is True
-        and not provider_bound_body
+        and provider_bound_body is None
     )
 
 
@@ -6281,185 +6330,59 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         are issued with stream=True so the caller can inspect content-type before
         buffering the body (enables SSE handoff without full-body buffer).
         """
-        if request.method == "GET":
-            if send_request_fn is not None:
-                req = async_client.build_request(
-                    method=request.method,
-                    url=url,
-                    headers=headers,
-                    params=requested_query_params,
-                )
-                response = await send_request_fn(req, False)
-            else:
-                if validate_request_fn is not None:
-                    req = async_client.build_request(
-                        method=request.method,
-                        url=url,
-                        headers=headers,
-                        params=requested_query_params,
-                    )
-                    validate_request_fn(req)
-                    send_kwargs: dict[str, Any] = {"stream": False}
-                    if follow_redirects is not None:
-                        send_kwargs["follow_redirects"] = follow_redirects
-                    response = await wait_for(
-                        "upstream_response", async_client.send(req, **send_kwargs)
-                    )
-                else:
-                    request_kwargs: dict[str, Any] = {
-                        "method": request.method,
-                        "url": url,
-                        "headers": headers,
-                        "params": requested_query_params,
-                    }
-                    if follow_redirects is not None:
-                        request_kwargs["follow_redirects"] = follow_redirects
-                    response = await wait_for(
-                        "upstream_response", async_client.request(**request_kwargs)
-                    )
-        elif raw_body is not None:
-            if send_request_fn is not None:
-                req = async_client.build_request(
-                    method=request.method,
-                    url=url,
-                    headers=headers,
-                    params=requested_query_params,
-                    content=raw_body,
-                )
-                response = await send_request_fn(
-                    req,
-                    prefer_stream_for_unknown_content,
-                )
-            elif prefer_stream_for_unknown_content:
-                req = async_client.build_request(
-                    method=request.method,
-                    url=url,
-                    headers=headers,
-                    params=requested_query_params,
-                    content=raw_body,
-                )
-                if validate_request_fn is not None:
-                    validate_request_fn(req)
-                send_kwargs: dict[str, Any] = {"stream": True}
-                if follow_redirects is not None:
-                    send_kwargs["follow_redirects"] = follow_redirects
-                response = await wait_for(
-                    "upstream_response", async_client.send(req, **send_kwargs)
-                )
-            else:
-                if validate_request_fn is not None:
-                    req = async_client.build_request(
-                        method=request.method,
-                        url=url,
-                        headers=headers,
-                        params=requested_query_params,
-                        content=raw_body,
-                    )
-                    validate_request_fn(req)
-                    send_kwargs = {"stream": False}
-                    if follow_redirects is not None:
-                        send_kwargs["follow_redirects"] = follow_redirects
-                    response = await wait_for(
-                        "upstream_response", async_client.send(req, **send_kwargs)
-                    )
-                else:
-                    request_kwargs = {
-                        "method": request.method,
-                        "url": url,
-                        "headers": headers,
-                        "params": requested_query_params,
-                        "content": raw_body,
-                    }
-                    if follow_redirects is not None:
-                        request_kwargs["follow_redirects"] = follow_redirects
-                    response = await wait_for(
-                        "upstream_response", async_client.request(**request_kwargs)
-                    )
-        elif (
-            HttpPassThroughEndpointHelpers.is_multipart(request) is True
-            and not _parsed_body
+        request_kwargs = await _build_passthrough_transport_kwargs(
+            request=request,
+            headers=headers,
+            raw_body=raw_body,
+            json_egress_body=_parsed_body,
+        )
+        request_kwargs.update(url=url, params=requested_query_params)
+        send_stream = request.method != "GET" and prefer_stream_for_unknown_content
+        if (
+            send_request_fn is not None
+            or validate_request_fn is not None
+            or send_stream
         ):
-            # Only use multipart handler if we don't have a parsed body
-            # (parsed body means it was JSON despite multipart content-type header)
-            return await HttpPassThroughEndpointHelpers.make_multipart_http_request(
-                request=request,
-                async_client=async_client,
-                url=url,
-                headers=headers,
-                requested_query_params=requested_query_params,
-                prefer_stream_for_unknown_content=prefer_stream_for_unknown_content,
-                follow_redirects=follow_redirects,
-                validate_request_fn=validate_request_fn,
-                send_request_fn=send_request_fn,
-            )
-        else:
-            # Generic httpx method
-            json_headers, _removed_content_type = _headers_for_json_passthrough_egress(
-                headers
-            )
+            req = async_client.build_request(**request_kwargs)
+            if validate_request_fn is not None:
+                validate_request_fn(req)
             if send_request_fn is not None:
-                req = async_client.build_request(
-                    method=request.method,
-                    url=url,
-                    headers=json_headers,
-                    params=requested_query_params,
-                    json=_parsed_body,
-                )
-                response = await send_request_fn(
-                    req,
-                    prefer_stream_for_unknown_content,
-                )
-            elif prefer_stream_for_unknown_content:
-                req = async_client.build_request(
-                    method=request.method,
-                    url=url,
-                    headers=json_headers,
-                    params=requested_query_params,
-                    json=_parsed_body,
-                )
-                if validate_request_fn is not None:
-                    validate_request_fn(req)
-                send_kwargs = {"stream": True}
-                if follow_redirects is not None:
-                    send_kwargs["follow_redirects"] = follow_redirects
-                response = await wait_for(
-                    "upstream_response", async_client.send(req, **send_kwargs)
-                )
-            else:
-                if validate_request_fn is not None:
-                    req = async_client.build_request(
-                        method=request.method,
-                        url=url,
-                        headers=json_headers,
-                        params=requested_query_params,
-                        json=_parsed_body,
-                    )
-                    validate_request_fn(req)
-                    send_kwargs = {"stream": False}
-                    if follow_redirects is not None:
-                        send_kwargs["follow_redirects"] = follow_redirects
-                    response = await wait_for(
-                        "upstream_response", async_client.send(req, **send_kwargs)
-                    )
-                else:
-                    request_kwargs = {
-                        "method": request.method,
-                        "url": url,
-                        "headers": json_headers,
-                        "params": requested_query_params,
-                        "json": _parsed_body,
-                    }
-                    if follow_redirects is not None:
-                        request_kwargs["follow_redirects"] = follow_redirects
-                    response = await wait_for(
-                        "upstream_response", async_client.request(**request_kwargs)
-                    )
-        return response
+                return await send_request_fn(req, send_stream)
+            send_kwargs: dict[str, Any] = {"stream": send_stream}
+            if follow_redirects is not None:
+                send_kwargs["follow_redirects"] = follow_redirects
+            return await wait_for(
+                "upstream_response", async_client.send(req, **send_kwargs)
+            )
+        if follow_redirects is not None:
+            request_kwargs["follow_redirects"] = follow_redirects
+        return await wait_for(
+            "upstream_response", async_client.request(**request_kwargs)
+        )
 
     @staticmethod
     def is_multipart(request: Request) -> bool:
         """Check if the request is a multipart/form-data request"""
         return "multipart/form-data" in request.headers.get("content-type", "")
+
+    @staticmethod
+    async def _build_multipart_transport_kwargs(
+        request: Request,
+    ) -> Dict[str, Any]:
+        """Build HTTPX arguments for an actual multipart/form-data request."""
+        form_data = await request.form()
+        files = {}
+        form_data_dict = {}
+        for field_name, field_value in form_data.items():
+            if isinstance(field_value, (StarletteUploadFile, UploadFile)):
+                files[field_name] = (
+                    await HttpPassThroughEndpointHelpers._build_request_files_from_upload_file(
+                        upload_file=field_value
+                    )
+                )
+            else:
+                form_data_dict[field_name] = field_value
+        return {"files": files, "data": form_data_dict}
 
     @staticmethod
     async def _build_request_files_from_upload_file(
@@ -6489,24 +6412,12 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         request uses stream=True so callers can inspect content-type before full
         body buffering (same contract as the JSON non-stream path).
         """
-        form_data = await request.form()
-        files = {}
-        form_data_dict = {}
-
-        for field_name, field_value in form_data.items():
-            if isinstance(field_value, (StarletteUploadFile, UploadFile)):
-                files[
-                    field_name
-                ] = await HttpPassThroughEndpointHelpers._build_request_files_from_upload_file(
-                    upload_file=field_value
-                )
-            else:
-                form_data_dict[field_name] = field_value
-
-        # Remove content-type header - httpx will set it correctly with the new boundary
-        # when it creates the multipart body from files/data parameters
-        headers_copy = headers.copy()
-        headers_copy.pop("content-type", None)
+        transport_kwargs = (
+            await HttpPassThroughEndpointHelpers._build_multipart_transport_kwargs(request)
+        )
+        files = transport_kwargs["files"]
+        form_data_dict = transport_kwargs["data"]
+        headers_copy = _headers_for_multipart_passthrough_egress(headers)
 
         if send_request_fn is not None:
             req = async_client.build_request(
@@ -6517,6 +6428,8 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 files=files,
                 data=form_data_dict,
             )
+            if validate_request_fn is not None:
+                validate_request_fn(req)
             return await send_request_fn(
                 req,
                 prefer_stream_for_unknown_content,
@@ -6578,13 +6491,17 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         passthrough_logging_payload: PassthroughStandardLoggingPayload,
         logging_obj: LiteLLMLoggingObj,
         _parsed_body: Optional[dict] = None,
+        transport_body_absent: bool = False,
         litellm_call_id: Optional[str] = None,
         compiled_wire_body: Any = None,
     ) -> dict:
         """
         Filter out litellm params from the request body
         """
-        _parsed_body = _parsed_body or {}
+        has_transport_body = (
+            isinstance(_parsed_body, dict) and not transport_body_absent
+        )
+        _parsed_body = _parsed_body if _parsed_body is not None else {}
         compiled_wire_body = compiled_wire_body or get_bound_openai_responses_wire_body(
             request,
             _parsed_body,
@@ -6667,7 +6584,11 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                     "body": (
                         compiled_provider_body
                         if compiled_provider_body is not None
-                        else _shallow_copy_request_dict(working_body)
+                        else (
+                            _shallow_copy_request_dict(working_body)
+                            if has_transport_body
+                            else None
+                        )
                     ),
                     "headers": request_headers or {},
                     "_request": request,
@@ -7864,6 +7785,7 @@ async def pass_through_request(  # noqa: PLR0915
     compiled_wire_body: Any = None
     client_metadata: Optional[dict[str, Any]] = None
     _transfer_identity: Optional[dict[str, Any]] = None
+    transport_body_absent = False
     deferred_success_holder = (
         DeferredPassthroughSuccess()
         if defer_session_owner_promotion
@@ -7973,25 +7895,16 @@ async def pass_through_request(  # noqa: PLR0915
         )
         if isinstance(selected_openai_account_context, Mapping):
             selected_openai_account_context = dict(selected_openai_account_context)
-        validate_prepared_request_fn: Optional[
-            Callable[[httpx.Request], None]
-        ] = None
-        if (
-            HttpPassThroughEndpointHelpers._is_exact_xai_egress_credential_family(
-                egress_credential_family
+        def _validate_prepared_request(prepared_request: httpx.Request) -> None:
+            HttpPassThroughEndpointHelpers.validate_prepared_request_egress(
+                prepared_request=prepared_request,
+                credential_family=egress_credential_family,
+                expected_target_family=expected_target_family,
             )
-            or expected_target_family
-            in {XAI_OAUTH_ROUTE_FAMILY, GROK_NATIVE_OAUTH_ROUTE_FAMILY}
-        ):
 
-            def _validate_prepared_request(prepared_request: httpx.Request) -> None:
-                HttpPassThroughEndpointHelpers.validate_prepared_request_egress(
-                    prepared_request=prepared_request,
-                    credential_family=egress_credential_family,
-                    expected_target_family=expected_target_family,
-                )
-
-            validate_prepared_request_fn = _validate_prepared_request
+        validate_prepared_request_fn: Callable[[httpx.Request], None] = (
+            _validate_prepared_request
+        )
         effective_blocked_pass_through_prefixed_headers = list(
             blocked_pass_through_prefixed_headers or []
         )
@@ -8038,6 +7951,15 @@ async def pass_through_request(  # noqa: PLR0915
                 ).encode("ascii")
             )
 
+        requested_query_params: Optional[dict]
+        if query_params is not None:
+            requested_query_params = query_params
+        else:
+            requested_query_params = dict(request.query_params) or None
+        url = _bind_final_transport_query(
+            url=url,
+            requested_query_params=requested_query_params,
+        )
         HttpPassThroughEndpointHelpers.validate_outgoing_egress(
             url=url,
             headers=headers,
@@ -8096,6 +8018,7 @@ async def pass_through_request(  # noqa: PLR0915
         elif is_multipart:
             # Don't parse multipart body here - it will be handled by make_multipart_http_request
             _parsed_body = {}
+            transport_body_absent = True
         elif raw_body_passthrough:
             raw_body = await request.body()
             _parsed_body = {
@@ -8188,6 +8111,7 @@ async def pass_through_request(  # noqa: PLR0915
         _parsed_body["litellm_logging_obj"] = logging_obj
 
         ### CALL HOOKS ### - modify incoming data / reject request before calling the model
+        body_before_hooks = _parsed_body
         _parsed_body = await wait_for(
             "request_hooks",
             proxy_logging_obj.pre_call_hook(
@@ -8196,6 +8120,15 @@ async def pass_through_request(  # noqa: PLR0915
                 call_type="pass_through_endpoint",
             ),
         )
+        if transport_body_absent and isinstance(_parsed_body, dict):
+            # Metadata-only edits to the original hook envelope do not replace
+            # the multipart body. A replacement mapping, a cleared envelope, or
+            # provider fields authored in place are authoritative JSON.
+            transport_body_absent = (
+                _parsed_body is body_before_hooks
+                and "litellm_logging_obj" in _parsed_body
+                and all(key in all_litellm_params for key in _parsed_body)
+            )
         # Second normalize pass only when pre_call_hook rewrote the tools object
         # (RR-056 #9). In-place first-pass fixes are already complete; skip when
         # hooks left tools identity unchanged or tools are absent.
@@ -8301,7 +8234,9 @@ async def pass_through_request(  # noqa: PLR0915
             params={"timeout": stream_read_timeout_policy.timeout},
         )
         async_client = async_client_obj.client
-        _cleaned_headers = clean_headers(request.headers)
+        _cleaned_headers = HttpPassThroughEndpointHelpers.get_masked_passthrough_headers(
+            headers=clean_headers(request.headers)
+        )
         passthrough_logging_payload = PassthroughStandardLoggingPayload(
             url=str(url),
             request_body=_parsed_body,
@@ -8317,14 +8252,13 @@ async def pass_through_request(  # noqa: PLR0915
             request=request,
             logging_obj=logging_obj,
             compiled_wire_body=compiled_wire_body,
+            transport_body_absent=transport_body_absent,
         )
         _set_passthrough_stream_timeout_metadata(
             kwargs=kwargs,
             policy=stream_read_timeout_policy,
         )
         provider_bound_body = _provider_bound_body_from_kwargs(kwargs)
-        if provider_bound_body is None:
-            provider_bound_body = _parsed_body if isinstance(_parsed_body, dict) else {}
         compiled_wire_body = (
             get_bound_openai_responses_wire_body(request, provider_bound_body)
             or compiled_wire_body
@@ -8480,25 +8414,7 @@ async def pass_through_request(  # noqa: PLR0915
                 exc_info=True,
             )
 
-        # combine url with query params for logging
-        requested_query_params: Optional[dict]
-        if query_params is not None:
-            requested_query_params = query_params
-        else:
-            requested_query_params = dict(request.query_params)
-
-        requested_query_params_str = None
-        if requested_query_params:
-            requested_query_params_str = "&".join(
-                f"{k}={v}" for k, v in requested_query_params.items()
-            )
-
         logging_url = str(url)
-        if requested_query_params_str:
-            if "?" in str(url):
-                logging_url = str(url) + "&" + requested_query_params_str
-            else:
-                logging_url = str(url) + "?" + requested_query_params_str
 
         _record_grok_billing_passthrough_request_contract(
             request=request,
@@ -8552,7 +8468,8 @@ async def pass_through_request(  # noqa: PLR0915
                 intake=_watermark_intake,
                 config=_get_runtime_text_watermark_config(),
                 endpoint=_watermark_endpoint_from_path(
-                    url, getattr(getattr(request, "url", None), "path", None)
+                    url,
+                    getattr(getattr(request, "url", None), "path", None),
                 ),
                 direction="request",
                 metadata=_watermark_metadata,
@@ -9726,7 +9643,7 @@ async def pass_through_request(  # noqa: PLR0915
                                 if isinstance(provider_bound_body, dict)
                                 else None
                             ),
-                            upstream_url=str(url) if url is not None else None,
+                            upstream_url=str(url),
                         ),
                         namespace=get_aawm_alias_routing_state_namespace(),
                         account_context=current_candidate_context(request),
@@ -9759,13 +9676,17 @@ async def pass_through_request(  # noqa: PLR0915
                                     )
                                 )
                     req = async_client.build_request(
-                        "POST",
-                        url,
-                        json=provider_bound_body,
-                        params=requested_query_params,
-                        headers=stream_headers,
+                        url=url,
+                        **await _build_passthrough_transport_kwargs(
+                            request=request,
+                            headers=stream_headers,
+                            raw_body=raw_body,
+                            json_egress_body=provider_bound_body,
+                        ),
                     )
                     if send_request_fn is not None:
+                        if validate_prepared_request_fn is not None:
+                            validate_prepared_request_fn(req)
                         response = await send_request_fn(req, stream)
                     else:
                         if validate_prepared_request_fn is not None:
@@ -10207,7 +10128,7 @@ async def pass_through_request(  # noqa: PLR0915
                             if isinstance(provider_bound_body, dict)
                             else None
                         ),
-                        upstream_url=str(url) if url is not None else None,
+                        upstream_url=str(url),
                     ),
                     namespace=get_aawm_alias_routing_state_namespace(),
                     account_context=current_candidate_context(request),
@@ -10246,7 +10167,6 @@ async def pass_through_request(  # noqa: PLR0915
                         async_client=async_client,
                         url=url,
                         headers=non_stream_headers,
-                        requested_query_params=requested_query_params,
                         _parsed_body=provider_bound_body,
                         raw_body=raw_body,
                         prefer_stream_for_unknown_content=True,
