@@ -656,6 +656,13 @@ def _get_auto_agent_alias_request_context(
         explicit_agent_name = _extract_auto_agent_alias_explicit_agent_name(
             _iter_auto_agent_alias_metadata_dicts(request, request_body)
         )
+        rollup_label_kwargs = {
+            "repository": repository,
+            "client_product_label": client_product_label,
+            "host_name": host_attribution.get("host_name"),
+        }
+        if explicit_agent_name is not None:
+            rollup_label_kwargs["agent_name"] = explicit_agent_name
         cached = {
             "agent_dispatch": agent_dispatch,
             "session_id": (
@@ -678,10 +685,7 @@ def _get_auto_agent_alias_request_context(
             "host_attribution": host_attribution,
             "rollup_group_header_label": (
                 _build_auto_agent_alias_rollup_group_header_label(
-                    repository=repository,
-                    client_product_label=client_product_label,
-                    host_name=host_attribution.get("host_name"),
-                    agent_name=explicit_agent_name,
+                    **rollup_label_kwargs,
                 )
             ),
         }
