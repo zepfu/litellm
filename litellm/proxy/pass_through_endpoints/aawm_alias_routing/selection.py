@@ -77,6 +77,7 @@ from .policy import (
 )
 from .request_metadata import _normalize_tui_family
 from .snapshot_select import (
+    _build_snapshot_selection_receipt,
     _commit_round_robin_selection,
     _lookup_active_snapshot_canonical_alias,
     _resolve_aawm_alias_selection_enumeration,
@@ -397,7 +398,11 @@ def _codex_auto_agent_candidate_public_shape(
     }
     if "last_resort" in candidate:
         shaped["last_resort"] = candidate["last_resort"]
-    for field in ("resolved_alias", "cooldown_identity_tag"):
+    for field in (
+        "resolved_alias",
+        "cooldown_identity_tag",
+        "selection_receipt",
+    ):
         if candidate.get(field) is not None:
             shaped[field] = candidate[field]
     for source_field, public_field in (
@@ -5682,25 +5687,21 @@ def _select_round_robin_available_state(
     if token is None:
         return tier[0]
 
-    cursor_key = (token.epoch_tag, token.alias_name)
     cursor = alias_routing_state.round_robin_cursor.get(
-        cursor_key,
+        (token.epoch_tag, token.alias_name),
         token.start_index,
     )
     available_by_identity = {
-        (
-            str(state["candidate"].get("provider") or ""),
-            str(state["candidate"].get("model") or ""),
-        ): state
+        _build_snapshot_selection_receipt(state["candidate"]): state
         for state in tier
     }
     selected = tier[0]
-    for offset in range(len(token.tied_candidate_ids)):
-        identity = token.tied_candidate_ids[
-            (cursor + offset) % len(token.tied_candidate_ids)
+    for offset in range(len(token.tied_candidate_receipts)):
+        candidate_receipt = token.tied_candidate_receipts[
+            (cursor + offset) % len(token.tied_candidate_receipts)
         ]
-        if identity in available_by_identity:
-            selected = available_by_identity[identity]
+        if candidate_receipt in available_by_identity:
+            selected = available_by_identity[candidate_receipt]
             break
     _commit_round_robin_selection(
         token,
@@ -8222,6 +8223,7 @@ def install(host_globals: dict) -> None:
         "_has_account_bound_state": _has_account_bound_state,
         "_find_anthropic_auto_agent_affinity_candidate": _find_anthropic_auto_agent_affinity_candidate,
         "_lookup_active_snapshot_canonical_alias": _lookup_active_snapshot_canonical_alias,
+        "_build_snapshot_selection_receipt": _build_snapshot_selection_receipt,
         "_resolve_aawm_alias_selection_enumeration": _resolve_aawm_alias_selection_enumeration,
         "_select_snapshot_candidates": _select_snapshot_candidates,
         # OPENAI-020: rebound affinity matchers LOAD_GLOBAL these helpers.

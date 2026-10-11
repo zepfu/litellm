@@ -31,6 +31,20 @@ _ANTHROPIC_CREDENTIAL_ROUTE_FAMILIES: frozenset[str] = frozenset(
     }
 )
 
+_SnapshotSelectionReceipt = Tuple[
+    str,
+    Optional[str],
+    Tuple[str, ...],
+    str,
+    str,
+    Optional[str],
+    str,
+    int,
+    bool,
+    Optional[str],
+    Optional[str],
+]
+
 # ---------------------------------------------------------------------------
 # Injected runtime state
 # ---------------------------------------------------------------------------
@@ -201,16 +215,41 @@ class RoundRobinCommitToken(NamedTuple):
 
     Captured once per request (in the selection context) at enumeration time so
     the actual selection -- not any getter call multiplicity -- drives the single
-    cursor advance. ``tied_candidate_ids`` is the stable, priority-ordered tied
-    top-tier identity tuple; ``start_index`` is the cursor value read when the
+    cursor advance. ``tied_candidate_receipts`` is the stable, receipt-ordered
+    tied top-tier tuple; ``start_index`` is the cursor value read when the
     enumeration resolved (Wave 3 seam / diagnostics -- the commit itself keys off
     the actually selected member's position, never blindly ``start_index + 1``).
     """
 
     alias_name: str
     epoch_tag: str
-    tied_candidate_ids: Tuple[Tuple[str, str], ...]
+    tied_candidate_receipts: Tuple[_SnapshotSelectionReceipt, ...]
     start_index: int
+
+
+def _build_snapshot_selection_receipt(
+    candidate: Mapping[str, Any],
+) -> _SnapshotSelectionReceipt:
+    """Build the exact snapshot provenance identity for a resolved candidate.
+
+    Round-robin commits use this instead of only ``provider`` and ``model`` so
+    distinct branches containing the same leaf rotate independently. The
+    leading snapshot hash prevents a request captured before a config swap from
+    advancing a cursor owned by a different snapshot.
+    """
+    return (
+        str(candidate.get("config_epoch_tag") or ""),
+        candidate.get("resolved_alias"),
+        tuple(candidate.get("alias_path") or ()),
+        str(candidate.get("provider") or ""),
+        str(candidate.get("model") or ""),
+        candidate.get("route_family"),
+        str(candidate.get("cooldown_identity_tag") or ""),
+        int(candidate.get("selection_priority") or 0),
+        bool(candidate.get("last_resort")),
+        candidate.get("selection_group"),
+        candidate.get("selection_choice"),
+    )
 
 
 class SelectionEnumeration(NamedTuple):
@@ -257,12 +296,14 @@ def _commit_round_robin_selection(
         return
     if bool(selected_candidate.get("last_resort")):
         return
-    identity = (selected_candidate.get("provider"), selected_candidate.get("model"))
+    receipt = _build_snapshot_selection_receipt(selected_candidate)
     try:
-        index = token.tied_candidate_ids.index(identity)
+        index = token.tied_candidate_receipts.index(receipt)
     except ValueError:
         return
-    _rr_cursor[(token.epoch_tag, token.alias_name)] = (index + 1) % len(token.tied_candidate_ids)
+    _rr_cursor[(token.epoch_tag, token.alias_name)] = (
+        index + 1
+    ) % len(token.tied_candidate_receipts)
 
 
 def _apply_snapshot_alias_distribution_strategy(
@@ -561,15 +602,15 @@ def _resolve_snapshot_alias_candidates(
                 # reference's outer ordering priority.
                 shaped["last_resort"] = bool(child.get("last_resort")) or (entry.priority == 0)
                 shaped["alias_reference"] = entry.alias_name
-                # A child already carries its complete path through the alias
-                # graph. Re-prepending the reference would duplicate the graph
-                # root and make nested reference paths ambiguous.
+                # A recursive child already carries the complete graph path,
+                # including both the reference and dispatch edges above it.
                 shaped["alias_path"] = list(child["alias_path"])
                 if alias.distribution_strategy is not None:
                     shaped["selection_group"] = alias.name
                     shaped["selection_strategy"] = alias.distribution_strategy
                     shaped["selection_choice"] = entry.alias_name
                     shaped["selection_weight"] = entry.weight
+                shaped["selection_receipt"] = _build_snapshot_selection_receipt(shaped)
                 resolved.append(shaped)
             continue
 
@@ -597,6 +638,9 @@ def _resolve_snapshot_alias_candidates(
             shaped_candidate["selection_strategy"] = alias.distribution_strategy
             shaped_candidate["selection_choice"] = f"{entry.provider}:{entry.model}"
             shaped_candidate["selection_weight"] = entry.weight
+        shaped_candidate["selection_receipt"] = _build_snapshot_selection_receipt(
+            shaped_candidate
+        )
         resolved.append(shaped_candidate)
     return resolved
 
@@ -683,23 +727,33 @@ def _derive_round_robin_commit_token(
             now_utc=now_utc,
             request=request,
         )
-    non_last_resort_candidates = [
-        candidate for candidate in resolved_candidates if not bool(candidate.get("last_resort"))
-    ]
-    if len(non_last_resort_candidates) < 2:
+    # Receipts are captured from this snapshot's resolved tuples. A later
+    # commit therefore cannot reconstruct members from a newer configuration.
+    snapshot_receipts = tuple(
+        _build_snapshot_selection_receipt(candidate)
+        for candidate in resolved_candidates
+    )
+    non_last_resort_receipts = tuple(
+        receipt
+        for candidate, receipt in zip(resolved_candidates, snapshot_receipts)
+        if not bool(candidate.get("last_resort"))
+    )
+    if len(non_last_resort_receipts) < 2:
         return None
-    top_priority = non_last_resort_candidates[0].get("selection_priority", 0)
-    tied = [
-        candidate for candidate in non_last_resort_candidates if candidate.get("selection_priority", 0) == top_priority
-    ]
-    if len(tied) < 2:
+    top_priority = non_last_resort_receipts[0][7]
+    tied_receipts = tuple(
+        receipt
+        for receipt in non_last_resort_receipts
+        if receipt[7] == top_priority
+    )
+    if len(tied_receipts) < 2:
         return None
     epoch_tag = snapshot.config_hash
     start_index = _rr_cursor.get((epoch_tag, canonical_alias), 0)
     return RoundRobinCommitToken(
         alias_name=canonical_alias,
         epoch_tag=epoch_tag,
-        tied_candidate_ids=tuple((str(candidate["provider"]), str(candidate["model"])) for candidate in tied),
+        tied_candidate_receipts=tuple(tied_receipts),
         start_index=start_index,
     )
 
