@@ -2591,6 +2591,9 @@ async def _persist_session_history_records(records: List[Dict[str, Any]]) -> Non
                     _build_session_history_db_payload(record)
                     for record in history_records
                 ]
+                # Preserve identity processing order, but take row locks in the
+                # same call-ID order as checkpoint batches and spool replay.
+                payloads.sort(key=lambda payload: payload[0])
                 tool_activity_payloads: List[Tuple[Any, ...]] = []
                 for record in history_records:
                     tool_activity_payloads.extend(

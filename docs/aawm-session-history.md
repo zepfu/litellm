@@ -64,9 +64,13 @@ treated as public LiteLLM API guarantees.
 ## Durable request waits
 
 Inference HTTP requests persist `metadata.wait_accounting` through the existing
-session-history queue, batch writer, and degraded-mode spool. No new table,
-timer, or storage service is required. Checkpoints start at server admission,
-update at wait boundaries, and finish when the ASGI request exits. The first
+session-history queue, batch writer, and degraded-mode spool. Checkpoints start
+at server admission, accumulate at wait boundaries, and finish when the ASGI
+request exits. Intermediate updates are coalesced in request-local state before
+queue admission, with at most one snapshot per second. One deferred callback
+flushes the latest state even if the request enters a silent wait. Admission,
+identity changes and terminal state bypass this interval; request exit cancels
+the deferred callback. The first
 logging call shares the admission call ID; subsequent provider attempts retain
 separate token/cost rows. Request-wide waits remain on the first row, even when
 a later attempt succeeds.
@@ -115,7 +119,7 @@ Measured boundaries:
 - `cancellation_cleanup` / `resource_cleanup`: settling cancelled tasks and
   closing native responses or retained sessions.
 
-Checkpoints are cumulative and coalesced per call within each writer batch.
+Checkpoints are cumulative and also coalesced per call within each writer batch.
 Older queued/spooled snapshots cannot replace a newer sequence. Checkpoints do
 not update terminal payloads, costs, tokens, tools, latency fields, or previous
 response gaps; checkpoint-only rows are excluded from previous-gap lookups.
@@ -128,6 +132,15 @@ exit before a checkpoint flush/spool can lose that checkpoint. Client-side
 credential, network, or scheduling waits before LiteLLM admission are outside
 this measurement. Existing latency columns and retry `Elapsed Wait` retain their
 meanings; these checkpoints supplement them for unfinished requests.
+
+Checkpoint and normal-history batches take primary row locks in sorted call-ID
+order across the main writer, overflow writer and spool replay. PostgreSQL
+deadlocks (`40P01`) receive retry write-ahead spool protection and bounded retry
+without resetting a healthy connection pool. Retry logs report loss risk whenever
+the failed batch has no spool protection, regardless of failure classification.
+Spool writes flush and synchronize the file before atomic rename, then synchronize
+the directory before reporting success. In-memory queued snapshots can still be
+lost on an abrupt process exit before persistence or spooling.
 
 ### Native Responses cancellation cleanup
 
