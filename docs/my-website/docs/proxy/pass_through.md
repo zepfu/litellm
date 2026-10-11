@@ -234,6 +234,8 @@ general_settings:
 
 Pass-through endpoints support default query parameters that are automatically added to every request. This is useful for API versioning, format specifications, authentication tokens, or any default configuration.
 
+When a configured target is not an adapter, the URL factory preserves the guardrail and default-query settings captured at registration. A registry update with valid values overrides them; unavailable metadata values preserve the captured settings. An omitted request query remains omitted, while an explicit `{}` request query remains an empty replacement map.
+
 #### How It Works
 
 **Parameter Precedence (highest to lowest priority):**
@@ -273,6 +275,10 @@ general_settings:
 - **Format Control**: Default to `format=json` but allow client override
 - **Rate Limiting**: Set `rate_limit=standard` as default
 - **Feature Flags**: Enable `experimental=false` by default
+
+---
+
+Endpoint refresh and deletion reconcile registrations by exact registration key and preserve unaffected sibling registrations that share the endpoint ID or route path. Removing a registered URL route also removes that installed route so it cannot dispatch with the prior target or defaults.
 
 ---
 

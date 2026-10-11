@@ -11809,6 +11809,17 @@ async def _parse_request_data_by_content_type(
     return query_params_data, custom_body_data, file_data, stream
 
 
+def _resolve_url_route_target_params(
+    target_params: Dict[str, Any], fallback_values: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Prefer registry values while preserving captured factory fallbacks."""
+    resolved_values = dict(fallback_values)
+    for param_name, metadata_value in target_params.items():
+        if param_name in resolved_values:
+            resolved_values[param_name] = metadata_value
+    return resolved_values
+
+
 def create_pass_through_route(
     endpoint,
     target: str,
@@ -11909,7 +11920,8 @@ def create_pass_through_route(
                 "forward_headers": _forward_headers,
                 "merge_query_params": _merge_query_params,
                 "cost_per_request": cost_per_request,
-                "guardrails": None,
+                "guardrails": guardrails,
+                "default_query_params": default_query_params,
                 "egress_credential_family": egress_credential_family,
                 "expected_target_family": expected_target_family,
                 "managed_xai_oauth_request": managed_xai_oauth_request,
@@ -11923,38 +11935,42 @@ def create_pass_through_route(
             if passthrough_params is not None:
                 target_params.update(passthrough_params.get("passthrough_params", {}))
 
-            # Extract and cast parameters with proper types
-            param_target = target_params.get("target") or target
-            param_custom_headers = target_params.get("custom_headers", custom_headers)
-            param_forward_headers = target_params.get(
-                "forward_headers", _forward_headers
+            # Registry metadata is authoritative for values it provides.
+            # A partial entry falls back to the captured factory value
+            # without treating an absent value as an explicit empty.
+            registry_values = _resolve_url_route_target_params(
+                target_params=target_params,
+                fallback_values={
+                    "target": target,
+                    "custom_headers": custom_headers,
+                    "forward_headers": _forward_headers,
+                    "merge_query_params": _merge_query_params,
+                    "cost_per_request": cost_per_request,
+                    "guardrails": guardrails,
+                    "default_query_params": default_query_params,
+                    "egress_credential_family": egress_credential_family,
+                    "expected_target_family": expected_target_family,
+                    "managed_xai_oauth_request": managed_xai_oauth_request,
+                    "allowed_forward_headers": allowed_forward_headers,
+                    "allowed_pass_through_prefixed_headers": allowed_pass_through_prefixed_headers,
+                    "blocked_pass_through_prefixed_headers": blocked_pass_through_prefixed_headers,
+                },
             )
-            param_merge_query_params = target_params.get(
-                "merge_query_params", _merge_query_params
-            )
-            param_cost_per_request = target_params.get(
-                "cost_per_request", cost_per_request
-            )
-            param_guardrails = target_params.get("guardrails", None)
-            param_default_query_params = target_params.get("default_query_params", None)
-            param_egress_credential_family = target_params.get(
-                "egress_credential_family", egress_credential_family
-            )
-            param_expected_target_family = target_params.get(
-                "expected_target_family", expected_target_family
-            )
-            param_managed_xai_oauth_request = managed_xai_oauth_request
-            param_allowed_forward_headers = target_params.get(
-                "allowed_forward_headers", allowed_forward_headers
-            )
-            param_allowed_pass_through_prefixed_headers = target_params.get(
-                "allowed_pass_through_prefixed_headers",
-                allowed_pass_through_prefixed_headers,
-            )
-            param_blocked_pass_through_prefixed_headers = target_params.get(
-                "blocked_pass_through_prefixed_headers",
-                blocked_pass_through_prefixed_headers,
-            )
+            (
+                param_target,
+                param_custom_headers,
+                param_forward_headers,
+                param_merge_query_params,
+                param_cost_per_request,
+                param_guardrails,
+                param_default_query_params,
+                param_egress_credential_family,
+                param_expected_target_family,
+                param_managed_xai_oauth_request,
+                param_allowed_forward_headers,
+                param_allowed_pass_through_prefixed_headers,
+                param_blocked_pass_through_prefixed_headers,
+            ) = registry_values.values()
             # Retry ownership is executable control flow. Route metadata must
             # not turn a direct native OpenAI request into a caller-managed
             # retry with no outer owner; callers must opt in explicitly.
@@ -11974,12 +11990,23 @@ def create_pass_through_route(
                 param_custom_headers if isinstance(param_custom_headers, dict) else {}
             )
 
-            # Ensure query_params and custom_body are dicts or None
-            final_query_params = (
-                query_params_data if isinstance(query_params_data, dict) else {}
+            # Keep omitted query parameters distinct from an explicit empty
+            # replacement map so pass_through_request can apply its fallback
+            # and query-default precedence without inventing an empty override.
+            if isinstance(query_params_data, dict):
+                request_query_params = dict(query_params_data)
+            elif query_params_data is None:
+                request_query_params = None
+            else:
+                request_query_params = {"query_params": query_params_data}
+            final_query_params: Optional[dict] = (
+                request_query_params
+                if query_params is None
+                else {
+                    **(request_query_params or {}),
+                    **query_params,
+                }
             )
-            if query_params:
-                final_query_params.update(query_params)
             # Caller-supplied custom_body takes precedence over the request-parsed body
             final_custom_body: Optional[dict] = None
             if custom_body is not None:
@@ -12610,6 +12637,30 @@ class SafeRouteAdder:
         return False
 
     @staticmethod
+    def _get_overlapping_route(app: FastAPI, path: str, methods: List[str]):
+        """Return the first route overlapping this normalized path/method set."""
+        for route in app.routes:
+            route_path = getattr(route, "path", None)
+            route_methods = getattr(route, "methods", None)
+            if route_path == path and route_methods is not None:
+                if any(method in route_methods for method in methods):
+                    return route
+        return None
+
+    @staticmethod
+    def _is_managed_pass_through_callable(endpoint: Any) -> bool:
+        """Identify callables created by pass-through route factories."""
+        managed_qualnames = {
+            "create_pass_through_route.<locals>.endpoint_func",
+            "create_websocket_passthrough_route.<locals>.endpoint_func",
+        }
+        return (
+            getattr(endpoint, "__module__", None)
+            == create_pass_through_route.__module__
+            and getattr(endpoint, "__qualname__", None) in managed_qualnames
+        )
+
+    @staticmethod
     def add_api_route_if_not_exists(
         app: FastAPI,
         path: str,
@@ -12630,12 +12681,27 @@ class SafeRouteAdder:
         Returns:
             True if route was added, False if it already existed
         """
-        if SafeRouteAdder._is_path_registered(app=app, path=path, methods=methods):
-            verbose_proxy_logger.debug(
-                "Skipping route registration - path %s with methods %s already registered on app",
-                path,
-                methods,
-            )
+        existing_route = SafeRouteAdder._get_overlapping_route(
+            app=app, path=path, methods=methods
+        )
+        if existing_route is not None:
+            if SafeRouteAdder._is_managed_pass_through_callable(existing_route.endpoint):
+                verbose_proxy_logger.debug(
+                    "Refreshing existing pass-through route: %s with methods %s",
+                    path,
+                    methods,
+                )
+                existing_route.dependant.call = endpoint
+                existing_route.endpoint = endpoint
+                if app.router.routes and existing_route is not app.router.routes[-1]:
+                    app.router.routes.remove(existing_route)
+                    app.router.routes.append(existing_route)
+            else:
+                verbose_proxy_logger.debug(
+                    "Skipping non-pass-through route registration - path %s with methods %s already registered on app",
+                    path,
+                    methods,
+                )
             return False
 
         app.add_api_route(
@@ -12799,6 +12865,56 @@ def _rebuild_pass_through_route_indexes() -> None:
             _index_pass_through_route_key(route_key, path, route_type)
 
 
+def _remove_installed_pass_through_route(
+    app: FastAPI, registry_entry: Dict[str, Any]
+) -> bool:
+    """Remove the application route installed for a registry entry."""
+    route_key = registry_entry.get("_aawm_registry_key")
+    path = registry_entry.get("path")
+    route_type = registry_entry.get("type")
+    methods = registry_entry.get("methods")
+    if not isinstance(route_key, str) or not isinstance(path, str):
+        verbose_proxy_logger.warning(
+            "Retaining application route for registry entry without identity: %s",
+            registry_entry,
+        )
+        return False
+    if route_type not in {"exact", "subpath"} or not isinstance(methods, list):
+        verbose_proxy_logger.warning(
+            "Retaining application route for unsupported registry entry: %s",
+            route_key,
+        )
+        return False
+
+    route_path = _normalize_pass_through_route_path(path)
+    if route_type == "subpath":
+        route_path = f"{route_path}/{{subpath:path}}"
+
+    for route in list(app.routes):
+        route_path_value = getattr(route, "path", None)
+        route_methods_value = getattr(route, "methods", None)
+        route_endpoint = getattr(route, "endpoint", None)
+        route_registry_key = getattr(
+            route_endpoint, "_aawm_pass_through_registry_key", None
+        )
+        route_matches_key = route_registry_key == route_key or (
+            route_registry_key is None
+            and getattr(route_endpoint, "__module__", None)
+            == create_pass_through_route.__module__
+            and getattr(route_endpoint, "__qualname__", None)
+            == "create_pass_through_route.<locals>.endpoint_func"
+        )
+        route_matches_identity = (
+            route_path_value == route_path
+            and isinstance(route_methods_value, set)
+            and (not methods or any(method in route_methods_value for method in methods))
+        )
+        if route_matches_key and route_matches_identity:
+            app.router.routes.remove(route)
+            return True
+    return False
+
+
 class InitPassThroughEndpointHelpers:
     @staticmethod
     def add_exact_path_route(
@@ -12839,27 +12955,30 @@ class InitPassThroughEndpointHelpers:
             dependencies,
         )
 
+        route_endpoint = create_pass_through_route(  # type: ignore
+            path,
+            target,
+            custom_headers,
+            forward_headers,
+            merge_query_params,
+            dependencies,
+            cost_per_request=cost_per_request,
+            default_query_params=default_query_params,
+            guardrails=guardrails,
+        )
+        route_endpoint._aawm_pass_through_registry_key = route_key
+
         # Use SafeRouteAdder to only add route if it doesn't exist on the app
         SafeRouteAdder.add_api_route_if_not_exists(
             app=app,
             path=path,
-            endpoint=create_pass_through_route(  # type: ignore
-                path,
-                target,
-                custom_headers,
-                forward_headers,
-                merge_query_params,
-                dependencies,
-                cost_per_request=cost_per_request,
-                default_query_params=default_query_params,
-                guardrails=guardrails,
-            ),
+            endpoint=route_endpoint,
             methods=methods,
             dependencies=dependencies,
         )
 
         # Always register/update the route metadata (headers, target) even if FastAPI route exists
-        _registered_pass_through_routes[route_key] = {
+        registry_entry: Dict[str, Any] = {
             "endpoint_id": endpoint_id,
             "path": path,
             "type": "exact",
@@ -12875,6 +12994,8 @@ class InitPassThroughEndpointHelpers:
                 "guardrails": guardrails,
             },
         }
+        registry_entry["_aawm_registry_key"] = route_key
+        _registered_pass_through_routes[route_key] = registry_entry
         _index_pass_through_route_key(route_key, path, "exact")
 
     @staticmethod
@@ -12916,28 +13037,31 @@ class InitPassThroughEndpointHelpers:
             dependencies,
         )
 
+        route_endpoint = create_pass_through_route(  # type: ignore
+            path,
+            target,
+            custom_headers,
+            forward_headers,
+            merge_query_params,
+            dependencies,
+            include_subpath=True,
+            cost_per_request=cost_per_request,
+            default_query_params=default_query_params,
+            guardrails=guardrails,
+        )
+        route_endpoint._aawm_pass_through_registry_key = route_key
+
         # Use SafeRouteAdder to only add route if it doesn't exist on the app
         SafeRouteAdder.add_api_route_if_not_exists(
             app=app,
             path=wildcard_path,
-            endpoint=create_pass_through_route(  # type: ignore
-                path,
-                target,
-                custom_headers,
-                forward_headers,
-                merge_query_params,
-                dependencies,
-                include_subpath=True,
-                cost_per_request=cost_per_request,
-                default_query_params=default_query_params,
-                guardrails=guardrails,
-            ),
+            endpoint=route_endpoint,
             methods=methods,
             dependencies=dependencies,
         )
 
         # Register the route to prevent duplicates only if it was added
-        _registered_pass_through_routes[route_key] = {
+        registry_entry: Dict[str, Any] = {
             "endpoint_id": endpoint_id,
             "path": path,
             "type": "subpath",
@@ -12953,19 +13077,37 @@ class InitPassThroughEndpointHelpers:
                 "guardrails": guardrails,
             },
         }
+        registry_entry["_aawm_registry_key"] = route_key
+        _registered_pass_through_routes[route_key] = registry_entry
         _index_pass_through_route_key(route_key, path, "subpath")
 
     @staticmethod
     def remove_endpoint_routes(endpoint_id: str):
-        """Remove all routes for a specific endpoint ID from the registry"""
+        """Remove all registry and application routes for an endpoint ID."""
+        from litellm.proxy.proxy_server import app
+
         keys_to_remove = [
             key
             for key, value in _registered_pass_through_routes.items()
             if value["endpoint_id"] == endpoint_id
         ]
         for key in keys_to_remove:
+            registry_entry = _registered_pass_through_routes.get(key)
             _unindex_pass_through_route_key(key)
             del _registered_pass_through_routes[key]
+            if isinstance(registry_entry, dict):
+                if not _remove_installed_pass_through_route(
+                    app=app, registry_entry=registry_entry
+                ):
+                    verbose_proxy_logger.debug(
+                        "No installed application route found for pass-through registry key: %s",
+                        key,
+                    )
+            else:
+                verbose_proxy_logger.warning(
+                    "Retaining application route for malformed pass-through registry entry: %s",
+                    key,
+                )
             verbose_proxy_logger.debug(
                 "Removed pass-through route from registry: %s", key
             )
@@ -13162,9 +13304,9 @@ async def initialize_pass_through_endpoints(
     from litellm._uuid import uuid
 
     verbose_proxy_logger.debug("initializing pass through endpoints")
+    from litellm.proxy.proxy_server import app
     from litellm.proxy._types import CommonProxyErrors, LiteLLMRoutes
     from litellm.proxy.proxy_server import (
-        app,
         config_passthrough_endpoints,
         premium_user,
     )
