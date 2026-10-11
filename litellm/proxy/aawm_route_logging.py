@@ -2289,6 +2289,7 @@ class AawmRouteRollupAccumulator:
         message: Optional[str] = None,
         request_status: Optional[str] = None,
         provenance_snapshot: Optional[dict[str, Any]] = None,
+        provenance_context_missing: bool = False,
         request_only: bool = False,
         origin_identity: Optional[_AawmRouteRollupOriginIdentity] = None,
         review_decision: Optional[AawmReviewDecision] = None,
@@ -2324,14 +2325,32 @@ class AawmRouteRollupAccumulator:
         ):
             return []
         emitted_lines: list[str] = []
-        if (
-            review_decision is not None
-            and review_correlation is not None
-            and self._record_correlated_review(
+
+        def register_provenance_snapshot(
+            target_group: _AawmRouteRollupGroup,
+        ) -> None:
+            if provenance_snapshot is None:
+                if provenance_context_missing:
+                    target_group.provenance_unknown_origin_event_count += 1
+                return
+            target_group.record_provenance_snapshot(
+                provenance_snapshot,
+                matches_observation_scope=(
+                    _aawm_route_rollup_observation_scope_matches(
+                        provenance_snapshot.get("context"),
+                        origin_identity=provenance_snapshot.get("origin_identity"),
+                    )
+                ),
+            )
+
+        correlated_group: Optional[_AawmRouteRollupGroup] = None
+        if review_decision is not None and review_correlation is not None:
+            correlated_group = self._record_correlated_review(
                 decision=review_decision,
                 correlation=review_correlation,
             )
-        ):
+        if correlated_group is not None:
+            register_provenance_snapshot(correlated_group)
             emitted_lines.extend(
                 self.flush_due(
                     now=now,
@@ -2362,21 +2381,6 @@ class AawmRouteRollupAccumulator:
                 incoming_endpoint=cleaned_incoming_endpoint,
             )
             self._groups[group_key] = group
-
-        def register_provenance_snapshot(
-            target_group: _AawmRouteRollupGroup,
-        ) -> None:
-            if provenance_snapshot is None:
-                return
-            target_group.record_provenance_snapshot(
-                provenance_snapshot,
-                matches_observation_scope=(
-                    _aawm_route_rollup_observation_scope_matches(
-                        provenance_snapshot.get("context"),
-                        origin_identity=provenance_snapshot.get("origin_identity"),
-                    )
-                ),
-            )
 
         if request_only:
             assert normalized_request_status is not None
@@ -2532,7 +2536,7 @@ class AawmRouteRollupAccumulator:
             group.sublines[subline_key] = subline
             group.subline_order.append(subline_key)
 
-        register_provenance_snapshot(group)
+        retry_count_before = subline.retry_logical_count
         self._record_subline_activity(
             group=group,
             subline=subline,
@@ -2556,6 +2560,16 @@ class AawmRouteRollupAccumulator:
                     else None
                 ),
             )
+
+        if (
+            turns > 0
+            or normalized_status is not None
+            or cleaned_message is not None
+            or normalized_request_status
+            in _AAWM_ROUTE_ROLLUP_REQUEST_TERMINAL_STATUS_VALUES
+            or subline.retry_logical_count > retry_count_before
+        ):
+            register_provenance_snapshot(group)
 
         emitted_lines.extend(
             self.flush_due(
@@ -2618,15 +2632,17 @@ class AawmRouteRollupAccumulator:
         if message is not None:
             subline.message = message
 
-    def _matching_origin_sublines(
+    def _matching_origin_group_sublines(
         self,
         predicate: Callable[[_AawmRouteRollupOriginIdentity], bool],
-    ) -> list[_AawmRouteRollupSubline]:
-        matches: dict[int, _AawmRouteRollupSubline] = {}
+    ) -> list[tuple[_AawmRouteRollupGroup, _AawmRouteRollupSubline]]:
+        matches: dict[
+            int, tuple[_AawmRouteRollupGroup, _AawmRouteRollupSubline]
+        ] = {}
         for group in self._groups.values():
             for subline in group.sublines.values():
                 if any(predicate(identity) for identity in subline.origin_identities):
-                    matches[id(subline)] = subline
+                    matches[id(subline)] = (group, subline)
         return list(matches.values())
 
     def _record_correlated_review(
@@ -2634,12 +2650,12 @@ class AawmRouteRollupAccumulator:
         *,
         decision: AawmReviewDecision,
         correlation: _AawmRouteRollupReviewCorrelation,
-    ) -> bool:
+    ) -> Optional[_AawmRouteRollupGroup]:
         if correlation.canonical_session_identity is None or (
             correlation.parent_actor_id is None
             and correlation.parent_thread_id is None
         ):
-            return False
+            return None
 
         def matches_parent(
             identity: _AawmRouteRollupOriginIdentity,
@@ -2667,12 +2683,13 @@ class AawmRouteRollupAccumulator:
                 return False
             return True
 
-        matches = self._matching_origin_sublines(matches_parent)
+        matches = self._matching_origin_group_sublines(matches_parent)
 
         if len(matches) != 1:
-            return False
-        matches[0].record_review(decision)
-        return True
+            return None
+        group, subline = matches[0]
+        subline.record_review(decision)
+        return group
 
     def flush_due(
         self,
@@ -2773,35 +2790,52 @@ class AawmRouteRollupAccumulator:
                 companion_snapshot["untracked_origin_events_count"] = (
                     group.provenance_untracked_origin_events_count
                 )
+                common_outgoing_target = (
+                    sublines[0][4]
+                    if sublines
+                    and all(
+                        subline[4] == sublines[0][4]
+                        for subline in sublines
+                    )
+                    else None
+                )
+                common_model_label = (
+                    sublines[0][0]
+                    if sublines
+                    and all(
+                        subline[0] == sublines[0][0]
+                        for subline in sublines
+                    )
+                    else None
+                )
+                common_effort = (
+                    sublines[0][1]
+                    if sublines
+                    and all(
+                        subline[1] == sublines[0][1]
+                        for subline in sublines
+                    )
+                    else None
+                )
                 companion_snapshot["rollup_emission"] = {
-                    "group_header_label": group.group_header_label,
-                    "incoming_endpoint": group.incoming_endpoint,
-                    "outgoing_target": (
-                        sublines[0][4]
-                        if sublines
-                        and all(
-                            subline[4] == sublines[0][4]
-                            for subline in sublines
-                        )
-                        else None
+                    "group_header_label": _clean_aawm_route_rollup_observation_label(
+                        group.group_header_label,
+                        max_chars=_AAWM_ROUTE_OBSERVATION_MAX_GROUP_HEADER_CHARS,
                     ),
-                    "model_label": (
-                        sublines[0][0]
-                        if sublines
-                        and all(
-                            subline[0] == sublines[0][0]
-                            for subline in sublines
-                        )
-                        else None
+                    "incoming_endpoint": _clean_aawm_route_rollup_observation_label(
+                        group.incoming_endpoint,
+                        max_chars=_AAWM_ROUTE_OBSERVATION_MAX_ENDPOINT_CHARS,
                     ),
-                    "effort": (
-                        sublines[0][1]
-                        if sublines
-                        and all(
-                            subline[1] == sublines[0][1]
-                            for subline in sublines
-                        )
-                        else None
+                    "outgoing_target": _clean_aawm_route_rollup_observation_target(
+                        common_outgoing_target
+                    ),
+                    "model_label": _clean_aawm_route_rollup_observation_label(
+                        common_model_label,
+                        max_chars=_AAWM_ROUTE_OBSERVATION_MAX_MODEL_CHARS,
+                    ),
+                    "effort": _clean_aawm_route_rollup_observation_label(
+                        common_effort,
+                        max_chars=_AAWM_ROUTE_ROLLUP_REASONING_EFFORT_MAX_CHARS,
                     ),
                     "turn_count": sum(subline[2] for subline in sublines),
                     "request_outcome": (
@@ -2813,11 +2847,19 @@ class AawmRouteRollupAccumulator:
                     and request_terminal_state is not None,
                     "sublines": [
                         {
-                            "model_label": subline[0],
-                            "effort": subline[1],
+                            "model_label": _clean_aawm_route_rollup_observation_label(
+                                subline[0],
+                                max_chars=_AAWM_ROUTE_OBSERVATION_MAX_MODEL_CHARS,
+                            ),
+                            "effort": _clean_aawm_route_rollup_observation_label(
+                                subline[1],
+                                max_chars=_AAWM_ROUTE_ROLLUP_REASONING_EFFORT_MAX_CHARS,
+                            ),
                             "turn_count": subline[2],
                             "status": subline[3],
-                            "outgoing_target": subline[4],
+                            "outgoing_target": _clean_aawm_route_rollup_observation_target(
+                                subline[4]
+                            ),
                             "approved_reviews": subline[6],
                             "denied_reviews": subline[8],
                             "retry_count": subline[11],
@@ -3963,6 +4005,9 @@ def record_aawm_route_rollup(
         # Get-or-replace and record under one continuous critical section so an
         # interval-driven singleton swap cannot orphan this mutation.
         accumulator = _get_or_replace_aawm_route_rollup_accumulator_locked()
+        observation_scope_enabled = bool(
+            _get_aawm_route_rollup_observation_scope()
+        )
         lines = accumulator.record(
             group_header_label=group_header_label,
             incoming_endpoint=incoming_endpoint,
@@ -3988,8 +4033,11 @@ def record_aawm_route_rollup(
                     context=observation_context,
                 )
                 if observation_context is not None
-                and _get_aawm_route_rollup_observation_scope()
+                and observation_scope_enabled
                 else None
+            ),
+            provenance_context_missing=(
+                observation_context is None and observation_scope_enabled
             ),
             origin_identity=origin_identity,
             review_decision=review_decision,
