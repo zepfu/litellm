@@ -368,7 +368,7 @@ def _extract_auto_agent_alias_agent_dispatch_fields(  # noqa: PLR0915
         "aawm_agent_profile",
         "codex_agent_profile",
     )
-    source_kind = "codex_turn"
+    source_kind: Optional[str] = None
 
     if agent_name is None:
         agent_name, agent_name_winning_source = (
@@ -380,7 +380,7 @@ def _extract_auto_agent_alias_agent_dispatch_fields(  # noqa: PLR0915
                 "x-aawm-agent-name",
             )
         )
-    if agent_name is not None:
+    if agent_name is not None and agent_name_winning_source is not None:
         source_kind = _classify_auto_agent_alias_agent_name_source(
             agent_name_winning_source
         )
@@ -395,6 +395,7 @@ def _extract_auto_agent_alias_agent_dispatch_fields(  # noqa: PLR0915
             agent_role = inferred_role
         if agent_name is None:
             agent_name = inferred_role
+            source_kind = "inferred_role"
         if agent_profile is None:
             agent_profile = inferred_role
     if thread_source is None and inferred_role is not None:

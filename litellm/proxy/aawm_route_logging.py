@@ -3726,7 +3726,16 @@ def build_aawm_route_rollup_context(
         preserve_agent_name=True,
     )
     identity_sources = [
-        codex_turn_metadata,
+        *(
+            [
+                {
+                    **codex_turn_metadata,
+                    _AAWM_ROUTE_ROLLUP_IDENTITY_SOURCE_KIND_KEY: "codex_turn",
+                }
+            ]
+            if codex_turn_metadata is not None
+            else []
+        ),
         *_iter_aawm_route_rollup_identity_sources(
             request=request,
             request_body=request_body,
@@ -5023,7 +5032,13 @@ def _classify_aawm_route_rollup_identity_source(
         return "header"
     if normalized_source_kind == "agent_dispatch":
         return "agent_dispatch"
-    if normalized_source_kind in {"codex_turn", "structured", "structured_nested"}:
+    if normalized_source_kind in {
+        "codex_turn",
+        "structured",
+        "structured_nested",
+        "client_metadata",
+        "inferred_role",
+    }:
         return normalized_source_kind
     return "unknown"
 
