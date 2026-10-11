@@ -1669,12 +1669,19 @@ def build_aawm_route_rollup_group_header_label(
     repository: Optional[str],
     client_product_label: Optional[str],
     host_name: Optional[str] = None,
+    agent_name: Optional[str] = None,
 ) -> Optional[str]:
-    return build_aawm_route_repo_client_host_label(
+    label = build_aawm_route_repo_client_host_label(
         repository=repository,
         client_product_label=client_product_label,
         host_name=host_name,
     )
+    normalized_agent_name = _normalize_aawm_route_log_agent_label(agent_name)
+    if label and normalized_agent_name:
+        return f"{label}[{normalized_agent_name}]"
+    if normalized_agent_name:
+        return f"[{normalized_agent_name}]"
+    return label
 
 
 def _format_aawm_route_rollup_status_tag(status: Optional[str]) -> str:

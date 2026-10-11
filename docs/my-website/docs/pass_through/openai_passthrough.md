@@ -39,6 +39,13 @@ affinity remain request-scoped while the stream is active. A completed terminal
 can promote the owner and commit affinity. Failed, incomplete, cancelled, or
 disconnected streams release the reservation and do not write new affinity.
 
+Route rollups attribute a managed request to the explicitly dispatched agent
+name when the client provides structured `agent_name` metadata or the
+`x-aawm-agent-name` header. Structured metadata retains precedence. LiteLLM
+rejects unsafe or oversized labels and preserves the existing header when no
+explicit name is supplied; a role declaration alone is not treated as a
+dispatched agent name.
+
 The final delivered disposition is also published for logging, rollup, and
 session-transfer consumers. Consumers must use this disposition rather than
 the upstream HTTP status: `completed` is the only successful outcome;

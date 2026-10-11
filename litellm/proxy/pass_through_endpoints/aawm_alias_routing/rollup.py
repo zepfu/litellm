@@ -287,11 +287,13 @@ def _build_auto_agent_alias_rollup_group_header_label(
     repository: Optional[str],
     client_product_label: Optional[str],
     host_name: Optional[str],
+    agent_name: Optional[str] = None,
 ) -> Optional[str]:
     return build_aawm_route_rollup_group_header_label(
         repository=repository,
         client_product_label=client_product_label,
         host_name=host_name,
+        agent_name=agent_name,
     )
 
 
