@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import random
-from datetime import datetime, time, timezone, tzinfo
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from typing import Any, Mapping, NamedTuple, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -101,11 +101,7 @@ def _get_request_routing_snapshot(
     if cached is not _REQUEST_ROUTING_SNAPSHOT_UNSET:
         return cached if isinstance(cached, _RoutingSnapshot) else None
 
-    snapshot = (
-        None
-        if _is_alias_config_startup_failed()
-        else get_active_routing_snapshot()
-    )
+    snapshot = None if _is_alias_config_startup_failed() else get_active_routing_snapshot()
     setattr(state, _REQUEST_ROUTING_SNAPSHOT_STATE_KEY, snapshot)
     return snapshot
 
@@ -322,9 +318,7 @@ def _is_tui_attached_candidate_eligible(
         return True
     if not client_product_label:
         return False
-    return _normalize_tui_family(client_product_label) == _normalize_tui_family(
-        candidate.tui_attached
-    )
+    return _normalize_tui_family(client_product_label) == _normalize_tui_family(candidate.tui_attached)
 
 
 def _is_tui_excluded_candidate_eligible(
@@ -344,13 +338,23 @@ def _is_tui_excluded_candidate_eligible(
         return True
     if not client_product_label:
         return True
-    return _normalize_tui_family(client_product_label) != _normalize_tui_family(
-        candidate.tui_excluded
-    )
+    return _normalize_tui_family(client_product_label) != _normalize_tui_family(candidate.tui_excluded)
 
 
 def _clock_seconds(value: time) -> int:
     return value.hour * 3600 + value.minute * 60 + value.second
+
+
+def _schedule_anchor_date(
+    *,
+    local_date: date,
+    now_seconds: int,
+    start_seconds: int,
+    end_seconds: int,
+) -> date:
+    """Return the local day owning the recurring window containing now."""
+    anchor_is_previous_day = start_seconds > end_seconds and now_seconds < end_seconds
+    return local_date - timedelta(days=1) if anchor_is_previous_day else local_date
 
 
 def _is_schedule_window_active(
@@ -365,32 +369,47 @@ def _is_schedule_window_active(
         if schedule.start is None or schedule.end is None:
             return False
         return schedule.start <= now_utc <= schedule.end
-    if (
-        schedule.start_time is None
-        or schedule.end_time is None
-        or (schedule.utc_offset is None and schedule.timezone is None)
-    ):
-        return False
     local_timezone: tzinfo
     if schedule.timezone is not None:
         try:
             local_timezone = ZoneInfo(schedule.timezone)
         except (ValueError, ZoneInfoNotFoundError):
             return False
+    elif schedule.utc_offset is None:
+        local_timezone = timezone.utc
     else:
         assert schedule.utc_offset is not None
         local_timezone = timezone(schedule.utc_offset)
-    local_now = now_utc.astimezone(local_timezone).timetz().replace(
-        tzinfo=None, microsecond=0
-    )
-    now_seconds = _clock_seconds(local_now)
-    start_seconds = _clock_seconds(schedule.start_time)
-    end_seconds = _clock_seconds(schedule.end_time)
-    if start_seconds == end_seconds:
+    local_datetime = now_utc.astimezone(local_timezone)
+    anchor_date = local_datetime.date()
+    has_clock_window = schedule.start_time is not None and schedule.end_time is not None
+    if has_clock_window:
+        assert schedule.start_time is not None
+        assert schedule.end_time is not None
+        local_now = local_datetime.timetz().replace(tzinfo=None, microsecond=0)
+        now_seconds = _clock_seconds(local_now)
+        start_seconds = _clock_seconds(schedule.start_time)
+        end_seconds = _clock_seconds(schedule.end_time)
+        if start_seconds == end_seconds:
+            return False
+        anchor_date = _schedule_anchor_date(
+            local_date=anchor_date,
+            now_seconds=now_seconds,
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
+        )
+    if schedule.weekdays is not None and anchor_date.weekday() not in schedule.weekdays:
         return False
-    if start_seconds < end_seconds:
-        return start_seconds <= now_seconds < end_seconds
-    return now_seconds >= start_seconds or now_seconds < end_seconds
+    if schedule.start_date is not None and schedule.end_date is not None:
+        if not schedule.start_date <= anchor_date <= schedule.end_date:
+            return False
+    if has_clock_window:
+        assert schedule.start_time is not None
+        assert schedule.end_time is not None
+        if start_seconds < end_seconds:
+            return start_seconds <= now_seconds < end_seconds
+        return now_seconds >= start_seconds or now_seconds < end_seconds
+    return True
 
 
 def _is_snapshot_candidate_in_schedule_window(
@@ -433,11 +452,14 @@ def _order_snapshot_entries_by_priority(
 ) -> list[_RoutingSnapshotCandidate | _AliasReference]:
     non_zero = [entry for entry in entries if entry.priority != 0]
     zero = [entry for entry in entries if entry.priority == 0]
-    return sorted(
-        non_zero,
-        key=lambda entry: entry.priority,
-        reverse=True,
-    ) + zero
+    return (
+        sorted(
+            non_zero,
+            key=lambda entry: entry.priority,
+            reverse=True,
+        )
+        + zero
+    )
 
 
 def _shape_snapshot_candidate(
@@ -465,9 +487,9 @@ def _snapshot_cooldown_identity_tag(
     candidate: Mapping[str, Any],
 ) -> str:
     """Return the stable cooldown identity for one resolved alias candidate."""
-    route_family = canonicalize_openrouter_native_responses_route_family(
-        candidate["route_family"]
-    ) or candidate["route_family"]
+    route_family = (
+        canonicalize_openrouter_native_responses_route_family(candidate["route_family"]) or candidate["route_family"]
+    )
     return "alias:{}:{}:{}:{}".format(
         owning_alias,
         candidate["provider"],
@@ -516,17 +538,10 @@ def _resolve_snapshot_alias_candidates(
     for entry in _order_snapshot_entries_by_priority(alias.candidates):
         if not _is_tui_attached_candidate_eligible(
             entry, client_product_label=client_product_label
-        ) or not _is_tui_excluded_candidate_eligible(
-            entry, client_product_label=client_product_label
-        ):
+        ) or not _is_tui_excluded_candidate_eligible(entry, client_product_label=client_product_label):
             continue
         if isinstance(entry, _AliasReference):
-            if (
-                not include_out_of_schedule
-                and not _is_snapshot_candidate_in_schedule_window(
-                    entry, now_utc=now_utc
-                )
-            ):
+            if not include_out_of_schedule and not _is_snapshot_candidate_in_schedule_window(entry, now_utc=now_utc):
                 continue
             children = _resolve_snapshot_alias_candidates(
                 entry.alias_name,
@@ -544,9 +559,7 @@ def _resolve_snapshot_alias_candidates(
                 # promoting a nested priority-zero tail. Preserve the
                 # child's terminal last-resort boundary while applying the
                 # reference's outer ordering priority.
-                shaped["last_resort"] = bool(child.get("last_resort")) or (
-                    entry.priority == 0
-                )
+                shaped["last_resort"] = bool(child.get("last_resort")) or (entry.priority == 0)
                 shaped["alias_reference"] = entry.alias_name
                 # A child already carries its complete path through the alias
                 # graph. Re-prepending the reference would duplicate the graph
@@ -560,10 +573,7 @@ def _resolve_snapshot_alias_candidates(
                 resolved.append(shaped)
             continue
 
-        if (
-            not include_out_of_schedule
-            and not _is_snapshot_candidate_in_schedule_window(entry, now_utc=now_utc)
-        ):
+        if not include_out_of_schedule and not _is_snapshot_candidate_in_schedule_window(entry, now_utc=now_utc):
             continue
         shaped_candidate = _shape_snapshot_candidate(
             entry,
@@ -674,17 +684,13 @@ def _derive_round_robin_commit_token(
             request=request,
         )
     non_last_resort_candidates = [
-        candidate
-        for candidate in resolved_candidates
-        if not bool(candidate.get("last_resort"))
+        candidate for candidate in resolved_candidates if not bool(candidate.get("last_resort"))
     ]
     if len(non_last_resort_candidates) < 2:
         return None
     top_priority = non_last_resort_candidates[0].get("selection_priority", 0)
     tied = [
-        candidate
-        for candidate in non_last_resort_candidates
-        if candidate.get("selection_priority", 0) == top_priority
+        candidate for candidate in non_last_resort_candidates if candidate.get("selection_priority", 0) == top_priority
     ]
     if len(tied) < 2:
         return None
@@ -693,10 +699,7 @@ def _derive_round_robin_commit_token(
     return RoundRobinCommitToken(
         alias_name=canonical_alias,
         epoch_tag=epoch_tag,
-        tied_candidate_ids=tuple(
-            (str(candidate["provider"]), str(candidate["model"]))
-            for candidate in tied
-        ),
+        tied_candidate_ids=tuple((str(candidate["provider"]), str(candidate["model"])) for candidate in tied),
         start_index=start_index,
     )
 

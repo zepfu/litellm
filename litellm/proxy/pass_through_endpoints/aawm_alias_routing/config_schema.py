@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Literal, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -140,16 +140,12 @@ DistributionStrategy = Literal[
 # (CFG-006). Matches the tier order used by the shared reasoning-effort
 # normalization seams; values are stored verbatim and translated per provider
 # route at dispatch time.
-REGISTERED_REASONING_EFFORTS: frozenset[str] = frozenset(
-    {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
-)
+REGISTERED_REASONING_EFFORTS: frozenset[str] = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
 
 # TUI family normalization vocabulary (CFG-007 dispatch).
 # `ohmypi` is a first-class origin (Oh My Pi / ompla / omp). It is not a
 # `sota.yaml` by_tui target; logical `sota` still uses `default` for it.
-REGISTERED_TUI_FAMILIES: frozenset[str] = frozenset(
-    {"codex", "claude", "grok", "qwen", "kimi", "ohmypi", "unknown"}
-)
+REGISTERED_TUI_FAMILIES: frozenset[str] = frozenset({"codex", "claude", "grok", "qwen", "kimi", "ohmypi", "unknown"})
 
 
 def _require_registered_provider(value: str) -> str:
@@ -198,9 +194,7 @@ def _parse_fixed_utc_offset(value: object) -> timedelta:
                 if match is not None:
                     break
             if match is None:
-                raise ValueError(
-                    "daily schedule utc_offset must be a fixed offset such as +08:00"
-                )
+                raise ValueError("daily schedule utc_offset must be a fixed offset such as +08:00")
             hours = int(match.group("hours"))
             minutes = int(match.group("minutes") or 0)
             if hours > 18 or minutes > 59:
@@ -216,22 +210,65 @@ def _parse_fixed_utc_offset(value: object) -> timedelta:
 
 def _parse_timezone(value: object) -> str:
     if not isinstance(value, str) or not value.strip():
-        raise ValueError(
-            "daily schedule timezone must be an IANA timezone such as "
-            "America/Los_Angeles"
-        )
+        raise ValueError("daily schedule timezone must be an IANA timezone such as " "America/Los_Angeles")
     raw = value.strip()
     try:
         ZoneInfo(raw)
     except (ValueError, ZoneInfoNotFoundError) as exc:
-        raise ValueError(
-            f"daily schedule timezone {raw!r} is not a valid IANA timezone"
-        ) from exc
+        raise ValueError(f"daily schedule timezone {raw!r} is not a valid IANA timezone") from exc
     return raw
 
 
+_WEEKDAY_NAMES = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
+
+def _parse_schedule_date(value: object) -> date:
+    if type(value) is date:
+        return value
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("daily schedule dates must use YYYY/MM/DD")
+    try:
+        return datetime.strptime(value.strip(), "%Y/%m/%d").date()
+    except ValueError as exc:
+        raise ValueError("daily schedule dates must use YYYY/MM/DD") from exc
+
+
+def _parse_weekdays(value: object) -> tuple[int, ...]:
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes, int)) or not isinstance(value, Sequence):
+        raise ValueError("daily schedule weekdays must be a list")
+    weekdays: set[int] = set()
+    for item in value:
+        if isinstance(item, bool):
+            raise ValueError(
+                "daily schedule weekdays must be Monday=0 through Sunday=6 " "or an unabbreviated English weekday name"
+            )
+        if isinstance(item, int):
+            if item not in range(7):
+                raise ValueError("daily schedule weekdays must be Monday=0 through Sunday=6")
+            weekdays.add(item)
+            continue
+        if not isinstance(item, str) or item.strip().lower() not in _WEEKDAY_NAMES:
+            raise ValueError(
+                "daily schedule weekdays must be Monday=0 through Sunday=6 " "or an unabbreviated English weekday name"
+            )
+        weekdays.add(_WEEKDAY_NAMES[item.strip().lower()])
+    if not weekdays:
+        raise ValueError("daily schedule weekdays must contain at least one day")
+    return tuple(sorted(weekdays))
+
+
 class ScheduleWindowConfig(BaseModel):
-    """Absolute UTC or recurring daily local-time window for a candidate."""
+    """Absolute UTC, whole-day calendar, or daily local-time window."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -239,8 +276,11 @@ class ScheduleWindowConfig(BaseModel):
     end: Optional[datetime] = None
     start_time: Optional[time] = None
     end_time: Optional[time] = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
     utc_offset: Optional[timedelta] = None
     timezone: Optional[str] = None
+    weekdays: Optional[tuple[int, ...]] = None
 
     @field_validator("start", "end")
     @classmethod
@@ -257,6 +297,18 @@ class ScheduleWindowConfig(BaseModel):
         if value is None:
             return None
         return _parse_local_clock_time(value)
+
+    @field_validator("start_date", "end_date", mode="before")
+    @classmethod
+    def _parse_daily_date(cls, value: object) -> object:
+        if value is None:
+            return None
+        return _parse_schedule_date(value)
+
+    @field_validator("weekdays", mode="before")
+    @classmethod
+    def _parse_daily_weekdays(cls, value: object) -> object:
+        return _parse_weekdays(value)
 
     @field_validator("utc_offset", mode="before")
     @classmethod
@@ -278,36 +330,40 @@ class ScheduleWindowConfig(BaseModel):
         has_daily = (
             self.start_time is not None
             or self.end_time is not None
+            or self.start_date is not None
+            or self.end_date is not None
             or self.utc_offset is not None
             or self.timezone is not None
+            or self.weekdays is not None
         )
         if has_absolute and has_daily:
             raise ValueError(
-                "schedule cannot mix absolute start/end with daily "
-                "start_time/end_time/utc_offset/timezone"
+                "schedule cannot mix absolute start/end with daily " "start_time/end_time/utc_offset/timezone"
             )
         if has_absolute:
             if self.start is None or self.end is None:
                 raise ValueError("absolute schedule windows require both start and end")
             if self.end < self.start:
-                raise ValueError(
-                    f"schedule window end ({self.end!r}) must not precede start ({self.start!r})"
-                )
+                raise ValueError(f"schedule window end ({self.end!r}) must not precede start ({self.start!r})")
             return self
+        if (self.start_date is None) != (self.end_date is None):
+            raise ValueError("daily schedule date ranges require start_date and end_date")
+        if self.start_date is not None and self.end_date < self.start_date:
+            raise ValueError(
+                f"daily schedule end_date ({self.end_date!r}) must not precede " f"start_date ({self.start_date!r})"
+            )
         if self.utc_offset is not None and self.timezone is not None:
+            raise ValueError("daily schedule windows require either utc_offset or timezone, " "not both")
+        has_clocks = self.start_time is not None or self.end_time is not None
+        has_calendar_gate = self.start_date is not None or self.end_date is not None or self.weekdays is not None
+        if has_clocks and (self.start_time is None or self.end_time is None):
+            raise ValueError("daily schedule clock windows require start_time and end_time")
+        if has_clocks and (self.utc_offset is None and self.timezone is None):
             raise ValueError(
-                "daily schedule windows require either utc_offset or timezone, "
-                "not both"
+                "daily schedule windows require start_time, end_time, and " "either utc_offset or timezone"
             )
-        if (
-            self.start_time is None
-            or self.end_time is None
-            or (self.utc_offset is None and self.timezone is None)
-        ):
-            raise ValueError(
-                "daily schedule windows require start_time, end_time, and "
-                "either utc_offset or timezone"
-            )
+        if not has_clocks and not has_calendar_gate:
+            raise ValueError("daily schedule windows require clocks or whole-day calendar gates")
         return self
 
     @property
@@ -324,6 +380,7 @@ class ErrorRuleConfig(BaseModel):
 
     class_name: str
     cools: bool = True
+
 
 class AliasReferenceCandidateConfig(BaseModel):
     """Reference to another alias as a weighted branch (CFG-009).
@@ -380,14 +437,10 @@ class DispatchConfig(BaseModel):
 
     @field_validator("blocked_tui_families")
     @classmethod
-    def _require_registered_blocked_tui_families(
-        cls, value: list[str]
-    ) -> list[str]:
+    def _require_registered_blocked_tui_families(cls, value: list[str]) -> list[str]:
         invalid = [family for family in value if family not in REGISTERED_TUI_FAMILIES]
         if invalid:
-            raise ValueError(
-                f"blocked_tui_families contains unregistered TUI families: {invalid!r}"
-            )
+            raise ValueError(f"blocked_tui_families contains unregistered TUI families: {invalid!r}")
         if len(set(value)) != len(value):
             raise ValueError("blocked_tui_families must not contain duplicates")
         return value
@@ -453,9 +506,7 @@ class AliasConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
-    candidates: list[CandidateConfig | AliasReferenceCandidateConfig] = Field(
-        default_factory=list
-    )
+    candidates: list[CandidateConfig | AliasReferenceCandidateConfig] = Field(default_factory=list)
     route_family: Optional[str] = None
     distribution_strategy: Optional[DistributionStrategy] = None
     # CURSOR-014: optional stock Codex collaboration metadata for the alias
@@ -476,28 +527,20 @@ class AliasConfig(BaseModel):
         for entry in value:
             if isinstance(entry, CandidateConfig):
                 if entry.model in seen:
-                    raise ValueError(
-                        f"duplicate model {entry.model!r} within a single alias"
-                    )
+                    raise ValueError(f"duplicate model {entry.model!r} within a single alias")
                 seen.add(entry.model)
             elif isinstance(entry, AliasReferenceCandidateConfig):
                 if entry.alias_reference in seen:
-                    raise ValueError(
-                        f"duplicate alias_reference {entry.alias_reference!r}"
-                    )
+                    raise ValueError(f"duplicate alias_reference {entry.alias_reference!r}")
                 seen.add(entry.alias_reference)
         return value
 
     @model_validator(mode="after")
     def _require_candidates_or_dispatch(self) -> "AliasConfig":
         if not self.candidates and self.dispatch is None:
-            raise ValueError(
-                f"alias {self.name!r} must have either candidates or dispatch"
-            )
+            raise ValueError(f"alias {self.name!r} must have either candidates or dispatch")
         if self.candidates and self.dispatch is not None:
-            raise ValueError(
-                f"alias {self.name!r} cannot have both candidates and dispatch"
-            )
+            raise ValueError(f"alias {self.name!r} cannot have both candidates and dispatch")
         return self
 
     @model_validator(mode="after")
@@ -506,15 +549,10 @@ class AliasConfig(BaseModel):
             "highest_quota_available",
             "lowest_quota_available",
         }:
-            weighted = [
-                entry
-                for entry in self.candidates
-                if float(getattr(entry, "weight", 1.0)) != 1.0
-            ]
+            weighted = [entry for entry in self.candidates if float(getattr(entry, "weight", 1.0)) != 1.0]
             if weighted:
                 raise ValueError(
-                    "quota availability strategies require default weight 1.0 "
-                    "for every candidate or alias reference"
+                    "quota availability strategies require default weight 1.0 " "for every candidate or alias reference"
                 )
         return self
 
@@ -594,11 +632,7 @@ def resolve_inheritance(document: RoutingConfigDocument) -> RoutingConfigDocumen
     """
     resolved_aliases: list[AliasConfig] = []
     for alias in document.aliases:
-        alias_route_family = (
-            alias.route_family
-            if alias.route_family is not None
-            else document.defaults.route_family
-        )
+        alias_route_family = alias.route_family if alias.route_family is not None else document.defaults.route_family
         resolved_candidates: list[CandidateConfig | AliasReferenceCandidateConfig] = []
         for candidate in alias.candidates:
             if isinstance(candidate, AliasReferenceCandidateConfig):
@@ -607,12 +641,8 @@ def resolve_inheritance(document: RoutingConfigDocument) -> RoutingConfigDocumen
             effective_route_family = (
                 candidate.route_family if candidate.route_family is not None else alias_route_family
             )
-            resolved_candidates.append(
-                candidate.model_copy(update={"route_family": effective_route_family})
-            )
-        resolved_aliases.append(
-            alias.model_copy(update={"candidates": resolved_candidates})
-        )
+            resolved_candidates.append(candidate.model_copy(update={"route_family": effective_route_family}))
+        resolved_aliases.append(alias.model_copy(update={"candidates": resolved_candidates}))
     return document.model_copy(update={"aliases": resolved_aliases})
 
 
@@ -629,9 +659,7 @@ def detect_alias_reference_cycles(document: RoutingConfigDocument) -> list[str]:
             return " -> ".join(path + [name])
         alias = alias_map.get(name)
         if alias is None:
-            raise ValueError(
-                f"alias_reference {name!r} not found in config document"
-            )
+            raise ValueError(f"alias_reference {name!r} not found in config document")
         path = path + [name]
         targets = [
             candidate.alias_reference

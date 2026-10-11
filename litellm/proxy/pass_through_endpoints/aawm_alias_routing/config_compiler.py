@@ -57,13 +57,12 @@ _PROVIDER_ALIAS_IDS: dict[str, str] = {
     "cursor": "cursor_agent",
     "zai": "zai_coding_plan",
 }
-_PROVIDER_ID_ALIAS_NAMES = {
-    provider_id: alias_id for alias_id, provider_id in _PROVIDER_ALIAS_IDS.items()
-}
+_PROVIDER_ID_ALIAS_NAMES = {provider_id: alias_id for alias_id, provider_id in _PROVIDER_ALIAS_IDS.items()}
 
 
 def _provider_alias_id(name: str) -> str:
-    return _PROVIDER_ALIAS_IDS.get(name[len(PROVIDER_ALIAS_PREFIX):], name[len(PROVIDER_ALIAS_PREFIX):])
+    return _PROVIDER_ALIAS_IDS.get(name[len(PROVIDER_ALIAS_PREFIX) :], name[len(PROVIDER_ALIAS_PREFIX) :])
+
 
 
 def _assert_provider_route_family_compatibility(
@@ -199,21 +198,15 @@ def _assert_provider_alias_coverage(aliases: dict[str, RoutingAlias]) -> None:
     for name in provider_names:
         provider_id = _provider_alias_id(name)
         if provider_id not in schema.REGISTERED_PROVIDERS:
-            errors.append(
-                f"alias {name!r} does not name a registered provider"
-            )
+            errors.append(f"alias {name!r} does not name a registered provider")
             continue
         if provider_id in seen_providers:
-            errors.append(
-                f"duplicate provider alias {name!r} (already {seen_providers[provider_id]!r})"
-            )
+            errors.append(f"duplicate provider alias {name!r} (already {seen_providers[provider_id]!r})")
             continue
         seen_providers[provider_id] = name
         alias = aliases[name]
         if alias.dispatch is not None:
-            errors.append(
-                f"{name} uses TUI dispatch; provider aliases must be closed candidate sets"
-            )
+            errors.append(f"{name} uses TUI dispatch; provider aliases must be closed candidate sets")
         concrete = 0
         for entry in alias.candidates:
             if isinstance(entry, AliasReference):
@@ -225,8 +218,7 @@ def _assert_provider_alias_coverage(aliases: dict[str, RoutingAlias]) -> None:
             concrete += 1
             if entry.provider != provider_id:
                 errors.append(
-                    f"{name} candidate {entry.model!r} has provider "
-                    f"{entry.provider!r}, expected {provider_id!r}"
+                    f"{name} candidate {entry.model!r} has provider " f"{entry.provider!r}, expected {provider_id!r}"
                 )
             allowed = _PROVIDER_ALLOWED_ROUTE_FAMILIES.get(provider_id)
             if allowed is None:
@@ -245,19 +237,12 @@ def _assert_provider_alias_coverage(aliases: dict[str, RoutingAlias]) -> None:
             errors.append(f"{name} has no concrete same-provider candidates")
 
     missing_vocab = sorted(
-        provider_id
-        for provider_id in seen_providers
-        if provider_id not in _PROVIDER_ALLOWED_ROUTE_FAMILIES
+        provider_id for provider_id in seen_providers if provider_id not in _PROVIDER_ALLOWED_ROUTE_FAMILIES
     )
     if missing_vocab:
-        errors.append(
-            "configured providers lack provider-alias route-family vocabulary: "
-            + ", ".join(missing_vocab)
-        )
+        errors.append("configured providers lack provider-alias route-family vocabulary: " + ", ".join(missing_vocab))
     if errors:
-        raise ConfigCompileError(
-            "provider-alias inventory incomplete: " + "; ".join(errors)
-        )
+        raise ConfigCompileError("provider-alias inventory incomplete: " + "; ".join(errors))
 
 
 _epoch_lock = threading.Lock()
@@ -368,27 +353,17 @@ def _validate_cohere_credential_domain(
     route_family: Optional[str],
     anthropic_route_family: Optional[str],
 ) -> None:
-    route_families = tuple(
-        value
-        for value in (route_family, anthropic_route_family)
-        if value is not None
-    )
-    uses_cohere_credentials = any(
-        value in _COHERE_CREDENTIAL_ROUTE_FAMILIES for value in route_families
-    )
+    route_families = tuple(value for value in (route_family, anthropic_route_family) if value is not None)
+    uses_cohere_credentials = any(value in _COHERE_CREDENTIAL_ROUTE_FAMILIES for value in route_families)
     is_cohere_provider = provider in _COHERE_NATIVE_PROVIDERS
 
     if uses_cohere_credentials and not is_cohere_provider:
         raise ConfigCompileError(
-            f"candidate model {model!r}: provider {provider!r} is incompatible "
-            "with Cohere-credential route family"
+            f"candidate model {model!r}: provider {provider!r} is incompatible " "with Cohere-credential route family"
         )
-    if is_cohere_provider and any(
-        value not in _COHERE_CREDENTIAL_ROUTE_FAMILIES for value in route_families
-    ):
+    if is_cohere_provider and any(value not in _COHERE_CREDENTIAL_ROUTE_FAMILIES for value in route_families):
         raise ConfigCompileError(
-            f"candidate model {model!r}: provider {provider!r} requires "
-            "Cohere-native route families"
+            f"candidate model {model!r}: provider {provider!r} requires " "Cohere-native route families"
         )
 
 
@@ -399,27 +374,17 @@ def _validate_nous_credential_domain(
     route_family: Optional[str],
     anthropic_route_family: Optional[str],
 ) -> None:
-    route_families = tuple(
-        value
-        for value in (route_family, anthropic_route_family)
-        if value is not None
-    )
-    uses_nous_credentials = any(
-        value in _NOUS_CREDENTIAL_ROUTE_FAMILIES for value in route_families
-    )
+    route_families = tuple(value for value in (route_family, anthropic_route_family) if value is not None)
+    uses_nous_credentials = any(value in _NOUS_CREDENTIAL_ROUTE_FAMILIES for value in route_families)
     is_nous_provider = provider in _NOUS_NATIVE_PROVIDERS
 
     if uses_nous_credentials and not is_nous_provider:
         raise ConfigCompileError(
-            f"candidate model {model!r}: provider {provider!r} is incompatible "
-            "with Nous-credential route family"
+            f"candidate model {model!r}: provider {provider!r} is incompatible " "with Nous-credential route family"
         )
-    if is_nous_provider and any(
-        value not in _NOUS_CREDENTIAL_ROUTE_FAMILIES for value in route_families
-    ):
+    if is_nous_provider and any(value not in _NOUS_CREDENTIAL_ROUTE_FAMILIES for value in route_families):
         raise ConfigCompileError(
-            f"candidate model {model!r}: provider {provider!r} requires "
-            "Nous-native route families"
+            f"candidate model {model!r}: provider {provider!r} requires " "Nous-native route families"
         )
 
 
@@ -430,14 +395,8 @@ def _validate_zai_coding_plan_credential_domain(
     route_family: Optional[str],
     anthropic_route_family: Optional[str],
 ) -> None:
-    route_families = tuple(
-        value
-        for value in (route_family, anthropic_route_family)
-        if value is not None
-    )
-    uses_coding_plan_credentials = any(
-        value in _ZAI_CODING_PLAN_CREDENTIAL_ROUTE_FAMILIES for value in route_families
-    )
+    route_families = tuple(value for value in (route_family, anthropic_route_family) if value is not None)
+    uses_coding_plan_credentials = any(value in _ZAI_CODING_PLAN_CREDENTIAL_ROUTE_FAMILIES for value in route_families)
     is_coding_plan_provider = provider in _ZAI_CODING_PLAN_NATIVE_PROVIDERS
 
     if uses_coding_plan_credentials and not is_coding_plan_provider:
@@ -449,8 +408,7 @@ def _validate_zai_coding_plan_credential_domain(
         value not in _ZAI_CODING_PLAN_CREDENTIAL_ROUTE_FAMILIES for value in route_families
     ):
         raise ConfigCompileError(
-            f"candidate model {model!r}: provider {provider!r} requires "
-            "Z.AI Coding Plan-native route families"
+            f"candidate model {model!r}: provider {provider!r} requires " "Z.AI Coding Plan-native route families"
         )
 
 
@@ -461,14 +419,8 @@ def _validate_cursor_agent_credential_domain(
     route_family: Optional[str],
     anthropic_route_family: Optional[str],
 ) -> None:
-    route_families = tuple(
-        value
-        for value in (route_family, anthropic_route_family)
-        if value is not None
-    )
-    uses_cursor_agent_credentials = any(
-        value in _CURSOR_AGENT_CREDENTIAL_ROUTE_FAMILIES for value in route_families
-    )
+    route_families = tuple(value for value in (route_family, anthropic_route_family) if value is not None)
+    uses_cursor_agent_credentials = any(value in _CURSOR_AGENT_CREDENTIAL_ROUTE_FAMILIES for value in route_families)
     is_cursor_agent_provider = provider in _CURSOR_AGENT_NATIVE_PROVIDERS
 
     if uses_cursor_agent_credentials and not is_cursor_agent_provider:
@@ -480,8 +432,7 @@ def _validate_cursor_agent_credential_domain(
         value not in _CURSOR_AGENT_CREDENTIAL_ROUTE_FAMILIES for value in route_families
     ):
         raise ConfigCompileError(
-            f"candidate model {model!r}: provider {provider!r} requires "
-            "Cursor Agent route families"
+            f"candidate model {model!r}: provider {provider!r} requires " "Cursor Agent route families"
         )
 
 
@@ -492,27 +443,17 @@ def _validate_nvidia_credential_domain(
     route_family: Optional[str],
     anthropic_route_family: Optional[str],
 ) -> None:
-    route_families = tuple(
-        value
-        for value in (route_family, anthropic_route_family)
-        if value is not None
-    )
-    uses_nvidia_credentials = any(
-        value in _NVIDIA_CREDENTIAL_ROUTE_FAMILIES for value in route_families
-    )
+    route_families = tuple(value for value in (route_family, anthropic_route_family) if value is not None)
+    uses_nvidia_credentials = any(value in _NVIDIA_CREDENTIAL_ROUTE_FAMILIES for value in route_families)
     is_nvidia_provider = provider in _NVIDIA_NATIVE_PROVIDERS
 
     if uses_nvidia_credentials and not is_nvidia_provider:
         raise ConfigCompileError(
-            f"candidate model {model!r}: provider {provider!r} is incompatible "
-            "with NVIDIA-credential route family"
+            f"candidate model {model!r}: provider {provider!r} is incompatible " "with NVIDIA-credential route family"
         )
-    if is_nvidia_provider and any(
-        value not in _NVIDIA_CREDENTIAL_ROUTE_FAMILIES for value in route_families
-    ):
+    if is_nvidia_provider and any(value not in _NVIDIA_CREDENTIAL_ROUTE_FAMILIES for value in route_families):
         raise ConfigCompileError(
-            f"candidate model {model!r}: provider {provider!r} requires "
-            "NVIDIA-native route families"
+            f"candidate model {model!r}: provider {provider!r} requires " "NVIDIA-native route families"
         )
 
 
@@ -531,17 +472,11 @@ def alibaba_token_plan_route_contract_mismatch(
     neither side stay untouched so generic providers keep their own routes.
     """
 
-    allowed = _PROVIDER_ALLOWED_ROUTE_FAMILIES[
-        policy.CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
-    ]
+    allowed = _PROVIDER_ALLOWED_ROUTE_FAMILIES[policy.CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER]
     present = tuple(value for value in route_families if value is not None)
     uses_contract_route = any(value in allowed for value in present)
-    is_alibaba_provider = (
-        provider == policy.CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
-    )
-    if is_alibaba_provider and (
-        not present or any(value not in allowed for value in present)
-    ):
+    is_alibaba_provider = provider == policy.CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
+    if is_alibaba_provider and (not present or any(value not in allowed for value in present)):
         return "provider_to_route"
     if uses_contract_route and not is_alibaba_provider:
         return "route_to_provider"
@@ -580,14 +515,8 @@ def _validate_openrouter_credential_domain(
     route_family: Optional[str],
     anthropic_route_family: Optional[str],
 ) -> None:
-    route_families = tuple(
-        value
-        for value in (route_family, anthropic_route_family)
-        if value is not None
-    )
-    uses_openrouter_credentials = any(
-        value in _OPENROUTER_CREDENTIAL_ROUTE_FAMILIES for value in route_families
-    )
+    route_families = tuple(value for value in (route_family, anthropic_route_family) if value is not None)
+    uses_openrouter_credentials = any(value in _OPENROUTER_CREDENTIAL_ROUTE_FAMILIES for value in route_families)
     is_openrouter_provider = provider in _OPENROUTER_NATIVE_PROVIDERS
 
     if uses_openrouter_credentials and not is_openrouter_provider:
@@ -595,12 +524,9 @@ def _validate_openrouter_credential_domain(
             f"candidate model {model!r}: provider {provider!r} is incompatible "
             "with OpenRouter-credential route family"
         )
-    if is_openrouter_provider and any(
-        value not in _OPENROUTER_CREDENTIAL_ROUTE_FAMILIES for value in route_families
-    ):
+    if is_openrouter_provider and any(value not in _OPENROUTER_CREDENTIAL_ROUTE_FAMILIES for value in route_families):
         raise ConfigCompileError(
-            f"candidate model {model!r}: provider {provider!r} requires "
-            "OpenRouter-native route families"
+            f"candidate model {model!r}: provider {provider!r} requires " "OpenRouter-native route families"
         )
 
 
@@ -626,8 +552,11 @@ def _compile_schedule(
         kind="daily",
         start_time=schedule.start_time,
         end_time=schedule.end_time,
+        start_date=schedule.start_date,
+        end_date=schedule.end_date,
         utc_offset=schedule.utc_offset,
         timezone=schedule.timezone,
+        weekdays=schedule.weekdays,
     )
 
 
@@ -644,22 +573,21 @@ def _canonical_schedule_repr(
             "kind": "absolute",
             "start": schedule.start.isoformat(),
         }
-    assert schedule.start_time is not None
-    assert schedule.end_time is not None
+    schedule_repr: dict[str, object] = {"kind": "daily"}
+    if schedule.start_time is not None and schedule.end_time is not None:
+        schedule_repr["end_time"] = schedule.end_time.isoformat()
+        schedule_repr["start_time"] = schedule.start_time.isoformat()
     if schedule.timezone is not None:
-        return {
-            "end_time": schedule.end_time.isoformat(),
-            "kind": "daily",
-            "start_time": schedule.start_time.isoformat(),
-            "timezone": schedule.timezone,
-        }
-    assert schedule.utc_offset is not None
-    return {
-        "end_time": schedule.end_time.isoformat(),
-        "kind": "daily",
-        "start_time": schedule.start_time.isoformat(),
-        "utc_offset": _format_fixed_utc_offset(schedule.utc_offset),
-    }
+        schedule_repr["timezone"] = schedule.timezone
+    elif schedule.utc_offset is not None:
+        assert schedule.utc_offset is not None
+        schedule_repr["utc_offset"] = _format_fixed_utc_offset(schedule.utc_offset)
+    if schedule.start_date is not None and schedule.end_date is not None:
+        schedule_repr["end_date"] = schedule.end_date.isoformat()
+        schedule_repr["start_date"] = schedule.start_date.isoformat()
+    if schedule.weekdays is not None:
+        schedule_repr["weekdays"] = list(schedule.weekdays)
+    return schedule_repr
 
 
 def _compile_candidate(candidate: schema.CandidateConfig, weight: float) -> RoutingCandidate:
@@ -669,10 +597,7 @@ def _compile_candidate(candidate: schema.CandidateConfig, weight: float) -> Rout
         candidate.route_family,
         candidate.anthropic_route_family,
     )
-    if (
-        candidate.route_family in schema.CODEX_ONLY_ROUTE_FAMILIES
-        and candidate.anthropic_route_family is not None
-    ):
+    if candidate.route_family in schema.CODEX_ONLY_ROUTE_FAMILIES and candidate.anthropic_route_family is not None:
         raise ConfigCompileError(
             f"candidate model {candidate.model!r}: Codex-only route family "
             f"{candidate.route_family!r} cannot set anthropic_route_family"
@@ -703,9 +628,7 @@ def _compile_candidate(candidate: schema.CandidateConfig, weight: float) -> Rout
             f"candidate model {candidate.model!r}: provider {candidate.provider!r} "
             f"is incompatible with codex-credential route_family {candidate.route_family!r}"
         )
-    if anthropic_rf in _ANTHROPIC_CREDENTIAL_ROUTE_FAMILIES and (
-        candidate.provider in _OPENAI_NATIVE_PROVIDERS
-    ):
+    if anthropic_rf in _ANTHROPIC_CREDENTIAL_ROUTE_FAMILIES and (candidate.provider in _OPENAI_NATIVE_PROVIDERS):
         raise ConfigCompileError(
             f"candidate model {candidate.model!r}: provider {candidate.provider!r} "
             f"is incompatible with anthropic-credential route_family {anthropic_rf!r}"
@@ -762,9 +685,7 @@ def _compile_candidate(candidate: schema.CandidateConfig, weight: float) -> Rout
         try:
             compiled_model = canonicalize_opencode_go_alias_model(candidate.model)
         except ValueError as exc:
-            raise ConfigCompileError(
-                f"candidate model {candidate.model!r}: {exc}"
-            ) from exc
+            raise ConfigCompileError(f"candidate model {candidate.model!r}: {exc}") from exc
     return RoutingCandidate(
         provider=candidate.provider,
         model=compiled_model,
@@ -780,7 +701,6 @@ def _compile_candidate(candidate: schema.CandidateConfig, weight: float) -> Rout
     )
 
 
-
 def _compile_alias_reference(
     alias_ref: schema.AliasReferenceCandidateConfig,
     *,
@@ -788,9 +708,7 @@ def _compile_alias_reference(
 ) -> AliasReference:
     """Compile an alias reference, validating the target exists."""
     if alias_ref.alias_reference not in available_aliases:
-        raise ConfigCompileError(
-            f"alias_reference {alias_ref.alias_reference!r} not found in config document"
-        )
+        raise ConfigCompileError(f"alias_reference {alias_ref.alias_reference!r} not found in config document")
     return AliasReference(
         alias_name=alias_ref.alias_reference,
         priority=alias_ref.priority,
@@ -813,8 +731,7 @@ def _compile_dispatch(
     for rule in dispatch.by_tui:
         if rule.target_alias not in available_aliases:
             raise ConfigCompileError(
-                f"dispatch rule for tui_family {rule.tui_family!r}: "
-                f"target_alias {rule.target_alias!r} not found"
+                f"dispatch rule for tui_family {rule.tui_family!r}: " f"target_alias {rule.target_alias!r} not found"
             )
         compiled_rules.append(
             DispatchRule(
@@ -823,9 +740,7 @@ def _compile_dispatch(
             )
         )
     if dispatch.default is not None and dispatch.default not in available_aliases:
-        raise ConfigCompileError(
-            f"dispatch default {dispatch.default!r} not found in config document"
-        )
+        raise ConfigCompileError(f"dispatch default {dispatch.default!r} not found in config document")
     return DispatchSnapshot(
         by_tui=tuple(compiled_rules),
         default=dispatch.default,
@@ -833,13 +748,9 @@ def _compile_dispatch(
     )
 
 
-def _compile_alias(
-    alias: schema.AliasConfig, *, available_aliases: set[str]
-) -> RoutingAlias:
+def _compile_alias(alias: schema.AliasConfig, *, available_aliases: set[str]) -> RoutingAlias:
     if not alias.candidates and alias.dispatch is not None:
-        dispatch_snapshot = _compile_dispatch(
-            alias.dispatch, available_aliases=available_aliases
-        )
+        dispatch_snapshot = _compile_dispatch(alias.dispatch, available_aliases=available_aliases)
         return RoutingAlias(
             name=alias.name,
             distribution_strategy=alias.distribution_strategy,
@@ -849,35 +760,21 @@ def _compile_alias(
         )
 
     ordered_entries = schema.order_alias_entries_by_priority(alias.candidates)
-    concrete_candidates = [
-        entry
-        for entry in ordered_entries
-        if isinstance(entry, schema.CandidateConfig)
-    ]
+    concrete_candidates = [entry for entry in ordered_entries if isinstance(entry, schema.CandidateConfig)]
     ordered = schema.order_candidates_by_priority(concrete_candidates)
     if alias.distribution_strategy == "proportional":
         weights_by_model = schema.normalized_weights(ordered)
     else:
-        weights_by_model = {
-            candidate.model: candidate.weight for candidate in ordered
-        }
+        weights_by_model = {candidate.model: candidate.weight for candidate in ordered}
 
     compiled_entries: list[RoutingCandidate | AliasReference] = []
     for entry in ordered_entries:
         if isinstance(entry, schema.CandidateConfig):
-            compiled_entries.append(
-                _compile_candidate(entry, weights_by_model[entry.model])
-            )
+            compiled_entries.append(_compile_candidate(entry, weights_by_model[entry.model]))
         else:
-            compiled_entries.append(
-                _compile_alias_reference(
-                    entry, available_aliases=available_aliases
-                )
-            )
+            compiled_entries.append(_compile_alias_reference(entry, available_aliases=available_aliases))
 
-    dispatch_snapshot = _compile_dispatch(
-        alias.dispatch, available_aliases=available_aliases
-    )
+    dispatch_snapshot = _compile_dispatch(alias.dispatch, available_aliases=available_aliases)
 
     return RoutingAlias(
         name=alias.name,
@@ -918,10 +815,7 @@ def _canonical_snapshot_repr(aliases: dict[str, RoutingAlias]) -> str:
                 canonical_candidates.append(
                     {
                         "type": "candidate",
-                        "error_rules": [
-                            {"class_name": r.class_name, "cools": r.cools}
-                            for r in entry.error_rules
-                        ],
+                        "error_rules": [{"class_name": r.class_name, "cools": r.cools} for r in entry.error_rules],
                         "model": entry.model,
                         "priority": entry.priority,
                         "provider": entry.provider,
@@ -939,13 +833,10 @@ def _canonical_snapshot_repr(aliases: dict[str, RoutingAlias]) -> str:
         if alias.dispatch is not None:
             dispatch_repr = {
                 "by_tui": [
-                    {"tui_family": rule.tui_family, "target_alias": rule.target_alias}
-                    for rule in alias.dispatch.by_tui
+                    {"tui_family": rule.tui_family, "target_alias": rule.target_alias} for rule in alias.dispatch.by_tui
                 ],
                 "default": alias.dispatch.default,
-                "blocked_tui_families": list(
-                    alias.dispatch.blocked_tui_families
-                ),
+                "blocked_tui_families": list(alias.dispatch.blocked_tui_families),
             }
 
         canonical_aliases.append(
@@ -981,10 +872,7 @@ def compile_yaml(raw_yaml: str) -> RoutingSnapshot:
         raise ConfigCompileError(f"alias delegation cycle detected: {'; '.join(cycles)}")
 
     available_aliases = {alias.name for alias in resolved.aliases}
-    aliases = {
-        alias.name: _compile_alias(alias, available_aliases=available_aliases)
-        for alias in resolved.aliases
-    }
+    aliases = {alias.name: _compile_alias(alias, available_aliases=available_aliases) for alias in resolved.aliases}
     _assert_provider_alias_coverage(aliases)
     source_hash = hashlib.sha256(raw_yaml.encode("utf-8")).hexdigest()
     semantic_repr = _canonical_snapshot_repr(aliases)

@@ -462,8 +462,29 @@ schedule:
   timezone: "America/Los_Angeles"
 ```
 
+Clock windows may add inclusive calendar-date bounds and weekday eligibility:
+
+```yaml
+schedule:
+  start_date: "2026/09/01"
+  end_date: "2026/10/20"
+  start_time: "22:00:00"
+  end_time: "09:00:00"
+  timezone: "UTC"
+  weekdays: ["tuesday"]
+```
+
+A date/weekday-only schedule is a whole-day calendar gate:
+
+```yaml
+schedule:
+  start_date: "2026/09/01"
+  end_date: "2026/10/20"
+  weekdays: ["tuesday"]
+```
+
 Absolute windows stay UTC-only and closed-closed (`start <= now <= end`).
-Daily windows require a local start time, local end time, and exactly one of
+Clock windows require a local start time, local end time, and exactly one of
 fixed `utc_offset` or an IANA `timezone`. They are half-open: the start is
 included and the end is excluded. When `start_time` is later than `end_time`,
 the window wraps midnight in the configured zone. Mixing the two forms,
@@ -474,6 +495,17 @@ An IANA `timezone` such as `America/Los_Angeles` applies its daylight-saving
 rules at selection time. For example, the Z.AI `03:00-23:00` eligibility
 window blocks `23:00-03:00` at `06:00-10:00 UTC` during PDT and
 `07:00-11:00 UTC` during PST.
+
+Dates use `YYYY/MM/DD`; both bounds are inclusive. A clock window is owned by
+the calendar day containing `start_time`, including the after-midnight portion
+of a wrapping window; a whole-day gate uses the schedule zone's local calendar
+day directly, or UTC when neither offset nor timezone is set. In the first
+bounded example above, September 1 owns the interval through September 2 at
+08:59:59 UTC, and October 20 owns its interval through October 21 at 08:59:59
+UTC. `weekdays` accepts unabbreviated English names or `0` through `6`, where
+Monday is `0` and Sunday is `6`; the schedule timezone's day that owns the
+occurrence must match. Existing schedules without
+`start_date`, `end_date`, or `weekdays` remain unrestricted by these gates.
 
 The schedule gate applies only to new affinity. Existing session owners are
 still found through `include_out_of_schedule` membership.
