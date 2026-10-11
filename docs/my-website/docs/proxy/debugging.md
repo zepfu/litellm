@@ -113,6 +113,36 @@ $ litellm
 
 The proxy will now all logs in json format.
 
+## Proxy lifecycle diagnostics
+
+Proxy startup, configuration application, explicit initialization, and
+shutdown emit bounded `proxy_lifecycle` records. These records contain process
+and parent PIDs, a lifecycle counter, process start ticks where available, a
+container instance ID where available, and a UTC Unix timestamp in nanoseconds.
+Successful config application includes an ephemeral keyed
+`config_revision_id` computed from the effective in-memory config; only the
+opaque identifier is logged. It is not a durable cross-restart version number.
+For local files, `config_mtime_ns`,
+`config_size_bytes`, and `config_inode` provide additional content-free source
+metadata. Configuration paths and values are not included. Lifecycle records
+are capped at 20 per process per second; `suppressed_events` reports records
+skipped since the previous emitted record.
+
+`signal_observer_status=installed` means the proxy wrapped a recognized
+Uvicorn, Gunicorn, or Hypercorn `SIGINT`/`SIGTERM` handler and delegates each
+signal to that handler unchanged. `proxy_shutdown` includes the observed signal
+number when available. A zero signal number means the proxy did not observe
+either signal through a recognized handler.
+
+Identify an in-process lifespan re-entry from repeated
+`proxy_lifespan_start` records with the same PID and process start ticks and
+increasing `lifecycle_id` values. `initialize_started` and
+`initialize_completed` describe explicit initialization calls and do not by
+themselves establish lifespan re-entry. Changed process identity indicates a
+new process. Correlate process and container IDs with the container runtime's
+start, restart, and recreate events to distinguish process replacement from a
+container restart; the proxy cannot infer that distinction from its own logs.
+
 ## Control Log Output 
 
 Turn off fastapi's default 'INFO' logs 
