@@ -21,7 +21,7 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
-from types import FunctionType
+from types import FunctionType, MethodType
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 import litellm
@@ -203,6 +203,11 @@ _CURSOR_AUTO_REVIEW_DIAGNOSTIC_SWITCH = "1"
 _CURSOR_AUTO_REVIEW_DIAGNOSTIC_ENVIRONMENT = "litellm-alpha"
 _CURSOR_AUTO_REVIEW_DIAGNOSTIC_MAX_RESULT_BYTES = 64 * 1024
 _CURSOR_AUTO_REVIEW_DIAGNOSTIC_MAX_EVENTS = 64
+_CURSOR_OBSERVATION_ALIAS = "sota-cursor"
+_CURSOR_OBSERVATION_ENVIRONMENT = "litellm-alpha"
+_CURSOR_OBSERVATION_MAX_TEXT_HASH_BYTES = 64 * 1024
+_CURSOR_OBSERVATION_MAX_CONTENT_ITEMS = 8
+_CURSOR_OBSERVATION_MAX_TOOL_OUTPUTS = 32
 _CURSOR_AUTO_REVIEW_DIAGNOSTIC_EVENT_FIELDS = (
     ("interactionUpdate", "interaction_update_count"),
     ("textDelta", "text_delta_count"),
@@ -729,6 +734,339 @@ def _cursor_replay_safe_diagnostic_token(value: Any) -> Optional[str]:
     ):
         return None
     return value
+
+
+def _cursor_observation_enabled(
+    *,
+    request: Any,
+    request_body: Mapping[str, Any],
+) -> bool:
+    """Gate observation to alpha Cursor traffic in the configured rollup scope."""
+    if (
+        os.getenv("AAWM_LITELLM_ENVIRONMENT", "").strip()
+        != _CURSOR_OBSERVATION_ENVIRONMENT
+    ):
+        return False
+    try:
+        from litellm.integrations.aawm_passthrough_shape_capture import (
+            diagnostic_payload_capture_enabled,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        if not diagnostic_payload_capture_enabled():
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    metadata = request_body.get("litellm_metadata")
+    if not isinstance(metadata, Mapping):
+        return False
+    alias = metadata.get("codex_auto_agent_alias")
+    if not (isinstance(alias, str) and alias.strip().casefold() == (
+        _CURSOR_OBSERVATION_ALIAS
+    )):
+        return False
+    try:
+        request_state = getattr(request, "state", None)
+        cached_origin = getattr(
+            request_state,
+            "aawm_alias_request_context",
+            None,
+        )
+        if not isinstance(cached_origin, Mapping):
+            return False
+        origin_context = dict(cached_origin)
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        from litellm.proxy.aawm_route_logging import (
+            _aawm_route_rollup_observation_scope_matches,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        if not _aawm_route_rollup_observation_scope_matches(
+            origin_context,
+            origin_identity=None,
+        ):
+            return False
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _emit_cursor_observation_payload(
+    *,
+    request: Any,
+    payload: dict[str, Any],
+) -> None:
+    try:
+        payload["event"] = "cursor049_observation"
+        payload["code_provenance"] = _cursor_observation_code_provenance()
+        correlation_id = _cursor_retained_history_correlation_id(request)
+        if correlation_id is not None:
+            payload["litellm_call_id"] = correlation_id
+        verbose_aawm_route_logger.info(
+            "AAWM_CURSOR049_OBSERVATION: %s",
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+    except Exception:
+        # Observation must never alter continuation or fresh-dispatch behavior.
+        return
+
+
+def _cursor_observation_fingerprint(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not value:
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def _cursor_observation_tool_output_evidence(
+    outputs: list[tuple[str, str]],
+) -> dict[str, Any]:
+    bounded_outputs = outputs[:_CURSOR_OBSERVATION_MAX_TOOL_OUTPUTS]
+    call_ids: list[str] = []
+    hashes: list[str] = []
+    lengths: list[int] = []
+    for call_id, output in bounded_outputs:
+        call_ids.append(_cursor_replay_safe_diagnostic_token(call_id) or "other")
+        encoded = str(output).encode("utf-8")
+        hashes.append(hashlib.sha256(encoded).hexdigest())
+        lengths.append(len(encoded))
+    return {
+        "tool_output_call_ids": call_ids,
+        "tool_output_hashes": hashes,
+        "tool_output_lengths": lengths,
+        "tool_outputs_omitted_unbounded": (
+            len(outputs) > _CURSOR_OBSERVATION_MAX_TOOL_OUTPUTS
+        ),
+    }
+
+
+def _cursor_observation_request_identity(
+    cursor_request: Mapping[str, Any],
+) -> dict[str, Any]:
+    run_request = _cursor_as_mapping(cursor_request.get("runRequest"))
+    action = _cursor_as_mapping(run_request.get("action"))
+    user_message_action = _cursor_as_mapping(action.get("userMessageAction"))
+    user_message = _cursor_as_mapping(user_message_action.get("userMessage"))
+    user_text = user_message.get("text")
+    user_text = user_text if isinstance(user_text, str) else ""
+    history = user_message_action.get("conversationHistory")
+    history = history if isinstance(history, Mapping) else {}
+    history_items = history.get("messages")
+    history_items = history_items if isinstance(history_items, list) else []
+    roles: list[str] = []
+    call_ids: list[str] = []
+    content_omitted = False
+    for raw_item in history_items[:_CURSOR_OBSERVATION_MAX_TOOL_OUTPUTS]:
+        item = _cursor_as_mapping(raw_item)
+        user = item.get("user")
+        assistant = item.get("assistant")
+        tool = item.get("tool")
+        if isinstance(user, Mapping):
+            roles.append("user")
+            contents = user.get("content")
+            contents = contents if isinstance(contents, list) else []
+            content_omitted = content_omitted or len(contents) > (
+                _CURSOR_OBSERVATION_MAX_CONTENT_ITEMS
+            )
+            continue
+        if isinstance(assistant, Mapping):
+            roles.append("assistant")
+            contents = assistant.get("content")
+            contents = contents if isinstance(contents, list) else []
+            content_omitted = content_omitted or len(contents) > (
+                _CURSOR_OBSERVATION_MAX_CONTENT_ITEMS
+            )
+            for raw_content in contents[:_CURSOR_OBSERVATION_MAX_CONTENT_ITEMS]:
+                content = _cursor_as_mapping(raw_content)
+                tool_call = content.get("toolCall")
+                if not isinstance(tool_call, Mapping):
+                    continue
+                call_ids.append(
+                    _cursor_replay_safe_diagnostic_token(
+                        tool_call.get("toolCallId")
+                    )
+                    or "other"
+                )
+            continue
+        if isinstance(tool, Mapping):
+            roles.append("tool")
+            call_ids.append(
+                _cursor_replay_safe_diagnostic_token(tool.get("toolCallId"))
+                or "other"
+            )
+            contents = tool.get("content")
+            contents = contents if isinstance(contents, list) else []
+            content_omitted = content_omitted or len(contents) > (
+                _CURSOR_OBSERVATION_MAX_CONTENT_ITEMS
+            )
+            continue
+        roles.append("other")
+    return {
+        "native_run_id": _cursor_replay_safe_diagnostic_token(
+            run_request.get("runId")
+        ),
+        "native_conversation_id": _cursor_replay_safe_diagnostic_token(
+            run_request.get("conversationId")
+        ),
+        "native_message_id": _cursor_replay_safe_diagnostic_token(
+            user_message.get("messageId")
+        ),
+        "native_agent_session_id": _cursor_replay_safe_diagnostic_token(
+            run_request.get("agentSessionId")
+        ),
+        "user_message_text_sha256": hashlib.sha256(
+            user_text.encode("utf-8")
+        ).hexdigest(),
+        "conversation_history_roles": roles,
+        "conversation_history_call_ids": call_ids,
+        "identity_omitted_unbounded": len(history_items)
+        > _CURSOR_OBSERVATION_MAX_TOOL_OUTPUTS,
+        "conversation_history_content_omitted_unbounded": content_omitted,
+    }
+
+
+def _cursor_observation_result_evidence(result: Any) -> dict[str, Any]:
+    text = getattr(result, "text", "")
+    if not isinstance(text, str):
+        text = ""
+    encoded = text.encode("utf-8")
+    tool_calls = getattr(result, "tool_calls", [])
+    if not isinstance(tool_calls, list):
+        tool_calls = []
+    tool_call_ids = [
+        _cursor_replay_safe_diagnostic_token(item.get("call_id")) or "other"
+        for item in tool_calls
+        if isinstance(item, Mapping)
+    ][:_CURSOR_OBSERVATION_MAX_TOOL_OUTPUTS]
+    events = getattr(result, "events", [])
+    if not isinstance(events, list):
+        events = []
+    event_counts: dict[str, int] = {}
+    for raw_event in events[:_CURSOR_AUTO_REVIEW_DIAGNOSTIC_MAX_EVENTS]:
+        event = raw_event if isinstance(raw_event, Mapping) else {}
+        recognized = False
+        for event_name, count_name in (
+            _CURSOR_AUTO_REVIEW_DIAGNOSTIC_EVENT_FIELDS
+        ):
+            if event_name in event:
+                event_counts[count_name] = event_counts.get(count_name, 0) + 1
+                recognized = True
+        if not recognized:
+            event_counts["unknown_event_count"] = (
+                event_counts.get("unknown_event_count", 0) + 1
+            )
+    exec_server_messages = getattr(result, "exec_server_messages", [])
+    if not isinstance(exec_server_messages, list):
+        exec_server_messages = []
+    return {
+        "result_text_sha256": hashlib.sha256(
+            encoded[:_CURSOR_OBSERVATION_MAX_TEXT_HASH_BYTES]
+        ).hexdigest(),
+        "result_text_sha256_truncated": len(encoded)
+        > _CURSOR_OBSERVATION_MAX_TEXT_HASH_BYTES,
+        "result_text_length": len(text),
+        "result_tool_call_ids": tool_call_ids,
+        "result_tool_call_count": len(tool_calls),
+        "result_turn_ended": bool(getattr(result, "turn_ended", False)),
+        "result_end_stream": bool(getattr(result, "end_stream", False)),
+        "result_event_type_counts": event_counts,
+        "result_exec_server_message_count": len(exec_server_messages),
+        "result_omitted_unbounded": len(events)
+        > _CURSOR_AUTO_REVIEW_DIAGNOSTIC_MAX_EVENTS,
+    }
+
+
+def _cursor_observation_session_evidence(session: Any) -> dict[str, Any]:
+    evidence = getattr(session, "continuation_evidence", None)
+    evidence = dict(evidence) if isinstance(evidence, Mapping) else {}
+    encode_evidence = getattr(session, "_continuation_encode_evidence", None)
+    if isinstance(encode_evidence, list):
+        evidence["encode_evidence"] = encode_evidence[
+            :_CURSOR_OBSERVATION_MAX_TOOL_OUTPUTS
+        ]
+        evidence["encode_evidence_omitted_unbounded"] = len(
+            encode_evidence
+        ) > _CURSOR_OBSERVATION_MAX_TOOL_OUTPUTS
+    write_bytes = getattr(session, "_h2_write_bytes_total", None)
+    if isinstance(write_bytes, int) and not isinstance(write_bytes, bool):
+        evidence["h2_write_bytes_total"] = write_bytes
+    encoder_bytes = getattr(session, "_h2_encoder_payload_bytes_total", None)
+    if isinstance(encoder_bytes, int) and not isinstance(encoder_bytes, bool):
+        evidence["h2_encoder_payload_bytes_total"] = encoder_bytes
+    writer_handoff_attempt = getattr(
+        session,
+        "_h2_first_result_writer_handoff_attempt",
+        None,
+    )
+    if isinstance(writer_handoff_attempt, Mapping):
+        evidence["h2_first_result_writer_handoff_attempt"] = dict(
+            writer_handoff_attempt
+        )
+    return evidence
+
+
+def _cursor_observation_code_provenance() -> dict[str, Any]:
+    module_prefix = (
+        "litellm.proxy.pass_through_endpoints.aawm_adapter_runtime"
+        ".codex_candidate_calls"
+    )
+    targets = (
+        f"{module_prefix}:_cursor_observation_enabled",
+        f"{module_prefix}:_emit_cursor_observation_payload",
+        f"{module_prefix}:_perform_codex_auto_agent_cursor_agent_request",
+    )
+    functions: list[dict[str, Any]] = []
+    try:
+        from litellm.proxy.aawm_route_logging import (
+            _hash_aawm_route_observation_code_object,
+        )
+    except Exception:  # noqa: BLE001
+        return {
+            "algorithm": "aawm-code-object-sha256-v1",
+            "available": False,
+            "functions": [],
+            "reason": "shared_hash_helper_unavailable",
+        }
+    for symbol in targets:
+        prefix, local_name = symbol.split(":", 1)
+        owner: Any = sys.modules.get(prefix)
+        if owner is None:
+            functions.append({"symbol": symbol, "digest": None})
+            continue
+        for attribute_name in local_name.split("."):
+            owner = getattr(owner, attribute_name, None)
+            if owner is None:
+                break
+        if isinstance(owner, MethodType):
+            function = owner.__func__
+        elif isinstance(owner, FunctionType):
+            function = owner
+        else:
+            function = None
+        try:
+            digest = _hash_aawm_route_observation_code_object(function)
+        except Exception:  # noqa: BLE001
+            digest = None
+        functions.append({"symbol": symbol, "digest": digest})
+    return {
+        "algorithm": "aawm-code-object-sha256-v1",
+        "available": True,
+        "functions": functions,
+    }
+
+
+def _cursor_observation_encoded_request_evidence(client: Any) -> dict[str, Any]:
+    evidence = getattr(client, "_fresh_run_evidence", None)
+    if not isinstance(evidence, Mapping):
+        return {"fresh_encoded_request_omitted_unbounded": True}
+    return {
+        "fresh_encoded_request_sha256": evidence.get("encoded_request_sha256"),
+        "fresh_encoded_request_bytes": evidence.get("encoded_request_bytes"),
+        "fresh_encoded_request_omitted_unbounded": False,
+    }
 
 
 def _cursor_replay_safe_diagnostic_keys(
@@ -6547,6 +6885,10 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         )
 
     request_body = dict(candidate_body)
+    cursor_observation_enabled = _cursor_observation_enabled(
+        request=request,
+        request_body=request_body,
+    )
     cursor_auto_review_alias = _cursor_auto_review_alias_from_request_body(request_body)
     litellm_metadata = request_body.get("litellm_metadata")
     rollup_kwargs = _build_adapted_route_rollup_kwargs(
@@ -6665,6 +7007,57 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         retained_session=retained_session,
     )
 
+    safe_registry_pending_call_ids: list[str] = []
+    if cursor_observation_enabled:
+        try:
+            if previous_response_id is None and not cursor_tool_outputs:
+                continuation_branch = "fresh_dispatch"
+            elif full_history_continuation:
+                continuation_branch = "full_history_retained"
+            else:
+                continuation_branch = "explicit_id"
+            registry_pending_call_ids = (
+                replay_state.get("pending_call_ids")
+                if isinstance(replay_state, dict)
+                else []
+            )
+            if isinstance(registry_pending_call_ids, list):
+                safe_registry_pending_call_ids = [
+                    _cursor_replay_safe_diagnostic_token(item) or "other"
+                    for item in registry_pending_call_ids[
+                        :_CURSOR_OBSERVATION_MAX_TOOL_OUTPUTS
+                    ]
+                ]
+            matched_response_id = (
+                previous_response_id if full_history_continuation else None
+            )
+            owner_cache_key = owner_scope[0] if owner_scope is not None else ""
+            payload: dict[str, Any] = {
+                "phase": "continuation_branch",
+                "continuation_branch": continuation_branch,
+                "owner_cache_key_fingerprint": (
+                    _cursor_observation_fingerprint(owner_cache_key)
+                ),
+                "owner_scope_present": owner_scope is not None,
+                "owner_id_present": owner_scope is not None
+                and bool(owner_scope[1]),
+                "previous_response_id": _cursor_replay_safe_diagnostic_token(
+                    previous_response_id
+                ),
+                "matched_response_id": _cursor_replay_safe_diagnostic_token(
+                    matched_response_id
+                ),
+                "registry_pending_call_ids": safe_registry_pending_call_ids,
+                "registry_continuation_outcome": (
+                    replay_state.get("continuation_outcome")
+                    if isinstance(replay_state, dict)
+                    else None
+                ),
+            }
+            _emit_cursor_observation_payload(request=request, payload=payload)
+        except Exception:
+            pass
+
     messages = _responses_input_to_cursor_messages(
         request_body,
         prior_messages=(
@@ -6686,6 +7079,33 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         # CURSOR-035 leftover handoff (distinct from archived CURSOR-016).
         transferred = False
         try:
+            if cursor_observation_enabled:
+                try:
+                    payload: dict[str, Any] = {
+                        "phase": "continuation_pre_dispatch",
+                        **_cursor_observation_tool_output_evidence(
+                            cursor_tool_outputs
+                        ),
+                        "messages_length": len(messages),
+                        "cue_marker_on_last_message": bool(
+                            messages
+                            and isinstance(messages[-1], Mapping)
+                            and _CURSOR_TOOL_CONTINUATION_CUE_MARKER
+                            in messages[-1]
+                        ),
+                    }
+                    _emit_cursor_observation_payload(
+                        request=request,
+                        payload=payload,
+                    )
+                except Exception:
+                    pass
+            try:
+                retained_session._observation_enabled_for_request = (
+                    cursor_observation_enabled
+                )
+            except Exception:
+                pass
             result = await retained_session.continue_with_tool_outputs(
                 cursor_tool_outputs
             )
@@ -6694,6 +7114,43 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
                 request_body=request_body,
                 result=result,
             )
+            if cursor_observation_enabled:
+                try:
+                    result_tool_call_ids = [
+                        item.get("call_id")
+                        for item in result.tool_calls
+                        if isinstance(item, Mapping)
+                    ]
+                    payload = {
+                        "phase": "continuation_success",
+                        "outcome": "success",
+                        **_cursor_observation_result_evidence(result),
+                        "retained_session_evidence": (
+                            _cursor_observation_session_evidence(retained_session)
+                        ),
+                        "can_continue_after_result": bool(
+                            retained_session.can_continue
+                        ),
+                        "reexposed_call_ids": [
+                            token
+                            for call_id in result_tool_call_ids[
+                                :_CURSOR_OBSERVATION_MAX_TOOL_OUTPUTS
+                            ]
+                            if (
+                                token := _cursor_replay_safe_diagnostic_token(
+                                    call_id
+                                )
+                            )
+                            is not None
+                            and token in safe_registry_pending_call_ids
+                        ],
+                    }
+                    _emit_cursor_observation_payload(
+                        request=request,
+                        payload=payload,
+                    )
+                except Exception:
+                    pass
             if cursor_auto_review_alias is not None and result.tool_calls:
                 raise _CursorPostEgressOutputError(
                     "Cursor auto-review returned executable tool calls; "
@@ -6750,6 +7207,23 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             else:
                 await close_retained_session_once(retained_session)
         except BaseException as exc:
+            if cursor_observation_enabled:
+                try:
+                    payload = {
+                        "phase": "continuation_failure",
+                        "outcome": "failure",
+                        "exception_type": type(exc).__name__,
+                        "retained_session_evidence": (
+                            _cursor_observation_session_evidence(retained_session)
+                        ),
+                        "result_assigned": "result" in locals(),
+                    }
+                    _emit_cursor_observation_payload(
+                        request=request,
+                        payload=payload,
+                    )
+                except Exception:
+                    pass
             if not transferred:
                 await close_retained_session_once(retained_session)
             _record_cursor_replay_outcome(
@@ -6828,7 +7302,23 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         if request_id:
             extra_headers["x-request-id"] = str(request_id)
 
+    fresh_observation: dict[str, Any] = {}
+    if cursor_observation_enabled:
+        try:
+            fresh_observation = _cursor_observation_request_identity(cursor_request)
+            payload = {
+                "phase": "fresh_pre_run",
+                **fresh_observation,
+            }
+            _emit_cursor_observation_payload(request=request, payload=payload)
+        except Exception:
+            pass
+
     client = CursorAgentConnectClient()
+    try:
+        client._observation_enabled_for_request = cursor_observation_enabled
+    except Exception:
+        pass
     try:
         result = await client.run(
             cursor_request,
@@ -6837,6 +7327,20 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             stop_on_tool_call=True,
             retain_on_tool_call=True,
         )
+        encoded_evidence = _cursor_observation_encoded_request_evidence(client)
+        client._fresh_run_evidence = None
+        if cursor_observation_enabled:
+            try:
+                payload = {
+                    "phase": "fresh_success",
+                    "outcome": "success",
+                    **fresh_observation,
+                    **encoded_evidence,
+                    **_cursor_observation_result_evidence(result),
+                }
+                _emit_cursor_observation_payload(request=request, payload=payload)
+            except Exception:
+                pass
         _emit_cursor_auto_review_result_diagnostic(
             request=request,
             request_body=request_body,
@@ -6853,6 +7357,20 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
     except _CursorPostEgressOutputError:
         raise
     except Exception as exc:
+        encoded_evidence = _cursor_observation_encoded_request_evidence(client)
+        client._fresh_run_evidence = None
+        if cursor_observation_enabled:
+            try:
+                payload = {
+                    "phase": "fresh_failure",
+                    "outcome": "failure",
+                    "exception_type": type(exc).__name__,
+                    **fresh_observation,
+                    **encoded_evidence,
+                }
+                _emit_cursor_observation_payload(request=request, payload=payload)
+            except Exception:
+                pass
         if (
             isinstance(previous_response_id, str)
             and replay_state is not None

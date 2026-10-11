@@ -313,6 +313,26 @@ session fails closed. Claimed and consumed generations remain non-replayable
 within the process-local registry's existing 600-second/256-entry retention
 bounds. This is not durable deduplication across worker replacement or eviction.
 
+Alpha can emit scoped `cursor049_observation` records for the exact
+`sota-cursor` alias when trusted capture is enabled and the route-rollup
+provenance observation mapping contains a valid matching request selector.
+Observation is off by default and does not change continuation decisions.
+
+`h2_first_result_writer_handoff_attempt`, when present, describes the first
+writer invocation whose existing body-boundary calculation includes some
+tool-result bytes. It records the serialized buffer length, sampled prefix
+length, SHA-256 digest, and truncation flag. The digest covers at most 64 KiB
+from the beginning of that entire writer argument, with domain
+`cursor-h2-writer-buffer-prefix:v1\0`; the prefix may contain framing or
+preceding body bytes without any tool-result bytes. Encoder evidence has a
+separate domain.
+
+The record becomes available after the write invocation returns or raises and
+observation construction succeeds. It proves an attempted handoff, not complete
+tool-result delivery, socket transmission, provider receipt, or progress.
+Missing observation does not prove that no write occurred. Loaded-function
+fingerprints cover the listed code objects, not the complete deployment.
+
 Missing retained state and recoverable failure of one live transport do not
 enter shared cooldown evidence or publication. Socket EOF after complete frames
 but before an accepted terminal is a transport failure; malformed framing and
