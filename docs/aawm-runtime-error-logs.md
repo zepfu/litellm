@@ -505,7 +505,12 @@ completed-valid post-terminal ASGI cancel:
 `finalize_enter` with `requested_success=false` after
 `terminal_status=completed`). Rejection, transport failure, renewal
 failure, validation failure, mid-stream cancel, and other deferred-stream
-failure phases remain enabled; observation persistence is unchanged.
+failure phases remain enabled; observation persistence is unchanged. The
+deferred-lease wrapper resolves a held-lease cancellation as success only
+before the first finalization task, without a known renewal error, after
+completed valid validation with terminal status `completed`; terminal delivery
+and iterator EOF retain their own success decisions. Cancellation before that
+valid completed terminal remains an ownership failure.
 
 `provider_terminal_error` and `candidate_unavailable` alias cooldowns are
 durable per-candidate cooldowns because those outcomes are reusable across

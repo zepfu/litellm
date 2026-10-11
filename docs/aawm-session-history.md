@@ -2403,9 +2403,16 @@ events are skipped unless `AAWM_ALIAS_ROUTE_LOG_HEALTHY=1` is set for a targeted
 debug window. The same flag also gates healthy `AAWM_XAI_DEFERRED_STREAM`
 validator-pass / iterator-progress snapshots and completed-valid
 post-terminal ASGI cancel; renewal, validation, mid-stream cancel, and
-iterator failure phases still emit. Terminal no-candidate and pre-attempt terminal warnings
-additionally emit one sanitized `AAWM_ALIAS_ROUTE: terminal warning` line even
-when `AAWM_ALIAS_ROUTE_VERBOSE_JSON` and `AAWM_ALIAS_ROUTE_LOG_HEALTHY` are both
+iterator failure phases still emit. At a cancellation observer, a held lease
+selects success instead of failure only when no finalization task exists, a
+known renewal error is absent, and validation is complete and valid with
+terminal status `completed`; an existing finalization task remains
+authoritative. Mid-stream cancellation and non-cancellation, renewal,
+validation, and finalizer errors still fail closed. Terminal delivery and
+iterator EOF retain their own success decisions. Terminal no-candidate and
+pre-attempt terminal warnings additionally emit one sanitized
+`AAWM_ALIAS_ROUTE: terminal warning` line even when
+`AAWM_ALIAS_ROUTE_VERBOSE_JSON` and `AAWM_ALIAS_ROUTE_LOG_HEALTHY` are both
 off. The pre-attempt variants identify pinned-session cooldown and provider-lane
 admission denial without changing the client response.
 
