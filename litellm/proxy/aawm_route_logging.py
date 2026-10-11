@@ -3046,6 +3046,7 @@ def build_aawm_route_rollup_context(
     codex_turn_metadata = _get_aawm_route_log_codex_turn_metadata(
         headers=headers,
         request_body=request_body,
+        preserve_agent_name=True,
     )
     identity_sources = [
         codex_turn_metadata,
@@ -3103,6 +3104,8 @@ def build_aawm_route_rollup_context(
         agent_name=_get_aawm_route_rollup_agent_name(
             *identity_sources,
             headers=headers,
+            metadata=metadata,
+            request_body=request_body,
         ),
     )
     model_label = _get_aawm_route_rollup_model_label(
@@ -3826,7 +3829,11 @@ def _get_case_insensitive_header_value(
     return None
 
 
-def _decode_aawm_route_log_codex_turn_metadata(value: Any) -> dict[str, str]:
+def _decode_aawm_route_log_codex_turn_metadata(
+    value: Any,
+    *,
+    preserve_agent_name: bool = False,
+) -> dict[str, str]:
     if not isinstance(value, str):
         return {}
     raw_value = value.strip()
@@ -3846,6 +3853,12 @@ def _decode_aawm_route_log_codex_turn_metadata(value: Any) -> dict[str, str]:
     project_path = _clean_aawm_route_log_field(parsed_value.get("project_path"))
     if project_path:
         sanitized["project_path"] = project_path
+    if preserve_agent_name:
+        agent_name = _normalize_aawm_route_log_agent_label(
+            parsed_value.get("agent_name")
+        )
+        if agent_name:
+            sanitized["agent_name"] = agent_name
     for key in (
         *_AAWM_ROUTE_ROLLUP_SESSION_METADATA_KEYS,
         *_AAWM_ROUTE_ROLLUP_THREAD_ID_METADATA_KEYS,
@@ -3862,17 +3875,26 @@ def _get_aawm_route_log_codex_turn_metadata(
     *,
     headers: Optional[dict[str, Any]],
     request_body: Optional[dict[str, Any]],
+    preserve_agent_name: bool = False,
 ) -> dict[str, str]:
     normalized_headers = (
         {str(key).lower(): value for key, value in headers.items()}
         if isinstance(headers, dict)
         else {}
     )
-    candidates = [normalized_headers.get("x-codex-turn-metadata")]
+    candidates = []
+    if isinstance(request_body, dict):
+        client_metadata = request_body.get("client_metadata")
+        if isinstance(client_metadata, dict):
+            candidates.append(client_metadata.get("x-codex-turn-metadata"))
+    candidates.append(normalized_headers.get("x-codex-turn-metadata"))
     if isinstance(request_body, dict):
         candidates.append(request_body.get("x-codex-turn-metadata"))
     for candidate in candidates:
-        decoded = _decode_aawm_route_log_codex_turn_metadata(candidate)
+        decoded = _decode_aawm_route_log_codex_turn_metadata(
+            candidate,
+            preserve_agent_name=preserve_agent_name,
+        )
         if decoded:
             return decoded
     return {}
@@ -4182,12 +4204,33 @@ def _get_aawm_route_log_trace_user_repository(
 def _get_aawm_route_rollup_agent_name(
     *identity_sources: dict[str, Any],
     headers: dict[str, Any],
+    metadata: dict[str, Any],
+    request_body: Optional[dict[str, Any]] = None,
 ) -> Optional[str]:
-    return _first_aawm_route_log_value(
+    structured_sources: list[dict[str, Any]] = []
+    if isinstance(request_body, dict):
+        for candidate in (
+            request_body.get("litellm_metadata"),
+            request_body.get("metadata"),
+            request_body.get("source"),
+        ):
+            if isinstance(candidate, dict):
+                structured_sources.append(candidate)
+                nested_source = candidate.get("source")
+                if isinstance(nested_source, dict):
+                    structured_sources.append(nested_source)
+    structured_sources.append(metadata)
+    structured_agent_name = _first_aawm_route_log_value(
+        *structured_sources,
+        keys=_AAWM_ROUTE_LOG_AGENT_METADATA_KEYS,
+        normalizer=_normalize_aawm_route_log_agent_label,
+    )
+    native_agent_name = _first_aawm_route_log_value(
         *identity_sources,
         keys=_AAWM_ROUTE_LOG_AGENT_METADATA_KEYS,
         normalizer=_normalize_aawm_route_log_agent_label,
-    ) or _get_case_insensitive_header_value(
+    )
+    return structured_agent_name or native_agent_name or _get_case_insensitive_header_value(
         headers,
         _AAWM_ROUTE_LOG_AGENT_HEADER_KEYS,
         normalizer=_normalize_aawm_route_log_agent_label,

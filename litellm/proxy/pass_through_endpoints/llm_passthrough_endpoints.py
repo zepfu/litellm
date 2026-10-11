@@ -158,6 +158,7 @@ from litellm.proxy.aawm_route_logging import (
     build_aawm_route_rollup_group_header_label,  # noqa: F401 - rollup install host binding
     emit_aawm_route_access_log,  # noqa: F401 - Wave 6F facade host binding
     emit_aawm_route_status_event,  # noqa: F401 - rollup install host binding
+    _get_aawm_route_log_codex_turn_metadata,  # noqa: F401 - audit-context install host binding
     record_aawm_route_rollup,  # noqa: F401 - rollup install host binding
     record_aawm_route_rollup_turn,  # noqa: F401 - Wave 6F facade host binding
     _register_aawm_route_access_log_replacement,

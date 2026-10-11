@@ -40,12 +40,13 @@ can promote the owner and commit affinity. Failed, incomplete, cancelled, or
 disconnected streams release the reservation and do not write new affinity.
 
 Route rollups attribute a managed request to the explicitly dispatched agent
-name when the client provides structured `agent_name` metadata or the
-`x-aawm-agent-name` header. Structured metadata retains precedence. LiteLLM
-rejects unsafe or oversized labels and preserves the existing header when no
-explicit name is supplied; a role declaration alone is not treated as a
-dispatched agent name. All route-rollup producers apply this attribution when
-present; absent-name behavior is unchanged.
+name from structured `agent_name` metadata, including the canonical Codex name
+inside the JSON string at `client_metadata["x-codex-turn-metadata"]`, or the
+`x-aawm-agent-name` header. Structured names take precedence over the header
+fallback. LiteLLM rejects unsafe or oversized labels and preserves the existing
+header when no explicit name is supplied; a role declaration alone is not
+treated as a dispatched agent name. All route-rollup producers apply this
+attribution when present; absent-name behavior is unchanged.
 
 The final delivered disposition is also published for logging, rollup, and
 session-transfer consumers. Consumers must use this disposition rather than

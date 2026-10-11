@@ -19,6 +19,7 @@ from fastapi import Request
 from typing_extensions import NotRequired, TypedDict
 
 from litellm.proxy.common_utils.http_parsing_utils import _safe_get_request_headers
+from litellm.proxy.aawm_route_logging import _get_aawm_route_log_codex_turn_metadata
 
 from ..aawm_request_policy.observability_metadata import _extract_passthrough_repository
 from .codex_oauth import _clean_codex_auth_value
@@ -202,6 +203,13 @@ def _iter_auto_agent_alias_metadata_dicts(
             nested_source = candidate.get("source")
             if isinstance(nested_source, dict):
                 sources.append(nested_source)
+    codex_turn_metadata = _get_aawm_route_log_codex_turn_metadata(
+        headers=_safe_get_request_headers(request),
+        request_body=request_body,
+        preserve_agent_name=True,
+    )
+    if codex_turn_metadata:
+        sources.append(codex_turn_metadata)
     headers = _safe_get_request_headers(request)
     if isinstance(headers, dict) and headers:
         # RR-054 #56: only trusted/low-cardinality header keys may influence identity fields.
@@ -849,6 +857,10 @@ def install(host_globals: dict) -> None:
             "_extract_auto_agent_alias_parent_thread_id",
             _extract_auto_agent_alias_parent_thread_id,
         ),
+        (
+            "_get_aawm_route_log_codex_turn_metadata",
+            _get_aawm_route_log_codex_turn_metadata,
+        ),
     ):
         host_globals.setdefault(_sk, _sv)
 
@@ -871,6 +883,7 @@ _SEAM_NAMES = frozenset({
     "_extract_auto_agent_alias_session_id",
     "_build_auto_agent_alias_rollup_group_header_label",
     "_codex_auto_agent_request_has_continuation_state",
+    "_get_aawm_route_log_codex_turn_metadata",
 })
 
 
