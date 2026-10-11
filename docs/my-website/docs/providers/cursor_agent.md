@@ -314,9 +314,10 @@ within the process-local registry's existing 600-second/256-entry retention
 bounds. This is not durable deduplication across worker replacement or eviction.
 
 Alpha can emit scoped `cursor049_observation` records for the exact
-`sota-cursor` alias when trusted capture is enabled and the route-rollup
-provenance observation mapping contains a valid matching request selector.
-Observation is off by default and does not change continuation decisions.
+`sota-cursor` alias when the route-rollup provenance observation mapping contains
+a valid matching request selector. This fingerprint-only observation is off by
+default and does not require generic diagnostic or full-payload capture. It does
+not change continuation decisions.
 
 `h2_first_result_writer_handoff_attempt`, when present, describes the first
 writer invocation whose existing body-boundary calculation includes some
