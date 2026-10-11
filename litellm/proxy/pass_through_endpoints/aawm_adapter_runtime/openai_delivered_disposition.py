@@ -38,20 +38,19 @@ def annotate_delivered_wire_failure(
     return exception
 
 
-def _request_from_kwargs(kwargs: Any) -> Any:
-    if not isinstance(kwargs, dict):
-        return None
-    litellm_params = kwargs.get("litellm_params")
-    if not isinstance(litellm_params, dict):
-        return None
-    proxy_request = litellm_params.get("proxy_server_request")
-    if not isinstance(proxy_request, dict):
-        return None
-    return proxy_request.get("_request")
+def _request_from_kwargs(kwargs: Any, request: Optional[Any] = None) -> Any:
+    from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+        get_operational_passthrough_request,
+    )
+
+    return (
+        request if request is not None else get_operational_passthrough_request(kwargs)
+    )
 
 
 def get_delivered_wire_disposition(
     kwargs: Any,
+    request: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return only the post-ASGI immutable delivered snapshot.
 
@@ -60,7 +59,7 @@ def get_delivered_wire_disposition(
     publish this snapshot after finalization.
     """
 
-    request = _request_from_kwargs(kwargs)
+    request = _request_from_kwargs(kwargs, request=request)
     state = getattr(request, "state", None)
     if state is None:
         return None

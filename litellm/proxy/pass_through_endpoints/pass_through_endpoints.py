@@ -9,6 +9,7 @@ import sys
 import traceback
 from base64 import b64encode
 from collections import deque
+from contextvars import ContextVar, Token
 from datetime import datetime, timezone
 from math import isfinite
 import time
@@ -108,6 +109,7 @@ from litellm.proxy.aawm_route_logging import (
     register_aawm_route_rollup_access_log_replacement,
 )
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
+from litellm.proxy.litellm_pre_call_utils import clean_headers
 from litellm.proxy.common_utils.http_parsing_utils import (
     _read_request_body,
     _safe_get_request_headers,
@@ -116,7 +118,6 @@ from litellm.proxy.aawm_runtime_error_logging import (
     persist_agent_terminal_error,
 )
 from litellm.proxy.auth.auth_utils import get_end_user_id_from_request_body
-from litellm.proxy.litellm_pre_call_utils import clean_headers
 from litellm.proxy.utils import get_server_root_path, normalize_route_for_root_path
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_generated_send_message_gate import (
     CODEX_SEND_MESSAGE_OUTPUT_GATE_ATTR,
@@ -169,6 +170,63 @@ class _PassthroughHiddenRetryBudgetTimeout(httpx.ReadTimeout):
 
 
 _PASSTHROUGH_TERMINAL_RETRY_AFTER_MAX_SECONDS = 7200.0
+
+
+_operational_passthrough_request: ContextVar[Any] = ContextVar(
+    "aawm_operational_passthrough_request",
+    default=None,
+)
+
+_OPERATIONAL_PASSTHROUGH_REQUEST_ATTR = (
+    "_aawm_operational_passthrough_request"
+)
+
+
+def _set_operational_passthrough_request(
+    request: Any,
+) -> Token[Any]:
+    return _operational_passthrough_request.set(request)
+
+
+def get_operational_passthrough_request(
+    kwargs: Optional[dict] = None,
+) -> Any:
+    """Return the live pass-through request on the internal operational path."""
+
+    explicit_request = _get_explicit_operational_passthrough_request(kwargs)
+    if explicit_request is not None:
+        return explicit_request
+    return _operational_passthrough_request.get()
+
+
+def _bind_operational_passthrough_request_to_logging_obj(
+    logging_obj: Any,
+) -> Any:
+    """Retain the live request on the operational logging object."""
+
+    request = _operational_passthrough_request.get()
+    if logging_obj is None or request is None:
+        return None
+    setattr(logging_obj, _OPERATIONAL_PASSTHROUGH_REQUEST_ATTR, request)
+    return request
+
+
+def _get_explicit_operational_passthrough_request(
+    kwargs: Optional[dict],
+) -> Any:
+    """Read the request retained by supported operational boundaries."""
+
+    if not isinstance(kwargs, dict):
+        return None
+    for key in ("logging_obj", "litellm_logging_obj"):
+        request = getattr(
+            kwargs.get(key),
+            _OPERATIONAL_PASSTHROUGH_REQUEST_ATTR,
+            None,
+        )
+        if request is not None:
+            return request
+    return None
 
 
 from .aawm_adapter_runtime.repetitive_output import (
@@ -678,6 +736,9 @@ _WEBSOCKET_PASSTHROUGH_MESSAGE_BUFFER_MAX = 256
 _AAWM_PASSTHROUGH_ERROR_LOG_MAX_FIELD_CHARS = 240
 _AAWM_OPENAI_RAW_RETRY_EVENT_STATE_KEY = "aawm_openai_raw_retry_events"
 _AAWM_OPENAI_RAW_RETRY_EVENT_METADATA_KEY = "aawm_openai_raw_retry_events"
+_AAWM_VALIDATED_XAI_OAUTH_SERVER_ACCOUNT_METADATA_KEY = (
+    "aawm_validated_xai_oauth_server_account"
+)
 _AAWM_OPENAI_RAW_RETRY_EVENT_SEQUENCE_STATE_KEY = (
     "aawm_openai_raw_retry_event_sequence"
 )
@@ -6066,6 +6127,10 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             "api-key",
             "x-api-key",
             "proxy-authorization",
+            "x-goog-api-key",
+            "cookie",
+            "x-xai-token-auth",
+            "x-litellm-api-key",
         }
         for header_name, header_value in list(masked_headers.items()):
             if header_name.lower() not in sensitive_header_names:
@@ -6512,7 +6577,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         # all_litellm_params / get_end_user_id_from_request_body: module-scope (RR-056 #8).
         working_body, _provider_body = _detach_passthrough_body_for_kwargs(_parsed_body)
 
-        request_headers = dict(request.headers) if request.headers is not None else None
+        request_headers = HttpPassThroughEndpointHelpers.get_masked_passthrough_headers(
+            dict(request.headers) if request.headers is not None else None
+        )
         resolved_end_user_id = (
             get_end_user_id_from_request_body(
                 request_body=dict(_parsed_body),
@@ -6531,6 +6598,11 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         litellm_params_in_body = {}
         for k in all_litellm_params:
             if k in working_body:
+                if k == "litellm_logging_obj":
+                    # Logging owns this object on its operational carrier; do
+                    # not expose it through callback-visible litellm params.
+                    working_body.pop(k, None)
+                    continue
                 litellm_params_in_body[k] = working_body.pop(k, None)
 
         _metadata = dict(
@@ -6565,6 +6637,10 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         if metadata:
             _metadata.update(metadata)
         _metadata.pop(_AAWM_OPENAI_RAW_RETRY_EVENT_METADATA_KEY, None)
+        _metadata.pop(
+            _AAWM_VALIDATED_XAI_OAUTH_SERVER_ACCOUNT_METADATA_KEY,
+            None,
+        )
         _metadata.pop("aawm_openai_final_send_binding", None)
         if resolved_end_user_id:
             _metadata["user_api_key_end_user_id"] = resolved_end_user_id
@@ -6590,8 +6666,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                             else None
                         )
                     ),
-                    "headers": request_headers or {},
-                    "_request": request,
+                    "headers": request_headers,
                 },
             },
             "call_type": "pass_through_endpoint",
@@ -7864,6 +7939,7 @@ async def pass_through_request(  # noqa: PLR0915
     #########################################################
     try:
         start_time = datetime.now()
+        operational_request_token: Optional[Token[Any]] = None
         _clear_xai_oauth_send_auth_shape(request)
         # Register before session-owner 409 / candidate selection so native
         # uvicorn ACCESS on /openai_passthrough/responses is replaced even
@@ -8129,6 +8205,10 @@ async def pass_through_request(  # noqa: PLR0915
                 and "litellm_logging_obj" in _parsed_body
                 and all(key in all_litellm_params for key in _parsed_body)
             )
+        # The logging object was injected only for pre-call-hook ownership.
+        # Its callback-visible body and litellm-params lifetime ends here.
+        if isinstance(_parsed_body, dict):
+            _parsed_body.pop("litellm_logging_obj", None)
         # Second normalize pass only when pre_call_hook rewrote the tools object
         # (RR-056 #9). In-place first-pass fixes are already complete; skip when
         # hooks left tools identity unchanged or tools are absent.
@@ -8254,6 +8334,8 @@ async def pass_through_request(  # noqa: PLR0915
             compiled_wire_body=compiled_wire_body,
             transport_body_absent=transport_body_absent,
         )
+        operational_request_token = _set_operational_passthrough_request(request)
+        _bind_operational_passthrough_request_to_logging_obj(logging_obj)
         _set_passthrough_stream_timeout_metadata(
             kwargs=kwargs,
             policy=stream_read_timeout_policy,
@@ -9858,6 +9940,7 @@ async def pass_through_request(  # noqa: PLR0915
                 deferred_success_holder=deferred_success_holder,
                 openai_wire_trace=wire_trace,
                 openai_stream_bookkeeping_state=stream_bookkeeping_state,
+                operational_request=request,
             )
             cfg072_output_gate = (
                 _build_cfg072_send_message_output_gate(
@@ -9913,6 +9996,7 @@ async def pass_through_request(  # noqa: PLR0915
                         local_prepare_ms=local_prepare_ms,
                         error_log_context=error_log_context,
                         upstream_prefix_bytes=getattr(response, "_prefix", None),
+                        operational_request=request,
                     )
 
                 try:
@@ -10080,6 +10164,9 @@ async def pass_through_request(  # noqa: PLR0915
                     True,
                 )
             _publish_openai_send_telemetry()
+            if operational_request_token is not None:
+                _operational_passthrough_request.reset(operational_request_token)
+                operational_request_token = None
             return bind_output_guard_to_streaming_response(
                 bind_deferred_success_holder(
                     stream_response,
@@ -10392,6 +10479,7 @@ async def pass_through_request(  # noqa: PLR0915
                 deferred_success_holder=deferred_success_holder,
                 openai_wire_trace=wire_trace,
                 openai_stream_bookkeeping_state=stream_bookkeeping_state,
+                operational_request=request,
             )
             cfg072_output_gate = (
                 _build_cfg072_send_message_output_gate(
@@ -10447,6 +10535,7 @@ async def pass_through_request(  # noqa: PLR0915
                         local_prepare_ms=local_prepare_ms,
                         error_log_context=error_log_context,
                         upstream_prefix_bytes=getattr(response, "_prefix", None),
+                        operational_request=request,
                     )
 
                 try:
@@ -10614,6 +10703,9 @@ async def pass_through_request(  # noqa: PLR0915
                     True,
                 )
             _publish_openai_send_telemetry()
+            if operational_request_token is not None:
+                _operational_passthrough_request.reset(operational_request_token)
+                operational_request_token = None
             return bind_output_guard_to_streaming_response(
                 bind_deferred_success_holder(
                     stream_response,
@@ -10623,6 +10715,13 @@ async def pass_through_request(  # noqa: PLR0915
             )
 
         if response.status_code >= 300:
+            pass_through_endpoint_logging._record_upstream_rate_limit_headers_metadata(
+                kwargs,
+                httpx_response=response,
+                url_route=str(url),
+                custom_llm_provider=custom_llm_provider,
+                request=request,
+            )
             # Streamed non-SSE responses need aread() before .text (RR-056 #6).
             error_body = await wait_for("upstream_body_read", response.aread())
             try:
@@ -10793,6 +10892,7 @@ async def pass_through_request(  # noqa: PLR0915
                     start_time=start_time,
                     end_time=end_time,
                     logging_obj=logging_obj,
+                    operational_request=request,
                     cache_hit=False,
                     request_body=_parsed_body,
                     custom_llm_provider=custom_llm_provider,
@@ -10828,6 +10928,7 @@ async def pass_through_request(  # noqa: PLR0915
                     start_time=start_time,
                     end_time=end_time,
                     logging_obj=logging_obj,
+                    operational_request=request,
                     cache_hit=False,
                     request_body=_parsed_body,
                     custom_llm_provider=custom_llm_provider,
@@ -10968,6 +11069,7 @@ async def pass_through_request(  # noqa: PLR0915
                     start_time=start_time,
                     end_time=end_time,
                     logging_obj=logging_obj,
+                    operational_request=request,
                     cache_hit=False,
                     request_body=_parsed_body,
                     custom_llm_provider=custom_llm_provider,
@@ -10998,11 +11100,15 @@ async def pass_through_request(  # noqa: PLR0915
             )
         if deferred_success_holder is not None:
             deferred_success_holder.set_finalizer(_finalize_deferred_success)
+        if operational_request_token is not None:
+            _operational_passthrough_request.reset(operational_request_token)
         return bind_deferred_success_holder(
             response_to_return,
             deferred_success_holder,
         )
     except asyncio.CancelledError:
+        if operational_request_token is not None:
+            _operational_passthrough_request.reset(operational_request_token)
         try:
             await _aawm_session_owner_on_upstream_result(
                 request=request,
@@ -11019,6 +11125,8 @@ async def pass_through_request(  # noqa: PLR0915
             await deferred_success_holder.finalize_failure(phase="cancelled")
         raise
     except Exception as e:
+        if operational_request_token is not None:
+            _operational_passthrough_request.reset(operational_request_token)
         if deferred_success_holder is not None:
             await deferred_success_holder.finalize_failure()
         _publish_openai_send_telemetry()
@@ -12139,53 +12247,67 @@ async def websocket_passthrough_request(  # noqa: PLR0915
         method="WEBSOCKET",
         headers=dict(websocket.headers) if hasattr(websocket, "headers") else {},
     )
-
-    # Initialize kwargs for logging using the same pattern as HTTP passthrough
-    kwargs = HttpPassThroughEndpointHelpers._init_kwargs_for_pass_through_endpoint(
-        user_api_key_dict=user_api_key_dict,
-        _parsed_body={},  # WebSocket doesn't have a traditional request body
-        passthrough_logging_payload=passthrough_logging_payload,
-        litellm_call_id=litellm_call_id,
-        request=dummy_request,  # type: ignore
-        logging_obj=logging_obj,
+    operational_request_token: Optional[Token[Any]] = (
+        _set_operational_passthrough_request(dummy_request)
     )
-
-    # Update logging environment variables
-    logging_obj.update_environment_variables(
-        model="unknown",
-        user="unknown",
-        optional_params={},
-        litellm_params=dict(kwargs.get("litellm_params", {})),
-        call_type="pass_through_endpoint",
-    )
-    logging_obj.model_call_details["litellm_call_id"] = litellm_call_id
-
-    # Pre-call logging
-    logging_obj.pre_call(
-        input=[{"role": "user", "content": "WebSocket connection"}],
-        api_key="",
-        additional_args={
-            "complete_input_dict": {},
-            "api_base": target,
-            "headers": upstream_headers,
-        },
-    )
-
-    ### CALL HOOKS ### - modify incoming data / reject request before calling the model
-    websocket_data: dict[str, Any] = {}
-    websocket_data = await wait_for(
-        "request_hooks",
-        proxy_logging_obj.pre_call_hook(
+    try:
+        # Initialize kwargs for logging using the same pattern as HTTP passthrough
+        kwargs = HttpPassThroughEndpointHelpers._init_kwargs_for_pass_through_endpoint(
             user_api_key_dict=user_api_key_dict,
-            data=websocket_data,
-            call_type="pass_through_endpoint",
-        ),
-    )
+            _parsed_body={},  # WebSocket doesn't have a traditional request body
+            passthrough_logging_payload=passthrough_logging_payload,
+            litellm_call_id=litellm_call_id,
+            request=dummy_request,  # type: ignore
+            logging_obj=logging_obj,
+        )
+        _bind_operational_passthrough_request_to_logging_obj(logging_obj)
 
+        # Update logging environment variables
+        logging_obj.update_environment_variables(
+            model="unknown",
+            user="unknown",
+            optional_params={},
+            litellm_params=dict(kwargs.get("litellm_params", {})),
+            call_type="pass_through_endpoint",
+        )
+        logging_obj.model_call_details["litellm_call_id"] = litellm_call_id
+
+        # Pre-call logging
+        observable_headers = HttpPassThroughEndpointHelpers.get_masked_passthrough_headers(
+            upstream_headers
+        )
+        logging_obj.pre_call(
+            input=[{"role": "user", "content": "WebSocket connection"}],
+            api_key="",
+            additional_args={
+                "complete_input_dict": {},
+                "api_base": target,
+                "headers": observable_headers,
+            },
+        )
+
+        ### CALL HOOKS ### - modify incoming data / reject request before calling the model
+        websocket_data: dict[str, Any] = {}
+        websocket_data = await wait_for(
+            "request_hooks",
+            proxy_logging_obj.pre_call_hook(
+                user_api_key_dict=user_api_key_dict,
+                data=websocket_data,
+                call_type="pass_through_endpoint",
+            ),
+        )
+
+    except BaseException:
+        _operational_passthrough_request.reset(operational_request_token)
+        operational_request_token = None
+        raise
+
+    previous_request_token: Optional[Token[Any]] = None
     try:
         verbose_proxy_logger.debug(
             f"WebSocket passthrough ({endpoint}): Establishing upstream connection to {target}"
         )
+        previous_request_token = _set_operational_passthrough_request(dummy_request)
         async with connect(
             target,
             additional_headers=upstream_headers,
@@ -12434,6 +12556,7 @@ async def websocket_passthrough_request(  # noqa: PLR0915
                     start_time=start_time,
                     end_time=end_time,
                     logging_obj=logging_obj,
+                    operational_request=dummy_request,
                     cache_hit=False,
                     request_body={},
                     **success_kwargs,
@@ -12447,7 +12570,6 @@ async def websocket_passthrough_request(  # noqa: PLR0915
                     user_api_key_dict=user_api_key_dict,
                     response={"status": "websocket_connection_successful"},  # type: ignore
                 )
-
     except InvalidStatus as exc:
         verbose_proxy_logger.exception(
             f"WebSocket passthrough ({endpoint}): upstream rejected WebSocket connection"
@@ -12497,7 +12619,16 @@ async def websocket_passthrough_request(  # noqa: PLR0915
 
         if websocket.client_state != WebSocketState.DISCONNECTED:
             await websocket.close(code=1011, reason="WebSocket passthrough error")
+    except BaseException:
+        if previous_request_token is not None:
+            _operational_passthrough_request.reset(previous_request_token)
+            previous_request_token = None
+        raise
     finally:
+        if previous_request_token is not None:
+            _operational_passthrough_request.reset(previous_request_token)
+        if operational_request_token is not None:
+            _operational_passthrough_request.reset(operational_request_token)
         if websocket.client_state != WebSocketState.DISCONNECTED:
             await websocket.close()
 

@@ -744,6 +744,15 @@ def xai_oauth_selected_account_metadata(
     return metadata
 
 
+_AAWM_VALIDATED_XAI_OAUTH_SERVER_ACCOUNT_PROVENANCE = object()
+
+
+def validated_xai_oauth_server_account_provenance() -> object:
+    """Return the producer-only provenance token for validated server data."""
+
+    return _AAWM_VALIDATED_XAI_OAUTH_SERVER_ACCOUNT_PROVENANCE
+
+
 def validated_xai_oauth_server_account_metadata(
     metadata: Mapping[str, Any],
     *,
@@ -793,6 +802,7 @@ def validated_xai_oauth_server_account_metadata(
 
 
 __all__ = [
+    "validated_xai_oauth_server_account_provenance",
     "XaiOAuthSelectedAccount",
     "bind_xai_oauth_candidate_to_request",
     "build_xai_oauth_selected_account",

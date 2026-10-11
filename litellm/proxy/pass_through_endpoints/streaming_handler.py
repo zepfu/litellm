@@ -71,7 +71,6 @@ from .success_handler import PassThroughEndpointLogging
 
 
 
-
 def _truthy_env_flag(name: str) -> bool:
     value = os.environ.get(name, "")
     if value is None:
@@ -1524,6 +1523,7 @@ class PassThroughStreamingHandler:
         response: httpx.Response,
         endpoint_type: EndpointType,
         custom_llm_provider: Optional[str],
+        operational_request: Optional[Any] = None,
     ) -> None:
         metadata = PassThroughStreamingHandler._ensure_streaming_metadata(
             success_handler_kwargs
@@ -1546,6 +1546,10 @@ class PassThroughStreamingHandler:
                     metadata[
                         PassThroughStreamingHandler._XAI_OAUTH_RATE_LIMIT_HEADERS_KEY
                     ] = sanitized_headers
+                PassThroughEndpointLogging._record_validated_xai_oauth_server_account_metadata(
+                    metadata,
+                    operational_request,
+                )
             return
         if endpoint_type == EndpointType.ANTHROPIC or custom_llm_provider == "anthropic":
             sanitized_headers = PassThroughStreamingHandler._sanitize_anthropic_rate_limit_headers(
@@ -1567,6 +1571,7 @@ class PassThroughStreamingHandler:
         response: httpx.Response,
         endpoint_type: EndpointType,
         custom_llm_provider: Optional[str],
+        operational_request: Optional[Any] = None,
     ) -> Dict[str, Any]:
         metadata = PassThroughStreamingHandler._ensure_streaming_metadata(
             success_handler_kwargs
@@ -1576,6 +1581,7 @@ class PassThroughStreamingHandler:
             response=response,
             endpoint_type=endpoint_type,
             custom_llm_provider=custom_llm_provider,
+            operational_request=operational_request,
         )
         return metadata
 
@@ -1859,6 +1865,7 @@ class PassThroughStreamingHandler:
         deferred_success_holder: Optional[DeferredPassthroughSuccess] = None,
         openai_wire_trace: Optional[Any] = None,
         openai_stream_bookkeeping_state: Optional[Dict[str, Any]] = None,
+        operational_request: Optional[Any] = None,
     ):
         """
         - Yields chunks from the response
@@ -1952,6 +1959,7 @@ class PassThroughStreamingHandler:
                 response=response,
                 endpoint_type=endpoint_type,
                 custom_llm_provider=custom_llm_provider,
+                operational_request=operational_request,
             )
             metadata["aawm_stream_raw_bytes_buffered"] = buffer_raw_bytes
             transfer_identity = extract_transfer_identity(
@@ -2233,6 +2241,7 @@ class PassThroughStreamingHandler:
                             success_handler_kwargs=success_handler_kwargs,
                             local_prepare_ms=local_prepare_ms,
                             error_log_context=error_log_context,
+                            operational_request=operational_request,
                         )
                     )
                     if openai_wire_trace is not None:
@@ -2759,6 +2768,7 @@ class PassThroughStreamingHandler:
         local_prepare_ms: Optional[float] = None,
         error_log_context: Optional[Dict[str, Any]] = None,
         upstream_prefix_bytes: Optional[List[bytes]] = None,
+        operational_request: Optional[Any] = None,
     ) -> None:
         """Finish native stream bookkeeping when the body iterator never starts."""
 
@@ -2839,6 +2849,7 @@ class PassThroughStreamingHandler:
             success_handler_kwargs=success_handler_kwargs,
             local_prepare_ms=local_prepare_ms,
             error_log_context=error_log_context,
+            operational_request=operational_request,
         )
 
     @staticmethod
@@ -4238,6 +4249,7 @@ class PassThroughStreamingHandler:
         success_handler_kwargs: Optional[Dict[str, Any]] = None,
         local_prepare_ms: Optional[float] = None,
         error_log_context: Optional[Dict[str, Any]] = None,
+        operational_request: Optional[Any] = None,
     ):
         """
         Route the logging for the collected chunks to the appropriate handler
@@ -4296,7 +4308,10 @@ class PassThroughStreamingHandler:
                 )
             )
             delivered_wire_disposition = (
-                get_delivered_wire_disposition(kwargs)
+                get_delivered_wire_disposition(
+                    kwargs,
+                    request=operational_request,
+                )
                 if is_native_openai_responses_stream
                 else None
             )

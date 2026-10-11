@@ -205,6 +205,12 @@ provider markers do not independently prove that the host belongs to that
 provider. Requests without those signals remain unscoped. OpenAI-bound requests
 retain their separate final-send binding.
 
+Credential headers, cookies, and LiteLLM proxy API keys are masked in
+observability copies handed to callbacks and diagnostics. The configured or
+forwarded transport headers retain the values required by the upstream API.
+The original request remains available only to internal pass-through
+operations; callback-visible request data is detached from that live object.
+
 ### Default Query Parameters
 - **Parameter precedence**: Client params > URL params > default params
 - **Final binding**: An omitted selected query mapping keeps the target query as already constructed. An explicitly empty mapping clears it, and a nonempty mapping replaces it. The final URL is validated before send.
