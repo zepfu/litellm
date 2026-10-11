@@ -11808,6 +11808,21 @@ def create_pass_through_route(
                 InitPassThroughEndpointHelpers,
             )
 
+            # Only keyed callables claim registry ownership. An unkeyed
+            # callable remains an intentional static mapped route, while a
+            # retired or malformed key must not recover captured defaults.
+            route_key = getattr(
+                endpoint_func, "_aawm_pass_through_registry_key", None
+            )
+            if route_key is not None and (
+                not isinstance(route_key, str)
+                or route_key not in _registered_pass_through_routes
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={"error": "Retired pass-through route."},
+                )
+
             path = request.url.path
 
             # Parse request data based on content type
@@ -13003,13 +13018,13 @@ class InitPassThroughEndpointHelpers:
 
     @staticmethod
     def remove_endpoint_routes(endpoint_id: str):
-        """Remove all registry and application routes for an endpoint ID."""
+        """Remove registry and application routes by ID or exact registry key."""
         from litellm.proxy.proxy_server import app
 
         keys_to_remove = [
             key
             for key, value in _registered_pass_through_routes.items()
-            if value["endpoint_id"] == endpoint_id
+            if key == endpoint_id or value["endpoint_id"] == endpoint_id
         ]
         for key in keys_to_remove:
             registry_entry = _registered_pass_through_routes.get(key)
