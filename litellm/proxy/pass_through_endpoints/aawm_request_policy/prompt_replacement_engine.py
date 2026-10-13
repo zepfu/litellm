@@ -163,15 +163,27 @@ def _parse_rules_from_manifest(raw: dict[str, Any]) -> list[ReplacementRule]:
         if not isinstance(before_text, str):
             before_text = ""
 
-        after_text = descriptor.get("after")
+        if "after" not in descriptor:
+            raise ValueError(
+                f"Rule {rule_id} missing 'after' key"
+            )
+        after_text = descriptor["after"]
         if not isinstance(after_text, str):
-            after_text = ""
+            raise ValueError(
+                f"Rule {rule_id} 'after' must be a string,"
+                f" got {type(after_text).__name__}"
+            )
 
         before_pattern_raw = descriptor.get("before_pattern")
         before_pattern: Optional[re.Pattern] = None
         if isinstance(before_pattern_raw, str) and before_pattern_raw:
             before_pattern = re.compile(before_pattern_raw)
 
+        if not after_text and not before_text and not before_pattern:
+            raise ValueError(
+                f"Rule {rule_id} needs at least one of"
+                f" 'before', 'before_pattern', or non-empty 'after'"
+            )
         if not before_text and not before_pattern:
             raise ValueError(
                 f"Rule {rule_id} needs at least one of 'before' or 'before_pattern'"
@@ -221,20 +233,59 @@ def load_manifest(manifest_path: Path) -> list[ReplacementRule]:
     return _parse_rules_from_manifest(raw)
 
 
+# ---------------------------------------------------------------------------
+# Shared caches
+# ---------------------------------------------------------------------------
+
+_DEFAULT_MANIFEST_CACHE: dict[Path, list[ReplacementRule]] = {}
+_text_asset_cache: dict[Path, str] = {}
+
+
+# ---------------------------------------------------------------------------
+# Text asset loading
+# ---------------------------------------------------------------------------
+
+
+def load_text_asset(
+    asset_path: Path,
+    *,
+    cache: Optional[dict[Path, str]] = None,
+) -> str:
+    """Load and cache a plain-text asset file.
+
+    Returns the file content (rstripped + trailing newline).
+    Raises ValueError for empty files.
+    """
+    effective_cache = cache if cache is not None else _text_asset_cache
+    cached = effective_cache.get(asset_path)
+    if cached is not None:
+        return cached
+    text = asset_path.read_text(encoding="utf-8").strip()
+    if not text:
+        raise ValueError(f"Text asset is empty: {asset_path}")
+    cached_text = text + "\n"
+    effective_cache[asset_path] = cached_text
+    return cached_text
+
+
 def load_manifests(
     manifest_paths: list[Path],
     *,
     cache: Optional[dict[Path, list[ReplacementRule]]] = None,
 ) -> list[ReplacementRule]:
-    """Load rules from multiple manifests, using an optional per-path cache."""
+    """Load rules from multiple manifests, using an optional per-path cache.
+
+    Defaults to the module-level ``_DEFAULT_MANIFEST_CACHE`` when *cache*
+    is ``None``.
+    """
+    effective_cache = cache if cache is not None else _DEFAULT_MANIFEST_CACHE
     all_rules: list[ReplacementRule] = []
     for path in manifest_paths:
-        if cache is not None and path in cache:
-            all_rules.extend(cache[path])
+        if path in effective_cache:
+            all_rules.extend(effective_cache[path])
             continue
         rules = load_manifest(path)
-        if cache is not None:
-            cache[path] = rules
+        effective_cache[path] = rules
         all_rules.extend(rules)
     return all_rules
 
@@ -840,10 +891,13 @@ OWNED_SYMBOLS: tuple[str, ...] = (
     "_parse_cc_version",
     "load_manifest",
     "load_manifests",
+    "load_text_asset",
     "apply_rules_to_text",
     "apply_rules_to_responses_request",
     "apply_rules_to_chat_completions_messages",
     "apply_rules_to_anthropic_request",
     "apply_rules_to_gemini_request",
     "build_replacement_metadata",
+    "_DEFAULT_MANIFEST_CACHE",
+    "_text_asset_cache",
 )

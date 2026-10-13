@@ -100,6 +100,8 @@ class ClaudePromptReplacementServices:
 # Caches
 # ---------------------------------------------------------------------------
 
+# Auto-memory template loading uses shared load_text_asset / _text_asset_cache;
+# the local cache alias is kept for the legacy re-export contract.
 _claude_context_replacement_template_cache: dict[Path, str] = {}
 _claude_prompt_patch_manifest_cache: dict[Path, dict[str, Any]] = {}
 
@@ -181,74 +183,84 @@ def _resolve_claude_prompt_patch_manifest_path() -> Path:
 
 
 def _load_claude_context_replacement_template(template_path: Path) -> str:
+    from litellm.proxy.pass_through_endpoints.aawm_request_policy.prompt_replacement_engine import (
+        _text_asset_cache,
+        load_text_asset,
+    )
     cached_template = _claude_context_replacement_template_cache.get(template_path)
     if cached_template is not None:
         return cached_template
 
-    template_text = template_path.read_text(encoding="utf-8").strip()
-    if not template_text:
-        raise ValueError(
-            f"Claude context replacement template is empty: {template_path}"
-        )
-
-    cached_template = template_text + "\n"
-    _claude_context_replacement_template_cache[template_path] = cached_template
-    return cached_template
+    try:
+        template_text = load_text_asset(template_path, cache=_text_asset_cache)
+    except ValueError as exc:
+        if "empty" in str(exc):
+            raise ValueError(
+                f"Claude context replacement template is empty: {template_path}"
+            ) from exc
+        raise
+    _claude_context_replacement_template_cache[template_path] = template_text
+    return template_text
 
 
 def _load_claude_prompt_patch_manifest(manifest_path: Path) -> dict[str, Any]:
     """Load and validate the Claude prompt-patch manifest.
 
-    Returns the normalized dict (legacy contract).  Internal matching is
-    routed through the CFG-073 shared engine.
+    Returns the legacy dict contract.  Shared-engine loading, validation,
+    and caching are delegated to ``load_manifest`` /
+    ``_DEFAULT_MANIFEST_CACHE``.
     """
     cached_manifest = _claude_prompt_patch_manifest_cache.get(manifest_path)
     if cached_manifest is not None:
         return cached_manifest
 
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict):
-        raise ValueError(f"Invalid Claude prompt patch manifest: {manifest_path}")
-
-    patches = manifest.get("patches")
-    if not isinstance(patches, list) or not patches:
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Invalid Claude prompt patch manifest: {manifest_path}"
+        )
+    patches_raw = raw.get("patches")
+    if not isinstance(patches_raw, list) or not patches_raw:
         raise ValueError(
             f"Claude prompt patch manifest has no patches: {manifest_path}"
         )
-
-    normalized_patches: list[dict[str, str]] = []
-    for patch_descriptor in patches:
-        if not isinstance(patch_descriptor, dict):
+    for pd in patches_raw:
+        if not isinstance(pd, dict):
             raise ValueError(
                 f"Invalid Claude prompt patch descriptor in {manifest_path}"
             )
-        patch_id = patch_descriptor.get("id")
-        before_text = patch_descriptor.get("before")
-        after_text = patch_descriptor.get("after")
+        patch_id = pd.get("id")
         if not isinstance(patch_id, str) or not patch_id:
             raise ValueError(
                 f"Claude prompt patch manifest is missing patch id in {manifest_path}"
             )
+        before_text = pd.get("before")
         if not isinstance(before_text, str) or not before_text:
             raise ValueError(
                 f"Claude prompt patch manifest is missing before text for {patch_id}"
             )
+        after_text = pd.get("after")
         if not isinstance(after_text, str) or not after_text:
             raise ValueError(
                 f"Claude prompt patch manifest is missing after text for {patch_id}"
             )
-        normalized_patches.append(
-            {
-                "id": patch_id,
-                "before": before_text,
-                "after": after_text,
-            }
-        )
 
-    normalized_manifest = {
-        "source": manifest.get("source"),
-        "patches": normalized_patches,
-    }
+    from litellm.proxy.pass_through_endpoints.aawm_request_policy.prompt_replacement_engine import (
+        _DEFAULT_MANIFEST_CACHE,
+        load_manifest,
+    )
+    rules = load_manifest(manifest_path)
+    _DEFAULT_MANIFEST_CACHE[manifest_path] = rules
+    patches: list[dict[str, str]] = []
+    for rule in rules:
+        patches.append({
+            "id": rule.id,
+            "before": rule.before,
+            "after": rule.after,
+        })
+    normalized_manifest: dict[str, Any] = {"patches": patches}
+    if "source" in raw:
+        normalized_manifest["source"] = raw["source"]
     _claude_prompt_patch_manifest_cache[manifest_path] = normalized_manifest
     return normalized_manifest
 
@@ -541,16 +553,18 @@ def _claude_manifest_to_rules(manifest: dict[str, Any]) -> list[Any]:
     """Convert a legacy Claude patch manifest dict to ReplacementRule list.
 
     Enriches the report-file rule with its pre-compiled regex.
+    Uses the shared ``_DEFAULT_MANIFEST_CACHE`` to retrieve already-loaded
+    engine rules and re-enriches per Claude-specific contract.
     """
     from litellm.proxy.pass_through_endpoints.aawm_request_policy.prompt_replacement_engine import (
         ReplacementRule,
     )
-    rules: list[Any] = []
+    replacement_rules: list[Any] = []
     for patch in manifest["patches"]:
         before_pattern = None
         if patch["id"] == _CLAUDE_REPORT_FILE_PATCH_ID:
             before_pattern = _CLAUDE_REPORT_FILE_INSTRUCTION_PATTERN
-        rules.append(
+        replacement_rules.append(
             ReplacementRule(
                 id=patch["id"],
                 before=patch["before"],
@@ -558,7 +572,7 @@ def _claude_manifest_to_rules(manifest: dict[str, Any]) -> list[Any]:
                 before_pattern=before_pattern,
             )
         )
-    return rules
+    return replacement_rules
 
 
 def _apply_claude_prompt_patch_manifest_to_text(
