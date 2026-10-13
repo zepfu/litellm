@@ -244,6 +244,113 @@ def load_manifests(
 # ---------------------------------------------------------------------------
 
 
+def _overlaps(
+    start: int,
+    end: int,
+    protected_spans: list[tuple[int, int]],
+) -> bool:
+    """Return whether a half-open span intersects any protected span."""
+    return any(
+        start < protected_end and end > protected_start
+        for protected_start, protected_end in protected_spans
+    )
+
+
+def _replace_exact_idempotently(
+    text: str,
+    *,
+    before: str,
+    after: str,
+) -> tuple[str, int]:
+    """Replace source occurrences once and preserve complete replacements.
+
+    A conventional full-string replace rewrites text inserted by a prior
+    invocation when ``after`` contains ``before``.  Protect complete output
+    occurrences first, then replace only source occurrences outside them.
+    """
+    protected_spans: list[tuple[int, int]] = []
+    search_start = 0
+    while search_start <= len(text):
+        output_start = text.find(after, search_start)
+        if output_start < 0:
+            break
+        output_end = output_start + len(after)
+        protected_spans.append((output_start, output_end))
+        search_start = output_end
+
+    parts: list[str] = []
+    source_start = 0
+    occurrences = 0
+    while source_start <= len(text):
+        match_start = text.find(before, source_start)
+        if match_start < 0:
+            break
+        match_end = match_start + len(before)
+        if _overlaps(match_start, match_end, protected_spans):
+            parts.append(text[source_start:match_end])
+        else:
+            parts.append(text[source_start:match_start])
+            parts.append(after)
+            occurrences += 1
+        source_start = match_end
+
+    if occurrences == 0:
+        return text, 0
+    parts.append(text[source_start:])
+    return "".join(parts), occurrences
+
+
+def _replace_pattern_idempotently(
+    text: str,
+    *,
+    pattern: re.Pattern[str],
+    replacement: str,
+) -> tuple[str, int]:
+    """Replace source matches once and preserve completed replacements."""
+    matches = list(pattern.finditer(text))
+    protected_spans: list[tuple[int, int]] = []
+    protected_matches: set[int] = set()
+    for match_index, match in enumerate(matches):
+        output = match.expand(replacement)
+        if text[match.start() : match.end()] == output:
+            protected_spans.append(match.span())
+            protected_matches.add(match_index)
+            continue
+
+        output_start = text.find(output, match.start(), match.end())
+        if output_start >= 0:
+            output_end = output_start + len(output)
+            protected_spans.append((output_start, output_end))
+            protected_matches.add(match_index)
+            continue
+
+        output_start = text.find(output, match.start())
+        if output_start >= 0:
+            output_end = output_start + len(output)
+            protected_spans.append((output_start, output_end))
+            protected_matches.add(match_index)
+
+    if not protected_spans:
+        return pattern.subn(replacement, text)
+
+    parts: list[str] = []
+    source_start = 0
+    occurrences = 0
+    for match_index, match in enumerate(matches):
+        match_start, match_end = match.span()
+        if match_index in protected_matches or _overlaps(
+            match_start, match_end, protected_spans
+        ):
+            parts.append(text[source_start:match_end])
+        else:
+            parts.append(text[source_start:match_start])
+            parts.append(match.expand(replacement))
+            occurrences += 1
+        source_start = match_end
+    parts.append(text[source_start:])
+    return "".join(parts), occurrences
+
+
 def apply_rules_to_text(
     text: str,
     rules: list[ReplacementRule],
@@ -277,15 +384,20 @@ def apply_rules_to_text(
             match_types: list[str] = []
 
             if rule.before:
-                count = updated_text.count(rule.before)
+                updated_text, count = _replace_exact_idempotently(
+                    updated_text,
+                    before=rule.before,
+                    after=rule.after,
+                )
                 if count:
-                    updated_text = updated_text.replace(rule.before, rule.after)
                     occurrences += count
                     match_types.append("exact")
 
             if rule.before_pattern:
-                updated_text, pattern_count = rule.before_pattern.subn(
-                    rule.after, updated_text
+                updated_text, pattern_count = _replace_pattern_idempotently(
+                    updated_text,
+                    pattern=rule.before_pattern,
+                    replacement=rule.after,
                 )
                 if pattern_count:
                     occurrences += pattern_count
