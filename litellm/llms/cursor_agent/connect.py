@@ -2974,7 +2974,13 @@ def _decode_read_tool_call(
     read_args = _decode_read_args(exec_fields)
     request_id = int(read_args["request_id"])
     exec_id = str(read_args["exec_id"])
-    call_id = str(read_args["tool_call_id"] or exec_id or f"cursor-read-{request_id}")
+    tool_call_id = str(read_args["tool_call_id"])
+    if native_read:
+        call_id, item_id = _decode_mcp_tool_identity(tool_call_id)
+    else:
+        call_id, item_id = tool_call_id, ""
+    call_id = str(call_id or exec_id or f"cursor-read-{request_id}")
+    item_id = item_id or f"fc_{call_id}"
     if not call_id:
         raise CursorConnectProtocolError(
             "Cursor Agent read operation does not contain a replayable request identity."
@@ -2998,7 +3004,7 @@ def _decode_read_tool_call(
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ),
-                "itemId": f"fc_{call_id}",
+                "itemId": item_id,
             }
         }
     }
