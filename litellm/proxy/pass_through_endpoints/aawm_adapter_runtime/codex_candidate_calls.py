@@ -4748,7 +4748,15 @@ def _find_cursor_full_history_retained_state(
     # call-graph grammar used to authorize a provider-neutral fallback.
     for item_index, item in enumerate(input_items):
         item_type = item.get("type") if isinstance(item, Mapping) else None
-        if item_type == "message":
+        ohmypi_item = None
+        if isinstance(item, Mapping) and (
+            ("type" not in item and set(item) == {"role", "content"})
+            or (item_type == "function_call" and "id" not in item)
+        ):
+            ohmypi_item = _cursor_replay_ohmypi_client_history_item(item)
+        if ohmypi_item is not None:
+            validated = ohmypi_item
+        elif item_type == "message":
             validated = _cursor_replay_stock_codex_message_item(
                 item, allow_missing_metadata=True
             )
