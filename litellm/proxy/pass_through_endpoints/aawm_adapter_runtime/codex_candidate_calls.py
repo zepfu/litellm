@@ -4753,7 +4753,12 @@ def _find_cursor_full_history_retained_state(
             ("type" not in item and set(item) == {"role", "content"})
             or (item_type == "function_call" and "id" not in item)
         ):
-            ohmypi_item = _cursor_replay_ohmypi_client_history_item(item)
+            if "type" not in item:
+                ohmypi_item = (
+                    _cursor_replay_retained_ohmypi_untyped_message_item(item)
+                )
+            else:
+                ohmypi_item = _cursor_replay_ohmypi_client_history_item(item)
         if ohmypi_item is not None:
             validated = ohmypi_item
         elif item_type == "message":
@@ -5525,6 +5530,64 @@ def _cursor_replay_ohmypi_client_history_item(
         # Cursor-owned ciphertext cannot resume on native xAI. Drop it.
         return _CursorReplayValidationResult(value=_OHMYPI_SKIP_HISTORY_ITEM)
     return None
+
+
+def _cursor_replay_retained_ohmypi_untyped_message_item(
+    raw_item: Mapping[str, Any],
+) -> _CursorReplayValidationResult:
+    """Validate retained OMP role/content messages before text projection."""
+    item = dict(raw_item)
+    content = item.get("content")
+    if isinstance(content, list):
+        if not content:
+            return _cursor_replay_rejected(
+                "stock_full_history",
+                "content_container",
+                item=item,
+            )
+        expected_text_type = (
+            "output_text" if item.get("role") == "assistant" else "input_text"
+        )
+        for part in content:
+            if not isinstance(part, Mapping):
+                return _cursor_replay_rejected(
+                    "stock_full_history",
+                    "content_part_container",
+                    item=item,
+                )
+            if set(part) != {"type", "text"}:
+                return _cursor_replay_rejected(
+                    "stock_full_history",
+                    "content_part_keys",
+                    item=item,
+                )
+            if part.get("type") not in {expected_text_type, "text"}:
+                return _cursor_replay_rejected(
+                    "stock_full_history",
+                    "content_part_type",
+                    item=item,
+                )
+            if not isinstance(part.get("text"), str):
+                return _cursor_replay_rejected(
+                    "stock_full_history",
+                    "content_part_text_type",
+                    item=item,
+                )
+    elif not isinstance(content, str):
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "content_container",
+            item=item,
+        )
+
+    validated = _cursor_replay_ohmypi_client_history_item(item)
+    if validated is None:
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "item_type",
+            item=item,
+        )
+    return validated
 
 
 def _cursor_replay_stock_codex_full_history_input(  # noqa: PLR0915
