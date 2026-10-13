@@ -20,6 +20,8 @@ and `after`. Optional `source_tuis`, `cc_version_min`, and `prompt_fields`
 restrict a rule. Without those filters, a rule applies globally. The built-in
 memory rules live in
 `context-replacement/shared/codex-memory-edit-instructions.json`.
+Set `AAWM_PROMPT_REPLACEMENT_MANIFEST_DIR` to use another directory of JSON
+manifests. Reload the proxy after editing cached rules.
 
 The Codex memory rule changes the developer instructions to:
 
