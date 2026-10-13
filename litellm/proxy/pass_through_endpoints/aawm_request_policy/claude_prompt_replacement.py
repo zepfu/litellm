@@ -5,7 +5,9 @@ Do not import ``llm_passthrough_endpoints`` at module scope.
 
 This module owns:
 - Claude auto-memory section replacement (context replacement templates)
-- Claude prompt-patch manifest loading and application
+- Claude prompt-patch manifest loading and application (delegated to
+  ``prompt_replacement_engine`` for the shared matcher/loader/cache pipeline
+  required by CFG-073)
 - Metadata/logging helpers for both replacement families
 
 It uses the Wave 6D ``observability_metadata`` module for shared metadata
@@ -14,7 +16,6 @@ primitives via explicit imports.
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -25,6 +26,11 @@ from litellm.proxy.pass_through_endpoints.aawm_request_policy.observability_meta
     _build_langfuse_span_descriptor,
     _format_langfuse_span_timestamp,
     _merge_litellm_metadata,
+)
+from litellm.proxy.pass_through_endpoints.aawm_request_policy.prompt_replacement_engine import (  # CFG-073 shared engine
+    ReplacementRule,
+    apply_rules_to_text,
+    load_manifest,
 )
 
 # ---------------------------------------------------------------------------
@@ -77,7 +83,7 @@ _CLAUDE_CC_VERSION_PATTERN = re.compile(
 class ClaudePromptReplacementServices:
     resolve_auto_memory_template_path: Callable[[Optional[str]], Optional[Path]]
     resolve_prompt_patch_manifest_path: Callable[[], Path]
-    load_prompt_patch_manifest: Callable[[Path], dict[str, Any]]
+    load_prompt_patch_manifest: Callable[[Path], list[ReplacementRule]]
     replace_auto_memory_section: Callable[
         [str, str], tuple[str, Optional[dict[str, Any]]]
     ]
@@ -96,7 +102,7 @@ class ClaudePromptReplacementServices:
 # ---------------------------------------------------------------------------
 
 _claude_context_replacement_template_cache: dict[Path, str] = {}
-_claude_prompt_patch_manifest_cache: dict[Path, dict[str, Any]] = {}
+_claude_prompt_patch_manifest_cache: dict[Path, list[ReplacementRule]] = {}
 
 # ---------------------------------------------------------------------------
 # Version parsing / template resolution
@@ -191,56 +197,40 @@ def _load_claude_context_replacement_template(template_path: Path) -> str:
     return cached_template
 
 
-def _load_claude_prompt_patch_manifest(template_path: Path) -> dict[str, Any]:
-    cached_manifest = _claude_prompt_patch_manifest_cache.get(template_path)
-    if cached_manifest is not None:
-        return cached_manifest
+def _load_claude_prompt_patch_manifest(manifest_path: Path) -> list[ReplacementRule]:
+    """Load the Claude prompt-patch manifest as shared engine ReplacementRules.
 
-    manifest = json.loads(template_path.read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict):
-        raise ValueError(f"Invalid Claude prompt patch manifest: {template_path}")
+    Uses the CFG-073 shared loader and enriches the report-file rule with
+    the pre-compiled regex pattern that handles text variants.
+    """
+    cached_rules = _claude_prompt_patch_manifest_cache.get(manifest_path)
+    if cached_rules is not None:
+        return cached_rules
 
-    patches = manifest.get("patches")
-    if not isinstance(patches, list) or not patches:
+    rules = load_manifest(manifest_path)
+
+    # Enrich the report-file rule with its pre-compiled regex
+    for rule in rules:
+        if rule.id == _CLAUDE_REPORT_FILE_PATCH_ID:
+            # Replace the frozen dataclass with one that has the regex
+            enriched = ReplacementRule(
+                id=rule.id,
+                before=rule.before,
+                after=rule.after,
+                before_pattern=_CLAUDE_REPORT_FILE_INSTRUCTION_PATTERN,
+                source_tuis=rule.source_tuis,
+                cc_version_min=rule.cc_version_min,
+                prompt_fields=rule.prompt_fields,
+            )
+            rules[rules.index(rule)] = enriched
+            break
+    else:
         raise ValueError(
-            f"Claude prompt patch manifest has no patches: {template_path}"
+            f"Claude prompt patch manifest missing {_CLAUDE_REPORT_FILE_PATCH_ID}"
         )
 
-    normalized_patches: list[dict[str, str]] = []
-    for patch_descriptor in patches:
-        if not isinstance(patch_descriptor, dict):
-            raise ValueError(
-                f"Invalid Claude prompt patch descriptor in {template_path}"
-            )
-        patch_id = patch_descriptor.get("id")
-        before_text = patch_descriptor.get("before")
-        after_text = patch_descriptor.get("after")
-        if not isinstance(patch_id, str) or not patch_id:
-            raise ValueError(
-                f"Claude prompt patch manifest is missing patch id in {template_path}"
-            )
-        if not isinstance(before_text, str) or not before_text:
-            raise ValueError(
-                f"Claude prompt patch manifest is missing before text for {patch_id}"
-            )
-        if not isinstance(after_text, str) or not after_text:
-            raise ValueError(
-                f"Claude prompt patch manifest is missing after text for {patch_id}"
-            )
-        normalized_patches.append(
-            {
-                "id": patch_id,
-                "before": before_text,
-                "after": after_text,
-            }
-        )
-
-    normalized_manifest = {
-        "source": manifest.get("source"),
-        "patches": normalized_patches,
-    }
-    _claude_prompt_patch_manifest_cache[template_path] = normalized_manifest
-    return normalized_manifest
+    _claude_prompt_patch_manifest_cache[manifest_path] = rules
+    return rules
 
 
 # ---------------------------------------------------------------------------
@@ -523,7 +513,7 @@ def _replace_claude_system_prompt_in_anthropic_request_body(
 
 
 # ---------------------------------------------------------------------------
-# Prompt-patch replacement
+# Prompt-patch replacement  (CFG-073: routed through shared engine)
 # ---------------------------------------------------------------------------
 
 
@@ -531,45 +521,35 @@ def _apply_claude_prompt_patch_manifest_to_text(
     text: str,
     *,
     cc_version: str,
-    manifest: dict[str, Any],
+    manifest: list[ReplacementRule],
 ) -> tuple[str, list[dict[str, Any]]]:
-    updated_text = text
+    """Apply Claude prompt-patch rules via the shared CFG-073 engine.
+
+    The ``manifest`` (list[ReplacementRule]) is loaded by
+    ``_load_claude_prompt_patch_manifest`` and enriched with the
+    report-file regex pattern.
+    """
+    updated_text, result = apply_rules_to_text(
+        text,
+        manifest,
+        cc_version=cc_version,
+    )
+
     patch_events: list[dict[str, Any]] = []
-
-    for patch_descriptor in manifest["patches"]:
-        patch_id = patch_descriptor["id"]
-        before_text = patch_descriptor["before"]
-        after_text = patch_descriptor["after"]
-        occurrences = updated_text.count(before_text)
-        match_types: list[str] = []
-        if occurrences:
-            updated_text = updated_text.replace(before_text, after_text)
-            match_types.append("exact")
-
-        if patch_id == _CLAUDE_REPORT_FILE_PATCH_ID:
-            updated_text, pattern_occurrences = (
-                _CLAUDE_REPORT_FILE_INSTRUCTION_PATTERN.subn(
-                    after_text,
-                    updated_text,
-                )
-            )
-            if pattern_occurrences:
-                occurrences += pattern_occurrences
-                match_types.append("pattern")
-
-        if not occurrences:
-            continue
-
+    for match in result.matched:
         event: dict[str, Any] = {
-            "id": patch_id,
+            "id": match.rule_id,
             "status": "resolved",
             "cc_version": cc_version,
             "manifest_path": _CLAUDE_PROMPT_PATCH_MANIFEST_LOGICAL_PATH,
-            "occurrences": occurrences,
+            "occurrences": match.occurrences,
         }
-        if match_types:
-            event["match_types"] = match_types
+        if match.match_types:
+            event["match_types"] = match.match_types
         patch_events.append(event)
+
+    for failure in result.failures:
+        patch_events.append(failure)
 
     return updated_text, patch_events
 
@@ -578,11 +558,11 @@ def _apply_claude_prompt_patches_in_text(
     text: str, cc_version: str
 ) -> tuple[str, list[dict[str, Any]]]:
     manifest_path = _resolve_claude_prompt_patch_manifest_path()
-    manifest = _load_claude_prompt_patch_manifest(manifest_path)
+    rules = _load_claude_prompt_patch_manifest(manifest_path)
     return _apply_claude_prompt_patch_manifest_to_text(
         text,
         cc_version=cc_version,
-        manifest=manifest,
+        manifest=rules,
     )
 
 
@@ -762,6 +742,11 @@ def _apply_claude_prompt_patches_to_anthropic_request_body(
                         datetime.now(timezone.utc)
                     )
     return updated_body, patch_events
+
+
+# ---------------------------------------------------------------------------
+# Build services
+# ---------------------------------------------------------------------------
 
 
 def build_claude_prompt_replacement_services() -> ClaudePromptReplacementServices:
