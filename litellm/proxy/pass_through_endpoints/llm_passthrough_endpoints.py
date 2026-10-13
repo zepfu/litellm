@@ -4188,6 +4188,15 @@ async def gemini_proxy_route(
                     request=request,
                     adapter="gemini",
                 )
+                # Only override the request-parsed body when replacement
+                # actually changed content or attached metadata.  When no
+                # rules matched the hook returns the original dict object
+                # unchanged; preserve the baseline body-extraction path so
+                # _parse_request_data_by_content_type selects the intended
+                # nested provider body (contents/systemInstruction) rather
+                # than always taking the outer envelope.
+                if _gemini_custom_body is _gemini_raw_body:
+                    _gemini_custom_body = None
         except Exception:
             pass
     # --- end prompt-replacement hook ---

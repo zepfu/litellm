@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
+from litellm._logging import verbose_proxy_logger
 from litellm.proxy.pass_through_endpoints.aawm_request_policy.prompt_replacement_engine import (
     ReplacementRule,
     ReplacementResult,
@@ -39,6 +40,15 @@ from litellm.proxy.pass_through_endpoints.aawm_request_policy.observability_meta
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _DEFAULT_MANIFEST_DIR = _REPO_ROOT / "context-replacement" / "shared"
 
+# Installed-package fallback: wheel data lands under the same parent
+# package as the existing Claude control-plane data directory.
+_PACKAGED_MANIFEST_DIR: Optional[Path] = None
+_claude_cp_root = Path(__file__).resolve().parent.parent / "aawm_claude_control_plane_data"
+_packaged_candidate = _claude_cp_root / "context-replacement" / "shared"
+if _packaged_candidate.is_dir():
+    _PACKAGED_MANIFEST_DIR = _packaged_candidate
+del _claude_cp_root, _packaged_candidate
+
 # Shared cache reused across all callers (engine, claude_prompt_replacement,
 # and our hooks).  Owned by the engine owner; we reference it here to avoid
 # a duplicate module-level cache.
@@ -58,6 +68,8 @@ def _discover_manifest_paths() -> list[Path]:
             return sorted(candidate.glob("*.json"))
     if _DEFAULT_MANIFEST_DIR.is_dir():
         return sorted(_DEFAULT_MANIFEST_DIR.glob("*.json"))
+    if _PACKAGED_MANIFEST_DIR is not None and _PACKAGED_MANIFEST_DIR.is_dir():
+        return sorted(_PACKAGED_MANIFEST_DIR.glob("*.json"))
     return []
 
 
@@ -163,11 +175,21 @@ def _extract_cc_version(
 
 
 def _safe_get_headers(request: Any) -> dict[str, str]:
-    """Extract headers from a Starlette Request or dict."""
+    """Extract headers from a Starlette Request, Headers, or dict.
+
+    Starlette ``request.headers`` is a ``Headers`` (MutableMapping), not a
+    plain ``dict``.  Convert it so identity and filter lookups work.
+    """
     headers = getattr(request, "headers", None)
+    if headers is None:
+        return {}
     if isinstance(headers, dict):
         return headers
-    return {}
+    # Starlette Headers, werkzeug EnvironHeaders, etc.
+    try:
+        return dict(headers)
+    except (TypeError, ValueError, AttributeError):
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -233,9 +255,12 @@ def apply_prompt_replacement_to_standard_request(
     try:
         rules, manifest_paths = _get_rules()
     except Exception:
-        # Manifest load failures are observable via the logging subsystem;
-        # do not block the request path.  The exception trace was already
-        # emitted by load_manifest / load_manifests.
+        verbose_proxy_logger.exception(
+            "prompt_replacement: manifest load failed in standard hook; "
+            "passing request through unchanged.  Fix the manifest files "
+            "at the configured manifest directory or remove the "
+            "AAWM_PROMPT_REPLACEMENT_MANIFEST_DIR override."
+        )
         return data
 
     if not rules:
@@ -306,6 +331,12 @@ def apply_prompt_replacement_to_passthrough_body(
     try:
         rules, manifest_paths = _get_rules()
     except Exception:
+        verbose_proxy_logger.exception(
+            "prompt_replacement: manifest load failed in passthrough hook; "
+            "passing request through unchanged.  Fix the manifest files "
+            "at the configured manifest directory or remove the "
+            "AAWM_PROMPT_REPLACEMENT_MANIFEST_DIR override."
+        )
         return body
 
     if not rules:
