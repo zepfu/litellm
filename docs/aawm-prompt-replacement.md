@@ -44,6 +44,7 @@ logging callback arguments, rather than final HTTP serialization. Its presence
 and stream flags depend on that path. The existing
 `system`, `messages` and `tools` captures remain separate input evidence.
 Provider-body evidence is omitted when the provider path supplies none.
+It is also omitted when message logging is redacted.
 
 Source checks establish engine behavior; live acceptance requires correlated
 provider-bound request evidence. Reconstructed callback inputs, health checks
