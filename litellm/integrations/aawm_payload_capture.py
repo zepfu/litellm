@@ -45,6 +45,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from litellm._logging import _is_debugging_on, verbose_logger
 from litellm.integrations.custom_logger import CustomLogger
+from litellm.litellm_core_utils.redact_messages import should_redact_message_logging
 
 
 def _is_truthy(value: str) -> bool:
@@ -189,6 +190,9 @@ def _get_provider_request_body(kwargs: Dict[str, Any]) -> Any:
     call paths do not supply that field; return ``None`` for them rather than
     fabricating a body.
     """
+    if should_redact_message_logging(kwargs):
+        return None
+
     additional_args = kwargs.get("additional_args")
     if not isinstance(additional_args, dict):
         return None
