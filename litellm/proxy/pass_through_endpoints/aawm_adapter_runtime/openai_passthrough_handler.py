@@ -542,6 +542,23 @@ class BaseOpenAIPassThroughHandler:
                     request,
                     codex_collaboration_identities,
                 )
+            # --- prompt-replacement hook (early, before routing) ---
+            try:
+                from litellm.proxy.pass_through_endpoints.aawm_request_policy.prompt_replacement_hooks import (
+                    apply_prompt_replacement_to_passthrough_body,
+                )
+                _pr_adapter = "responses" if is_responses_endpoint else "chat"
+                _pr_body = apply_prompt_replacement_to_passthrough_body(
+                    request_body,
+                    request=request,
+                    adapter=_pr_adapter,
+                )
+                if _pr_body is not request_body:
+                    request_body = _pr_body
+                    prepared_request_body = _pr_body
+            except Exception:
+                pass
+            # --- end prompt-replacement hook ---
             is_codex_responses_request = (
                 rt.request_uses_codex_native_auth_fn(request)
                 and is_responses_endpoint

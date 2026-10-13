@@ -4174,6 +4174,24 @@ async def gemini_proxy_route(
     if "stream" in str(updated_url):
         is_streaming_request = True
 
+    # --- prompt-replacement hook (early, before passthrough) ---
+    _gemini_custom_body: Optional[dict] = None
+    if request.method == "POST":
+        try:
+            _gemini_raw_body = await get_request_body(request)
+            if isinstance(_gemini_raw_body, dict):
+                from litellm.proxy.pass_through_endpoints.aawm_request_policy.prompt_replacement_hooks import (
+                    apply_prompt_replacement_to_passthrough_body,
+                )
+                _gemini_custom_body = apply_prompt_replacement_to_passthrough_body(
+                    _gemini_raw_body,
+                    request=request,
+                    adapter="gemini",
+                )
+        except Exception:
+            pass
+    # --- end prompt-replacement hook ---
+
     ## CREATE PASS-THROUGH
     endpoint_func = create_pass_through_route(
         endpoint=endpoint,
@@ -4186,6 +4204,7 @@ async def gemini_proxy_route(
         request,
         fastapi_response,
         user_api_key_dict,
+        custom_body=_gemini_custom_body,
     )
 
     return received_value
@@ -4969,6 +4988,24 @@ async def anthropic_proxy_route(  # noqa: PLR0915
                 sorted(hooks),
                 sorted(billing_header_fields),
             )
+
+        # --- prompt-replacement hook (early, before routing) ---
+        try:
+            from litellm.proxy.pass_through_endpoints.aawm_request_policy.prompt_replacement_hooks import (
+                apply_prompt_replacement_to_passthrough_body,
+            )
+            _pr_cc_version = billing_header_fields.get("cc_version")
+            prepared_request_body = apply_prompt_replacement_to_passthrough_body(
+                prepared_request_body,
+                request=request,
+                adapter="anthropic",
+                cc_version=_pr_cc_version if isinstance(_pr_cc_version, str) else None,
+            )
+            if prepared_request_body is not request_body:
+                _safe_set_request_parsed_body(request, prepared_request_body)
+        except Exception:
+            pass
+        # --- end prompt-replacement hook ---
 
         anthropic_auto_agent_alias = _resolve_anthropic_auto_agent_alias_model(
             prepared_request_body,
