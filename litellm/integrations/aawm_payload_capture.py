@@ -19,6 +19,11 @@ Falsy values:  "", "0", "false", "False", "no", "off" — all disabled.
 Pass-through path: request body is in
     kwargs["passthrough_logging_payload"]["request_body"]
 
+Provider request path: when LiteLLM retained a provider-transformed logical
+request in Logging.model_call_details, write that object to provider_request.json.
+It is not the final byte-for-byte httpx request, and its stream flag can change
+after Logging.pre_call stores it.
+
 Standard path: reconstructed from kwargs["messages"], kwargs["system"], etc.
 
 Registration in litellm-config.yaml:
@@ -175,6 +180,25 @@ def _get_request_parts(
     )
 
 
+def _get_provider_request_body(kwargs: Dict[str, Any]) -> Any:
+    """Return the retained provider request body when LiteLLM preserved it.
+
+    The custom HTTP handler stores the provider-transformed logical request in
+    ``Logging.model_call_details.additional_args.complete_input_dict`` before
+    the success logging hook runs. Some providers and call paths do not supply
+    that field; in those cases return ``None`` rather than fabricating a body.
+    """
+    model_call_details = kwargs.get("model_call_details")
+    if not isinstance(model_call_details, dict):
+        return None
+
+    additional_args = model_call_details.get("additional_args")
+    if not isinstance(additional_args, dict):
+        return None
+
+    return additional_args.get("complete_input_dict")
+
+
 def _build_meta(kwargs: Dict[str, Any], agent: str, ts: str) -> Dict[str, Any]:
     """Build the meta.json payload from kwargs top-level fields."""
     meta: Dict[str, Any] = {
@@ -205,6 +229,22 @@ def _build_meta(kwargs: Dict[str, Any], agent: str, ts: str) -> Dict[str, Any]:
                 val = request_body.get(field)
                 if val is not None:
                     meta[field] = val
+
+    if _get_provider_request_body(kwargs) is not None:
+        meta["provider_request"] = {
+            "artifact": "provider_request.json",
+            "source": (
+                "Logging.model_call_details.additional_args.complete_input_dict"
+            ),
+            "captured_at": "Logging.pre_call",
+            "request_stage": (
+                "provider-transformed logical request after extra_body and signing"
+            ),
+            "final_httpx_serialization": False,
+            "stream_finalized": False,
+            "litellm_call_id": kwargs.get("litellm_call_id"),
+            "litellm_trace_id": kwargs.get("litellm_trace_id"),
+        }
 
     return meta
 
@@ -237,6 +277,10 @@ def _dump_capture(kwargs: Dict[str, Any]) -> None:
         _write("messages.json", messages)
         _write("tools.json", tools)
         _write("meta.json", meta)
+
+        provider_request_body = _get_provider_request_body(kwargs)
+        if provider_request_body is not None:
+            _write("provider_request.json", provider_request_body)
 
         tool_count = len(tools) if isinstance(tools, list) else 0
         msg_count = len(messages) if isinstance(messages, list) else 0
