@@ -5561,7 +5561,11 @@ def _cursor_replay_retained_ohmypi_untyped_message_item(
                     "content_part_keys",
                     item=item,
                 )
-            if part.get("type") not in {expected_text_type, "text"}:
+            part_type = part.get("type")
+            if not isinstance(part_type, str) or part_type not in {
+                expected_text_type,
+                "text",
+            }:
                 return _cursor_replay_rejected(
                     "stock_full_history",
                     "content_part_type",
