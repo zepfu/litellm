@@ -19,10 +19,10 @@ Falsy values:  "", "0", "false", "False", "no", "off" — all disabled.
 Pass-through path: request body is in
     kwargs["passthrough_logging_payload"]["request_body"]
 
-Provider request path: when LiteLLM retained a provider-transformed logical
-request in Logging.model_call_details, write that object to provider_request.json.
-It is not the final byte-for-byte httpx request, and its stream flag can change
-after Logging.pre_call stores it.
+Provider request path: when the provider call path retained a transformed
+logical request in additional_args.complete_input_dict, write it to
+provider_request.json. It is not the final byte-for-byte httpx request, and its
+stream flag can change after that logical request is retained.
 
 Standard path: reconstructed from kwargs["messages"], kwargs["system"], etc.
 
@@ -181,18 +181,15 @@ def _get_request_parts(
 
 
 def _get_provider_request_body(kwargs: Dict[str, Any]) -> Any:
-    """Return the retained provider request body when LiteLLM preserved it.
+    """Return the retained provider request body when its path preserved it.
 
-    The custom HTTP handler stores the provider-transformed logical request in
-    ``Logging.model_call_details.additional_args.complete_input_dict`` before
-    the success logging hook runs. Some providers and call paths do not supply
-    that field; in those cases return ``None`` rather than fabricating a body.
+    Logging passes ``model_call_details`` as the success hook kwargs, and
+    provider call handlers retain their logical request under
+    ``kwargs["additional_args"]["complete_input_dict"]``. Some providers and
+    call paths do not supply that field; return ``None`` for them rather than
+    fabricating a body.
     """
-    model_call_details = kwargs.get("model_call_details")
-    if not isinstance(model_call_details, dict):
-        return None
-
-    additional_args = model_call_details.get("additional_args")
+    additional_args = kwargs.get("additional_args")
     if not isinstance(additional_args, dict):
         return None
 
@@ -236,9 +233,13 @@ def _build_meta(kwargs: Dict[str, Any], agent: str, ts: str) -> Dict[str, Any]:
             "source": (
                 "Logging.model_call_details.additional_args.complete_input_dict"
             ),
-            "captured_at": "Logging.pre_call",
+            "captured_at": "Logging.post_call",
             "request_stage": (
                 "provider-transformed logical request after extra_body and signing"
+            ),
+            "availability": (
+                "present only when the provider/call path supplies "
+                "additional_args.complete_input_dict"
             ),
             "final_httpx_serialization": False,
             "stream_finalized": False,
