@@ -1,0 +1,15 @@
+{
+  "source": "CFG-073 revision2 codex-memory-edit-instructions",
+  "rules": [
+    {
+      "id": "codex-memory-edit-only",
+      "before": "You can update the memories **only** when explicitly asked by the user. This must always come from a direct request from the user.",
+      "after": "You can update the memories only when explicitly asked by the user. This must always come from a direct request from the user."
+    },
+    {
+      "id": "codex-memory-edit-note-path",
+      "before_pattern": "(Do not try to edit the memory files yourself)(, only add one update note in \\S+?)\\.?(?=\\s|$)",
+      "after": "\\1 unless explicitly directed by user\\2."
+    }
+  ]
+}
