@@ -108,23 +108,18 @@ _claude_prompt_patch_manifest_cache: dict[Path, dict[str, Any]] = {}
 # ---------------------------------------------------------------------------
 # Version parsing / template resolution
 # ---------------------------------------------------------------------------
+# _CLAUDE_CC_VERSION_PATTERN is kept for the legacy re-export contract
+# (prompt_replacement_legacy.py); actual version parsing is delegated to the
+# shared _parse_cc_version in prompt_replacement_engine.
 
 
 def _parse_claude_code_version(
     cc_version: Optional[str],
 ) -> Optional[tuple[int, int, int]]:
-    if not cc_version:
-        return None
-
-    match = _CLAUDE_CC_VERSION_PATTERN.match(cc_version.strip())
-    if match is None:
-        return None
-
-    return (
-        int(match.group("major")),
-        int(match.group("minor")),
-        int(match.group("patch")),
+    from litellm.proxy.pass_through_endpoints.aawm_request_policy.prompt_replacement_engine import (
+        _parse_cc_version,
     )
+    return _parse_cc_version(cc_version)
 
 
 def _candidate_context_replacement_dirs() -> tuple[Path, ...]:
@@ -207,8 +202,9 @@ def _load_claude_prompt_patch_manifest(manifest_path: Path) -> dict[str, Any]:
     """Load and validate the Claude prompt-patch manifest.
 
     Returns the legacy dict contract.  Shared-engine loading, validation,
-    and caching are delegated to ``load_manifest`` /
-    ``_DEFAULT_MANIFEST_CACHE``.
+    and caching are delegated to ``_parse_rules_from_manifest`` (the
+    already-parsed ``raw`` dict is fed directly to avoid a double file
+    read) / ``_DEFAULT_MANIFEST_CACHE``.
     """
     cached_manifest = _claude_prompt_patch_manifest_cache.get(manifest_path)
     if cached_manifest is not None:
@@ -247,9 +243,9 @@ def _load_claude_prompt_patch_manifest(manifest_path: Path) -> dict[str, Any]:
 
     from litellm.proxy.pass_through_endpoints.aawm_request_policy.prompt_replacement_engine import (
         _DEFAULT_MANIFEST_CACHE,
-        load_manifest,
+        _parse_rules_from_manifest,
     )
-    rules = load_manifest(manifest_path)
+    rules = _parse_rules_from_manifest(raw)
     _DEFAULT_MANIFEST_CACHE[manifest_path] = rules
     patches: list[dict[str, str]] = []
     for rule in rules:
@@ -258,9 +254,10 @@ def _load_claude_prompt_patch_manifest(manifest_path: Path) -> dict[str, Any]:
             "before": rule.before,
             "after": rule.after,
         })
-    normalized_manifest: dict[str, Any] = {"patches": patches}
-    if "source" in raw:
-        normalized_manifest["source"] = raw["source"]
+    normalized_manifest: dict[str, Any] = {
+        "patches": patches,
+        "source": raw.get("source"),
+    }
     _claude_prompt_patch_manifest_cache[manifest_path] = normalized_manifest
     return normalized_manifest
 
