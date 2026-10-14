@@ -19,7 +19,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 # ---------------------------------------------------------------------------
 # Types
@@ -138,12 +138,35 @@ def _rule_is_eligible(
 # ---------------------------------------------------------------------------
 
 
-def _parse_rules_from_manifest(raw: dict[str, Any]) -> list[ReplacementRule]:
+def _validate_legacy_manifest(raw: dict[str, Any], legacy_label: str) -> None:
+    patches = raw.get("patches")
+    if not isinstance(patches, list) or not patches:
+        raise ValueError(f"Claude prompt patch manifest has no patches: {legacy_label}")
+    for descriptor in patches:
+        if not isinstance(descriptor, dict):
+            raise ValueError(f"Invalid Claude prompt patch descriptor in {legacy_label}")
+        rule_id = descriptor.get("id")
+        if not isinstance(rule_id, str) or not rule_id:
+            raise ValueError(f"Claude prompt patch manifest is missing patch id in {legacy_label}")
+        for key in ("before", "after"):
+            value = descriptor.get(key)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"Claude prompt patch manifest is missing {key} text for {rule_id}")
+
+
+def _parse_rules_from_manifest(
+    raw: dict[str, Any],
+    *,
+    legacy_label: Optional[str] = None,
+    patterns: Optional[dict[str, re.Pattern[str]]] = None,
+) -> list[ReplacementRule]:
     """Parse a raw manifest dict into ReplacementRule objects.
 
     Accepts either ``"rules"`` (new shared format) or ``"patches"``
     (legacy Claude prompt-patch format) at the top level.
     """
+    if legacy_label is not None:
+        _validate_legacy_manifest(raw, legacy_label)
     raw_rules = raw.get("rules")
     if not isinstance(raw_rules, list):
         raw_rules = raw.get("patches")
@@ -210,6 +233,9 @@ def _parse_rules_from_manifest(raw: dict[str, Any]) -> list[ReplacementRule]:
             if filtered:
                 prompt_fields = filtered
 
+        if patterns and rule_id in patterns:
+            before_pattern = patterns[rule_id]
+
         rules.append(
             ReplacementRule(
                 id=rule_id,
@@ -225,25 +251,62 @@ def _parse_rules_from_manifest(raw: dict[str, Any]) -> list[ReplacementRule]:
     return rules
 
 
-def load_manifest(manifest_path: Path) -> list[ReplacementRule]:
-    """Load and parse a single prompt-replacement manifest."""
-    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict):
-        raise ValueError(f"Invalid manifest: {manifest_path}")
-    return _parse_rules_from_manifest(raw)
+class LoadedManifest(dict[str, Any]):
+    """Legacy-compatible document and its single compiled rule representation."""
+
+    def __init__(self, document: dict[str, Any], rules: list[ReplacementRule]):
+        super().__init__(document)
+        self.replacement_rules = rules
 
 
-# ---------------------------------------------------------------------------
-# Shared caches
-# ---------------------------------------------------------------------------
-
-_DEFAULT_MANIFEST_CACHE: dict[Path, list[ReplacementRule]] = {}
+_DEFAULT_MANIFEST_CACHE: dict[Path, dict[str, Any]] = {}
 _text_asset_cache: dict[Path, str] = {}
 
 
-# ---------------------------------------------------------------------------
-# Text asset loading
-# ---------------------------------------------------------------------------
+def rules_from_manifest(
+    document: dict[str, Any],
+    *,
+    patterns: Optional[dict[str, re.Pattern[str]]] = None,
+) -> list[ReplacementRule]:
+    if isinstance(document, LoadedManifest):
+        return document.replacement_rules
+    return _parse_rules_from_manifest(document, patterns=patterns)
+
+
+def load_manifest_document(
+    manifest_path: Path,
+    *,
+    legacy: bool = False,
+    patterns: Optional[dict[str, re.Pattern[str]]] = None,
+    cache: Optional[dict[Path, dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    """Read, validate and compile each manifest once, with one cache owner."""
+    effective_cache = _DEFAULT_MANIFEST_CACHE if cache is None else cache
+    cached = effective_cache.get(manifest_path)
+    if cached is not None:
+        return cached
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        label = "Claude prompt patch manifest" if legacy else "manifest"
+        raise ValueError(f"Invalid {label}: {manifest_path}")
+    rules = _parse_rules_from_manifest(
+        raw, legacy_label=str(manifest_path) if legacy else None, patterns=patterns,
+    )
+    if legacy:
+        document = {
+            "patches": [{"id": r.id, "before": r.before, "after": r.after} for r in rules],
+            "source": raw.get("source"),
+        }
+    else:
+        document = raw
+    loaded = LoadedManifest(document, rules)
+    effective_cache[manifest_path] = loaded
+    return loaded
+
+
+def load_manifest(manifest_path: Path) -> list[ReplacementRule]:
+    """Load a manifest through the common document and compiled-rule cache."""
+    return rules_from_manifest(load_manifest_document(manifest_path))
 
 
 def load_text_asset(
@@ -271,23 +334,58 @@ def load_text_asset(
 def load_manifests(
     manifest_paths: list[Path],
     *,
-    cache: Optional[dict[Path, list[ReplacementRule]]] = None,
+    cache: Optional[dict[Path, dict[str, Any]]] = None,
 ) -> list[ReplacementRule]:
-    """Load rules from multiple manifests, using an optional per-path cache.
+    """Load rules through the same cache used by the legacy Claude facade."""
+    return [
+        rule
+        for path in manifest_paths
+        for rule in rules_from_manifest(load_manifest_document(path, cache=cache))
+    ]
 
-    Defaults to the module-level ``_DEFAULT_MANIFEST_CACHE`` when *cache*
-    is ``None``.
-    """
-    effective_cache = cache if cache is not None else _DEFAULT_MANIFEST_CACHE
-    all_rules: list[ReplacementRule] = []
-    for path in manifest_paths:
-        if path in effective_cache:
-            all_rules.extend(effective_cache[path])
-            continue
-        rules = load_manifest(path)
-        effective_cache[path] = rules
-        all_rules.extend(rules)
-    return all_rules
+
+def extract_markdown_section(markdown_text: str, heading: str) -> str:
+    match = re.search(rf"(?ms)^## {re.escape(heading)}\n.*?(?=^## |\Z)", markdown_text)
+    if match is None:
+        raise ValueError(f"Missing Claude auto-memory section: {heading}")
+    return match.group(0).rstrip()
+
+
+def render_section_template(
+    section: str,
+    template: str,
+    *,
+    blocks: dict[str, re.Pattern[str]],
+    sections: dict[str, str],
+    placeholder_pattern: re.Pattern[str],
+) -> str:
+    """Render a section template while retaining captured source sections."""
+    for placeholder, pattern in blocks.items():
+        if placeholder in template:
+            match = pattern.search(section)
+            if match is None:
+                raise ValueError("Missing Claude auto-memory <types> block")
+            template = template.replace(placeholder, match.group(0).rstrip())
+    for placeholder, heading in sections.items():
+        if placeholder in template:
+            template = template.replace(placeholder, extract_markdown_section(section, heading))
+    unresolved = placeholder_pattern.findall(template)
+    if unresolved:
+        raise ValueError("Unresolved Claude context replacement placeholders: " + ", ".join(sorted(unresolved)))
+    return template
+
+
+def replace_template_section(
+    text: str,
+    pattern: re.Pattern[str],
+    render: Callable[[re.Match[str]], str],
+) -> tuple[str, Optional[re.Match[str]], Optional[str]]:
+    """Match and substitute one eligible section without touching its neighbors."""
+    match = pattern.search(text)
+    if match is None:
+        return text, None, None
+    replacement = render(match)
+    return text[:match.start()] + replacement + text[match.end():], match, replacement
 
 
 # ---------------------------------------------------------------------------
@@ -295,110 +393,61 @@ def load_manifests(
 # ---------------------------------------------------------------------------
 
 
-def _overlaps(
-    start: int,
-    end: int,
-    protected_spans: list[tuple[int, int]],
+def _contained_in_output(
+    text: str, start: int, end: int, output: str,
 ) -> bool:
-    """Return whether a half-open span intersects any protected span."""
-    return any(
-        start < protected_end and end > protected_start
-        for protected_start, protected_end in protected_spans
-    )
+    """Protect a match only when a complete replacement contains that match."""
+    if not output:
+        return False
+    position = text.find(output, max(0, end - len(output)), start + len(output))
+    while position >= 0 and position <= start:
+        if end <= position + len(output):
+            return True
+        position = text.find(output, position + 1, start + len(output))
+    return False
 
 
 def _replace_exact_idempotently(
-    text: str,
-    *,
-    before: str,
-    after: str,
+    text: str, *, before: str, after: str,
 ) -> tuple[str, int]:
-    """Replace source occurrences once and preserve complete replacements.
-
-    A conventional full-string replace rewrites text inserted by a prior
-    invocation when ``after`` contains ``before``.  Protect complete output
-    occurrences first, then replace only source occurrences outside them.
-    """
-    protected_spans: list[tuple[int, int]] = []
-    search_start = 0
-    while search_start <= len(text):
-        output_start = text.find(after, search_start)
-        if output_start < 0:
-            break
-        output_end = output_start + len(after)
-        protected_spans.append((output_start, output_end))
-        search_start = output_end
-
+    if before == after:
+        return text, 0
     parts: list[str] = []
-    source_start = 0
+    position = 0
     occurrences = 0
-    while source_start <= len(text):
-        match_start = text.find(before, source_start)
-        if match_start < 0:
+    while True:
+        start = text.find(before, position)
+        if start < 0:
             break
-        match_end = match_start + len(before)
-        if _overlaps(match_start, match_end, protected_spans):
-            parts.append(text[source_start:match_end])
+        end = start + len(before)
+        parts.append(text[position:start])
+        if _contained_in_output(text, start, end, after):
+            parts.append(text[start:end])
         else:
-            parts.append(text[source_start:match_start])
             parts.append(after)
             occurrences += 1
-        source_start = match_end
-
-    if occurrences == 0:
-        return text, 0
-    parts.append(text[source_start:])
+        position = end
+    parts.append(text[position:])
     return "".join(parts), occurrences
 
 
 def _replace_pattern_idempotently(
-    text: str,
-    *,
-    pattern: re.Pattern[str],
-    replacement: str,
+    text: str, *, pattern: re.Pattern[str], replacement: str,
 ) -> tuple[str, int]:
-    """Replace source matches once and preserve completed replacements."""
-    matches = list(pattern.finditer(text))
-    protected_spans: list[tuple[int, int]] = []
-    protected_matches: set[int] = set()
-    for match_index, match in enumerate(matches):
-        output = match.expand(replacement)
-        if text[match.start() : match.end()] == output:
-            protected_spans.append(match.span())
-            protected_matches.add(match_index)
-            continue
-
-        output_start = text.find(output, match.start(), match.end())
-        if output_start >= 0:
-            output_end = output_start + len(output)
-            protected_spans.append((output_start, output_end))
-            protected_matches.add(match_index)
-            continue
-
-        output_start = text.find(output, match.start())
-        if output_start >= 0:
-            output_end = output_start + len(output)
-            protected_spans.append((output_start, output_end))
-            protected_matches.add(match_index)
-
-    if not protected_spans:
-        return pattern.subn(replacement, text)
-
     parts: list[str] = []
-    source_start = 0
+    position = 0
     occurrences = 0
-    for match_index, match in enumerate(matches):
-        match_start, match_end = match.span()
-        if match_index in protected_matches or _overlaps(
-            match_start, match_end, protected_spans
-        ):
-            parts.append(text[source_start:match_end])
+    for match in pattern.finditer(text):
+        start, end = match.span()
+        output = match.expand(replacement)
+        parts.append(text[position:start])
+        if text[start:end] == output or _contained_in_output(text, start, end, output):
+            parts.append(text[start:end])
         else:
-            parts.append(text[source_start:match_start])
-            parts.append(match.expand(replacement))
+            parts.append(output)
             occurrences += 1
-        source_start = match_end
-    parts.append(text[source_start:])
+        position = end
+    parts.append(text[position:])
     return "".join(parts), occurrences
 
 
@@ -472,74 +521,6 @@ def apply_rules_to_text(
             )
 
     return updated_text, result
-
-
-# ---------------------------------------------------------------------------
-# Recursive dict/list walker (used by adapters)
-# ---------------------------------------------------------------------------
-
-
-def _replace_rules_in_value(
-    value: Any,
-    rules: list[ReplacementRule],
-    *,
-    source_tui: Optional[str] = None,
-    cc_version: Optional[str] = None,
-    prompt_field: Optional[str] = None,
-) -> tuple[Any, ReplacementResult]:
-    """Recursively apply rules to text leaves in a dict/list tree.
-
-    Only recurses into dicts and lists; scalar leaves are passed to
-    ``apply_rules_to_text`` if they are strings.
-    """
-    if isinstance(value, str):
-        return apply_rules_to_text(
-            value,
-            rules,
-            source_tui=source_tui,
-            cc_version=cc_version,
-            prompt_field=prompt_field,
-        )
-
-    if isinstance(value, dict):
-        updated_dict: dict[str, Any] = {}
-        combined = ReplacementResult()
-        changed = False
-        for key, child in value.items():
-            updated_child, child_result = _replace_rules_in_value(
-                child,
-                rules,
-                source_tui=source_tui,
-                cc_version=cc_version,
-                prompt_field=prompt_field,
-            )
-            updated_dict[key] = updated_child
-            combined.matched.extend(child_result.matched)
-            combined.failures.extend(child_result.failures)
-            if updated_child is not child:
-                changed = True
-        return (updated_dict if changed else value), combined
-
-    if isinstance(value, list):
-        updated_list: list[Any] = []
-        combined = ReplacementResult()
-        changed = False
-        for child in value:
-            updated_child, child_result = _replace_rules_in_value(
-                child,
-                rules,
-                source_tui=source_tui,
-                cc_version=cc_version,
-                prompt_field=prompt_field,
-            )
-            updated_list.append(updated_child)
-            combined.matched.extend(child_result.matched)
-            combined.failures.extend(child_result.failures)
-            if updated_child is not child:
-                changed = True
-        return (updated_list if changed else value), combined
-
-    return value, ReplacementResult()
 
 
 # ---------------------------------------------------------------------------
@@ -820,6 +801,15 @@ def apply_rules_to_gemini_request(
     """
     updated_body = dict(body)
     combined = ReplacementResult()
+
+    nested = body.get("custom_body")
+    if isinstance(nested, dict):
+        updated_nested, result = apply_rules_to_gemini_request(
+            nested, rules, source_tui=source_tui, cc_version=cc_version,
+        )
+        if result.matched or result.failures:
+            updated_body["custom_body"] = updated_nested
+        return updated_body, result
 
     system_instruction = updated_body.get("systemInstruction")
     if not isinstance(system_instruction, dict):

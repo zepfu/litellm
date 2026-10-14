@@ -557,7 +557,7 @@ class BaseOpenAIPassThroughHandler:
                     request_body = _pr_body
                     prepared_request_body = _pr_body
             except Exception:
-                pass
+                verbose_proxy_logger.exception("prompt_replacement: OpenAI body hook failed")
             # --- end prompt-replacement hook ---
             is_codex_responses_request = (
                 rt.request_uses_codex_native_auth_fn(request)

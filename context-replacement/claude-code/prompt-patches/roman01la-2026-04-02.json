@@ -54,7 +54,8 @@
     {
       "id": "subagent-report-file-explicit-request",
       "before": "Do NOT Write report/summary/findings/analysis .md files. Return findings directly as your final assistant message — the parent agent reads your text output, not files you create.",
-      "after": "Do NOT Write report/summary/findings/analysis .md files unless EXPLICITLY asked to do. Regardless of a file write-- you need to return findings directly as your final assistant message."
+      "after": "Do NOT Write report/summary/findings/analysis .md files unless EXPLICITLY asked to do. Regardless of a file write-- you need to return findings directly as your final assistant message.",
+      "before_pattern": "Do NOT\\s+(?:Write|\\$\\{[^}\\r\\n]+\\})\\s+report/summary/findings/analysis\\s+\\.md\\s+files\\.\\s+Return findings directly as your final assistant message(?:\\s+[—-]\\s+the parent agent reads your text output,\\s+not files you create)?\\.?"
     },
     {
       "id": "match-scope-instruction",

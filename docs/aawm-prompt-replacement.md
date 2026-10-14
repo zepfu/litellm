@@ -17,13 +17,20 @@ provider. Eligible fields whose text does not match remain unchanged.
 
 Shared JSON manifests define rules using `id`, `before` or `before_pattern`,
 and `after`. Optional `source_tuis`, `cc_version_min`, and `prompt_fields`
-restrict a rule. Without those filters, a rule applies globally. The built-in
+restrict a rule. Source identity uses client metadata or headers, including
+User-Agent product/version; unknown products remain usable as explicit filters.
+Prompt fields are `instructions`, `system`, or `developer`; Gemini's
+`systemInstruction` uses the `system` field filter. Without filters, a rule
+applies globally. The built-in
 memory rules live in
 `context-replacement/shared/codex-memory-edit-instructions.json`.
 Set `AAWM_PROMPT_REPLACEMENT_MANIFEST_DIR` to use another directory of JSON
 manifests. Default discovery checks the repository directory, then the
 installed control-plane package assets. Reload the proxy after editing cached
-rules.
+rules. Claude's compatibility facade and the generic hooks share the same
+manifest and text caches, including the compiled Claude report-file matcher.
+Gemini passthrough envelopes rewrite the selected `custom_body`, preserving
+unselected outer instructions.
 
 The Codex memory rule changes the developer instructions to:
 

@@ -4197,8 +4197,10 @@ async def gemini_proxy_route(
                 # than always taking the outer envelope.
                 if _gemini_custom_body is _gemini_raw_body:
                     _gemini_custom_body = None
+                elif isinstance(_gemini_custom_body.get("custom_body"), dict):
+                    _gemini_custom_body = _gemini_custom_body["custom_body"]
         except Exception:
-            pass
+            verbose_proxy_logger.exception("prompt_replacement: Gemini body hook failed")
     # --- end prompt-replacement hook ---
 
     ## CREATE PASS-THROUGH
@@ -5013,7 +5015,7 @@ async def anthropic_proxy_route(  # noqa: PLR0915
             if prepared_request_body is not request_body:
                 _safe_set_request_parsed_body(request, prepared_request_body)
         except Exception:
-            pass
+            verbose_proxy_logger.exception("prompt_replacement: Anthropic body hook failed")
         # --- end prompt-replacement hook ---
 
         anthropic_auto_agent_alias = _resolve_anthropic_auto_agent_alias_model(

@@ -19,8 +19,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 from litellm._logging import verbose_proxy_logger
+from litellm.integrations.aawm_agent_identity import _parse_client_identity_from_user_agent
 from litellm.proxy.pass_through_endpoints.aawm_request_policy.prompt_replacement_engine import (
     ReplacementRule,
+    _DEFAULT_MANIFEST_CACHE,
     ReplacementResult,
     apply_rules_to_anthropic_request,
     apply_rules_to_chat_completions_messages,
@@ -52,7 +54,7 @@ del _claude_cp_root, _packaged_candidate
 # Shared cache reused across all callers (engine, claude_prompt_replacement,
 # and our hooks).  Owned by the engine owner; we reference it here to avoid
 # a duplicate module-level cache.
-_shared_rule_cache: dict[Path, list[ReplacementRule]] = {}
+_shared_rule_cache = _DEFAULT_MANIFEST_CACHE
 
 
 def _discover_manifest_paths() -> list[Path]:
@@ -113,7 +115,7 @@ def _normalize_tui_family(label: Optional[str]) -> Optional[str]:
     product = label.split("/", 1)[0].strip().lower()
     product = product.replace("-", "").replace("_", "").replace(" ", "")
 
-    if product in ("codex", "codexcli", "codextui"):
+    if product in ("codex", "codexcli", "codextui", "codexclirs"):
         return "codex"
     if product in ("claude", "claudecode"):
         return "claude"
@@ -125,7 +127,7 @@ def _normalize_tui_family(label: Optional[str]) -> Optional[str]:
         return "kimi"
     if product in ("ohmypi", "omp", "ompla"):
         return "ohmypi"
-    return None
+    return label.split("/", 1)[0].strip().lower()
 
 
 def _extract_source_tui(
@@ -150,7 +152,8 @@ def _extract_source_tui(
             if tui:
                 return tui
 
-    return None
+    name, _ = _parse_client_identity_from_user_agent(headers.get("user-agent"))
+    return _normalize_tui_family(name)
 
 
 def _extract_cc_version(
@@ -161,7 +164,7 @@ def _extract_cc_version(
     if isinstance(data, dict):
         metadata = data.get("litellm_metadata") or data.get("metadata")
         if isinstance(metadata, dict):
-            version = metadata.get("client_version")
+            version = metadata.get("client_version") or metadata.get("cc_version")
             if isinstance(version, str) and version.strip():
                 return version.strip()
 
@@ -171,7 +174,8 @@ def _extract_cc_version(
         if isinstance(version, str) and version.strip():
             return version.strip()
 
-    return None
+    _, version = _parse_client_identity_from_user_agent(headers.get("user-agent"))
+    return version
 
 
 def _safe_get_headers(request: Any) -> dict[str, str]:
@@ -261,7 +265,9 @@ def apply_prompt_replacement_to_standard_request(
             "at the configured manifest directory or remove the "
             "AAWM_PROMPT_REPLACEMENT_MANIFEST_DIR override."
         )
-        return data
+        return _merge_replacement_metadata(
+            data, ReplacementResult(failures=[{"id": "manifest-load", "status": "failed", "error": "manifest-load-failed"}]),
+        )
 
     if not rules:
         return data
@@ -337,7 +343,9 @@ def apply_prompt_replacement_to_passthrough_body(
             "at the configured manifest directory or remove the "
             "AAWM_PROMPT_REPLACEMENT_MANIFEST_DIR override."
         )
-        return body
+        return _merge_replacement_metadata(
+            body, ReplacementResult(failures=[{"id": "manifest-load", "status": "failed", "error": "manifest-load-failed"}]),
+        )
 
     if not rules:
         return body
@@ -384,6 +392,12 @@ def apply_prompt_replacement_to_passthrough_body(
         )
         if not result.matched and not result.failures:
             return body
+        nested = updated_body.get("custom_body")
+        if isinstance(nested, dict):
+            updated_body["custom_body"] = _merge_replacement_metadata(
+                nested, result, manifest_paths=manifest_paths,
+            )
+            return updated_body
         return _merge_replacement_metadata(
             updated_body, result, manifest_paths=manifest_paths,
         )
