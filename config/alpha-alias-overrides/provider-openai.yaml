@@ -33,12 +33,3 @@ aliases:
         route_family: codex_responses
         priority: 0
         reasoning_effort: low
-
-  # Nightly-only alias; every session is forced to this model and effort.
-  - name: nightly-sol61
-    candidates:
-      - provider: openai
-        model: gpt-6.1-sol
-        route_family: codex_responses
-        priority: 100
-        reasoning_effort: xhigh
