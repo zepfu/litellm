@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -284,6 +284,11 @@ def load_manifest_document(
     effective_cache = _DEFAULT_MANIFEST_CACHE if cache is None else cache
     cached = effective_cache.get(manifest_path)
     if cached is not None:
+        if isinstance(cached, LoadedManifest) and patterns:
+            for index, rule in enumerate(cached.replacement_rules):
+                pattern = patterns.get(rule.id)
+                if pattern is not None and pattern != rule.before_pattern:
+                    cached.replacement_rules[index] = replace(rule, before_pattern=pattern)
         return cached
     raw = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
@@ -292,7 +297,7 @@ def load_manifest_document(
     rules = _parse_rules_from_manifest(
         raw, legacy_label=str(manifest_path) if legacy else None, patterns=patterns,
     )
-    if legacy:
+    if legacy or ("rules" not in raw and "patches" in raw):
         document = {
             "patches": [{"id": r.id, "before": r.before, "after": r.after} for r in rules],
             "source": raw.get("source"),
