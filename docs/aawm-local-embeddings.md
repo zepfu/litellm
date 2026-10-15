@@ -6,23 +6,30 @@ encoders separate and use the SPECTER-2 adapter service for SPECTER requests.
 
 | LiteLLM alias | Backend | Served model | Dimensions |
 | --- | --- | --- | --- |
-| `specter2-adapter` | Mahaf, port 8086 | `allenai/specter2`, active `[PRX]` adapter | 768 |
-| `tei-medcpt-article` | Mahaf, port 8083 | `tei-medcpt-article` (`ncbi/MedCPT-Article-Encoder`) | 768 |
-| `tei-medcpt-query` | Mahaf, port 8084 | `tei-medcpt-query` (`ncbi/MedCPT-Query-Encoder`) | 768 |
+| `specter2-adapter` | Thoth, `aawm-tap-specter2-adapter-dev:80` | `allenai/specter2`, active `[PRX]` adapter | 768 |
+| `tei-medcpt-article` | Thoth, `aawm-tap-tei-medcpt-article-dev:80` | `tei-medcpt-article` (`ncbi/MedCPT-Article-Encoder`) | 768 |
+| `tei-medcpt-query` | Thoth, `aawm-tap-tei-medcpt-query-dev:80` | `tei-medcpt-query` (`ncbi/MedCPT-Query-Encoder`) | 768 |
 | `nomic-embed-code` | Thoth, `aawm-tap-nomic-code-gguf-dev:8080` | `nomic-embed-code`, Q4_K_M | 3584 |
 | `qwen3-embedding-8b` | Thoth, `aawm-tap-qwen3-embedding-8b-dev:8080` | `qwen3-embedding-8b`, Q4_K_M | 4096 |
 
-Mahaf URLs retain `AAWM_TAP_MODEL_HOST`, normally
-`mahaf.tailf1878c.ts.net`, and the `/v1` suffix. The Thoth URLs use the
-container names above with `/v1`; their host ports 8082 and 8088 are published
-only on `127.0.0.1`. A bridge-networked proxy cannot reach those loopback
-publications merely by using a host-gateway address.
+The three SPECTER/MedCPT services run on Thoth's Intel Arc GPU using TAP's
+`docker-compose.intel-embed.yml`, with restart policy `unless-stopped`.
+MedCPT uses normalized FP16 CLS embeddings; SPECTER retains its FP32 adapter.
+Their host ports are 8086, 8083 and 8084 respectively. All Thoth URLs use the
+container names above with `/v1`; host publications are loopback-only.
+A bridge-networked proxy cannot reach those publications with a host-gateway
+address. Other Mahaf services retain `AAWM_TAP_MODEL_HOST`.
+
+The local Qwen container is intentionally stopped while TAP uses
+`openrouter/qwen/qwen3-embedding-8b`. Its local alias remains configured for
+an explicit future local startup; it is not an active backend.
 
 ## Private Docker connectivity
 
 The affected proxies share the existing `aawm-infrastructure_default` network.
-Attach each Thoth embedding container to that network before loading these
-routes:
+The Intel Compose file declares this external network, so its three services
+join automatically. Attach the existing llama.cpp containers before loading
+their local routes:
 
 ```bash
 docker network connect aawm-infrastructure_default aawm-tap-nomic-code-gguf-dev
@@ -53,12 +60,14 @@ proxy to an implementation worktree.
 
 ## Acceptance evidence
 
-From the affected proxy container, check Mahaf TEI `/info`, SPECTER `/health`,
-and the two Thoth `/v1/models` catalogs. SPECTER's health response identifies
-the active adapter; it does not implement TEI `/info` or `/v1/models`.
-Then send embedding requests through all five LiteLLM aliases using the
+From the affected proxy container, check each Intel service's `/health` and
+Nomic's `/v1/models` catalog. Intel health identifies `device=xpu`, CLS
+pooling, precision, normalization and the active SPECTER adapter. The Intel
+services do not implement TEI `/info` or `/v1/models`.
+Then send embedding requests through the four running local aliases using the
 deployment's supported authentication, and verify each vector is finite and
 has the dimension above. Correlate the request window with the named backend
-container's access logs and runtime model identity. Host-only probes, health
+container's access logs, runtime model identity and
+`x-litellm-model-api-base` response header. Host-only probes, health
 responses, and a successful vector from another model do not establish routed
 acceptance. Keep API credentials out of retained evidence.

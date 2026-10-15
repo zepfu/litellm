@@ -352,7 +352,7 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
    The fork image and model-config archive can contain the code and pricing, but
    prod will not expose the model until the compose-rendered config includes a
    `model_list` entry and the required upstream key is available in `.env`.
-   The eight TAP TEI embedding/rerank routes use the non-secret
+   The remaining Mahaf TAP embedding/rerank routes use the non-secret
    `AAWM_TAP_MODEL_HOST` environment value, defaulting to
    `mahaf.tailf1878c.ts.net`; their ports and route paths are fixed by the
    config template, with `/v1` on embeddings and no `/v1` suffix on the
@@ -369,6 +369,11 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
    proxy's actual configuration bind source before changing a template:
    Thoth's `aawm-litellm` currently loads repository-root
    `litellm-dev-config.yaml` at `/app/litellm-config.yaml`.
+
+   SPECTER2 and both MedCPT encoders also run on Thoth, using private Docker
+   DNS on container port 80. Their three model entries must retain those
+   explicit endpoints rather than inheriting the Mahaf host setting. The local
+   Qwen container remains stopped while TAP uses its OpenRouter route.
 
    Prod error-log mirroring also requires a writable mount from this repo's
    `.analysis` directory to the container path named by

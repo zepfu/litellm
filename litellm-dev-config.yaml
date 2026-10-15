@@ -25,7 +25,7 @@ model_list:
   - model_name: "tei-medcpt-article"
     litellm_params:
       model: "local_embed/tei-medcpt-article"
-      api_base: "http://os.environ/AAWM_TAP_MODEL_HOST:8083/v1"
+      api_base: "http://aawm-tap-tei-medcpt-article-dev:80/v1"
       api_key: "fake-api-key"
     model_info:
       mode: embedding
@@ -35,7 +35,7 @@ model_list:
   - model_name: "tei-medcpt-query"
     litellm_params:
       model: "local_embed/tei-medcpt-query"
-      api_base: "http://os.environ/AAWM_TAP_MODEL_HOST:8084/v1"
+      api_base: "http://aawm-tap-tei-medcpt-query-dev:80/v1"
       api_key: "fake-api-key"
     model_info:
       mode: embedding
@@ -45,7 +45,7 @@ model_list:
   - model_name: "specter2-adapter"
     litellm_params:
       model: "local_embed/allenai/specter2"
-      api_base: "http://os.environ/AAWM_TAP_MODEL_HOST:8086/v1"
+      api_base: "http://aawm-tap-specter2-adapter-dev:80/v1"
       api_key: "fake-api-key"
     model_info:
       mode: embedding

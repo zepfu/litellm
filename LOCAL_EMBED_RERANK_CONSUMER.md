@@ -56,16 +56,19 @@ Consumer-facing model names are LiteLLM aliases. The backing model and service p
 
 Listed costs are estimated commercial-equivalent token prices for local services so LiteLLM spend and AAWM `session_history.response_cost_usd` remain populated.
 
-The eight Mahaf TAP routes use `AAWM_TAP_MODEL_HOST` for their upstream host. It
-defaults to `mahaf.tailf1878c.ts.net` in the checked-in dev configuration and
-can be overridden in the LiteLLM service environment; ports and route paths
-remain fixed per alias.
+The five remaining Mahaf TAP routes use `AAWM_TAP_MODEL_HOST` for their
+upstream host. It defaults to `mahaf.tailf1878c.ts.net` in the checked-in dev
+configuration and can be overridden in the LiteLLM service environment; ports
+and route paths remain fixed per alias.
 
-The two Thoth embedding routes use private Docker DNS. Their host publications
+SPECTER2, both MedCPT encoders, Nomic and local Qwen use private Docker DNS on
+Thoth. SPECTER2 and MedCPT run on Intel Arc with container port 80; the
+llama.cpp services use container port 8080. Their host publications
 remain loopback-only. See [local embedding operations](docs/aawm-local-embeddings.md)
 for backend identities, vector dimensions, deployment connectivity, and
 acceptance checks. The local `qwen3-embedding-8b` alias is separate from
-`openrouter/qwen/qwen3-embedding-8b`.
+`openrouter/qwen/qwen3-embedding-8b`. The local Qwen container is stopped while
+TAP uses the OpenRouter route.
 
 ## Embeddings
 
