@@ -39,10 +39,11 @@ from litellm.proxy.pass_through_endpoints.success_handler import (
 from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
 
 
-def _sse(event_type: str, payload: dict[str, Any]) -> bytes:
+def _sse(event_type: str, payload: dict[str, Any], *, ensure_ascii: bool = True) -> bytes:
     return (
         f"event: {event_type}\ndata: "
-        + json.dumps(payload, separators=(",", ":"))
+        + json.dumps(payload, separators=(",", ":"),
+                     ensure_ascii=ensure_ascii)
         + "\n\n"
     ).encode("utf-8")
 
@@ -4254,150 +4255,181 @@ async def test_stream_read_retry_admits_ordinary_replacement_sends(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# OPENAI-080: replay-safety boundary — Oracle-freeze public-contract specs
-# Oracle REVISE 2026-10-15 (openai080-replay-boundary-20261015)
+# OPENAI-080: replay-safety boundary public-contract specs
 # ---------------------------------------------------------------------------
 
 
+_RSON_REASONING_DELTA = "Let me think\u2026"
+_TOOL_CITY = "\u6771\u4eac"  # 東京
+
+
 @pytest.mark.asyncio
-async def test_peek_safe_reasoning_overload_must_be_retry_eligible():
-    """Oracle §2: schema-defined reasoning_text content is safe.
-
-    Safe lifecycle + reasoning_text.delta + overload must remain private
-    and retry-eligible.  The current parser treats all response.reasoning*
-    events as substantive via prefix matching, so this correctly FAILS
-    until OPENAI-080 reclassifies reasoning per the Oracle allowlist.
-    """
-    created = _sse(
-        "response.created",
-        {"type": "response.created", "response": {
-            "id": "resp_1", "object": "response", "status": "in_progress",
-            "model": "gpt-5.4", "output": []}},
-    )
-    in_progress = _sse(
-        "response.in_progress",
-        {"type": "response.in_progress", "response": {
-            "id": "resp_1", "object": "response", "status": "in_progress",
-            "model": "gpt-5.4", "output": []}},
-    )
-    reasoning = _sse(
-        "response.reasoning_text.delta",
-        {"type": "response.reasoning_text.delta",
-         "item_id": "rsn_1", "output_index": 0, "content_index": 0,
-         "delta": "Let me think\u2026"},
-    )
-    overload_error = _sse(
-        "error",
-        {"type": "error", "error": {
-            "type": "server_error", "code": "server_overloaded",
-            "message": "overloaded"}},
-    )
-    overload_failed = _sse(
-        "response.failed",
-        {"type": "response.failed", "response": {
-            "id": "resp_1", "object": "response", "status": "failed",
-            "model": "gpt-5.4", "output": [],
-            "error": {"type": "server_error", "code": "server_overloaded",
-                      "message": "overloaded"}}},
-    )
-    frames = [created, in_progress, reasoning, overload_error, overload_failed]
-
-    # Coalesced read: every frame in one chunk.
-    coalesced = b"".join(frames)
-    response = _FakeUpstreamStream([coalesced])
-    peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
-        response,
-    )
-    assert failure is not None, (
-        "Oracle §2: safe reasoning prefix + overload must remain retry-eligible; "
-        "current parser commits at reasoning_text.delta (substantive prefix match) "
-        "and returns failure=None"
-    )
+@pytest.mark.parametrize("read_mode", ["coalesced", "utf8_split", "delimiter_split"])
+async def test_peek_safe_reasoning_overload_must_be_retry_eligible(read_mode: str):
+    """Schema-defined reasoning_text content remains private.  Safe lifecycle
+    plus reasoning_text.delta followed by overload must be retry-eligible."""
+    buf = _reasoning_overload_stream_bytes(ensure_ascii=False)
+    chunks = _chunks_for_read_mode(buf, read_mode, _reasoning_delta_utf8_split(buf))
+    response = None
+    peeked = None
+    try:
+        response = _FakeUpstreamStream(chunks)
+        peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+            response,
+            openai_alpha_capacity_retry_enabled=True,
+        )
+    finally:
+        if peeked is not None:
+            await _safe_aclose(peeked)
+    assert failure is not None
     assert failure.error_class is not None
-    replayed = [chunk async for chunk in peeked.aiter_bytes()]
-    assert len(replayed) == 1 and replayed[0] == coalesced
-
-    # Split: cut through the UTF-8 \u2026 (e2 80 a6) in the reasoning delta.
-    # The 3-byte sequence crosses a chunk boundary; logical events are identical.
-    split_point = len(created) + len(in_progress) + len(reasoning) - 2
-    chunk_a = coalesced[:split_point]
-    chunk_b = coalesced[split_point:]
-    response2 = _FakeUpstreamStream([chunk_a, chunk_b])
-    peeked2, failure2 = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
-        response2,
-    )
-    assert failure2 is not None, (
-        "Oracle §2: split read must produce same retry-eligible outcome"
-    )
-    replayed2 = [chunk async for chunk in peeked2.aiter_bytes()]
-    assert b"".join(replayed2) == coalesced
 
 
 @pytest.mark.asyncio
-async def test_peek_failed_with_tool_output_must_veto_replay():
-    """Oracle §3: response.failed with completed tool data in response.output
-    commits before failure classification.  The attempt cannot be retried.
+@pytest.mark.parametrize("read_mode", ["coalesced", "utf8_split", "delimiter_split"])
+async def test_peek_failed_with_tool_output_must_veto_replay(read_mode: str):
+    """response.failed with completed tool data in response.output commits
+    before failure classification; the attempt cannot be retried."""
+    buf = _tool_failed_stream_bytes(ensure_ascii=False)
+    chunks = _chunks_for_read_mode(buf, read_mode, _tool_utf8_split(buf))
+    response = _FakeUpstreamStream(chunks)
+    peeked = None
+    try:
+        peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+            response,
+            openai_alpha_capacity_retry_enabled=True,
+        )
+        assert failure is None
+        replayed = b"".join([chunk async for chunk in peeked.aiter_bytes()])
+        assert replayed == buf
+    finally:
+        if peeked is not None:
+            await _safe_aclose(peeked)
 
-    The current parser extracts the error payload from response.failed before
-    evaluating response.output, so this correctly FAILS until OPENAI-080
-    implements safety-before-classification (§3).
-    """
-    created = _sse(
-        "response.created",
-        {"type": "response.created", "response": {
-            "id": "resp_1", "object": "response", "status": "in_progress",
-            "model": "gpt-5.4", "output": []}},
-    )
-    in_progress = _sse(
-        "response.in_progress",
-        {"type": "response.in_progress", "response": {
-            "id": "resp_1", "object": "response", "status": "in_progress",
-            "model": "gpt-5.4", "output": []}},
-    )
-    failed_with_tool = _sse(
-        "response.failed",
-        {"type": "response.failed", "response": {
-            "id": "resp_1", "object": "response", "status": "failed",
-            "model": "gpt-5.4",
-            "output": [{
-                "id": "fc_1", "type": "function_call", "call_id": "call_1",
-                "name": "get_weather",
-                "arguments": '{"city":"\u6771\u4eac"}',
-                "status": "completed",
-            }],
-            "error": {"type": "server_error", "code": "server_overloaded",
-                      "message": "overloaded"}},
-        },
-    )
-    frames = [created, in_progress, failed_with_tool]
 
-    # Coalesced read.
-    coalesced = b"".join(frames)
-    response = _FakeUpstreamStream([coalesced])
-    peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
-        response,
-    )
-    assert failure is None, (
-        "Oracle §3: response.failed with completed tool output must veto replay; "
-        "current parser extracts error before evaluating response.output and "
-        "returns a failure object (incorrectly retry-eligible)"
-    )
-    replayed = [chunk async for chunk in peeked.aiter_bytes()]
-    assert len(replayed) == 1 and replayed[0] == coalesced
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    # Split: cut through the UTF-8 東京 (e6 9d b1 e4 ba ac) inside the
-    # response.failed payload.  Logical events are identical.
-    # Split after the second byte of 東 (e6 9d).
-    n_before_tokyo = coalesced.index("\u6771".encode("utf-8"))
-    split_point = n_before_tokyo + 1  # cut inside 東
-    chunk_a = coalesced[:split_point]
-    chunk_b = coalesced[split_point:]
-    response2 = _FakeUpstreamStream([chunk_a, chunk_b])
-    peeked2, failure2 = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
-        response2,
-    )
-    assert failure2 is None, (
-        "Oracle §3: split read must produce same veto-replay outcome"
-    )
-    replayed2 = [chunk async for chunk in peeked2.aiter_bytes()]
-    assert b"".join(replayed2) == coalesced
+
+def _reasoning_overload_stream_bytes(*, ensure_ascii: bool) -> bytes:
+    return b"".join([
+        _sse(
+            "response.created",
+            {"type": "response.created", "response": {
+                "id": "resp_1", "object": "response", "status": "in_progress",
+                "model": "gpt-5.4", "output": []}},
+            ensure_ascii=ensure_ascii,
+        ),
+        _sse(
+            "response.in_progress",
+            {"type": "response.in_progress", "response": {
+                "id": "resp_1", "object": "response", "status": "in_progress",
+                "model": "gpt-5.4", "output": []}},
+            ensure_ascii=ensure_ascii,
+        ),
+        _sse(
+            "response.output_item.added",
+            {"type": "response.output_item.added",
+             "item": {"id": "rsn_1", "type": "reasoning",
+                      "status": "in_progress", "summary": [],
+                      "content": []},
+             "output_index": 0},
+            ensure_ascii=ensure_ascii,
+        ),
+        _sse(
+            "response.reasoning_text.delta",
+            {"type": "response.reasoning_text.delta",
+             "item_id": "rsn_1", "output_index": 0, "content_index": 0,
+             "delta": _RSON_REASONING_DELTA},
+            ensure_ascii=ensure_ascii,
+        ),
+        _sse(
+            "error",
+            {"type": "error",
+             "error": {"type": "server_error", "code": "server_overloaded",
+                       "message": "overloaded"}},
+            ensure_ascii=ensure_ascii,
+        ),
+        _sse(
+            "response.failed",
+            {"type": "response.failed", "response": {
+                "id": "resp_1", "object": "response", "status": "failed",
+                "model": "gpt-5.4", "output": [],
+                "error": {"type": "server_error", "code": "server_overloaded",
+                          "message": "overloaded"}}},
+            ensure_ascii=ensure_ascii,
+        ),
+    ])
+
+
+def _tool_failed_stream_bytes(*, ensure_ascii: bool) -> bytes:
+    return b"".join([
+        _sse(
+            "response.created",
+            {"type": "response.created", "response": {
+                "id": "resp_1", "object": "response", "status": "in_progress",
+                "model": "gpt-5.4", "output": []}},
+            ensure_ascii=ensure_ascii,
+        ),
+        _sse(
+            "response.in_progress",
+            {"type": "response.in_progress", "response": {
+                "id": "resp_1", "object": "response", "status": "in_progress",
+                "model": "gpt-5.4", "output": []}},
+            ensure_ascii=ensure_ascii,
+        ),
+        _sse(
+            "response.failed",
+            {"type": "response.failed", "response": {
+                "id": "resp_1", "object": "response", "status": "failed",
+                "model": "gpt-5.4",
+                "output": [{
+                    "id": "fc_1", "type": "function_call",
+                    "call_id": "call_1", "name": "get_weather",
+                    "arguments": '{"city":"%s"}' % _TOOL_CITY,
+                    "status": "completed",
+                }],
+                "error": {"type": "server_error",
+                          "code": "server_overloaded",
+                          "message": "overloaded"}}},
+            ensure_ascii=ensure_ascii,
+        ),
+    ])
+
+
+def _reasoning_delta_utf8_split(buf: bytes) -> int:
+    """Split inside the UTF-8 encoding of \u2026 (e2 80 a6) in the reasoning delta."""
+    ellipsis = _RSON_REASONING_DELTA.encode("utf-8")
+    needle = ellipsis[ellipsis.find(b"\xe2\x80\xa6"):][:1]
+    offset = buf.find(needle)
+    assert offset >= 0, "\u2026 byte not found in reasoning stream"
+    return offset + 1
+
+
+def _tool_utf8_split(buf: bytes) -> int:
+    """Split inside the UTF-8 encoding of \u6771 (e6 9d b1) in tool arguments."""
+    offset = buf.find("\u6771".encode("utf-8"))
+    assert offset >= 0, "\u6771 byte not found in tool-failed stream"
+    return offset + 1
+
+
+def _chunks_for_read_mode(
+    buf: bytes, read_mode: str, utf8_split: int,
+) -> list[bytes]:
+    if read_mode == "coalesced":
+        return [buf]
+    if read_mode == "utf8_split":
+        return [buf[:utf8_split], buf[utf8_split:]]
+    if read_mode == "delimiter_split":
+        second_sse = buf.find(b"\n\n", buf.find(b"\n\n") + 2)
+        return [buf[: second_sse + 2], buf[second_sse + 2 :]]
+    raise ValueError(f"unknown read_mode: {read_mode}")
+
+
+async def _safe_aclose(peeked) -> None:
+    aclose = getattr(peeked, "aclose", None)
+    if callable(aclose):
+        result = aclose()
+        if hasattr(result, "__await__"):
+            await result
