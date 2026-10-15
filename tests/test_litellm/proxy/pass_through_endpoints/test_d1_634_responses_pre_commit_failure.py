@@ -4252,278 +4252,152 @@ async def test_stream_read_retry_admits_ordinary_replacement_sends(monkeypatch):
     coordinator.sleep_with_wakeup.assert_not_called()
     coordinator.record_retry.assert_not_called()
 
-# ---------------------------------------------------------------------------
-# OPENAI-080: replay-safety boundary tests (Oracle freeze 2026-10-15)
-#
-# Public-contract cases against the frozen Oracle REVISE policy.  Tests that
-# require the not-yet-delivered OPENAI-048 parse-once owner (payload-aware
-# event classification, hard retention bounds, shared ownership) cannot be
-# written against this baseline and are noted as blocked.
-# ---------------------------------------------------------------------------
-
-from litellm.proxy.pass_through_endpoints.streaming_handler import (
-    _ResponsesPreCommitPrefixStore,
-    _ResponsesPreCommitSSEParser,
-)
-
 
 # ---------------------------------------------------------------------------
-# Streaming peek: ordered-commit boundary (Oracle §3)
+# OPENAI-080: replay-safety boundary — Oracle-freeze public-contract specs
+# Oracle REVISE 2026-10-15 (openai080-replay-boundary-20261015)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_peek_text_then_overload_in_same_stream_commits_at_text():
-    """Oracle §3: safe prefix + text + overload in one read commits at text,
-    no retry.  The incremental parser encounters text first and returns None
-    (committed), ignoring the trailing overload frames.
+async def test_peek_safe_reasoning_overload_must_be_retry_eligible():
+    """Oracle §2: schema-defined reasoning_text content is safe.
 
-    Exercises the real peek_responses_pre_commit_stream path with a mixed
-    safe/unsafe/overload stream."""
-    chunks = [
-        _sse(
-            "response.created",
-            {"type": "response.created", "response": {
-                "id": "resp_1", "object": "response", "status": "in_progress",
-                "model": "gpt-5.4", "output": []}},
-        ),
-        _sse(
-            "response.in_progress",
-            {"type": "response.in_progress", "response": {
-                "id": "resp_1", "object": "response", "status": "in_progress",
-                "model": "gpt-5.4", "output": []}},
-        ),
-        _sse(
-            "response.output_text.delta",
-            {"type": "response.output_text.delta", "item_id": "msg_1",
-             "output_index": 0, "content_index": 0, "delta": "Hello"},
-        ),
-        _sse(
-            "error",
-            {"type": "error", "error": {
-                "type": "server_error", "code": "server_overloaded",
-                "message": "overloaded"}},
-        ),
-        _sse(
-            "response.failed",
-            {"type": "response.failed", "response": {
-                "id": "resp_1", "object": "response", "status": "failed",
-                "model": "gpt-5.4", "output": [],
-                "error": {"type": "server_error", "code": "server_overloaded",
-                          "message": "overloaded"}}},
-        ),
-    ]
-    response = _FakeUpstreamStream(chunks)
-    peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
-        response
-    )
-    # Committed at text; no failure to retry.
-    assert failure is None
-    replayed = [chunk async for chunk in peeked.aiter_bytes()]
-    assert replayed == chunks
-
-
-@pytest.mark.asyncio
-async def test_peek_safe_lifecycle_then_completed_commits():
-    """Oracle §4: safe lifecycle then response.completed commits (successful_terminal
-    reason).  Peek returns None and replays the full prefix."""
-    chunks = [
-        _sse(
-            "response.created",
-            {"type": "response.created", "response": {
-                "id": "resp_1", "object": "response", "status": "in_progress",
-                "model": "gpt-5.4", "output": []}},
-        ),
-        _sse(
-            "response.in_progress",
-            {"type": "response.in_progress", "response": {
-                "id": "resp_1", "object": "response", "status": "in_progress",
-                "model": "gpt-5.4", "output": []}},
-        ),
-        _sse(
-            "response.completed",
-            {"type": "response.completed", "response": {
-                "id": "resp_1", "object": "response", "status": "completed",
-                "model": "gpt-5.4", "output": []}},
-        ),
-    ]
-    response = _FakeUpstreamStream(chunks)
-    peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
-        response
-    )
-    assert failure is None
-    replayed = [chunk async for chunk in peeked.aiter_bytes()]
-    assert replayed == chunks
-
-
-# ---------------------------------------------------------------------------
-# Batch inspect: committed-terminal contract (Oracle §4)
-# ---------------------------------------------------------------------------
-
-
-def test_inspect_completed_commits_without_text():
-    """Oracle §4: response.completed alone commits without preceding text deltas.
-    The inspect function returns 'substantive' for response.completed."""
-    chunks = [
-        _sse(
-            "response.created",
-            {"type": "response.created", "response": {
-                "id": "resp_1", "object": "response", "status": "in_progress",
-                "model": "gpt-5.4", "output": []}},
-        ),
-        _sse(
-            "response.completed",
-            {"type": "response.completed", "response": {
-                "id": "resp_1", "object": "response", "status": "completed",
-                "model": "gpt-5.4", "output": []}},
-        ),
-    ]
-    decision, error_payload, event_type = (
-        PassThroughStreamingHandler._inspect_responses_pre_commit_chunks(chunks)
-    )
-    assert decision == "substantive"
-    assert error_payload is None
-    assert event_type == "response.completed"
-
-
-def test_inspect_completed_with_reasoning_output_commits():
-    """Oracle §4: response.completed with reasoning-only output commits.
-    Output in the terminal snapshot (no earlier delta) is real output."""
-    chunks = [
-        _sse(
-            "response.created",
-            {"type": "response.created", "response": {
-                "id": "resp_1", "object": "response", "status": "in_progress",
-                "model": "gpt-5.4", "output": []}},
-        ),
-        _sse(
-            "response.completed",
-            {"type": "response.completed", "response": {
-                "id": "resp_1", "object": "response", "status": "completed",
-                "model": "gpt-5.4",
-                "output": [{"id": "rsn_1", "type": "reasoning",
-                            "status": "completed", "summary": [],
-                            "content": [{"type": "reasoning_text",
-                                         "text": "The answer is 42."}]}]}},
-        ),
-    ]
-    decision, error_payload, event_type = (
-        PassThroughStreamingHandler._inspect_responses_pre_commit_chunks(chunks)
-    )
-    assert decision == "substantive"
-    assert error_payload is None
-    assert event_type == "response.completed"
-
-
-# ---------------------------------------------------------------------------
-# Chunk-invariant: same stream, different boundaries (Oracle §4)
-# ---------------------------------------------------------------------------
-
-
-def test_inspect_same_stream_split_vs_coalesced_same_decision():
-    """Oracle §4: classification is independent of transport chunk boundaries.
-    Same logical SSE stream, once coalesced and once split mid-frame, produces
-    identical decision."""
-    chunks = [
-        _sse(
-            "response.created",
-            {"type": "response.created", "response": {
-                "id": "resp_1", "object": "response", "status": "in_progress",
-                "model": "gpt-5.4", "output": []}},
-        ),
-        _sse(
-            "response.in_progress",
-            {"type": "response.in_progress", "response": {
-                "id": "resp_1", "object": "response", "status": "in_progress",
-                "model": "gpt-5.4", "output": []}},
-        ),
-        _sse(
-            "error",
-            {"type": "error", "error": {
-                "type": "server_error", "code": "server_overloaded",
-                "message": "overloaded"}},
-        ),
-        _sse(
-            "response.failed",
-            {"type": "response.failed", "response": {
-                "id": "resp_1", "object": "response", "status": "failed",
-                "model": "gpt-5.4", "output": [],
-                "error": {"type": "server_error", "code": "server_overloaded",
-                          "message": "overloaded"}}},
-        ),
-    ]
-    decision_coalesced, ep_c, et_c = (
-        PassThroughStreamingHandler._inspect_responses_pre_commit_chunks(chunks)
-    )
-    split_chunks: list[bytes] = []
-    for chunk in chunks:
-        mid = max(1, len(chunk) // 2)
-        split_chunks.append(chunk[:mid])
-        split_chunks.append(chunk[mid:])
-    decision_split, ep_s, et_s = (
-        PassThroughStreamingHandler._inspect_responses_pre_commit_chunks(split_chunks)
-    )
-    assert decision_coalesced == decision_split
-    if ep_c is None:
-        assert ep_s is None
-    assert et_c == et_s
-
-
-def test_inspect_utf8_boundary_split_preserves_classification():
-    """A UTF-8 multi-byte tail split mid-codepoint does not change classification
-    for a pure-lifecycle stream."""
-    complete = _sse(
+    Safe lifecycle + reasoning_text.delta + overload must remain private
+    and retry-eligible.  The current parser treats all response.reasoning*
+    events as substantive via prefix matching, so this correctly FAILS
+    until OPENAI-080 reclassifies reasoning per the Oracle allowlist.
+    """
+    created = _sse(
         "response.created",
         {"type": "response.created", "response": {
             "id": "resp_1", "object": "response", "status": "in_progress",
             "model": "gpt-5.4", "output": []}},
     )
-    chunks = [complete[:-1], complete[-1:]]
-    decision, error_payload, event_type = (
-        PassThroughStreamingHandler._inspect_responses_pre_commit_chunks(chunks)
+    in_progress = _sse(
+        "response.in_progress",
+        {"type": "response.in_progress", "response": {
+            "id": "resp_1", "object": "response", "status": "in_progress",
+            "model": "gpt-5.4", "output": []}},
     )
-    assert decision == "lifecycle"
-    assert error_payload is None
-    assert event_type is None
+    reasoning = _sse(
+        "response.reasoning_text.delta",
+        {"type": "response.reasoning_text.delta",
+         "item_id": "rsn_1", "output_index": 0, "content_index": 0,
+         "delta": "Let me think\u2026"},
+    )
+    overload_error = _sse(
+        "error",
+        {"type": "error", "error": {
+            "type": "server_error", "code": "server_overloaded",
+            "message": "overloaded"}},
+    )
+    overload_failed = _sse(
+        "response.failed",
+        {"type": "response.failed", "response": {
+            "id": "resp_1", "object": "response", "status": "failed",
+            "model": "gpt-5.4", "output": [],
+            "error": {"type": "server_error", "code": "server_overloaded",
+                      "message": "overloaded"}}},
+    )
+    frames = [created, in_progress, reasoning, overload_error, overload_failed]
+
+    # Coalesced read: every frame in one chunk.
+    coalesced = b"".join(frames)
+    response = _FakeUpstreamStream([coalesced])
+    peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+        response,
+    )
+    assert failure is not None, (
+        "Oracle §2: safe reasoning prefix + overload must remain retry-eligible; "
+        "current parser commits at reasoning_text.delta (substantive prefix match) "
+        "and returns failure=None"
+    )
+    assert failure.error_class is not None
+    replayed = [chunk async for chunk in peeked.aiter_bytes()]
+    assert len(replayed) == 1 and replayed[0] == coalesced
+
+    # Split: cut through the UTF-8 \u2026 (e2 80 a6) in the reasoning delta.
+    # The 3-byte sequence crosses a chunk boundary; logical events are identical.
+    split_point = len(created) + len(in_progress) + len(reasoning) - 2
+    chunk_a = coalesced[:split_point]
+    chunk_b = coalesced[split_point:]
+    response2 = _FakeUpstreamStream([chunk_a, chunk_b])
+    peeked2, failure2 = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+        response2,
+    )
+    assert failure2 is not None, (
+        "Oracle §2: split read must produce same retry-eligible outcome"
+    )
+    replayed2 = [chunk async for chunk in peeked2.aiter_bytes()]
+    assert b"".join(replayed2) == coalesced
 
 
-# ---------------------------------------------------------------------------
-# OPENAI-080 remaining approved cases: blocked on OPENAI-048
-# ---------------------------------------------------------------------------
-#
-# The following Oracle-frozen behaviors require the not-yet-delivered
-# OPENAI-048 parse-once event owner and cannot be exercised against this
-# baseline through any public entrypoint:
-#
-# 1. Safe reasoning-text/empty-tool-header classification (§2):
-#    Payload-aware event inspection distinguishing schema-defined reasoning
-#    text from other response.reasoning* events, and empty-arguments
-#    function_call/custom_tool_call headers from payload-bearing ones.
-#    Current parser treats all response.reasoning* and response.output_item*
-#    as substantive via prefix matching.
-#
-# 2. Safety-before-classification for response.failed with tool output (§3):
-#    Inspecting response.output for completed tool data before extracting
-#    the error payload.  Current _extract_responses_stream_error_payload
-#    runs before semantic output inspection.
-#
-# 3. Hard prefix/event retention bounds with accepted-prefix release (§4):
-#    The current _ResponsesPreCommitPrefixStore has a SpooledTemporaryFile
-#    memory threshold (64 KiB), not a hard admission limit.  No event-count
-#    bound exists.  No accepted-prefix-on-exhaustion path.
-#
-# 4. Monotonic replay-commit latch across sends (§3):
-#    No per-request latch consulted by every internal resend path exists yet.
-#
-# 5. Bare-DONE success contract (§4):
-#    The current peek ignores [DONE] frames; a DONE-only stream enters the
-#    missing-terminal failure path.  No terminal owner provides the required
-#    done-only behavior.
-#
-# 6. Provider-execution-possible commitment at dispatch (§2-§3):
-#    No per-send effective-capability input exists to conditionally commit
-#    at dispatch for opaque route-injected capabilities.
-#
-# Two-send recovery tests (exactly 2 provider sends, zero failed-attempt
-# events in client output) also require the not-yet-implemented OPENAI-080
-# data plane; the current peek only classifies, it does not orchestrate retry.
+@pytest.mark.asyncio
+async def test_peek_failed_with_tool_output_must_veto_replay():
+    """Oracle §3: response.failed with completed tool data in response.output
+    commits before failure classification.  The attempt cannot be retried.
+
+    The current parser extracts the error payload from response.failed before
+    evaluating response.output, so this correctly FAILS until OPENAI-080
+    implements safety-before-classification (§3).
+    """
+    created = _sse(
+        "response.created",
+        {"type": "response.created", "response": {
+            "id": "resp_1", "object": "response", "status": "in_progress",
+            "model": "gpt-5.4", "output": []}},
+    )
+    in_progress = _sse(
+        "response.in_progress",
+        {"type": "response.in_progress", "response": {
+            "id": "resp_1", "object": "response", "status": "in_progress",
+            "model": "gpt-5.4", "output": []}},
+    )
+    failed_with_tool = _sse(
+        "response.failed",
+        {"type": "response.failed", "response": {
+            "id": "resp_1", "object": "response", "status": "failed",
+            "model": "gpt-5.4",
+            "output": [{
+                "id": "fc_1", "type": "function_call", "call_id": "call_1",
+                "name": "get_weather",
+                "arguments": '{"city":"\u6771\u4eac"}',
+                "status": "completed",
+            }],
+            "error": {"type": "server_error", "code": "server_overloaded",
+                      "message": "overloaded"}},
+        },
+    )
+    frames = [created, in_progress, failed_with_tool]
+
+    # Coalesced read.
+    coalesced = b"".join(frames)
+    response = _FakeUpstreamStream([coalesced])
+    peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+        response,
+    )
+    assert failure is None, (
+        "Oracle §3: response.failed with completed tool output must veto replay; "
+        "current parser extracts error before evaluating response.output and "
+        "returns a failure object (incorrectly retry-eligible)"
+    )
+    replayed = [chunk async for chunk in peeked.aiter_bytes()]
+    assert len(replayed) == 1 and replayed[0] == coalesced
+
+    # Split: cut through the UTF-8 東京 (e6 9d b1 e4 ba ac) inside the
+    # response.failed payload.  Logical events are identical.
+    # Split after the second byte of 東 (e6 9d).
+    n_before_tokyo = coalesced.index("\u6771".encode("utf-8"))
+    split_point = n_before_tokyo + 1  # cut inside 東
+    chunk_a = coalesced[:split_point]
+    chunk_b = coalesced[split_point:]
+    response2 = _FakeUpstreamStream([chunk_a, chunk_b])
+    peeked2, failure2 = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+        response2,
+    )
+    assert failure2 is None, (
+        "Oracle §3: split read must produce same veto-replay outcome"
+    )
+    replayed2 = [chunk async for chunk in peeked2.aiter_bytes()]
+    assert b"".join(replayed2) == coalesced
