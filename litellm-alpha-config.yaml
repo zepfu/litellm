@@ -26,8 +26,8 @@ model_list:
       output_cost_per_token: 0.0
   - model_name: "tei-medcpt-article"
     litellm_params:
-      model: "local_embed/ncbi/MedCPT-Article-Encoder"
-      api_base: "http://os.environ/AAWM_TAP_MODEL_HOST:8083/v1"
+      model: "local_embed/tei-medcpt-article"
+      api_base: "http://aawm-tap-tei-medcpt-article-dev:80/v1"
       api_key: "fake-api-key"
     model_info:
       mode: embedding
@@ -36,8 +36,8 @@ model_list:
       output_cost_per_token: 0.0
   - model_name: "tei-medcpt-query"
     litellm_params:
-      model: "local_embed/ncbi/MedCPT-Query-Encoder"
-      api_base: "http://os.environ/AAWM_TAP_MODEL_HOST:8084/v1"
+      model: "local_embed/tei-medcpt-query"
+      api_base: "http://aawm-tap-tei-medcpt-query-dev:80/v1"
       api_key: "fake-api-key"
     model_info:
       mode: embedding
@@ -46,8 +46,8 @@ model_list:
       output_cost_per_token: 0.0
   - model_name: "specter2-adapter"
     litellm_params:
-      model: "local_embed/allenai/specter2_base"
-      api_base: "http://os.environ/AAWM_TAP_MODEL_HOST:8086/v1"
+      model: "local_embed/allenai/specter2"
+      api_base: "http://aawm-tap-specter2-adapter-dev:80/v1"
       api_key: "fake-api-key"
     model_info:
       mode: embedding
@@ -96,14 +96,24 @@ model_list:
       output_cost_per_token: 0.0
   - model_name: "nomic-embed-code"
     litellm_params:
-      model: "local_embed/nomic-embed-code.Q8_0.gguf"
-      api_base: "http://172.20.0.1:8082/v1"
+      model: "local_embed/nomic-embed-code"
+      api_base: "http://aawm-tap-nomic-code-gguf-dev:8080/v1"
       api_key: "fake-api-key"
     model_info:
       mode: embedding
-      base_model: "nomic-embed-code.Q8_0.gguf"
+      base_model: "nomic-embed-code"
       input_cost_per_token: 1.5e-07
       output_cost_per_token: 0.0
+      output_vector_size: 3584
+  - model_name: "qwen3-embedding-8b"
+    litellm_params:
+      model: "local_embed/qwen3-embedding-8b"
+      api_base: "http://aawm-tap-qwen3-embedding-8b-dev:8080/v1"
+      api_key: "fake-api-key"
+    model_info:
+      mode: embedding
+      base_model: "qwen3-embedding-8b"
+      output_vector_size: 4096
   - model_name: "tei-reranker"
     litellm_params:
       model: "local_rerank/BAAI/bge-reranker-v2-m3"

@@ -25,6 +25,11 @@ from typing import (
 
 from starlette.responses import Response, StreamingResponse
 
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+    PARSED_RESPONSES_EVENTS_ATTR,
+    responses_emissions_from_chunk,
+)
+
 
 _POLICY_FAILURE_VALUE_MAX_LENGTH = 128
 
@@ -878,16 +883,48 @@ class OpenAIResponsesWireCoordinator:
             async for raw_chunk in self._source_iterator:
                 if not raw_chunk:
                     continue
-                self._buffer += (
+                chunk = (
                     raw_chunk.encode("utf-8")
                     if isinstance(raw_chunk, str)
                     else bytes(raw_chunk)
                 )
-                blocks, self._buffer = _split_sse_blocks(self._buffer)
-                for block in blocks:
-                    event_type, payload, saw_done, malformed = _parse_sse_block(
-                        block, allow_response_done=self._allow_response_done
+                parsed_events = getattr(raw_chunk, PARSED_RESPONSES_EVENTS_ATTR, None)
+                typed_events = parsed_events if isinstance(parsed_events, list) else []
+                if typed_events:
+                    chunk = b""
+                    block = b""
+                    self._buffer = b""
+                else:
+                    self._buffer += chunk
+                    blocks, self._buffer = _split_sse_blocks(self._buffer)
+                for event_index, block in enumerate(
+                    typed_events or blocks
+                ):
+                    event = (
+                        typed_events[event_index]
+                        if typed_events
+                        else None
                     )
+                    emission = None
+                    if event is not None:
+                        emissions = responses_emissions_from_chunk(raw_chunk)
+                        emission = (
+                            emissions[event_index]
+                            if emissions is not None and event_index < len(emissions)
+                            else None
+                        )
+                        event_type = event.event_type
+                        payload = (
+                            emission.effective_payload
+                            if emission is not None
+                            else event.payload
+                        )
+                        saw_done = event.is_done_marker
+                        malformed = event.is_malformed
+                    else:
+                        event_type, payload, saw_done, malformed = _parse_sse_block(
+                            block, allow_response_done=self._allow_response_done
+                        )
                     if self.trace.terminal_selected:
                         if _terminal_disposition(
                             event_type,
@@ -898,6 +935,11 @@ class OpenAIResponsesWireCoordinator:
                         if saw_done:
                             self.trace.upstream_done_suppressed += 1
                         continue
+                    wire_bytes = (
+                        emission.wire_bytes
+                        if emission is not None
+                        else block
+                    )
                     if malformed:
                         self.trace.metadata["malformed_frame"] = True
                         async for emitted in self._emit_synthetic_terminal(
@@ -935,7 +977,7 @@ class OpenAIResponsesWireCoordinator:
                             self.trace.partial_frame_discarded = True
                         terminal_block, partial_prefix_discarded = (
                             _terminal_block_suffix(
-                                block,
+                                wire_bytes,
                                 event_type=event_type,
                             )
                         )
@@ -1005,7 +1047,7 @@ class OpenAIResponsesWireCoordinator:
                         ):
                             yield emitted
                         return
-                    yield block
+                    yield wire_bytes
 
             self._discard_partial_buffer()
             if not self.trace.terminal_selected:

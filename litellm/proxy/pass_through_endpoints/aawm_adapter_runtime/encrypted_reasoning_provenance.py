@@ -47,6 +47,7 @@ OPENAI-007 remains sole function_call id/call_id owner.
 from __future__ import annotations
 
 import base64
+import copy
 import json
 from typing import Any, Mapping, MutableMapping, Optional, Sequence
 
@@ -54,6 +55,11 @@ from fastapi import HTTPException
 
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
     normalize_codex_collaboration_dispatch_body,
+)
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+    ParsedResponsesEvent,
+    attach_responses_emissions,
+    responses_emissions_from_chunk,
 )
 
 # Exact compatibility source used by the guard and tests.
@@ -1200,6 +1206,76 @@ def should_strip_encrypted_function_output_without_plaintext(
     )
 
 
+def _sanitize_encrypted_function_output_item(
+    item: dict[str, Any],
+    *,
+    encrypted: Any,
+    original: Any,
+    strip_ciphertext_without_plaintext: bool,
+) -> tuple[dict[str, Any], int, int, int]:
+    """Sanitize one ciphertext-bearing item in place and return counts.
+
+    The count tuple is ``(stripped, unwrapped, changed)``. The caller owns
+    aggregate bookkeeping; mutating both the original and shallow copy here
+    prevents pass-through serialization from resurrecting ciphertext.
+    """
+    clean_item = dict(item)
+    has_plaintext = _function_call_output_has_plaintext(clean_item)
+    should_strip_nested = has_plaintext or strip_ciphertext_without_plaintext
+    if should_strip_nested:
+        nested_output, nested_changed = _strip_nested_encrypted_function_output(
+            clean_item.get("output")
+        )
+        if nested_changed:
+            clean_item["output"] = nested_output
+            item["output"] = nested_output
+        changed = nested_changed
+        stripped_count = int(nested_changed)
+        unwrapped_count = 0
+    else:
+        nested_output, nested_changed = _unwrap_nested_encrypted_function_output(
+            clean_item.get("output")
+        )
+        if nested_changed:
+            clean_item["output"] = nested_output
+            item["output"] = nested_output
+        changed = nested_changed
+        stripped_count = 0
+        unwrapped_count = int(nested_changed)
+
+    if has_plaintext:
+        if "encrypted_content" in clean_item or "encrypted_content" in item:
+            clean_item.pop("encrypted_content", None)
+            item.pop("encrypted_content", None)
+            stripped_count += 1
+            changed = True
+        return clean_item, stripped_count, unwrapped_count, changed
+
+    if strip_ciphertext_without_plaintext:
+        if "encrypted_content" in clean_item or "encrypted_content" in item:
+            clean_item.pop("encrypted_content", None)
+            item.pop("encrypted_content", None)
+            stripped_count += 1
+            changed = True
+        if not _function_call_output_has_plaintext(clean_item) and not (
+            _function_call_output_has_supported_output_part(clean_item.get("output"))
+        ):
+            # No supported plaintext or structured output remains after
+            # sanitization. Preserve the call ID with the same harmless
+            # placeholder.
+            clean_item["output"] = ""
+            item["output"] = ""
+            changed = True
+        return clean_item, stripped_count, unwrapped_count, changed
+
+    if isinstance(original, str) and original != encrypted:
+        clean_item["encrypted_content"] = original
+        item["encrypted_content"] = original
+        unwrapped_count += 1
+        changed = True
+    return clean_item, stripped_count, unwrapped_count, changed
+
+
 def prepare_encrypted_function_output_items_for_openai_egress(
     request_body: Mapping[str, Any] | dict[str, Any],
     *,
@@ -1284,62 +1360,19 @@ def prepare_encrypted_function_output_items_for_openai_egress(
             if isinstance(encrypted, str)
             else encrypted
         )
-        clean_item = dict(item)
-
-        has_plaintext = _function_call_output_has_plaintext(clean_item)
-        should_strip_nested = has_plaintext or strip_ciphertext_without_plaintext
-        if should_strip_nested:
-            nested_output, nested_changed = _strip_nested_encrypted_function_output(
-                clean_item.get("output")
+        clean_item, stripped_delta, unwrapped_delta, item_changed = (
+            _sanitize_encrypted_function_output_item(
+                item,
+                encrypted=encrypted,
+                original=original,
+                strip_ciphertext_without_plaintext=(
+                    strip_ciphertext_without_plaintext
+                ),
             )
-            if nested_changed:
-                clean_item["output"] = nested_output
-                item["output"] = nested_output
-                changed = True
-                stripped_count += 1
-        else:
-            nested_output, nested_changed = _unwrap_nested_encrypted_function_output(
-                clean_item.get("output")
-            )
-            if nested_changed:
-                clean_item["output"] = nested_output
-                item["output"] = nested_output
-                unwrapped_count += 1
-                changed = True
-
-        if has_plaintext:
-            if "encrypted_content" in clean_item or "encrypted_content" in item:
-                clean_item.pop("encrypted_content", None)
-                item.pop("encrypted_content", None)
-                stripped_count += 1
-                changed = True
-            normalized_input.append(clean_item)
-            continue
-
-        if strip_ciphertext_without_plaintext:
-            if "encrypted_content" in clean_item or "encrypted_content" in item:
-                clean_item.pop("encrypted_content", None)
-                item.pop("encrypted_content", None)
-                stripped_count += 1
-                changed = True
-            if not _function_call_output_has_plaintext(clean_item) and not (
-                _function_call_output_has_supported_output_part(
-                    clean_item.get("output")
-                )
-            ):
-                # No supported plaintext or structured output remains after
-                # sanitization. Preserve the call ID with the same harmless
-                # placeholder.
-                clean_item["output"] = ""
-                item["output"] = ""
-                changed = True
-            normalized_input.append(clean_item)
-            continue
-
-        if isinstance(original, str) and original != encrypted:
-            clean_item["encrypted_content"] = original
-            item["encrypted_content"] = original
-            unwrapped_count += 1
+        )
+        stripped_count += stripped_delta
+        unwrapped_count += unwrapped_delta
+        if item_changed:
             changed = True
         normalized_input.append(clean_item)
 
@@ -1757,13 +1790,14 @@ def is_openai_responses_egress(
 
 
 
-def stamp_encrypted_reasoning_in_responses_sse_chunk(
+def stamp_encrypted_reasoning_in_responses_sse_chunk(  # noqa: PLR0915
     chunk: bytes,
     *,
     request_body: Optional[Mapping[str, Any]] = None,
     custom_llm_provider: Any = None,
     egress_credential_family: Any = None,
     expected_target_family: Any = None,
+    events: Optional[list[Any]] = None,
 ) -> bytes:
     """Stamp producer provenance onto encrypted reasoning in SSE data lines.
 
@@ -1772,6 +1806,45 @@ def stamp_encrypted_reasoning_in_responses_sse_chunk(
     """
     if not chunk:
         return chunk
+
+    associated_emissions = responses_emissions_from_chunk(chunk)
+    if associated_emissions is None and events:
+        associated_emissions = [
+            event.emission()
+            for event in events
+            if isinstance(event, ParsedResponsesEvent)
+        ]
+    if associated_emissions:
+        provenance = build_producer_provenance_from_egress_context(
+            custom_llm_provider=custom_llm_provider,
+            egress_credential_family=egress_credential_family,
+            expected_target_family=expected_target_family,
+            request_body=request_body if isinstance(request_body, Mapping) else None,
+        )
+        updated: list[Any] = []
+        changed = False
+        for emission in associated_emissions:
+            payload = emission.effective_payload
+            source_wire = emission.wire_bytes
+            if not isinstance(payload, dict) or not source_wire:
+                updated.append(emission)
+                continue
+            working = copy.deepcopy(payload)
+            line_changed = _stamp_encrypted_reasoning_in_sse_event(
+                working, provenance
+            )
+            identity_changed = _stamp_route_identity_in_sse_event(
+                working, provenance
+            )
+            if not line_changed and not identity_changed:
+                updated.append(emission)
+                continue
+            changed = True
+            updated.append(emission.transformed(working))
+        if not changed:
+            return chunk
+        return attach_responses_emissions(b"", updated)
+
     try:
         decoded = chunk.decode("utf-8")
     except Exception:
