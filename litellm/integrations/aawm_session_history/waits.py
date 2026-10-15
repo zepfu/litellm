@@ -27,6 +27,7 @@ _current: ContextVar[Optional["RequestWaits"]] = ContextVar(
     "session_history_waits", default=None
 )
 _T = TypeVar("_T")
+_CHECKPOINT_INTERVAL_SECONDS = 1.0
 
 
 def _now() -> datetime:
@@ -46,10 +47,24 @@ class RequestWaits:
         self.active: dict[str, tuple[str, datetime, float]] = {}
         self.durations: dict[str, float] = {}
         self.counts: dict[str, int] = {}
+        self._last_checkpoint_at = float("-inf")
+        self._checkpoint_handle: Optional[asyncio.TimerHandle] = None
 
-    def checkpoint(self) -> None:
-        # Snapshots are independent queue/spool records, never mutable aliases.
+    def checkpoint(self, *, force: bool = False) -> None:
         self.sequence += 1
+        now = time.monotonic()
+        remaining = _CHECKPOINT_INTERVAL_SECONDS - (now - self._last_checkpoint_at)
+        if not force and remaining > 0:
+            if self._checkpoint_handle is None:
+                self._checkpoint_handle = asyncio.get_running_loop().call_later(
+                    remaining, self._flush_pending_checkpoint
+                )
+            return
+        if self._checkpoint_handle is not None:
+            self._checkpoint_handle.cancel()
+            self._checkpoint_handle = None
+        self._last_checkpoint_at = now
+        # Coalesce in request-local state before making an independent snapshot.
         snapshot = {
             "version": 1,
             "sequence": self.sequence,
@@ -87,6 +102,10 @@ class RequestWaits:
                 "Session history wait checkpoint enqueue failed", exc_info=True
             )
 
+    def _flush_pending_checkpoint(self) -> None:
+        self._checkpoint_handle = None
+        self.checkpoint(force=True)
+
     def enrich(self, identity: Mapping[str, Any]) -> None:
         changed = False
         for attr, keys in (
@@ -103,7 +122,7 @@ class RequestWaits:
                 setattr(self, attr, value)
                 changed = True
         if changed:
-            self.checkpoint()
+            self.checkpoint(force=True)
 
     def begin(self, kind: str) -> str:
         key = str(uuid4())
@@ -126,7 +145,7 @@ class RequestWaits:
         for key in list(self.active):
             self.end(key)
         self.status = status
-        self.checkpoint()
+        self.checkpoint(force=True)
 
 
 def claim_request_call_id(default: str) -> str:
@@ -214,13 +233,13 @@ async def persist_wait_checkpoints(conn: Any, records: list[dict[str, Any]]) -> 
                     record["start_time"],
                     json.dumps(record["metadata"]),
                 )
-                for record in latest.values()
+                for record in (latest[call_id] for call_id in sorted(latest))
             ],
         )
 
 
 class SessionHistoryWaitMiddleware:
-    """Pure ASGI admission/terminal accounting; no body consumption or timers."""
+    """ASGI accounting with coalesced snapshots and no body consumption."""
 
     def __init__(self, app: Any) -> None:
         self.app = app

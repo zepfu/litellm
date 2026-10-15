@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from types import MappingProxyType
 from typing import Literal, Mapping, Optional
 
@@ -28,8 +28,11 @@ class ScheduleWindow:
     end: Optional[datetime] = None
     start_time: Optional[time] = None
     end_time: Optional[time] = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
     utc_offset: Optional[timedelta] = None
     timezone: Optional[str] = None
+    weekdays: Optional[tuple[int, ...]] = None
 
 
 @dataclass(frozen=True, slots=True)

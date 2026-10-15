@@ -18,6 +18,17 @@ the configured prefix appropriate to each item. Use `$aawmdt-todo-goal`,
 counterparts. Former Markdown queues are non-authoritative; do not duplicate
 CLI records there. Supporting worklogs remain evidence, not queue authority.
 
+Only the parent orchestrator may mutate TODO records, exclusively through
+`aawmdt todo` with the authoritative root/configuration, a fresh expected
+revision where supported, and a CLI reread after each mutation. Agents return
+evidence and proposed updates; they never mutate the queue.
+
+Never edit or replace TODO storage directly, including JSONL records,
+manifests, agent-event files, and archives. This prohibition includes repair
+attempts, scripts, and whole-file rewrites. If the CLI reports an integrity or
+transaction problem, preserve storage and report the exact failure; do not
+bypass the CLI. Include this boundary in every agent dispatch and recovery.
+
 ## Ownership and Routing
 
 Implement LiteLLM-owned behavior here and preserve compatibility with the

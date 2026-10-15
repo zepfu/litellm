@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Optional
 
-from fastapi import Request, Response
+from fastapi import HTTPException, Request, Response
 
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
@@ -885,6 +885,40 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
             model=alibaba_token_plan_adapter_model,
             route_family="codex_alibaba_token_plan_chat_completions_adapter",
         )
+
+        # Imported inside the rebound function so a tiny host dict still
+        # reaches the real helper. A block happens before the pre-egress
+        # reserve and does not fall through to another adapter.
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.selection import (
+            alibaba_token_plan_direct_route_admission,
+        )
+
+        admission = await alibaba_token_plan_direct_route_admission(
+            alibaba_token_plan_adapter_model
+        )
+        if not admission.get("admit", False):
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": {
+                        "message": (
+                            "Alibaba Token Plan direct route "
+                            f"{alibaba_token_plan_adapter_model} is unavailable: "
+                            f"{admission.get('reason')}."
+                        ),
+                        "type": "rate_limit_error",
+                        "code": admission.get("reason"),
+                        "provider": "alibaba_token_plan",
+                        "model": alibaba_token_plan_adapter_model,
+                    },
+                    "provider": "alibaba_token_plan",
+                    "model": alibaba_token_plan_adapter_model,
+                    "reason": admission.get("reason"),
+                    "subscription_identity": admission.get(
+                        "subscription_identity"
+                    ),
+                },
+            )
 
         # Concrete pre-egress reserve after alibaba route resolution.
         await _ensure_codex_nested_session_owner_pre_egress(

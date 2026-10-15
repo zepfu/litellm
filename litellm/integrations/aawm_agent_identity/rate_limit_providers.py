@@ -764,29 +764,38 @@ def _validated_xai_oauth_server_account_metadata(
     metadata: Dict[str, Any],
     *,
     kwargs: Optional[Dict[str, Any]] = None,
+    request: Optional[Any] = None,
 ) -> Optional[Dict[str, str | bool]]:
     """Accept only a request-bound managed xAI account binding."""
 
-    try:
-        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
-            validated_xai_oauth_server_account_metadata,
-        )
-
-        request = None
-        if isinstance(kwargs, dict):
-            litellm_params = kwargs.get("litellm_params")
-            if isinstance(litellm_params, dict):
-                proxy_server_request = litellm_params.get(
-                    "proxy_server_request"
-                )
-                if isinstance(proxy_server_request, dict):
-                    request = proxy_server_request.get("_request")
-        return validated_xai_oauth_server_account_metadata(
-            metadata,
-            request=request,
-        )
-    except Exception:  # noqa: BLE001
+    internal_result = metadata.get("aawm_validated_xai_oauth_server_account")
+    if internal_result is None or not isinstance(internal_result, dict):
         return None
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
+        validated_xai_oauth_server_account_provenance,
+    )
+
+    if internal_result.get("aawm_server_provenance") is not validated_xai_oauth_server_account_provenance():
+        return None
+    required_fields = (
+        "xai_oauth_server_account_binding",
+        "xai_oauth_account_label",
+        "xai_oauth_account_hash",
+        "xai_oauth_lane_key",
+        "xai_oauth_record_identity",
+        "xai_oauth_scope_identity",
+    )
+    if (
+        isinstance(internal_result, dict)
+        and internal_result.get("xai_oauth_server_account_binding") is True
+        and all(
+            isinstance(internal_result.get(field), str)
+            and bool(internal_result.get(field))
+            for field in required_fields[1:]
+        )
+    ):
+        return {field: internal_result[field] for field in required_fields}
+    return None
 
 
 def _extract_xai_oauth_account_hash(
@@ -910,6 +919,7 @@ def _extract_xai_header_rate_limit_observations(  # noqa: PLR0915
     observed_at: Any,
     *,
     native: bool,
+    request: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     source_name = "xai_grok_oidc_response_headers" if native else "xai_oauth_response_headers"
     context = _build_rate_limit_context(
@@ -933,6 +943,7 @@ def _extract_xai_header_rate_limit_observations(  # noqa: PLR0915
         else _validated_xai_oauth_server_account_metadata(
             metadata,
             kwargs=kwargs,
+            request=request,
         )
     )
     if not native and server_account_metadata is None:
@@ -1155,12 +1166,14 @@ def _extract_xai_oauth_header_rate_limit_observations(
     kwargs: Dict[str, Any],
     result: Any,
     observed_at: Any,
+    request: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     return _extract_xai_header_rate_limit_observations(
         kwargs,
         result,
         observed_at,
         native=False,
+        request=request,
     )
 
 
@@ -1662,6 +1675,7 @@ def _build_rate_limit_observations(
     result: Any,
     start_time: Any,
     end_time: Any,
+    request: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     observed_at = _parse_datetime_value(end_time) or _parse_datetime_value(start_time) or datetime.now(timezone.utc)
     observations: List[Dict[str, Any]] = []
@@ -1669,7 +1683,14 @@ def _build_rate_limit_observations(
     observations.extend(_extract_codex_header_rate_limit_observations(kwargs, result, observed_at))
     observations.extend(_extract_codex_usage_limit_error_observations(kwargs, result, observed_at))
     observations.extend(_extract_anthropic_header_rate_limit_observations(kwargs, result, observed_at))
-    observations.extend(_extract_xai_oauth_header_rate_limit_observations(kwargs, result, observed_at))
+    observations.extend(
+        _extract_xai_oauth_header_rate_limit_observations(
+            kwargs,
+            result,
+            observed_at,
+            request=request,
+        )
+    )
     observations.extend(_extract_xai_grok_oidc_header_rate_limit_observations(kwargs, result, observed_at))
     observations.extend(_extract_grok_billing_observations(kwargs, result, observed_at))
     observations.extend(_extract_openrouter_free_error_observations(kwargs, result, observed_at))

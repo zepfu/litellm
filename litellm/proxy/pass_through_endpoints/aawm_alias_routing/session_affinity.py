@@ -6482,6 +6482,19 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
             and _validation_status()[0]
         )
 
+    def _cancelled_after_valid_terminal(cause: BaseException) -> bool:
+        return (
+            finalization_task is None
+            and isinstance(cause, asyncio.CancelledError)
+            and lease is not None
+            and lease.held_reservation
+            and bool(lease.reservation_token)
+            and not lease.promoted
+            and not lease.released
+            and _validation_status()[0]
+            and _renewal_error() is None
+        )
+
     async def _notify_failure(cause: Optional[BaseException]) -> None:
         if on_failure is not None:
             await on_failure(cause)
@@ -6724,7 +6737,13 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
         task = _select_finalization_task(
             success,
             cause,
-            basis="iterator_eof" if success else "failure",
+            basis=(
+                "post_terminal_cancel"
+                if success and isinstance(cause, asyncio.CancelledError)
+                else "iterator_eof"
+                if success
+                else "failure"
+            ),
         )
         try:
             await asyncio.shield(task)
@@ -6891,6 +6910,7 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
                     await _close_original_iterator()
                 raise
             except BaseException as exc:
+                cancel_success = _cancelled_after_valid_terminal(exc)
                 observe(
                     (
                         "iterator_cancelled"
@@ -6907,7 +6927,7 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
                 )
                 try:
                     await _cancel_and_await_tasks(next_task)
-                    await _finalize(False, exc)
+                    await _finalize(cancel_success, exc)
                 finally:
                     self._closed = True
                     await _close_original_iterator()
@@ -7014,6 +7034,7 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
                     _send_with_owner_terminal if terminal_wire_path else send
                 )
             except BaseException as exc:
+                cancel_success = _cancelled_after_valid_terminal(exc)
                 observe(
                     (
                         "stream_response_cancelled"
@@ -7024,7 +7045,7 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
                     iterator=wrapped_iterator,
                     finalization_task=finalization_task,
                 )
-                await _finalize(False, exc)
+                await _finalize(cancel_success, exc)
                 raise
             finally:
                 await wrapped_iterator.aclose()
@@ -7339,7 +7360,7 @@ _XAI_DEFERRED_STREAM_WIRE_DISPOSITIONS = frozenset(
     {"completed", "failed", "incomplete", "cancelled", "disconnected", "error"}
 )
 _XAI_DEFERRED_STREAM_FINALIZATION_BASES = frozenset(
-    {"terminal_delivery", "iterator_eof", "failure"}
+    {"terminal_delivery", "iterator_eof", "post_terminal_cancel", "failure"}
 )
 _XAI_DEFERRED_STREAM_FAILURE_PHASES = frozenset(
     {

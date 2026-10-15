@@ -202,6 +202,10 @@ from functools import lru_cache
 import litellm
 from litellm import Router
 from litellm._logging import verbose_proxy_logger, verbose_router_logger
+from litellm.proxy.lifecycle_observability import (
+    begin_proxy_lifecycle,
+    log_proxy_lifecycle,
+)
 from litellm.caching.caching import DualCache, RedisCache
 from litellm.caching.redis_cluster_cache import RedisClusterCache
 from litellm.constants import (
@@ -728,6 +732,7 @@ def cleanup_router_config_variables():
 
 async def proxy_shutdown_event():
     global prisma_client, master_key, user_custom_auth, user_custom_key_generate
+    log_proxy_lifecycle(verbose_proxy_logger, event="proxy_shutdown")
     verbose_proxy_logger.info("Shutting down LiteLLM Proxy Server")
     # Catch Exception only (not BaseException/CancelledError) so genuine
     # asyncio cancellation still aborts the remaining shutdown sequence.
@@ -907,12 +912,21 @@ async def _initialize_shared_aiohttp_session():
         return None
 
 
+def _config_bucket_source() -> Optional[str]:
+    if os.environ.get("LITELLM_CONFIG_BUCKET_NAME") is None:
+        return None
+    if os.environ.get("LITELLM_CONFIG_BUCKET_TYPE") == "gcs":
+        return "config_bucket_gcs"
+    return "config_bucket_s3"
+
+
 @asynccontextmanager
 async def proxy_startup_event(app: FastAPI):  # noqa: PLR0915
     global prisma_client, master_key, use_background_health_checks, llm_router, llm_model_list, general_settings, proxy_budget_rescheduler_min_time, proxy_budget_rescheduler_max_time, litellm_proxy_admin_name, db_writer_client, store_model_in_db, premium_user, _license_check, proxy_batch_polling_interval, shared_aiohttp_session
     import json
 
     init_verbose_loggers()
+    begin_proxy_lifecycle(verbose_proxy_logger)
 
     ## RUN WORKER STARTUP HOOKS (e.g., gflags initialization) ##
     _startup_hooks_env = os.environ.get("LITELLM_WORKER_STARTUP_HOOKS", "")
@@ -956,7 +970,43 @@ async def proxy_startup_event(app: FastAPI):  # noqa: PLR0915
     ### LOAD CONFIG ###
     worker_config: Optional[Union[str, dict]] = get_secret("WORKER_CONFIG")  # type: ignore
     env_config_yaml: Optional[str] = get_secret_str("CONFIG_FILE_PATH")
-    verbose_proxy_logger.debug("worker_config: %s", worker_config)
+    worker_config_kind = "object" if isinstance(worker_config, dict) else "string" if isinstance(worker_config, str) else "unset"
+    verbose_proxy_logger.debug("worker_config_kind=%s", worker_config_kind)
+    config_bucket_source = _config_bucket_source()
+    startup_config_path: Optional[str] = None
+    if env_config_yaml is not None:
+        if (
+            config_bucket_source is not None
+            and os.path.isfile(env_config_yaml)
+            and proxy_config.is_yaml(config_file_path=env_config_yaml)
+        ):
+            startup_config_source = config_bucket_source
+        else:
+            startup_config_source = "environment_config_file"
+            startup_config_path = env_config_yaml
+    elif isinstance(worker_config, dict):
+        startup_config_source = "worker_config_object"
+    elif isinstance(worker_config, str):
+        startup_config_path = worker_config
+        if os.path.isfile(worker_config) and proxy_config.is_yaml(
+            config_file_path=worker_config
+        ):
+            startup_config_source = config_bucket_source or "worker_config_file"
+            if config_bucket_source is not None:
+                startup_config_path = None
+        elif config_bucket_source is not None:
+            startup_config_source = config_bucket_source
+            startup_config_path = None
+        else:
+            startup_config_source = "worker_config_json"
+    else:
+        startup_config_source = "no_config"
+    log_proxy_lifecycle(
+        verbose_proxy_logger,
+        event="config_source_selected",
+        config_source=startup_config_source,
+        config_file_path=startup_config_path,
+    )
     # check if it's a valid file path
     if env_config_yaml is not None:
         if os.path.isfile(env_config_yaml) and proxy_config.is_yaml(
@@ -968,6 +1018,15 @@ async def proxy_startup_event(app: FastAPI):  # noqa: PLR0915
                 general_settings,
             ) = await proxy_config.load_config(
                 router=llm_router, config_file_path=env_config_yaml
+            )
+            log_proxy_lifecycle(
+                verbose_proxy_logger,
+                event="config_applied",
+                config_source=config_bucket_source or "environment_config_file",
+                config_file_path=(
+                    None if config_bucket_source is not None else env_config_yaml
+                ),
+                config_snapshot=proxy_config.config,
             )
     elif worker_config is not None:
         if (
@@ -982,9 +1041,16 @@ async def proxy_startup_event(app: FastAPI):  # noqa: PLR0915
             ) = await proxy_config.load_config(
                 router=llm_router, config_file_path=worker_config
             )
-        elif os.environ.get("LITELLM_CONFIG_BUCKET_NAME") is not None and isinstance(
-            worker_config, str
-        ):
+            log_proxy_lifecycle(
+                verbose_proxy_logger,
+                event="config_applied",
+                config_source=config_bucket_source or "worker_config_file",
+                config_file_path=(
+                    None if config_bucket_source is not None else worker_config
+                ),
+                config_snapshot=proxy_config.config,
+            )
+        elif config_bucket_source is not None and isinstance(worker_config, str):
             (
                 llm_router,
                 llm_model_list,
@@ -992,13 +1058,31 @@ async def proxy_startup_event(app: FastAPI):  # noqa: PLR0915
             ) = await proxy_config.load_config(
                 router=llm_router, config_file_path=worker_config
             )
+            log_proxy_lifecycle(
+                verbose_proxy_logger,
+                event="config_applied",
+                config_source=config_bucket_source,
+                config_snapshot=proxy_config.config,
+            )
         elif isinstance(worker_config, dict):
             await initialize(**worker_config)
+            log_proxy_lifecycle(
+                verbose_proxy_logger,
+                event="config_applied",
+                config_source="worker_config_object",
+                config_snapshot=worker_config,
+            )
         else:
             # if not, assume it's a json string
             worker_config = json.loads(worker_config)
             if isinstance(worker_config, dict):
                 await initialize(**worker_config)
+                log_proxy_lifecycle(
+                    verbose_proxy_logger,
+                    event="config_applied",
+                    config_source="worker_config_json",
+                    config_snapshot=worker_config,
+                )
 
     # check if DATABASE_URL in environment - load from there
     if prisma_client is None:
@@ -2798,9 +2882,6 @@ class ProxyConfig:
             bucket_name = os.environ.get("LITELLM_CONFIG_BUCKET_NAME")
             object_key = os.environ.get("LITELLM_CONFIG_BUCKET_OBJECT_KEY")
             bucket_type = os.environ.get("LITELLM_CONFIG_BUCKET_TYPE")
-            verbose_proxy_logger.debug(
-                "bucket_name: %s, object_key: %s", bucket_name, object_key
-            )
             if bucket_type == "gcs":
                 config = await get_config_file_contents_from_gcs(
                     bucket_name=bucket_name, object_key=object_key
@@ -5562,6 +5643,19 @@ async def initialize(  # noqa: PLR0915
     config=None,
 ):
     global user_model, user_api_base, user_debug, user_detailed_debug, user_user_max_tokens, user_request_timeout, user_temperature, user_telemetry, user_headers, experimental, llm_model_list, llm_router, general_settings, master_key, user_custom_auth, prisma_client
+    config_bucket_source = _config_bucket_source() if config else None
+    initialization_source = config_bucket_source or (
+        "initialize_config_file" if isinstance(config, str) else "initialize_parameters"
+    )
+    initialization_config_file_path = (
+        config if isinstance(config, str) and config_bucket_source is None else None
+    )
+    log_proxy_lifecycle(
+        verbose_proxy_logger,
+        event="initialize_started",
+        config_source=initialization_source,
+        config_file_path=initialization_config_file_path,
+    )
     from litellm.proxy.common_utils.banner import show_banner
 
     show_banner()
@@ -5574,7 +5668,6 @@ async def initialize(  # noqa: PLR0915
 
         from litellm._logging import (
             verbose_logger,
-            verbose_proxy_logger,
             verbose_router_logger,
         )
 
@@ -5587,7 +5680,6 @@ async def initialize(  # noqa: PLR0915
 
         from litellm._logging import (
             verbose_logger,
-            verbose_proxy_logger,
             verbose_router_logger,
         )
 
@@ -5601,7 +5693,7 @@ async def initialize(  # noqa: PLR0915
             if litellm_log_setting.upper() == "INFO":
                 import logging
 
-                from litellm._logging import verbose_proxy_logger, verbose_router_logger
+                from litellm._logging import verbose_router_logger
 
                 # this must ALWAYS remain logging.INFO, DO NOT MODIFY THIS
 
@@ -5616,7 +5708,6 @@ async def initialize(  # noqa: PLR0915
 
                 from litellm._logging import (
                     verbose_logger,
-                    verbose_proxy_logger,
                     verbose_router_logger,
                 )
 
@@ -5634,6 +5725,13 @@ async def initialize(  # noqa: PLR0915
             llm_model_list,
             general_settings,
         ) = await proxy_config.load_config(router=llm_router, config_file_path=config)
+        log_proxy_lifecycle(
+            verbose_proxy_logger,
+            event="config_applied",
+            config_source=initialization_source,
+            config_file_path=initialization_config_file_path,
+            config_snapshot=proxy_config.config,
+        )
     if headers:  # model-specific param
         user_headers = headers
         dynamic_config[user_model]["headers"] = headers
@@ -5666,6 +5764,13 @@ async def initialize(  # noqa: PLR0915
     if experimental:
         pass
     user_telemetry = telemetry
+    log_proxy_lifecycle(
+        verbose_proxy_logger,
+        event="initialize_completed",
+        config_source=initialization_source,
+        config_file_path=initialization_config_file_path,
+        config_snapshot=proxy_config.config if config else dynamic_config,
+    )
 
 
 # for streaming

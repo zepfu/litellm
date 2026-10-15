@@ -9,6 +9,9 @@ from litellm.proxy._types import *
 from litellm.proxy.auth.user_api_key_auth import UserAPIKeyAuth, user_api_key_auth
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
 from litellm.proxy.common_utils.http_parsing_utils import _read_request_body
+from litellm.proxy.pass_through_endpoints.aawm_request_policy.prompt_replacement_hooks import (
+    apply_prompt_replacement_to_standard_request,
+)
 from litellm.types.llms.vertex_ai import TokenCountDetailsResponse
 
 router = APIRouter(
@@ -60,6 +63,11 @@ async def google_generate_content(
     # Create logging object with full request metadata so callbacks (e.g. S3) get user/trace_id
     data["litellm_call_id"] = request.headers.get(
         "x-litellm-call-id", str(uuid.uuid4())
+    )
+    data = apply_prompt_replacement_to_standard_request(
+        data,
+        route_type="agenerate_content",
+        request=request,
     )
     logging_obj, data = litellm.utils.function_setup(
         original_function="agenerate_content",
@@ -123,6 +131,11 @@ async def google_stream_generate_content(
     # Create logging object with full request metadata so streaming END callbacks (e.g. S3) get user/trace_id
     data["litellm_call_id"] = request.headers.get(
         "x-litellm-call-id", str(uuid.uuid4())
+    )
+    data = apply_prompt_replacement_to_standard_request(
+        data,
+        route_type="agenerate_content_stream",
+        request=request,
     )
     logging_obj, data = litellm.utils.function_setup(
         original_function="agenerate_content_stream",

@@ -9,6 +9,7 @@ import sys
 import traceback
 from base64 import b64encode
 from collections import deque
+from contextvars import ContextVar, Token
 from datetime import datetime, timezone
 from math import isfinite
 import time
@@ -108,6 +109,7 @@ from litellm.proxy.aawm_route_logging import (
     register_aawm_route_rollup_access_log_replacement,
 )
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
+from litellm.proxy.litellm_pre_call_utils import clean_headers
 from litellm.proxy.common_utils.http_parsing_utils import (
     _read_request_body,
     _safe_get_request_headers,
@@ -116,7 +118,6 @@ from litellm.proxy.aawm_runtime_error_logging import (
     persist_agent_terminal_error,
 )
 from litellm.proxy.auth.auth_utils import get_end_user_id_from_request_body
-from litellm.proxy.litellm_pre_call_utils import clean_headers
 from litellm.proxy.utils import get_server_root_path, normalize_route_for_root_path
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_generated_send_message_gate import (
     CODEX_SEND_MESSAGE_OUTPUT_GATE_ATTR,
@@ -169,6 +170,63 @@ class _PassthroughHiddenRetryBudgetTimeout(httpx.ReadTimeout):
 
 
 _PASSTHROUGH_TERMINAL_RETRY_AFTER_MAX_SECONDS = 7200.0
+
+
+_operational_passthrough_request: ContextVar[Any] = ContextVar(
+    "aawm_operational_passthrough_request",
+    default=None,
+)
+
+_OPERATIONAL_PASSTHROUGH_REQUEST_ATTR = (
+    "_aawm_operational_passthrough_request"
+)
+
+
+def _set_operational_passthrough_request(
+    request: Any,
+) -> Token[Any]:
+    return _operational_passthrough_request.set(request)
+
+
+def get_operational_passthrough_request(
+    kwargs: Optional[dict] = None,
+) -> Any:
+    """Return the live pass-through request on the internal operational path."""
+
+    explicit_request = _get_explicit_operational_passthrough_request(kwargs)
+    if explicit_request is not None:
+        return explicit_request
+    return _operational_passthrough_request.get()
+
+
+def _bind_operational_passthrough_request_to_logging_obj(
+    logging_obj: Any,
+) -> Any:
+    """Retain the live request on the operational logging object."""
+
+    request = _operational_passthrough_request.get()
+    if logging_obj is None or request is None:
+        return None
+    setattr(logging_obj, _OPERATIONAL_PASSTHROUGH_REQUEST_ATTR, request)
+    return request
+
+
+def _get_explicit_operational_passthrough_request(
+    kwargs: Optional[dict],
+) -> Any:
+    """Read the request retained by supported operational boundaries."""
+
+    if not isinstance(kwargs, dict):
+        return None
+    for key in ("logging_obj", "litellm_logging_obj"):
+        request = getattr(
+            kwargs.get(key),
+            _OPERATIONAL_PASSTHROUGH_REQUEST_ATTR,
+            None,
+        )
+        if request is not None:
+            return request
+    return None
 
 
 from .aawm_adapter_runtime.repetitive_output import (
@@ -721,6 +779,9 @@ _WEBSOCKET_PASSTHROUGH_MESSAGE_BUFFER_MAX = 256
 _AAWM_PASSTHROUGH_ERROR_LOG_MAX_FIELD_CHARS = 240
 _AAWM_OPENAI_RAW_RETRY_EVENT_STATE_KEY = "aawm_openai_raw_retry_events"
 _AAWM_OPENAI_RAW_RETRY_EVENT_METADATA_KEY = "aawm_openai_raw_retry_events"
+_AAWM_VALIDATED_XAI_OAUTH_SERVER_ACCOUNT_METADATA_KEY = (
+    "aawm_validated_xai_oauth_server_account"
+)
 _AAWM_OPENAI_RAW_RETRY_EVENT_SEQUENCE_STATE_KEY = (
     "aawm_openai_raw_retry_event_sequence"
 )
@@ -1369,6 +1430,55 @@ def _provider_bound_body_from_kwargs(kwargs: Optional[dict]) -> Optional[dict]:
         return provider_bound_body
 
     return None
+
+
+def _bind_final_transport_query(
+    *,
+    url: httpx.URL,
+    requested_query_params: Optional[dict],
+) -> httpx.URL:
+    """Bind the selected query parameters to the exact transport URL."""
+    if requested_query_params is None:
+        return url
+    query_params = httpx.QueryParams(requested_query_params)
+    return url.copy_with(query=str(query_params).encode("ascii"))
+
+
+def _headers_for_multipart_passthrough_egress(headers: dict) -> dict:
+    # HTTPX must generate a boundary matching the reconstructed form.
+    return {key: value for key, value in headers.items() if key.lower() != "content-type"}
+
+
+async def _build_passthrough_transport_kwargs(
+    *,
+    request: Request,
+    headers: dict,
+    raw_body: Optional[bytes],
+    json_egress_body: Optional[dict],
+) -> Dict[str, Any]:
+    """Select method, headers, and body representation for both send paths."""
+    transport_kwargs: Dict[str, Any] = {
+        "method": request.method,
+        "headers": headers,
+    }
+    if request.method == "GET":
+        return transport_kwargs
+    if raw_body is not None:
+        transport_kwargs["content"] = raw_body
+    elif (
+        json_egress_body is None
+        and HttpPassThroughEndpointHelpers.is_multipart(request)
+    ):
+        transport_kwargs["headers"] = _headers_for_multipart_passthrough_egress(headers)
+        transport_kwargs.update(
+            await HttpPassThroughEndpointHelpers._build_multipart_transport_kwargs(
+                request
+            )
+        )
+    else:
+        transport_kwargs["headers"], _ = _headers_for_json_passthrough_egress(headers)
+        transport_kwargs["json"] = json_egress_body
+    return transport_kwargs
 
 
 def _get_case_insensitive_mapping_value(
@@ -4737,7 +4847,7 @@ def _is_json_passthrough_egress(
         return False
     return not (
         HttpPassThroughEndpointHelpers.is_multipart(request) is True
-        and not provider_bound_body
+        and provider_bound_body is None
     )
 
 
@@ -5432,6 +5542,126 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         }
 
     @staticmethod
+    def _provider_family_for_egress_family(
+        family: Optional[str],
+    ) -> Optional[str]:
+        normalized = str(family or "").strip().casefold()
+        if not normalized or normalized == "generic":
+            return None
+        if normalized == "codex_oauth":
+            return "openai"
+        if normalized in {
+            XAI_OAUTH_CREDENTIAL_FAMILY,
+            GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
+            XAI_OAUTH_ROUTE_FAMILY,
+            GROK_NATIVE_OAUTH_ROUTE_FAMILY,
+        }:
+            return "xai"
+        if normalized in {
+            _OPENCODE_ZEN_CREDENTIAL_FAMILY,
+            _OPENCODE_ZEN_TARGET_FAMILY,
+            _OPENCODE_GO_CREDENTIAL_FAMILY,
+            _OPENCODE_GO_TARGET_FAMILY,
+        }:
+            return "opencode"
+        return normalized
+
+    @staticmethod
+    def _validate_generic_target_egress(
+        *,
+        url: Union[str, httpx.URL],
+        credential_family: Optional[str],
+        expected_target_family: Optional[str],
+        marker_families: set[str],
+    ) -> None:
+        normalized_credential_family = str(
+            credential_family or ""
+        ).strip().casefold()
+        normalized_expected_family = str(
+            expected_target_family or ""
+        ).strip().casefold()
+        expected_provider_family = (
+            HttpPassThroughEndpointHelpers._provider_family_for_egress_family(
+                normalized_expected_family
+            )
+        )
+        credential_provider_family = (
+            HttpPassThroughEndpointHelpers._provider_family_for_egress_family(
+                normalized_credential_family
+            )
+        )
+        provider_scoped_egress = bool(
+            normalized_credential_family
+            or normalized_expected_family
+            or marker_families
+        )
+        openai_bound_egress = HttpPassThroughEndpointHelpers._is_openai_bound_egress(
+            custom_llm_provider=None,
+            egress_credential_family=credential_family,
+            expected_target_family=expected_target_family,
+            url=url,
+        )
+        detail: Optional[str] = None
+        if normalized_expected_family and expected_provider_family is None:
+            detail = (
+                "Blocked passthrough egress: the expected family is not a "
+                "recognized provider family for an unknown target."
+            )
+        elif (
+            credential_provider_family is not None
+            and expected_provider_family is not None
+            and credential_provider_family != expected_provider_family
+        ):
+            detail = (
+                "Blocked passthrough egress: the expected provider family "
+                "does not match the credential family for an unknown target."
+            )
+        exact_credential_route_families = {
+            XAI_OAUTH_CREDENTIAL_FAMILY: XAI_OAUTH_ROUTE_FAMILY,
+            GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY: GROK_NATIVE_OAUTH_ROUTE_FAMILY,
+            _OPENCODE_ZEN_CREDENTIAL_FAMILY: _OPENCODE_ZEN_TARGET_FAMILY,
+            _OPENCODE_GO_CREDENTIAL_FAMILY: _OPENCODE_GO_TARGET_FAMILY,
+        }
+        required_route_family = exact_credential_route_families.get(
+            normalized_credential_family
+        )
+        if (
+            detail is None
+            and required_route_family is not None
+            and normalized_expected_family != required_route_family
+        ):
+            detail = (
+                "Blocked passthrough egress: the expected route family does "
+                "not match the credential family for an unknown target."
+            )
+        marker_provider_family = expected_provider_family or credential_provider_family
+        if detail is None and marker_provider_family is not None:
+            cross_provider_markers = {
+                marker for marker in marker_families if marker != marker_provider_family
+            }
+            if cross_provider_markers:
+                detail = (
+                    "Blocked passthrough egress due to cross-provider "
+                    "credential/header markers: target=generic, "
+                    f"expected={marker_provider_family}, "
+                    f"markers={sorted(cross_provider_markers)}."
+                )
+        if detail is None and provider_scoped_egress and not openai_bound_egress:
+            detail = (
+                "Blocked passthrough egress: provider-scoped credentials or "
+                "markers cannot be sent to an unknown target without "
+                "independent provider proof."
+            )
+        if detail is not None:
+            HttpPassThroughEndpointHelpers._raise_egress_guard_block(
+                detail=detail,
+                url=url,
+                credential_family=credential_family,
+                target_family="generic",
+                marker_families=marker_families,
+            )
+
+    @staticmethod
     def _expected_opencode_route_family(
         *,
         credential_family: Optional[str],
@@ -5482,6 +5712,27 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             return "xai"
         if hostname in {"integrate.api.nvidia.com", "ai.api.nvidia.com"}:
             return "nvidia"
+        # These canonical adapter targets have source-defined host contracts;
+        # custom proxy domains remain generic and require independent proof.
+        if hostname in {"api.cohere.com", "api.cohere.ai"}:
+            return "cohere"
+        if hostname == "api.kimi.com":
+            return "kimi_code"
+        if hostname == "token-plan.ap-southeast-1.maas.aliyuncs.com":
+            return "alibaba_token_plan"
+        target_path = (parsed_url.path or "").rstrip("/")
+        if hostname == "api.z.ai" and (
+            target_path == "/api/coding/paas/v4"
+            or target_path.startswith("/api/coding/paas/v4/")
+        ):
+            return "zai_coding_plan"
+        if hostname == "inference-api.nousresearch.com":
+            return "nous"
+        if (
+            hostname == "agentn.global.api5.cursor.sh"
+            and target_path == "/agent.v1.AgentService/Run"
+        ):
+            return "cursor_agent"
         if (
             hostname == "generativelanguage.googleapis.com"
             or hostname.endswith(".googleapis.com")
@@ -5658,8 +5909,8 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
 
         # OC-010: Zen/Go egress must bind the exact Zen/Go route family, so
         # a Zen credential cannot reach a Go target. xAI resolution is
-        # checked first and keeps its existing exact semantics. Generic
-        # proxy hosts stay generic-aware, matching xAI.
+        # checked first and keeps its existing exact semantics. Unknown proxy
+        # hosts remain generic here and are subject to the proof guard below.
         if expected_opencode_route_family is not None and (
             (
                 opencode_target_route_family is not None
@@ -5728,16 +5979,27 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             headers=headers,
             url=url,
         )
+        if target_family == "generic":
+            # This returns only after generic proof and marker checks;
+            # OpenAI-bound egress remains separately bound at final send.
+            HttpPassThroughEndpointHelpers._validate_generic_target_egress(
+                url=url,
+                credential_family=credential_family,
+                expected_target_family=expected_target_family,
+                marker_families=marker_families,
+            )
+            return
         cross_provider_markers = {
             marker
             for marker in marker_families
-            if target_family != "generic" and marker != target_family
+            if marker != target_family
         }
         if cross_provider_markers:
             HttpPassThroughEndpointHelpers._raise_egress_guard_block(
                 detail=(
                     "Blocked passthrough egress due to cross-provider credential/header "
-                    f"markers: target={target_family}, markers={sorted(cross_provider_markers)}."
+                    f"markers: target={target_family}, "
+                    f"markers={sorted(cross_provider_markers)}."
                 ),
                 url=url,
                 credential_family=credential_family,
@@ -5990,6 +6252,10 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             "api-key",
             "x-api-key",
             "proxy-authorization",
+            "x-goog-api-key",
+            "cookie",
+            "x-xai-token-auth",
+            "x-litellm-api-key",
         }
         for header_name, header_value in list(masked_headers.items()):
             if header_name.lower() not in sensitive_header_names:
@@ -6254,185 +6520,59 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         are issued with stream=True so the caller can inspect content-type before
         buffering the body (enables SSE handoff without full-body buffer).
         """
-        if request.method == "GET":
-            if send_request_fn is not None:
-                req = async_client.build_request(
-                    method=request.method,
-                    url=url,
-                    headers=headers,
-                    params=requested_query_params,
-                )
-                response = await send_request_fn(req, False)
-            else:
-                if validate_request_fn is not None:
-                    req = async_client.build_request(
-                        method=request.method,
-                        url=url,
-                        headers=headers,
-                        params=requested_query_params,
-                    )
-                    validate_request_fn(req)
-                    send_kwargs: dict[str, Any] = {"stream": False}
-                    if follow_redirects is not None:
-                        send_kwargs["follow_redirects"] = follow_redirects
-                    response = await wait_for(
-                        "upstream_response", async_client.send(req, **send_kwargs)
-                    )
-                else:
-                    request_kwargs: dict[str, Any] = {
-                        "method": request.method,
-                        "url": url,
-                        "headers": headers,
-                        "params": requested_query_params,
-                    }
-                    if follow_redirects is not None:
-                        request_kwargs["follow_redirects"] = follow_redirects
-                    response = await wait_for(
-                        "upstream_response", async_client.request(**request_kwargs)
-                    )
-        elif raw_body is not None:
-            if send_request_fn is not None:
-                req = async_client.build_request(
-                    method=request.method,
-                    url=url,
-                    headers=headers,
-                    params=requested_query_params,
-                    content=raw_body,
-                )
-                response = await send_request_fn(
-                    req,
-                    prefer_stream_for_unknown_content,
-                )
-            elif prefer_stream_for_unknown_content:
-                req = async_client.build_request(
-                    method=request.method,
-                    url=url,
-                    headers=headers,
-                    params=requested_query_params,
-                    content=raw_body,
-                )
-                if validate_request_fn is not None:
-                    validate_request_fn(req)
-                send_kwargs: dict[str, Any] = {"stream": True}
-                if follow_redirects is not None:
-                    send_kwargs["follow_redirects"] = follow_redirects
-                response = await wait_for(
-                    "upstream_response", async_client.send(req, **send_kwargs)
-                )
-            else:
-                if validate_request_fn is not None:
-                    req = async_client.build_request(
-                        method=request.method,
-                        url=url,
-                        headers=headers,
-                        params=requested_query_params,
-                        content=raw_body,
-                    )
-                    validate_request_fn(req)
-                    send_kwargs = {"stream": False}
-                    if follow_redirects is not None:
-                        send_kwargs["follow_redirects"] = follow_redirects
-                    response = await wait_for(
-                        "upstream_response", async_client.send(req, **send_kwargs)
-                    )
-                else:
-                    request_kwargs = {
-                        "method": request.method,
-                        "url": url,
-                        "headers": headers,
-                        "params": requested_query_params,
-                        "content": raw_body,
-                    }
-                    if follow_redirects is not None:
-                        request_kwargs["follow_redirects"] = follow_redirects
-                    response = await wait_for(
-                        "upstream_response", async_client.request(**request_kwargs)
-                    )
-        elif (
-            HttpPassThroughEndpointHelpers.is_multipart(request) is True
-            and not _parsed_body
+        request_kwargs = await _build_passthrough_transport_kwargs(
+            request=request,
+            headers=headers,
+            raw_body=raw_body,
+            json_egress_body=_parsed_body,
+        )
+        request_kwargs.update(url=url, params=requested_query_params)
+        send_stream = request.method != "GET" and prefer_stream_for_unknown_content
+        if (
+            send_request_fn is not None
+            or validate_request_fn is not None
+            or send_stream
         ):
-            # Only use multipart handler if we don't have a parsed body
-            # (parsed body means it was JSON despite multipart content-type header)
-            return await HttpPassThroughEndpointHelpers.make_multipart_http_request(
-                request=request,
-                async_client=async_client,
-                url=url,
-                headers=headers,
-                requested_query_params=requested_query_params,
-                prefer_stream_for_unknown_content=prefer_stream_for_unknown_content,
-                follow_redirects=follow_redirects,
-                validate_request_fn=validate_request_fn,
-                send_request_fn=send_request_fn,
-            )
-        else:
-            # Generic httpx method
-            json_headers, _removed_content_type = _headers_for_json_passthrough_egress(
-                headers
-            )
+            req = async_client.build_request(**request_kwargs)
+            if validate_request_fn is not None:
+                validate_request_fn(req)
             if send_request_fn is not None:
-                req = async_client.build_request(
-                    method=request.method,
-                    url=url,
-                    headers=json_headers,
-                    params=requested_query_params,
-                    json=_parsed_body,
-                )
-                response = await send_request_fn(
-                    req,
-                    prefer_stream_for_unknown_content,
-                )
-            elif prefer_stream_for_unknown_content:
-                req = async_client.build_request(
-                    method=request.method,
-                    url=url,
-                    headers=json_headers,
-                    params=requested_query_params,
-                    json=_parsed_body,
-                )
-                if validate_request_fn is not None:
-                    validate_request_fn(req)
-                send_kwargs = {"stream": True}
-                if follow_redirects is not None:
-                    send_kwargs["follow_redirects"] = follow_redirects
-                response = await wait_for(
-                    "upstream_response", async_client.send(req, **send_kwargs)
-                )
-            else:
-                if validate_request_fn is not None:
-                    req = async_client.build_request(
-                        method=request.method,
-                        url=url,
-                        headers=json_headers,
-                        params=requested_query_params,
-                        json=_parsed_body,
-                    )
-                    validate_request_fn(req)
-                    send_kwargs = {"stream": False}
-                    if follow_redirects is not None:
-                        send_kwargs["follow_redirects"] = follow_redirects
-                    response = await wait_for(
-                        "upstream_response", async_client.send(req, **send_kwargs)
-                    )
-                else:
-                    request_kwargs = {
-                        "method": request.method,
-                        "url": url,
-                        "headers": json_headers,
-                        "params": requested_query_params,
-                        "json": _parsed_body,
-                    }
-                    if follow_redirects is not None:
-                        request_kwargs["follow_redirects"] = follow_redirects
-                    response = await wait_for(
-                        "upstream_response", async_client.request(**request_kwargs)
-                    )
-        return response
+                return await send_request_fn(req, send_stream)
+            send_kwargs: dict[str, Any] = {"stream": send_stream}
+            if follow_redirects is not None:
+                send_kwargs["follow_redirects"] = follow_redirects
+            return await wait_for(
+                "upstream_response", async_client.send(req, **send_kwargs)
+            )
+        if follow_redirects is not None:
+            request_kwargs["follow_redirects"] = follow_redirects
+        return await wait_for(
+            "upstream_response", async_client.request(**request_kwargs)
+        )
 
     @staticmethod
     def is_multipart(request: Request) -> bool:
         """Check if the request is a multipart/form-data request"""
         return "multipart/form-data" in request.headers.get("content-type", "")
+
+    @staticmethod
+    async def _build_multipart_transport_kwargs(
+        request: Request,
+    ) -> Dict[str, Any]:
+        """Build HTTPX arguments for an actual multipart/form-data request."""
+        form_data = await request.form()
+        files = {}
+        form_data_dict = {}
+        for field_name, field_value in form_data.items():
+            if isinstance(field_value, (StarletteUploadFile, UploadFile)):
+                files[field_name] = (
+                    await HttpPassThroughEndpointHelpers._build_request_files_from_upload_file(
+                        upload_file=field_value
+                    )
+                )
+            else:
+                form_data_dict[field_name] = field_value
+        return {"files": files, "data": form_data_dict}
 
     @staticmethod
     async def _build_request_files_from_upload_file(
@@ -6462,24 +6602,12 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         request uses stream=True so callers can inspect content-type before full
         body buffering (same contract as the JSON non-stream path).
         """
-        form_data = await request.form()
-        files = {}
-        form_data_dict = {}
-
-        for field_name, field_value in form_data.items():
-            if isinstance(field_value, (StarletteUploadFile, UploadFile)):
-                files[
-                    field_name
-                ] = await HttpPassThroughEndpointHelpers._build_request_files_from_upload_file(
-                    upload_file=field_value
-                )
-            else:
-                form_data_dict[field_name] = field_value
-
-        # Remove content-type header - httpx will set it correctly with the new boundary
-        # when it creates the multipart body from files/data parameters
-        headers_copy = headers.copy()
-        headers_copy.pop("content-type", None)
+        transport_kwargs = (
+            await HttpPassThroughEndpointHelpers._build_multipart_transport_kwargs(request)
+        )
+        files = transport_kwargs["files"]
+        form_data_dict = transport_kwargs["data"]
+        headers_copy = _headers_for_multipart_passthrough_egress(headers)
 
         if send_request_fn is not None:
             req = async_client.build_request(
@@ -6490,6 +6618,8 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 files=files,
                 data=form_data_dict,
             )
+            if validate_request_fn is not None:
+                validate_request_fn(req)
             return await send_request_fn(
                 req,
                 prefer_stream_for_unknown_content,
@@ -6551,13 +6681,17 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         passthrough_logging_payload: PassthroughStandardLoggingPayload,
         logging_obj: LiteLLMLoggingObj,
         _parsed_body: Optional[dict] = None,
+        transport_body_absent: bool = False,
         litellm_call_id: Optional[str] = None,
         compiled_wire_body: Any = None,
     ) -> dict:
         """
         Filter out litellm params from the request body
         """
-        _parsed_body = _parsed_body or {}
+        has_transport_body = (
+            isinstance(_parsed_body, dict) and not transport_body_absent
+        )
+        _parsed_body = _parsed_body if _parsed_body is not None else {}
         compiled_wire_body = compiled_wire_body or get_bound_openai_responses_wire_body(
             request,
             _parsed_body,
@@ -6568,7 +6702,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         # all_litellm_params / get_end_user_id_from_request_body: module-scope (RR-056 #8).
         working_body, _provider_body = _detach_passthrough_body_for_kwargs(_parsed_body)
 
-        request_headers = dict(request.headers) if request.headers is not None else None
+        request_headers = HttpPassThroughEndpointHelpers.get_masked_passthrough_headers(
+            dict(request.headers) if request.headers is not None else None
+        )
         resolved_end_user_id = (
             get_end_user_id_from_request_body(
                 request_body=dict(_parsed_body),
@@ -6587,6 +6723,11 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         litellm_params_in_body = {}
         for k in all_litellm_params:
             if k in working_body:
+                if k == "litellm_logging_obj":
+                    # Logging owns this object on its operational carrier; do
+                    # not expose it through callback-visible litellm params.
+                    working_body.pop(k, None)
+                    continue
                 litellm_params_in_body[k] = working_body.pop(k, None)
 
         _metadata = dict(
@@ -6621,6 +6762,10 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         if metadata:
             _metadata.update(metadata)
         _metadata.pop(_AAWM_OPENAI_RAW_RETRY_EVENT_METADATA_KEY, None)
+        _metadata.pop(
+            _AAWM_VALIDATED_XAI_OAUTH_SERVER_ACCOUNT_METADATA_KEY,
+            None,
+        )
         _metadata.pop("aawm_openai_final_send_binding", None)
         if resolved_end_user_id:
             _metadata["user_api_key_end_user_id"] = resolved_end_user_id
@@ -6640,10 +6785,13 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                     "body": (
                         compiled_provider_body
                         if compiled_provider_body is not None
-                        else _shallow_copy_request_dict(working_body)
+                        else (
+                            _shallow_copy_request_dict(working_body)
+                            if has_transport_body
+                            else None
+                        )
                     ),
-                    "headers": request_headers or {},
-                    "_request": request,
+                    "headers": request_headers,
                 },
             },
             "call_type": "pass_through_endpoint",
@@ -7837,6 +7985,7 @@ async def pass_through_request(  # noqa: PLR0915
     compiled_wire_body: Any = None
     client_metadata: Optional[dict[str, Any]] = None
     _transfer_identity: Optional[dict[str, Any]] = None
+    transport_body_absent = False
     deferred_success_holder = (
         DeferredPassthroughSuccess()
         if defer_session_owner_promotion
@@ -7916,6 +8065,7 @@ async def pass_through_request(  # noqa: PLR0915
     #########################################################
     try:
         start_time = datetime.now()
+        operational_request_token: Optional[Token[Any]] = None
         _clear_xai_oauth_send_auth_shape(request)
         # Register before session-owner 409 / candidate selection so native
         # uvicorn ACCESS on /openai_passthrough/responses is replaced even
@@ -7947,25 +8097,16 @@ async def pass_through_request(  # noqa: PLR0915
         )
         if isinstance(selected_openai_account_context, Mapping):
             selected_openai_account_context = dict(selected_openai_account_context)
-        validate_prepared_request_fn: Optional[
-            Callable[[httpx.Request], None]
-        ] = None
-        if (
-            HttpPassThroughEndpointHelpers._is_exact_xai_egress_credential_family(
-                egress_credential_family
+        def _validate_prepared_request(prepared_request: httpx.Request) -> None:
+            HttpPassThroughEndpointHelpers.validate_prepared_request_egress(
+                prepared_request=prepared_request,
+                credential_family=egress_credential_family,
+                expected_target_family=expected_target_family,
             )
-            or expected_target_family
-            in {XAI_OAUTH_ROUTE_FAMILY, GROK_NATIVE_OAUTH_ROUTE_FAMILY}
-        ):
 
-            def _validate_prepared_request(prepared_request: httpx.Request) -> None:
-                HttpPassThroughEndpointHelpers.validate_prepared_request_egress(
-                    prepared_request=prepared_request,
-                    credential_family=egress_credential_family,
-                    expected_target_family=expected_target_family,
-                )
-
-            validate_prepared_request_fn = _validate_prepared_request
+        validate_prepared_request_fn: Callable[[httpx.Request], None] = (
+            _validate_prepared_request
+        )
         effective_blocked_pass_through_prefixed_headers = list(
             blocked_pass_through_prefixed_headers or []
         )
@@ -8012,6 +8153,15 @@ async def pass_through_request(  # noqa: PLR0915
                 ).encode("ascii")
             )
 
+        requested_query_params: Optional[dict]
+        if query_params is not None:
+            requested_query_params = query_params
+        else:
+            requested_query_params = dict(request.query_params) or None
+        url = _bind_final_transport_query(
+            url=url,
+            requested_query_params=requested_query_params,
+        )
         HttpPassThroughEndpointHelpers.validate_outgoing_egress(
             url=url,
             headers=headers,
@@ -8070,6 +8220,7 @@ async def pass_through_request(  # noqa: PLR0915
         elif is_multipart:
             # Don't parse multipart body here - it will be handled by make_multipart_http_request
             _parsed_body = {}
+            transport_body_absent = True
         elif raw_body_passthrough:
             raw_body = await request.body()
             _parsed_body = {
@@ -8162,6 +8313,7 @@ async def pass_through_request(  # noqa: PLR0915
         _parsed_body["litellm_logging_obj"] = logging_obj
 
         ### CALL HOOKS ### - modify incoming data / reject request before calling the model
+        body_before_hooks = _parsed_body
         _parsed_body = await wait_for(
             "request_hooks",
             proxy_logging_obj.pre_call_hook(
@@ -8170,6 +8322,19 @@ async def pass_through_request(  # noqa: PLR0915
                 call_type="pass_through_endpoint",
             ),
         )
+        if transport_body_absent and isinstance(_parsed_body, dict):
+            # Metadata-only edits to the original hook envelope do not replace
+            # the multipart body. A replacement mapping, a cleared envelope, or
+            # provider fields authored in place are authoritative JSON.
+            transport_body_absent = (
+                _parsed_body is body_before_hooks
+                and "litellm_logging_obj" in _parsed_body
+                and all(key in all_litellm_params for key in _parsed_body)
+            )
+        # The logging object was injected only for pre-call-hook ownership.
+        # Its callback-visible body and litellm-params lifetime ends here.
+        if isinstance(_parsed_body, dict):
+            _parsed_body.pop("litellm_logging_obj", None)
         # Second normalize pass only when pre_call_hook rewrote the tools object
         # (RR-056 #9). In-place first-pass fixes are already complete; skip when
         # hooks left tools identity unchanged or tools are absent.
@@ -8275,7 +8440,9 @@ async def pass_through_request(  # noqa: PLR0915
             params={"timeout": stream_read_timeout_policy.timeout},
         )
         async_client = async_client_obj.client
-        _cleaned_headers = clean_headers(request.headers)
+        _cleaned_headers = HttpPassThroughEndpointHelpers.get_masked_passthrough_headers(
+            headers=clean_headers(request.headers)
+        )
         passthrough_logging_payload = PassthroughStandardLoggingPayload(
             url=str(url),
             request_body=_parsed_body,
@@ -8291,14 +8458,15 @@ async def pass_through_request(  # noqa: PLR0915
             request=request,
             logging_obj=logging_obj,
             compiled_wire_body=compiled_wire_body,
+            transport_body_absent=transport_body_absent,
         )
+        operational_request_token = _set_operational_passthrough_request(request)
+        _bind_operational_passthrough_request_to_logging_obj(logging_obj)
         _set_passthrough_stream_timeout_metadata(
             kwargs=kwargs,
             policy=stream_read_timeout_policy,
         )
         provider_bound_body = _provider_bound_body_from_kwargs(kwargs)
-        if provider_bound_body is None:
-            provider_bound_body = _parsed_body if isinstance(_parsed_body, dict) else {}
         compiled_wire_body = (
             get_bound_openai_responses_wire_body(request, provider_bound_body)
             or compiled_wire_body
@@ -8454,25 +8622,7 @@ async def pass_through_request(  # noqa: PLR0915
                 exc_info=True,
             )
 
-        # combine url with query params for logging
-        requested_query_params: Optional[dict]
-        if query_params is not None:
-            requested_query_params = query_params
-        else:
-            requested_query_params = dict(request.query_params)
-
-        requested_query_params_str = None
-        if requested_query_params:
-            requested_query_params_str = "&".join(
-                f"{k}={v}" for k, v in requested_query_params.items()
-            )
-
         logging_url = str(url)
-        if requested_query_params_str:
-            if "?" in str(url):
-                logging_url = str(url) + "&" + requested_query_params_str
-            else:
-                logging_url = str(url) + "?" + requested_query_params_str
 
         _record_grok_billing_passthrough_request_contract(
             request=request,
@@ -8526,7 +8676,8 @@ async def pass_through_request(  # noqa: PLR0915
                 intake=_watermark_intake,
                 config=_get_runtime_text_watermark_config(),
                 endpoint=_watermark_endpoint_from_path(
-                    url, getattr(getattr(request, "url", None), "path", None)
+                    url,
+                    getattr(getattr(request, "url", None), "path", None),
                 ),
                 direction="request",
                 metadata=_watermark_metadata,
@@ -9702,7 +9853,7 @@ async def pass_through_request(  # noqa: PLR0915
                                 if isinstance(provider_bound_body, dict)
                                 else None
                             ),
-                            upstream_url=str(url) if url is not None else None,
+                            upstream_url=str(url),
                         ),
                         namespace=get_aawm_alias_routing_state_namespace(),
                         account_context=current_candidate_context(request),
@@ -9752,13 +9903,17 @@ async def pass_through_request(  # noqa: PLR0915
                         else headers
                     )
                     req = async_client.build_request(
-                        "POST",
-                        url,
-                        json=provider_bound_body,
-                        params=requested_query_params,
-                        headers=stream_headers,
+                        url=url,
+                        **await _build_passthrough_transport_kwargs(
+                            request=request,
+                            headers=stream_headers,
+                            raw_body=raw_body,
+                            json_egress_body=provider_bound_body,
+                        ),
                     )
                     if send_request_fn is not None:
+                        if validate_prepared_request_fn is not None:
+                            validate_prepared_request_fn(req)
                         response = await send_request_fn(req, stream)
                     else:
                         if validate_prepared_request_fn is not None:
@@ -9932,6 +10087,7 @@ async def pass_through_request(  # noqa: PLR0915
                 openai_wire_trace=wire_trace,
                 openai_stream_bookkeeping_state=stream_bookkeeping_state,
                 responses_event_pipeline=responses_event_pipeline,
+                operational_request=request,
             )
             cfg072_output_gate = (
                 _build_cfg072_send_message_output_gate(
@@ -9988,6 +10144,7 @@ async def pass_through_request(  # noqa: PLR0915
                         error_log_context=error_log_context,
                         upstream_prefix_bytes=getattr(response, "_prefix", None),
                         responses_event_pipeline=responses_event_pipeline,
+                        operational_request=request,
                     )
 
                 try:
@@ -10157,6 +10314,9 @@ async def pass_through_request(  # noqa: PLR0915
                     True,
                 )
             _publish_openai_send_telemetry()
+            if operational_request_token is not None:
+                _operational_passthrough_request.reset(operational_request_token)
+                operational_request_token = None
             return bind_output_guard_to_streaming_response(
                 bind_deferred_success_holder(
                     stream_response,
@@ -10205,7 +10365,7 @@ async def pass_through_request(  # noqa: PLR0915
                             if isinstance(provider_bound_body, dict)
                             else None
                         ),
-                        upstream_url=str(url) if url is not None else None,
+                        upstream_url=str(url),
                     ),
                     namespace=get_aawm_alias_routing_state_namespace(),
                     account_context=current_candidate_context(request),
@@ -10255,7 +10415,6 @@ async def pass_through_request(  # noqa: PLR0915
                         async_client=async_client,
                         url=url,
                         headers=non_stream_headers,
-                        requested_query_params=requested_query_params,
                         _parsed_body=provider_bound_body,
                         raw_body=raw_body,
                         prefer_stream_for_unknown_content=True,
@@ -10483,6 +10642,7 @@ async def pass_through_request(  # noqa: PLR0915
                 openai_wire_trace=wire_trace,
                 openai_stream_bookkeeping_state=stream_bookkeeping_state,
                 responses_event_pipeline=responses_event_pipeline,
+                operational_request=request,
             )
             cfg072_output_gate = (
                 _build_cfg072_send_message_output_gate(
@@ -10539,6 +10699,7 @@ async def pass_through_request(  # noqa: PLR0915
                         error_log_context=error_log_context,
                         upstream_prefix_bytes=getattr(response, "_prefix", None),
                         responses_event_pipeline=responses_event_pipeline,
+                        operational_request=request,
                     )
 
                 try:
@@ -10708,6 +10869,9 @@ async def pass_through_request(  # noqa: PLR0915
                     True,
                 )
             _publish_openai_send_telemetry()
+            if operational_request_token is not None:
+                _operational_passthrough_request.reset(operational_request_token)
+                operational_request_token = None
             return bind_output_guard_to_streaming_response(
                 bind_deferred_success_holder(
                     stream_response,
@@ -10717,6 +10881,13 @@ async def pass_through_request(  # noqa: PLR0915
             )
 
         if response.status_code >= 300:
+            pass_through_endpoint_logging._record_upstream_rate_limit_headers_metadata(
+                kwargs,
+                httpx_response=response,
+                url_route=str(url),
+                custom_llm_provider=custom_llm_provider,
+                request=request,
+            )
             # Streamed non-SSE responses need aread() before .text (RR-056 #6).
             error_body = await wait_for("upstream_body_read", response.aread())
             try:
@@ -10887,6 +11058,7 @@ async def pass_through_request(  # noqa: PLR0915
                     start_time=start_time,
                     end_time=end_time,
                     logging_obj=logging_obj,
+                    operational_request=request,
                     cache_hit=False,
                     request_body=_parsed_body,
                     custom_llm_provider=custom_llm_provider,
@@ -10922,6 +11094,7 @@ async def pass_through_request(  # noqa: PLR0915
                     start_time=start_time,
                     end_time=end_time,
                     logging_obj=logging_obj,
+                    operational_request=request,
                     cache_hit=False,
                     request_body=_parsed_body,
                     custom_llm_provider=custom_llm_provider,
@@ -11062,6 +11235,7 @@ async def pass_through_request(  # noqa: PLR0915
                     start_time=start_time,
                     end_time=end_time,
                     logging_obj=logging_obj,
+                    operational_request=request,
                     cache_hit=False,
                     request_body=_parsed_body,
                     custom_llm_provider=custom_llm_provider,
@@ -11092,11 +11266,15 @@ async def pass_through_request(  # noqa: PLR0915
             )
         if deferred_success_holder is not None:
             deferred_success_holder.set_finalizer(_finalize_deferred_success)
+        if operational_request_token is not None:
+            _operational_passthrough_request.reset(operational_request_token)
         return bind_deferred_success_holder(
             response_to_return,
             deferred_success_holder,
         )
     except asyncio.CancelledError:
+        if operational_request_token is not None:
+            _operational_passthrough_request.reset(operational_request_token)
         try:
             await _aawm_session_owner_on_upstream_result(
                 request=request,
@@ -11113,6 +11291,8 @@ async def pass_through_request(  # noqa: PLR0915
             await deferred_success_holder.finalize_failure(phase="cancelled")
         raise
     except Exception as e:
+        if operational_request_token is not None:
+            _operational_passthrough_request.reset(operational_request_token)
         if deferred_success_holder is not None:
             await deferred_success_holder.finalize_failure()
         _publish_openai_send_telemetry()
@@ -11823,6 +12003,17 @@ async def _parse_request_data_by_content_type(
     return query_params_data, custom_body_data, file_data, stream
 
 
+def _resolve_url_route_target_params(
+    target_params: Dict[str, Any], fallback_values: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Prefer registry values while preserving captured factory fallbacks."""
+    resolved_values = dict(fallback_values)
+    for param_name, metadata_value in target_params.items():
+        if param_name in resolved_values:
+            resolved_values[param_name] = metadata_value
+    return resolved_values
+
+
 def create_pass_through_route(
     endpoint,
     target: str,
@@ -11891,6 +12082,21 @@ def create_pass_through_route(
                 InitPassThroughEndpointHelpers,
             )
 
+            # Only keyed callables claim registry ownership. An unkeyed
+            # callable remains an intentional static mapped route, while a
+            # retired or malformed key must not recover captured defaults.
+            route_key = getattr(
+                endpoint_func, "_aawm_pass_through_registry_key", None
+            )
+            if route_key is not None and (
+                not isinstance(route_key, str)
+                or route_key not in _registered_pass_through_routes
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={"error": "Retired pass-through route."},
+                )
+
             path = request.url.path
 
             # Parse request data based on content type
@@ -11923,7 +12129,8 @@ def create_pass_through_route(
                 "forward_headers": _forward_headers,
                 "merge_query_params": _merge_query_params,
                 "cost_per_request": cost_per_request,
-                "guardrails": None,
+                "guardrails": guardrails,
+                "default_query_params": default_query_params,
                 "egress_credential_family": egress_credential_family,
                 "expected_target_family": expected_target_family,
                 "managed_xai_oauth_request": managed_xai_oauth_request,
@@ -11937,38 +12144,42 @@ def create_pass_through_route(
             if passthrough_params is not None:
                 target_params.update(passthrough_params.get("passthrough_params", {}))
 
-            # Extract and cast parameters with proper types
-            param_target = target_params.get("target") or target
-            param_custom_headers = target_params.get("custom_headers", custom_headers)
-            param_forward_headers = target_params.get(
-                "forward_headers", _forward_headers
+            # Registry metadata is authoritative for values it provides.
+            # A partial entry falls back to the captured factory value
+            # without treating an absent value as an explicit empty.
+            registry_values = _resolve_url_route_target_params(
+                target_params=target_params,
+                fallback_values={
+                    "target": target,
+                    "custom_headers": custom_headers,
+                    "forward_headers": _forward_headers,
+                    "merge_query_params": _merge_query_params,
+                    "cost_per_request": cost_per_request,
+                    "guardrails": guardrails,
+                    "default_query_params": default_query_params,
+                    "egress_credential_family": egress_credential_family,
+                    "expected_target_family": expected_target_family,
+                    "managed_xai_oauth_request": managed_xai_oauth_request,
+                    "allowed_forward_headers": allowed_forward_headers,
+                    "allowed_pass_through_prefixed_headers": allowed_pass_through_prefixed_headers,
+                    "blocked_pass_through_prefixed_headers": blocked_pass_through_prefixed_headers,
+                },
             )
-            param_merge_query_params = target_params.get(
-                "merge_query_params", _merge_query_params
-            )
-            param_cost_per_request = target_params.get(
-                "cost_per_request", cost_per_request
-            )
-            param_guardrails = target_params.get("guardrails", None)
-            param_default_query_params = target_params.get("default_query_params", None)
-            param_egress_credential_family = target_params.get(
-                "egress_credential_family", egress_credential_family
-            )
-            param_expected_target_family = target_params.get(
-                "expected_target_family", expected_target_family
-            )
-            param_managed_xai_oauth_request = managed_xai_oauth_request
-            param_allowed_forward_headers = target_params.get(
-                "allowed_forward_headers", allowed_forward_headers
-            )
-            param_allowed_pass_through_prefixed_headers = target_params.get(
-                "allowed_pass_through_prefixed_headers",
-                allowed_pass_through_prefixed_headers,
-            )
-            param_blocked_pass_through_prefixed_headers = target_params.get(
-                "blocked_pass_through_prefixed_headers",
-                blocked_pass_through_prefixed_headers,
-            )
+            (
+                param_target,
+                param_custom_headers,
+                param_forward_headers,
+                param_merge_query_params,
+                param_cost_per_request,
+                param_guardrails,
+                param_default_query_params,
+                param_egress_credential_family,
+                param_expected_target_family,
+                param_managed_xai_oauth_request,
+                param_allowed_forward_headers,
+                param_allowed_pass_through_prefixed_headers,
+                param_blocked_pass_through_prefixed_headers,
+            ) = registry_values.values()
             # Retry ownership is executable control flow. Route metadata must
             # not turn a direct native OpenAI request into a caller-managed
             # retry with no outer owner; callers must opt in explicitly.
@@ -11988,12 +12199,23 @@ def create_pass_through_route(
                 param_custom_headers if isinstance(param_custom_headers, dict) else {}
             )
 
-            # Ensure query_params and custom_body are dicts or None
-            final_query_params = (
-                query_params_data if isinstance(query_params_data, dict) else {}
+            # Keep omitted query parameters distinct from an explicit empty
+            # replacement map so pass_through_request can apply its fallback
+            # and query-default precedence without inventing an empty override.
+            if isinstance(query_params_data, dict):
+                request_query_params = dict(query_params_data)
+            elif query_params_data is None:
+                request_query_params = None
+            else:
+                request_query_params = {"query_params": query_params_data}
+            final_query_params: Optional[dict] = (
+                request_query_params
+                if query_params is None
+                else {
+                    **(request_query_params or {}),
+                    **query_params,
+                }
             )
-            if query_params:
-                final_query_params.update(query_params)
             # Caller-supplied custom_body takes precedence over the request-parsed body
             final_custom_body: Optional[dict] = None
             if custom_body is not None:
@@ -12191,53 +12413,67 @@ async def websocket_passthrough_request(  # noqa: PLR0915
         method="WEBSOCKET",
         headers=dict(websocket.headers) if hasattr(websocket, "headers") else {},
     )
-
-    # Initialize kwargs for logging using the same pattern as HTTP passthrough
-    kwargs = HttpPassThroughEndpointHelpers._init_kwargs_for_pass_through_endpoint(
-        user_api_key_dict=user_api_key_dict,
-        _parsed_body={},  # WebSocket doesn't have a traditional request body
-        passthrough_logging_payload=passthrough_logging_payload,
-        litellm_call_id=litellm_call_id,
-        request=dummy_request,  # type: ignore
-        logging_obj=logging_obj,
+    operational_request_token: Optional[Token[Any]] = (
+        _set_operational_passthrough_request(dummy_request)
     )
-
-    # Update logging environment variables
-    logging_obj.update_environment_variables(
-        model="unknown",
-        user="unknown",
-        optional_params={},
-        litellm_params=dict(kwargs.get("litellm_params", {})),
-        call_type="pass_through_endpoint",
-    )
-    logging_obj.model_call_details["litellm_call_id"] = litellm_call_id
-
-    # Pre-call logging
-    logging_obj.pre_call(
-        input=[{"role": "user", "content": "WebSocket connection"}],
-        api_key="",
-        additional_args={
-            "complete_input_dict": {},
-            "api_base": target,
-            "headers": upstream_headers,
-        },
-    )
-
-    ### CALL HOOKS ### - modify incoming data / reject request before calling the model
-    websocket_data: dict[str, Any] = {}
-    websocket_data = await wait_for(
-        "request_hooks",
-        proxy_logging_obj.pre_call_hook(
+    try:
+        # Initialize kwargs for logging using the same pattern as HTTP passthrough
+        kwargs = HttpPassThroughEndpointHelpers._init_kwargs_for_pass_through_endpoint(
             user_api_key_dict=user_api_key_dict,
-            data=websocket_data,
-            call_type="pass_through_endpoint",
-        ),
-    )
+            _parsed_body={},  # WebSocket doesn't have a traditional request body
+            passthrough_logging_payload=passthrough_logging_payload,
+            litellm_call_id=litellm_call_id,
+            request=dummy_request,  # type: ignore
+            logging_obj=logging_obj,
+        )
+        _bind_operational_passthrough_request_to_logging_obj(logging_obj)
 
+        # Update logging environment variables
+        logging_obj.update_environment_variables(
+            model="unknown",
+            user="unknown",
+            optional_params={},
+            litellm_params=dict(kwargs.get("litellm_params", {})),
+            call_type="pass_through_endpoint",
+        )
+        logging_obj.model_call_details["litellm_call_id"] = litellm_call_id
+
+        # Pre-call logging
+        observable_headers = HttpPassThroughEndpointHelpers.get_masked_passthrough_headers(
+            upstream_headers
+        )
+        logging_obj.pre_call(
+            input=[{"role": "user", "content": "WebSocket connection"}],
+            api_key="",
+            additional_args={
+                "complete_input_dict": {},
+                "api_base": target,
+                "headers": observable_headers,
+            },
+        )
+
+        ### CALL HOOKS ### - modify incoming data / reject request before calling the model
+        websocket_data: dict[str, Any] = {}
+        websocket_data = await wait_for(
+            "request_hooks",
+            proxy_logging_obj.pre_call_hook(
+                user_api_key_dict=user_api_key_dict,
+                data=websocket_data,
+                call_type="pass_through_endpoint",
+            ),
+        )
+
+    except BaseException:
+        _operational_passthrough_request.reset(operational_request_token)
+        operational_request_token = None
+        raise
+
+    previous_request_token: Optional[Token[Any]] = None
     try:
         verbose_proxy_logger.debug(
             f"WebSocket passthrough ({endpoint}): Establishing upstream connection to {target}"
         )
+        previous_request_token = _set_operational_passthrough_request(dummy_request)
         async with connect(
             target,
             additional_headers=upstream_headers,
@@ -12486,6 +12722,7 @@ async def websocket_passthrough_request(  # noqa: PLR0915
                     start_time=start_time,
                     end_time=end_time,
                     logging_obj=logging_obj,
+                    operational_request=dummy_request,
                     cache_hit=False,
                     request_body={},
                     **success_kwargs,
@@ -12499,7 +12736,6 @@ async def websocket_passthrough_request(  # noqa: PLR0915
                     user_api_key_dict=user_api_key_dict,
                     response={"status": "websocket_connection_successful"},  # type: ignore
                 )
-
     except InvalidStatus as exc:
         verbose_proxy_logger.exception(
             f"WebSocket passthrough ({endpoint}): upstream rejected WebSocket connection"
@@ -12549,7 +12785,16 @@ async def websocket_passthrough_request(  # noqa: PLR0915
 
         if websocket.client_state != WebSocketState.DISCONNECTED:
             await websocket.close(code=1011, reason="WebSocket passthrough error")
+    except BaseException:
+        if previous_request_token is not None:
+            _operational_passthrough_request.reset(previous_request_token)
+            previous_request_token = None
+        raise
     finally:
+        if previous_request_token is not None:
+            _operational_passthrough_request.reset(previous_request_token)
+        if operational_request_token is not None:
+            _operational_passthrough_request.reset(operational_request_token)
         if websocket.client_state != WebSocketState.DISCONNECTED:
             await websocket.close()
 
@@ -12624,6 +12869,30 @@ class SafeRouteAdder:
         return False
 
     @staticmethod
+    def _get_overlapping_route(app: FastAPI, path: str, methods: List[str]):
+        """Return the first route overlapping this normalized path/method set."""
+        for route in app.routes:
+            route_path = getattr(route, "path", None)
+            route_methods = getattr(route, "methods", None)
+            if route_path == path and route_methods is not None:
+                if any(method in route_methods for method in methods):
+                    return route
+        return None
+
+    @staticmethod
+    def _is_managed_pass_through_callable(endpoint: Any) -> bool:
+        """Identify callables created by pass-through route factories."""
+        managed_qualnames = {
+            "create_pass_through_route.<locals>.endpoint_func",
+            "create_websocket_passthrough_route.<locals>.endpoint_func",
+        }
+        return (
+            getattr(endpoint, "__module__", None)
+            == create_pass_through_route.__module__
+            and getattr(endpoint, "__qualname__", None) in managed_qualnames
+        )
+
+    @staticmethod
     def add_api_route_if_not_exists(
         app: FastAPI,
         path: str,
@@ -12644,12 +12913,27 @@ class SafeRouteAdder:
         Returns:
             True if route was added, False if it already existed
         """
-        if SafeRouteAdder._is_path_registered(app=app, path=path, methods=methods):
-            verbose_proxy_logger.debug(
-                "Skipping route registration - path %s with methods %s already registered on app",
-                path,
-                methods,
-            )
+        existing_route = SafeRouteAdder._get_overlapping_route(
+            app=app, path=path, methods=methods
+        )
+        if existing_route is not None:
+            if SafeRouteAdder._is_managed_pass_through_callable(existing_route.endpoint):
+                verbose_proxy_logger.debug(
+                    "Refreshing existing pass-through route: %s with methods %s",
+                    path,
+                    methods,
+                )
+                existing_route.dependant.call = endpoint
+                existing_route.endpoint = endpoint
+                if app.router.routes and existing_route is not app.router.routes[-1]:
+                    app.router.routes.remove(existing_route)
+                    app.router.routes.append(existing_route)
+            else:
+                verbose_proxy_logger.debug(
+                    "Skipping non-pass-through route registration - path %s with methods %s already registered on app",
+                    path,
+                    methods,
+                )
             return False
 
         app.add_api_route(
@@ -12813,6 +13097,56 @@ def _rebuild_pass_through_route_indexes() -> None:
             _index_pass_through_route_key(route_key, path, route_type)
 
 
+def _remove_installed_pass_through_route(
+    app: FastAPI, registry_entry: Dict[str, Any]
+) -> bool:
+    """Remove the application route installed for a registry entry."""
+    route_key = registry_entry.get("_aawm_registry_key")
+    path = registry_entry.get("path")
+    route_type = registry_entry.get("type")
+    methods = registry_entry.get("methods")
+    if not isinstance(route_key, str) or not isinstance(path, str):
+        verbose_proxy_logger.warning(
+            "Retaining application route for registry entry without identity: %s",
+            registry_entry,
+        )
+        return False
+    if route_type not in {"exact", "subpath"} or not isinstance(methods, list):
+        verbose_proxy_logger.warning(
+            "Retaining application route for unsupported registry entry: %s",
+            route_key,
+        )
+        return False
+
+    route_path = _normalize_pass_through_route_path(path)
+    if route_type == "subpath":
+        route_path = f"{route_path}/{{subpath:path}}"
+
+    for route in list(app.routes):
+        route_path_value = getattr(route, "path", None)
+        route_methods_value = getattr(route, "methods", None)
+        route_endpoint = getattr(route, "endpoint", None)
+        route_registry_key = getattr(
+            route_endpoint, "_aawm_pass_through_registry_key", None
+        )
+        route_matches_key = route_registry_key == route_key or (
+            route_registry_key is None
+            and getattr(route_endpoint, "__module__", None)
+            == create_pass_through_route.__module__
+            and getattr(route_endpoint, "__qualname__", None)
+            == "create_pass_through_route.<locals>.endpoint_func"
+        )
+        route_matches_identity = (
+            route_path_value == route_path
+            and isinstance(route_methods_value, set)
+            and (not methods or any(method in route_methods_value for method in methods))
+        )
+        if route_matches_key and route_matches_identity:
+            app.router.routes.remove(route)
+            return True
+    return False
+
+
 class InitPassThroughEndpointHelpers:
     @staticmethod
     def add_exact_path_route(
@@ -12853,27 +13187,30 @@ class InitPassThroughEndpointHelpers:
             dependencies,
         )
 
+        route_endpoint = create_pass_through_route(  # type: ignore
+            path,
+            target,
+            custom_headers,
+            forward_headers,
+            merge_query_params,
+            dependencies,
+            cost_per_request=cost_per_request,
+            default_query_params=default_query_params,
+            guardrails=guardrails,
+        )
+        route_endpoint._aawm_pass_through_registry_key = route_key
+
         # Use SafeRouteAdder to only add route if it doesn't exist on the app
         SafeRouteAdder.add_api_route_if_not_exists(
             app=app,
             path=path,
-            endpoint=create_pass_through_route(  # type: ignore
-                path,
-                target,
-                custom_headers,
-                forward_headers,
-                merge_query_params,
-                dependencies,
-                cost_per_request=cost_per_request,
-                default_query_params=default_query_params,
-                guardrails=guardrails,
-            ),
+            endpoint=route_endpoint,
             methods=methods,
             dependencies=dependencies,
         )
 
         # Always register/update the route metadata (headers, target) even if FastAPI route exists
-        _registered_pass_through_routes[route_key] = {
+        registry_entry: Dict[str, Any] = {
             "endpoint_id": endpoint_id,
             "path": path,
             "type": "exact",
@@ -12889,6 +13226,8 @@ class InitPassThroughEndpointHelpers:
                 "guardrails": guardrails,
             },
         }
+        registry_entry["_aawm_registry_key"] = route_key
+        _registered_pass_through_routes[route_key] = registry_entry
         _index_pass_through_route_key(route_key, path, "exact")
 
     @staticmethod
@@ -12930,28 +13269,31 @@ class InitPassThroughEndpointHelpers:
             dependencies,
         )
 
+        route_endpoint = create_pass_through_route(  # type: ignore
+            path,
+            target,
+            custom_headers,
+            forward_headers,
+            merge_query_params,
+            dependencies,
+            include_subpath=True,
+            cost_per_request=cost_per_request,
+            default_query_params=default_query_params,
+            guardrails=guardrails,
+        )
+        route_endpoint._aawm_pass_through_registry_key = route_key
+
         # Use SafeRouteAdder to only add route if it doesn't exist on the app
         SafeRouteAdder.add_api_route_if_not_exists(
             app=app,
             path=wildcard_path,
-            endpoint=create_pass_through_route(  # type: ignore
-                path,
-                target,
-                custom_headers,
-                forward_headers,
-                merge_query_params,
-                dependencies,
-                include_subpath=True,
-                cost_per_request=cost_per_request,
-                default_query_params=default_query_params,
-                guardrails=guardrails,
-            ),
+            endpoint=route_endpoint,
             methods=methods,
             dependencies=dependencies,
         )
 
         # Register the route to prevent duplicates only if it was added
-        _registered_pass_through_routes[route_key] = {
+        registry_entry: Dict[str, Any] = {
             "endpoint_id": endpoint_id,
             "path": path,
             "type": "subpath",
@@ -12967,19 +13309,37 @@ class InitPassThroughEndpointHelpers:
                 "guardrails": guardrails,
             },
         }
+        registry_entry["_aawm_registry_key"] = route_key
+        _registered_pass_through_routes[route_key] = registry_entry
         _index_pass_through_route_key(route_key, path, "subpath")
 
     @staticmethod
     def remove_endpoint_routes(endpoint_id: str):
-        """Remove all routes for a specific endpoint ID from the registry"""
+        """Remove registry and application routes by ID or exact registry key."""
+        from litellm.proxy.proxy_server import app
+
         keys_to_remove = [
             key
             for key, value in _registered_pass_through_routes.items()
-            if value["endpoint_id"] == endpoint_id
+            if key == endpoint_id or value["endpoint_id"] == endpoint_id
         ]
         for key in keys_to_remove:
+            registry_entry = _registered_pass_through_routes.get(key)
             _unindex_pass_through_route_key(key)
             del _registered_pass_through_routes[key]
+            if isinstance(registry_entry, dict):
+                if not _remove_installed_pass_through_route(
+                    app=app, registry_entry=registry_entry
+                ):
+                    verbose_proxy_logger.debug(
+                        "No installed application route found for pass-through registry key: %s",
+                        key,
+                    )
+            else:
+                verbose_proxy_logger.warning(
+                    "Retaining application route for malformed pass-through registry entry: %s",
+                    key,
+                )
             verbose_proxy_logger.debug(
                 "Removed pass-through route from registry: %s", key
             )
@@ -13176,9 +13536,9 @@ async def initialize_pass_through_endpoints(
     from litellm._uuid import uuid
 
     verbose_proxy_logger.debug("initializing pass through endpoints")
+    from litellm.proxy.proxy_server import app
     from litellm.proxy._types import CommonProxyErrors, LiteLLMRoutes
     from litellm.proxy.proxy_server import (
-        app,
         config_passthrough_endpoints,
         premium_user,
     )

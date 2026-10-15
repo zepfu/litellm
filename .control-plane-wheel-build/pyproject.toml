@@ -16,3 +16,4 @@ only-include = []
 "../litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py" = "litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py"
 "../context-replacement/claude-code/2.1.110/auto-memory-replacement.md" = "litellm/proxy/pass_through_endpoints/aawm_claude_control_plane_data/claude-code/2.1.110/auto-memory-replacement.md"
 "../context-replacement/claude-code/prompt-patches/roman01la-2026-04-02.json" = "litellm/proxy/pass_through_endpoints/aawm_claude_control_plane_data/claude-code/prompt-patches/roman01la-2026-04-02.json"
+"../context-replacement/shared/codex-memory-edit-instructions.json" = "litellm/proxy/pass_through_endpoints/aawm_claude_control_plane_data/context-replacement/shared/codex-memory-edit-instructions.json"

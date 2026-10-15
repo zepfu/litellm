@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import random
-from datetime import datetime, time, timezone, tzinfo
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from typing import Any, Mapping, NamedTuple, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -30,6 +30,55 @@ _ANTHROPIC_CREDENTIAL_ROUTE_FAMILIES: frozenset[str] = frozenset(
         "anthropic_messages",
     }
 )
+
+_SnapshotSelectionReceipt = Tuple[
+    str,
+    Optional[str],
+    Tuple[str, ...],
+    str,
+    str,
+    Optional[str],
+    str,
+    int,
+    bool,
+    Optional[str],
+    Optional[str],
+]
+
+# A snapshot built by the compiler is already graph-bounded. Other supported
+# construction paths can install a hand-built snapshot, so selection remains
+# fail-closed below the same documented graph budgets.
+_MAX_ALIAS_GRAPH_DEPTH = 64
+_MAX_ALIAS_EXPANDED_CANDIDATES = 4096
+_MAX_ALIAS_EXPANSION_WORK = 32768
+
+
+def _raise_alias_snapshot_budget(budget: str, actual: int, maximum: int) -> None:
+    raise ValueError(
+        f"routing snapshot alias graph exceeds maximum {budget} budget: "
+        f"{actual} > {maximum}"
+    )
+
+
+def _check_alias_snapshot_budget(budget: str, actual: int, maximum: int) -> None:
+    if actual > maximum:
+        _raise_alias_snapshot_budget(budget, actual, maximum)
+
+
+def _charge_snapshot_traversal_work(traversal_work: list[int]) -> None:
+    """Charge one alias visit to the total resolution-wide traversal budget."""
+    traversal_work[0] += 1
+    if traversal_work[0] > _MAX_ALIAS_EXPANSION_WORK:
+        _raise_alias_snapshot_budget(
+            "expansion-work", traversal_work[0], _MAX_ALIAS_EXPANSION_WORK
+        )
+
+
+def _raise_snapshot_expanded_candidates(actual: int) -> None:
+    _raise_alias_snapshot_budget(
+        "expanded-candidate", actual, _MAX_ALIAS_EXPANDED_CANDIDATES
+    )
+
 
 # ---------------------------------------------------------------------------
 # Injected runtime state
@@ -101,11 +150,7 @@ def _get_request_routing_snapshot(
     if cached is not _REQUEST_ROUTING_SNAPSHOT_UNSET:
         return cached if isinstance(cached, _RoutingSnapshot) else None
 
-    snapshot = (
-        None
-        if _is_alias_config_startup_failed()
-        else get_active_routing_snapshot()
-    )
+    snapshot = None if _is_alias_config_startup_failed() else get_active_routing_snapshot()
     setattr(state, _REQUEST_ROUTING_SNAPSHOT_STATE_KEY, snapshot)
     return snapshot
 
@@ -205,16 +250,41 @@ class RoundRobinCommitToken(NamedTuple):
 
     Captured once per request (in the selection context) at enumeration time so
     the actual selection -- not any getter call multiplicity -- drives the single
-    cursor advance. ``tied_candidate_ids`` is the stable, priority-ordered tied
-    top-tier identity tuple; ``start_index`` is the cursor value read when the
+    cursor advance. ``tied_candidate_receipts`` is the stable, receipt-ordered
+    tied top-tier tuple; ``start_index`` is the cursor value read when the
     enumeration resolved (Wave 3 seam / diagnostics -- the commit itself keys off
     the actually selected member's position, never blindly ``start_index + 1``).
     """
 
     alias_name: str
     epoch_tag: str
-    tied_candidate_ids: Tuple[Tuple[str, str], ...]
+    tied_candidate_receipts: Tuple[_SnapshotSelectionReceipt, ...]
     start_index: int
+
+
+def _build_snapshot_selection_receipt(
+    candidate: Mapping[str, Any],
+) -> _SnapshotSelectionReceipt:
+    """Build the exact snapshot provenance identity for a resolved candidate.
+
+    Round-robin commits use this instead of only ``provider`` and ``model`` so
+    distinct branches containing the same leaf rotate independently. The
+    leading snapshot hash prevents a request captured before a config swap from
+    advancing a cursor owned by a different snapshot.
+    """
+    return (
+        str(candidate.get("config_epoch_tag") or ""),
+        candidate.get("resolved_alias"),
+        tuple(candidate.get("alias_path") or ()),
+        str(candidate.get("provider") or ""),
+        str(candidate.get("model") or ""),
+        candidate.get("route_family"),
+        str(candidate.get("cooldown_identity_tag") or ""),
+        int(candidate.get("selection_priority") or 0),
+        bool(candidate.get("last_resort")),
+        candidate.get("selection_group"),
+        candidate.get("selection_choice"),
+    )
 
 
 class SelectionEnumeration(NamedTuple):
@@ -261,12 +331,14 @@ def _commit_round_robin_selection(
         return
     if bool(selected_candidate.get("last_resort")):
         return
-    identity = (selected_candidate.get("provider"), selected_candidate.get("model"))
+    receipt = _build_snapshot_selection_receipt(selected_candidate)
     try:
-        index = token.tied_candidate_ids.index(identity)
+        index = token.tied_candidate_receipts.index(receipt)
     except ValueError:
         return
-    _rr_cursor[(token.epoch_tag, token.alias_name)] = (index + 1) % len(token.tied_candidate_ids)
+    _rr_cursor[(token.epoch_tag, token.alias_name)] = (
+        index + 1
+    ) % len(token.tied_candidate_receipts)
 
 
 def _apply_snapshot_alias_distribution_strategy(
@@ -322,9 +394,7 @@ def _is_tui_attached_candidate_eligible(
         return True
     if not client_product_label:
         return False
-    return _normalize_tui_family(client_product_label) == _normalize_tui_family(
-        candidate.tui_attached
-    )
+    return _normalize_tui_family(client_product_label) == _normalize_tui_family(candidate.tui_attached)
 
 
 def _is_tui_excluded_candidate_eligible(
@@ -344,13 +414,23 @@ def _is_tui_excluded_candidate_eligible(
         return True
     if not client_product_label:
         return True
-    return _normalize_tui_family(client_product_label) != _normalize_tui_family(
-        candidate.tui_excluded
-    )
+    return _normalize_tui_family(client_product_label) != _normalize_tui_family(candidate.tui_excluded)
 
 
 def _clock_seconds(value: time) -> int:
     return value.hour * 3600 + value.minute * 60 + value.second
+
+
+def _schedule_anchor_date(
+    *,
+    local_date: date,
+    now_seconds: int,
+    start_seconds: int,
+    end_seconds: int,
+) -> date:
+    """Return the local day owning the recurring window containing now."""
+    anchor_is_previous_day = start_seconds > end_seconds and now_seconds < end_seconds
+    return local_date - timedelta(days=1) if anchor_is_previous_day else local_date
 
 
 def _is_schedule_window_active(
@@ -365,32 +445,47 @@ def _is_schedule_window_active(
         if schedule.start is None or schedule.end is None:
             return False
         return schedule.start <= now_utc <= schedule.end
-    if (
-        schedule.start_time is None
-        or schedule.end_time is None
-        or (schedule.utc_offset is None and schedule.timezone is None)
-    ):
-        return False
     local_timezone: tzinfo
     if schedule.timezone is not None:
         try:
             local_timezone = ZoneInfo(schedule.timezone)
         except (ValueError, ZoneInfoNotFoundError):
             return False
+    elif schedule.utc_offset is None:
+        local_timezone = timezone.utc
     else:
         assert schedule.utc_offset is not None
         local_timezone = timezone(schedule.utc_offset)
-    local_now = now_utc.astimezone(local_timezone).timetz().replace(
-        tzinfo=None, microsecond=0
-    )
-    now_seconds = _clock_seconds(local_now)
-    start_seconds = _clock_seconds(schedule.start_time)
-    end_seconds = _clock_seconds(schedule.end_time)
-    if start_seconds == end_seconds:
+    local_datetime = now_utc.astimezone(local_timezone)
+    anchor_date = local_datetime.date()
+    has_clock_window = schedule.start_time is not None and schedule.end_time is not None
+    if has_clock_window:
+        assert schedule.start_time is not None
+        assert schedule.end_time is not None
+        local_now = local_datetime.timetz().replace(tzinfo=None, microsecond=0)
+        now_seconds = _clock_seconds(local_now)
+        start_seconds = _clock_seconds(schedule.start_time)
+        end_seconds = _clock_seconds(schedule.end_time)
+        if start_seconds == end_seconds:
+            return False
+        anchor_date = _schedule_anchor_date(
+            local_date=anchor_date,
+            now_seconds=now_seconds,
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
+        )
+    if schedule.weekdays is not None and anchor_date.weekday() not in schedule.weekdays:
         return False
-    if start_seconds < end_seconds:
-        return start_seconds <= now_seconds < end_seconds
-    return now_seconds >= start_seconds or now_seconds < end_seconds
+    if schedule.start_date is not None and schedule.end_date is not None:
+        if not schedule.start_date <= anchor_date <= schedule.end_date:
+            return False
+    if has_clock_window:
+        assert schedule.start_time is not None
+        assert schedule.end_time is not None
+        if start_seconds < end_seconds:
+            return start_seconds <= now_seconds < end_seconds
+        return now_seconds >= start_seconds or now_seconds < end_seconds
+    return True
 
 
 def _is_snapshot_candidate_in_schedule_window(
@@ -433,11 +528,14 @@ def _order_snapshot_entries_by_priority(
 ) -> list[_RoutingSnapshotCandidate | _AliasReference]:
     non_zero = [entry for entry in entries if entry.priority != 0]
     zero = [entry for entry in entries if entry.priority == 0]
-    return sorted(
-        non_zero,
-        key=lambda entry: entry.priority,
-        reverse=True,
-    ) + zero
+    return (
+        sorted(
+            non_zero,
+            key=lambda entry: entry.priority,
+            reverse=True,
+        )
+        + zero
+    )
 
 
 def _shape_snapshot_candidate(
@@ -465,15 +563,47 @@ def _snapshot_cooldown_identity_tag(
     candidate: Mapping[str, Any],
 ) -> str:
     """Return the stable cooldown identity for one resolved alias candidate."""
-    route_family = canonicalize_openrouter_native_responses_route_family(
-        candidate["route_family"]
-    ) or candidate["route_family"]
+    route_family = (
+        canonicalize_openrouter_native_responses_route_family(candidate["route_family"]) or candidate["route_family"]
+    )
     return "alias:{}:{}:{}:{}".format(
         owning_alias,
         candidate["provider"],
         candidate["model"],
         route_family,
     )
+
+
+def _append_snapshot_alias_reference_candidates(
+    resolved: list[dict[str, Any]],
+    children: Sequence[dict[str, Any]],
+    *,
+    entry: _AliasReference,
+    alias_name: str,
+    distribution_strategy: Optional[str],
+) -> None:
+    for child in children:
+        if len(resolved) >= _MAX_ALIAS_EXPANDED_CANDIDATES:
+            _raise_snapshot_expanded_candidates(len(resolved) + 1)
+        shaped = dict(child)
+        shaped["selection_priority"] = entry.priority
+        # A delegated alias may be promoted as a group without promoting a
+        # nested priority-zero tail. Preserve the child's terminal last-resort
+        # boundary while applying the reference's outer ordering priority.
+        shaped["last_resort"] = bool(child.get("last_resort")) or (
+            entry.priority == 0
+        )
+        shaped["alias_reference"] = entry.alias_name
+        # A recursive child already carries the complete graph path, including
+        # both the reference and dispatch edges above it.
+        shaped["alias_path"] = list(child["alias_path"])
+        if distribution_strategy is not None:
+            shaped["selection_group"] = alias_name
+            shaped["selection_strategy"] = distribution_strategy
+            shaped["selection_choice"] = entry.alias_name
+            shaped["selection_weight"] = entry.weight
+        shaped["selection_receipt"] = _build_snapshot_selection_receipt(shaped)
+        resolved.append(shaped)
 
 
 def _resolve_snapshot_alias_candidates(
@@ -485,13 +615,22 @@ def _resolve_snapshot_alias_candidates(
     snapshot: _RoutingSnapshot,
     include_out_of_schedule: bool = False,
     path: tuple[str, ...] = (),
+    traversal_work: Optional[list[int]] = None,
 ) -> list[dict[str, Any]]:
     """Resolve one config alias to concrete candidates without nested loops."""
+    if traversal_work is None:
+        traversal_work = [0]
+    _charge_snapshot_traversal_work(traversal_work)
+
     if alias_name in path:
         return []
     alias = snapshot.aliases.get(alias_name)
     if alias is None:
         return []
+
+    _check_alias_snapshot_budget(
+        "depth", len(path) + 1, _MAX_ALIAS_GRAPH_DEPTH
+    )
 
     next_path = (*path, alias_name)
     if alias.dispatch is not None:
@@ -510,23 +649,17 @@ def _resolve_snapshot_alias_candidates(
             snapshot=snapshot,
             include_out_of_schedule=include_out_of_schedule,
             path=next_path,
+            traversal_work=traversal_work,
         )
 
     resolved: list[dict[str, Any]] = []
     for entry in _order_snapshot_entries_by_priority(alias.candidates):
         if not _is_tui_attached_candidate_eligible(
             entry, client_product_label=client_product_label
-        ) or not _is_tui_excluded_candidate_eligible(
-            entry, client_product_label=client_product_label
-        ):
+        ) or not _is_tui_excluded_candidate_eligible(entry, client_product_label=client_product_label):
             continue
         if isinstance(entry, _AliasReference):
-            if (
-                not include_out_of_schedule
-                and not _is_snapshot_candidate_in_schedule_window(
-                    entry, now_utc=now_utc
-                )
-            ):
+            if not include_out_of_schedule and not _is_snapshot_candidate_in_schedule_window(entry, now_utc=now_utc):
                 continue
             children = _resolve_snapshot_alias_candidates(
                 entry.alias_name,
@@ -536,31 +669,18 @@ def _resolve_snapshot_alias_candidates(
                 snapshot=snapshot,
                 include_out_of_schedule=include_out_of_schedule,
                 path=next_path,
+                traversal_work=traversal_work,
             )
-            for child in children:
-                shaped = dict(child)
-                shaped["selection_priority"] = entry.priority
-                # A delegated alias may be promoted as a group without
-                # promoting a nested priority-zero tail. Preserve the
-                # child's terminal last-resort boundary while applying the
-                # reference's outer ordering priority.
-                shaped["last_resort"] = bool(child.get("last_resort")) or (
-                    entry.priority == 0
-                )
-                shaped["alias_reference"] = entry.alias_name
-                shaped["alias_path"] = [*next_path, entry.alias_name]
-                if alias.distribution_strategy is not None:
-                    shaped["selection_group"] = alias.name
-                    shaped["selection_strategy"] = alias.distribution_strategy
-                    shaped["selection_choice"] = entry.alias_name
-                    shaped["selection_weight"] = entry.weight
-                resolved.append(shaped)
+            _append_snapshot_alias_reference_candidates(
+                resolved,
+                children,
+                entry=entry,
+                alias_name=alias.name,
+                distribution_strategy=alias.distribution_strategy,
+            )
             continue
 
-        if (
-            not include_out_of_schedule
-            and not _is_snapshot_candidate_in_schedule_window(entry, now_utc=now_utc)
-        ):
+        if not include_out_of_schedule and not _is_snapshot_candidate_in_schedule_window(entry, now_utc=now_utc):
             continue
         shaped_candidate = _shape_snapshot_candidate(
             entry,
@@ -572,6 +692,8 @@ def _resolve_snapshot_alias_candidates(
         )
         if shaped_candidate is None:
             continue
+        if len(resolved) >= _MAX_ALIAS_EXPANDED_CANDIDATES:
+            _raise_snapshot_expanded_candidates(len(resolved) + 1)
         shaped_candidate["cooldown_identity_tag"] = _snapshot_cooldown_identity_tag(
             owning_alias=alias.name,
             candidate=shaped_candidate,
@@ -584,6 +706,9 @@ def _resolve_snapshot_alias_candidates(
             shaped_candidate["selection_strategy"] = alias.distribution_strategy
             shaped_candidate["selection_choice"] = f"{entry.provider}:{entry.model}"
             shaped_candidate["selection_weight"] = entry.weight
+        shaped_candidate["selection_receipt"] = _build_snapshot_selection_receipt(
+            shaped_candidate
+        )
         resolved.append(shaped_candidate)
     return resolved
 
@@ -670,30 +795,33 @@ def _derive_round_robin_commit_token(
             now_utc=now_utc,
             request=request,
         )
-    non_last_resort_candidates = [
-        candidate
+    # Receipts are captured from this snapshot's resolved tuples. A later
+    # commit therefore cannot reconstruct members from a newer configuration.
+    snapshot_receipts = tuple(
+        _build_snapshot_selection_receipt(candidate)
         for candidate in resolved_candidates
+    )
+    non_last_resort_receipts = tuple(
+        receipt
+        for candidate, receipt in zip(resolved_candidates, snapshot_receipts)
         if not bool(candidate.get("last_resort"))
-    ]
-    if len(non_last_resort_candidates) < 2:
+    )
+    if len(non_last_resort_receipts) < 2:
         return None
-    top_priority = non_last_resort_candidates[0].get("selection_priority", 0)
-    tied = [
-        candidate
-        for candidate in non_last_resort_candidates
-        if candidate.get("selection_priority", 0) == top_priority
-    ]
-    if len(tied) < 2:
+    top_priority = non_last_resort_receipts[0][7]
+    tied_receipts = tuple(
+        receipt
+        for receipt in non_last_resort_receipts
+        if receipt[7] == top_priority
+    )
+    if len(tied_receipts) < 2:
         return None
     epoch_tag = snapshot.config_hash
     start_index = _rr_cursor.get((epoch_tag, canonical_alias), 0)
     return RoundRobinCommitToken(
         alias_name=canonical_alias,
         epoch_tag=epoch_tag,
-        tied_candidate_ids=tuple(
-            (str(candidate["provider"]), str(candidate["model"]))
-            for candidate in tied
-        ),
+        tied_candidate_receipts=tuple(tied_receipts),
         start_index=start_index,
     )
 

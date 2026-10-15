@@ -19,6 +19,11 @@ Falsy values:  "", "0", "false", "False", "no", "off" — all disabled.
 Pass-through path: request body is in
     kwargs["passthrough_logging_payload"]["request_body"]
 
+Provider request path: when the provider call path retained a transformed
+logical request in additional_args.complete_input_dict, write it to
+provider_request.json. It is not the final byte-for-byte httpx request, and its
+stream flag can change after that logical request is retained.
+
 Standard path: reconstructed from kwargs["messages"], kwargs["system"], etc.
 
 Registration in litellm-config.yaml:
@@ -40,6 +45,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from litellm._logging import _is_debugging_on, verbose_logger
 from litellm.integrations.custom_logger import CustomLogger
+from litellm.litellm_core_utils.redact_messages import should_redact_message_logging
 
 
 def _is_truthy(value: str) -> bool:
@@ -175,6 +181,25 @@ def _get_request_parts(
     )
 
 
+def _get_provider_request_body(kwargs: Dict[str, Any]) -> Any:
+    """Return the retained provider request body when its path preserved it.
+
+    Logging passes ``model_call_details`` as the success hook kwargs, and
+    provider call handlers retain their logical request under
+    ``kwargs["additional_args"]["complete_input_dict"]``. Some providers and
+    call paths do not supply that field; return ``None`` for them rather than
+    fabricating a body.
+    """
+    if should_redact_message_logging(kwargs):
+        return None
+
+    additional_args = kwargs.get("additional_args")
+    if not isinstance(additional_args, dict):
+        return None
+
+    return additional_args.get("complete_input_dict")
+
+
 def _build_meta(kwargs: Dict[str, Any], agent: str, ts: str) -> Dict[str, Any]:
     """Build the meta.json payload from kwargs top-level fields."""
     meta: Dict[str, Any] = {
@@ -205,6 +230,26 @@ def _build_meta(kwargs: Dict[str, Any], agent: str, ts: str) -> Dict[str, Any]:
                 val = request_body.get(field)
                 if val is not None:
                     meta[field] = val
+
+    if _get_provider_request_body(kwargs) is not None:
+        meta["provider_request"] = {
+            "artifact": "provider_request.json",
+            "source": (
+                "Logging.model_call_details.additional_args.complete_input_dict"
+            ),
+            "captured_at": "Logging.post_call",
+            "request_stage": (
+                "provider-transformed logical request after extra_body and signing"
+            ),
+            "availability": (
+                "present only when the provider/call path supplies "
+                "additional_args.complete_input_dict"
+            ),
+            "final_httpx_serialization": False,
+            "stream_finalized": False,
+            "litellm_call_id": kwargs.get("litellm_call_id"),
+            "litellm_trace_id": kwargs.get("litellm_trace_id"),
+        }
 
     return meta
 
@@ -237,6 +282,10 @@ def _dump_capture(kwargs: Dict[str, Any]) -> None:
         _write("messages.json", messages)
         _write("tools.json", tools)
         _write("meta.json", meta)
+
+        provider_request_body = _get_provider_request_body(kwargs)
+        if provider_request_body is not None:
+            _write("provider_request.json", provider_request_body)
 
         tool_count = len(tools) if isinstance(tools, list) else 0
         msg_count = len(messages) if isinstance(messages, list) else 0

@@ -2,11 +2,17 @@
 
 ## MS-030/MS-031: managed Kimi contract boundary
 
-The authoritative native client for this contract is the WSL installation at
-`/home/zepfu/.kimi-code/bin/kimi`, version `0.29.1`. Older Thoth state is not
-authoritative. `MS-032`, the Thoth daily updater, is paused by operator
-decision and is not a prerequisite for this contract. Do not resume that
-updater or publish a Thoth-derived descriptor without separate authorization.
+The supported native client for this contract is the Thoth installation at
+`/home/zepfu/.kimi-code/bin/kimi`, verified as version `2.1.1` on October 10,
+2026. The former WSL `0.29.1` reference describes a historical installation;
+WSL is not the current client authority.
+
+`MS-032` installed the Thoth daily updater as `thoth-kimi-update.service` and
+`thoth-kimi-update.timer`. Both were disabled and inactive on October 10,
+2026. CLI self-update is separate from OAuth credential refresh and is not a
+prerequisite for the managed contract. Verify the installed client and unit
+state before maintenance; updater activation and descriptor publication require
+separate rollout authorization.
 
 All AAWM Moonshot traffic is OAuth-only through `kimi_code/*` and the Kimi Code
 `/coding/v1` upstream; no AAWM route uses a Moonshot API key. Generic upstream
@@ -33,6 +39,13 @@ without a restart. The host descriptor directory is configured by
 `/app/kimi-descriptor`; consumers read
 `/app/kimi-descriptor/native-contract.json`. The image contains the
 resolver, not a captured descriptor or OAuth credential.
+
+Alpha's verified October 10 deployment instead mounts
+`/home/zepfu/.kimi-code/native-contract-alpha` read-only at
+`/run/aawm/kimi-descriptor` and sets `LITELLM_KIMI_NATIVE_CONTRACT_PATH` to
+`/run/aawm/kimi-descriptor/native-contract.json`. That descriptor reports
+client version `2.1.1`; other retained descriptor files are not evidence of
+the identity loaded by alpha.
 
 The standalone image default
 `LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=false` is compatibility mode and does
@@ -732,10 +745,12 @@ The compose contract controls credential ownership and hot-reload visibility;
 it does not enable a Kimi route by itself. Managed-route behavior, exact model
 IDs, and `/models` capability gating are documented in
 [`moonshot.md`](my-website/docs/providers/moonshot.md#managed-kimi-code-oauth-aawm).
-Kimi Code `0.29.1` derives a separate OAuth storage slot for a custom
-`KIMI_CODE_BASE_URL`, so the CLI cannot currently use the local gateway while
-retaining this exact default credential file. Do not work around that client
-limitation by copying or symlinking the credential or enrolling another grant.
+Historical Kimi Code `0.29.1` derived a separate OAuth storage slot for a
+custom `KIMI_CODE_BASE_URL`. That observation does not establish the behavior
+of the current Thoth client. Before using a custom gateway, verify that the
+installed version preserves this exact default credential file. Do not copy
+or symlink the credential or enroll another grant to work around a client
+limitation.
 Any production-equivalent deployment must preserve the same read-only worker
 and single-writer sidecar contract, but production mutation remains a separate
 operator-authorized rollout.
