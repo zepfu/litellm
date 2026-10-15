@@ -26,7 +26,7 @@ model_list:
       output_cost_per_token: 0.0
   - model_name: "tei-medcpt-article"
     litellm_params:
-      model: "local_embed/ncbi/MedCPT-Article-Encoder"
+      model: "local_embed/tei-medcpt-article"
       api_base: "http://os.environ/AAWM_TAP_MODEL_HOST:8083/v1"
       api_key: "fake-api-key"
     model_info:
@@ -36,7 +36,7 @@ model_list:
       output_cost_per_token: 0.0
   - model_name: "tei-medcpt-query"
     litellm_params:
-      model: "local_embed/ncbi/MedCPT-Query-Encoder"
+      model: "local_embed/tei-medcpt-query"
       api_base: "http://os.environ/AAWM_TAP_MODEL_HOST:8084/v1"
       api_key: "fake-api-key"
     model_info:
@@ -46,7 +46,7 @@ model_list:
       output_cost_per_token: 0.0
   - model_name: "specter2-adapter"
     litellm_params:
-      model: "local_embed/allenai/specter2_base"
+      model: "local_embed/allenai/specter2"
       api_base: "http://os.environ/AAWM_TAP_MODEL_HOST:8086/v1"
       api_key: "fake-api-key"
     model_info:

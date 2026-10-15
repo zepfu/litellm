@@ -15,7 +15,7 @@ ENV_REFERENCE = "os.environ/AAWM_TAP_MODEL_HOST"
 
 TAP_ROUTES: Dict[str, Dict[str, Any]] = {
     "tei-medcpt-article": {
-        "model": "local_embed/ncbi/MedCPT-Article-Encoder",
+        "model": "local_embed/tei-medcpt-article",
         "mode": "embedding",
         "base_model": "ncbi/MedCPT-Article-Encoder",
         "port": 8083,
@@ -24,7 +24,7 @@ TAP_ROUTES: Dict[str, Dict[str, Any]] = {
         "output_cost_per_token": 0.0,
     },
     "tei-medcpt-query": {
-        "model": "local_embed/ncbi/MedCPT-Query-Encoder",
+        "model": "local_embed/tei-medcpt-query",
         "mode": "embedding",
         "base_model": "ncbi/MedCPT-Query-Encoder",
         "port": 8084,
@@ -33,7 +33,7 @@ TAP_ROUTES: Dict[str, Dict[str, Any]] = {
         "output_cost_per_token": 0.0,
     },
     "specter2-adapter": {
-        "model": "local_embed/allenai/specter2_base",
+        "model": "local_embed/allenai/specter2",
         "mode": "embedding",
         "base_model": "allenai/specter2_base",
         "port": 8086,
