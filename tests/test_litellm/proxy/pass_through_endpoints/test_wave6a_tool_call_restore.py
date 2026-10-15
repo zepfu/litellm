@@ -1477,3 +1477,111 @@ class TestNamespaceStreamingResponse:
         assert ": keep-alive" in combined
         assert "ns_adapter" in combined
         assert not combined.endswith("\n\n")
+
+    def test_namespace_restore_then_watermark_sanitize_reaches_collector(
+        self,
+        host_deps: None,
+    ) -> None:
+        from fastapi.responses import StreamingResponse
+
+        from litellm.proxy.pass_through_endpoints.aawm_text_watermark.config import (
+            load_text_watermark_config,
+        )
+        from litellm.proxy.pass_through_endpoints.aawm_text_watermark.response_hooks import (
+            maybe_wrap_passthrough_watermark_responses_stream,
+        )
+
+        watermark = "\u200b"
+        events = [
+            {
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "tool_a",
+                },
+                "output_index": 0,
+            },
+            {
+                "type": "response.function_call_arguments.done",
+                "item_id": "fc_1",
+                "output_index": 0,
+                "arguments": '{"query":"status"}',
+            },
+            {
+                "type": "response.output_text.done",
+                "text": f"visible{watermark}text",
+                "item_id": "msg_1",
+                "output_index": 1,
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_transformed",
+                    "status": "completed",
+                    "output": [],
+                },
+            },
+        ]
+
+        async def upstream_chunks():
+            for event in events:
+                event_type = event["type"]
+                wire = (
+                    f"event: {event_type}\ndata: "
+                    + json.dumps(event, separators=(",", ":"), ensure_ascii=False)
+                    + "\n\n"
+                )
+                yield wire.encode("utf-8")
+
+        upstream = StreamingResponse(
+            upstream_chunks(),
+            media_type="text/event-stream",
+        )
+        restored = mod._restore_adapted_namespace_tool_calls_in_streaming_response(
+            upstream,
+            request_body={"tools": []},
+            adapter_model="test-model",
+        )
+        config = load_text_watermark_config(
+            {
+                "mode": "sanitize",
+                "unicode": {"enabled": True, "policy": "conservative"},
+                "removal": {
+                    "enabled": True,
+                    "stream_policy": "buffer_response",
+                    "on_unremovable": "allow",
+                },
+            }
+        )
+        watermarked_chunks = maybe_wrap_passthrough_watermark_responses_stream(
+            restored.body_iterator,
+            config=config,
+            endpoint="responses",
+        )
+
+        wire_chunks: list[bytes] = []
+
+        async def capture_watermarked_chunks():
+            async for chunk in watermarked_chunks:
+                wire_chunks.append(bytes(chunk))
+                yield chunk
+
+        downstream = StreamingResponse(
+            capture_watermarked_chunks(),
+            media_type="text/event-stream",
+        )
+
+        result = asyncio.run(lpe._collect_responses_response_from_stream(downstream))
+
+        assert watermark.encode("utf-8") not in b"".join(wire_chunks)
+        function_calls = [
+            item for item in result["output"] if item.get("type") == "function_call"
+        ]
+        messages = [item for item in result["output"] if item.get("type") == "message"]
+        assert len(function_calls) == 1
+        assert function_calls[0]["namespace"] == "ns_adapter"
+        assert function_calls[0]["arguments"] == '{"query":"status"}'
+        assert len(messages) == 1
+        assert messages[0]["content"][0]["text"] == "visibletext"
