@@ -4295,28 +4295,52 @@ async def test_openai_responses_replays_safe_reasoning_prefix_once(
 
         iterator = result.body_iterator
         observed: list[bytes] = []
-        while b"Recovered \xe6\x9d\xb1\xe4\xba\xac" not in b"".join(observed):
-            observed.append(
-                bytes(await asyncio.wait_for(iterator.__anext__(), timeout=1))
-            )
+        while not any(
+            payload.get("type") == "response.output_text.delta"
+            and payload.get("delta") == "Recovered \u6771\u4eac"
+            for payload in _responses_sse_payloads(b"".join(observed))
+        ):
+            observed.append(bytes(await asyncio.wait_for(iterator.__anext__(), timeout=1)))
         assert not terminal_gate.is_set()
 
         terminal_gate.set()
         async for chunk in iterator:
             observed.append(bytes(chunk))
         body = b"".join(observed)
-        assert b"resp_failed" not in body
-        assert _RSON_REASONING_DELTA.encode("utf-8") not in body
-        assert b"msg_empty" not in body
-        assert b"fc_empty" not in body
         payloads = _responses_sse_payloads(body)
+        response_ids = {
+            response.get("id")
+            for payload in payloads
+            for response in [payload.get("response")]
+            if isinstance(response, dict)
+        }
+        assert "resp_1" not in response_ids
+        assert not any(
+            payload.get("type") == "response.reasoning_text.delta"
+            and payload.get("item_id") == "rsn_1"
+            and payload.get("delta") == _RSON_REASONING_DELTA
+            for payload in payloads
+        )
+        assert not any(
+            payload.get("type") == "response.output_item.added"
+            and isinstance(payload.get("item"), dict)
+            and payload["item"].get("id") in {"msg_empty", "fc_empty"}
+            for payload in payloads
+        )
         assert sum(
             payload.get("type") == "response.output_text.delta"
             and payload.get("delta") == "Recovered \u6771\u4eac"
             for payload in payloads
         ) == 1
-        assert b"resp_replacement" in body
-        assert b"response.completed" in body
+        assert "resp_replacement" in response_ids
+        assert any(
+            payload.get("type") == "response.completed"
+            and isinstance(payload.get("response"), dict)
+            and payload["response"].get("id") == "resp_replacement"
+            for payload in payloads
+        )
+        assert b"event: response.completed\n" in body
+        assert b"data: [DONE]\n\n" in body
     finally:
         terminal_gate.set()
         iterator = getattr(result, "body_iterator", None)
@@ -4330,24 +4354,32 @@ async def test_openai_responses_replays_safe_reasoning_prefix_once(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("scenario", "provider_tools"),
+    ("scenario", "provider_tools", "read_mode"),
     [
-        ("text", False),
-        ("tool_arguments", False),
-        ("failed_snapshot_text", False),
-        ("failed_snapshot_tool", False),
-        ("unknown_event", False),
-        ("provider_execution_event", False),
-        ("provider_execution_capability", True),
+        ("text", False, "coalesced"),
+        ("text", False, "utf8_split"),
+        ("text", False, "delimiter_split"),
+        ("tool_arguments", False, "coalesced"),
+        ("failed_snapshot_text", False, "coalesced"),
+        ("failed_snapshot_tool", False, "coalesced"),
+        ("unknown_event", False, "coalesced"),
+        ("provider_execution_event", False, "coalesced"),
+        ("provider_execution_capability", True, "coalesced"),
     ],
 )
 async def test_openai_responses_committed_prefix_is_not_replayed(
-    monkeypatch, scenario: str, provider_tools: bool
+    monkeypatch, scenario: str, provider_tools: bool, read_mode: str
 ):
     """Committed output, effects, or unknown semantics must retain one send and
     the provider-attributed failure on the returned Responses stream."""
     monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
     stream_bytes, marker = _committed_overload_stream_bytes(scenario)
+    split_offset = (
+        _utf8_split_offset(stream_bytes, "\u6771")
+        if read_mode == "utf8_split"
+        else 0
+    )
+    stream_chunks = _chunks_for_read_mode(stream_bytes, read_mode, split_offset)
     request_body: dict[str, Any] = {"model": "gpt-5.4", "input": "continue"}
     if scenario in {"tool_arguments", "failed_snapshot_tool"}:
         request_body["tools"] = [
@@ -4372,7 +4404,7 @@ async def test_openai_responses_committed_prefix_is_not_replayed(
         ]
     result, client, sent_requests, upstream_streams = await _start_openai_responses_stream(
         monkeypatch,
-        [_ClosableAsyncByteStream([stream_bytes])],
+        [_ClosableAsyncByteStream(stream_chunks)],
         custom_body=request_body,
     )
     try:
@@ -4382,7 +4414,8 @@ async def test_openai_responses_committed_prefix_is_not_replayed(
         async for chunk in result.body_iterator:
             body_chunks.append(bytes(chunk))
         body = b"".join(body_chunks)
-        assert marker.encode("utf-8") in body
+        payloads = _responses_sse_payloads(body)
+        _assert_committed_marker_is_preserved(payloads, scenario, marker)
         assert _assert_provider_overload_terminal(body)
     finally:
         iterator = getattr(result, "body_iterator", None)
@@ -4726,6 +4759,77 @@ def _responses_sse_payloads(body: bytes) -> list[dict[str, Any]]:
     return payloads
 
 
+def _assert_committed_marker_is_preserved(
+    payloads: list[dict[str, Any]], scenario: str, marker: str
+) -> None:
+    if scenario == "text":
+        assert any(
+            payload.get("type") == "response.output_text.delta"
+            and payload.get("delta") == marker
+            for payload in payloads
+        )
+    elif scenario == "tool_arguments":
+        assert any(
+            payload.get("type") == "response.function_call_arguments.delta"
+            and payload.get("delta") == marker
+            for payload in payloads
+        )
+        assert any(
+            payload.get("type") == "response.function_call_arguments.done"
+            and payload.get("arguments") == '{"city":"\u6771\u4eac"}'
+            for payload in payloads
+        )
+    elif scenario == "failed_snapshot_text":
+        assert any(
+            item.get("type") == "message"
+            and any(
+                isinstance(content, dict) and content.get("text") == marker
+                for content in item.get("content", [])
+            )
+            for item in _failed_snapshot_output_items(payloads)
+        )
+    elif scenario == "failed_snapshot_tool":
+        assert any(
+            item.get("type") == "function_call"
+            and item.get("arguments") == marker
+            for item in _failed_snapshot_output_items(payloads)
+        )
+    elif scenario == "unknown_event":
+        assert any(
+            payload.get("type") == "response.future_event"
+            and payload.get("opaque") == marker
+            for payload in payloads
+        )
+    elif scenario == "provider_execution_event":
+        assert any(
+            payload.get("type") == "response.mcp_call.in_progress"
+            and payload.get("item_id") == marker
+            for payload in payloads
+        )
+    elif scenario == "provider_execution_capability":
+        assert any(
+            payload.get("type") == "response.failed"
+            and isinstance(payload.get("response"), dict)
+            and payload["response"].get("id") == marker
+            for payload in payloads
+        )
+    else:
+        raise AssertionError(f"unknown committed marker scenario: {scenario}")
+
+
+def _failed_snapshot_output_items(
+    payloads: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        item
+        for payload in payloads
+        if payload.get("type") == "response.failed"
+        and isinstance(payload.get("response"), dict)
+        for item in payload["response"].get("output", [])
+        if isinstance(item, dict)
+    ]
+
+
 def _assert_provider_overload_terminal(body: bytes) -> bool:
     return any(
         payload.get("type") == "response.failed"
@@ -4818,8 +4922,13 @@ def _reasoning_overload_stream_bytes(*, ensure_ascii: bool) -> bytes:
 
 def _reasoning_delta_utf8_split(buf: bytes) -> int:
     """Split inside the UTF-8 encoding of \u2026 (e2 80 a6)."""
-    offset = buf.find("\u2026".encode("utf-8"))
-    assert offset >= 0, "\u2026 byte not found in reasoning stream"
+    return _utf8_split_offset(buf, "\u2026")
+
+
+def _utf8_split_offset(buf: bytes, value: str) -> int:
+    encoded = value.encode("utf-8")
+    offset = buf.find(encoded)
+    assert offset >= 0, f"{value!r} byte sequence not found in stream"
     return offset + 1
 
 
