@@ -9983,6 +9983,8 @@ async def pass_through_request(  # noqa: PLR0915
                                 and response.status_code == status.HTTP_200_OK
                             ),
                             event_pipeline=responses_event_pipeline,
+                            request=request,
+                            provider_bound_body=provider_bound_body,
                         )
                         if pre_commit_failure is not None:
                             retired_response = raw_response
@@ -10488,6 +10490,8 @@ async def pass_through_request(  # noqa: PLR0915
                             response,
                             openai_alpha_capacity_retry_enabled=True,
                             event_pipeline=responses_event_pipeline,
+                            request=request,
+                            provider_bound_body=provider_bound_body,
                         )
                         if pre_commit_failure is not None:
                             retired_response = raw_response
