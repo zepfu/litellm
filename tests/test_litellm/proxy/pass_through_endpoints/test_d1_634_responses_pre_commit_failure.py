@@ -4266,11 +4266,10 @@ _TOOL_CITY = "\u6771\u4eac"  # 東京
 @pytest.mark.asyncio
 @pytest.mark.parametrize("read_mode", ["coalesced", "utf8_split", "delimiter_split"])
 async def test_peek_safe_reasoning_overload_must_be_retry_eligible(read_mode: str):
-    """Schema-defined reasoning_text content remains private.  Safe lifecycle
-    plus reasoning_text.delta followed by overload must be retry-eligible."""
+    """Safe lifecycle, reasoning item header, reasoning_text.delta, and
+    overload: the attempt must remain private and retry-eligible."""
     buf = _reasoning_overload_stream_bytes(ensure_ascii=False)
     chunks = _chunks_for_read_mode(buf, read_mode, _reasoning_delta_utf8_split(buf))
-    response = None
     peeked = None
     try:
         response = _FakeUpstreamStream(chunks)
@@ -4278,23 +4277,23 @@ async def test_peek_safe_reasoning_overload_must_be_retry_eligible(read_mode: st
             response,
             openai_alpha_capacity_retry_enabled=True,
         )
+        assert failure is not None
+        assert failure.error_class is not None
     finally:
         if peeked is not None:
-            await _safe_aclose(peeked)
-    assert failure is not None
-    assert failure.error_class is not None
+            await peeked.aclose()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("read_mode", ["coalesced", "utf8_split", "delimiter_split"])
 async def test_peek_failed_with_tool_output_must_veto_replay(read_mode: str):
-    """response.failed with completed tool data in response.output commits
-    before failure classification; the attempt cannot be retried."""
+    """response.failed carrying completed tool output commits the attempt;
+    replay must be vetoed."""
     buf = _tool_failed_stream_bytes(ensure_ascii=False)
     chunks = _chunks_for_read_mode(buf, read_mode, _tool_utf8_split(buf))
-    response = _FakeUpstreamStream(chunks)
     peeked = None
     try:
+        response = _FakeUpstreamStream(chunks)
         peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
             response,
             openai_alpha_capacity_retry_enabled=True,
@@ -4304,7 +4303,7 @@ async def test_peek_failed_with_tool_output_must_veto_replay(read_mode: str):
         assert replayed == buf
     finally:
         if peeked is not None:
-            await _safe_aclose(peeked)
+            await peeked.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -4316,48 +4315,51 @@ def _reasoning_overload_stream_bytes(*, ensure_ascii: bool) -> bytes:
     return b"".join([
         _sse(
             "response.created",
-            {"type": "response.created", "response": {
-                "id": "resp_1", "object": "response", "status": "in_progress",
-                "model": "gpt-5.4", "output": []}},
+            {"type": "response.created", "sequence_number": 1,
+             "response": {
+                 "id": "resp_1", "object": "response", "status": "in_progress",
+                 "model": "gpt-5.4", "output": []}},
             ensure_ascii=ensure_ascii,
         ),
         _sse(
             "response.in_progress",
-            {"type": "response.in_progress", "response": {
-                "id": "resp_1", "object": "response", "status": "in_progress",
-                "model": "gpt-5.4", "output": []}},
+            {"type": "response.in_progress", "sequence_number": 2,
+             "response": {
+                 "id": "resp_1", "object": "response", "status": "in_progress",
+                 "model": "gpt-5.4", "output": []}},
             ensure_ascii=ensure_ascii,
         ),
         _sse(
             "response.output_item.added",
-            {"type": "response.output_item.added",
+            {"type": "response.output_item.added", "sequence_number": 3,
+             "output_index": 0,
              "item": {"id": "rsn_1", "type": "reasoning",
                       "status": "in_progress", "summary": [],
-                      "content": []},
-             "output_index": 0},
+                      "content": []}},
             ensure_ascii=ensure_ascii,
         ),
         _sse(
             "response.reasoning_text.delta",
-            {"type": "response.reasoning_text.delta",
+            {"type": "response.reasoning_text.delta", "sequence_number": 4,
              "item_id": "rsn_1", "output_index": 0, "content_index": 0,
              "delta": _RSON_REASONING_DELTA},
             ensure_ascii=ensure_ascii,
         ),
         _sse(
             "error",
-            {"type": "error",
+            {"type": "error", "sequence_number": 5,
              "error": {"type": "server_error", "code": "server_overloaded",
                        "message": "overloaded"}},
             ensure_ascii=ensure_ascii,
         ),
         _sse(
             "response.failed",
-            {"type": "response.failed", "response": {
-                "id": "resp_1", "object": "response", "status": "failed",
-                "model": "gpt-5.4", "output": [],
-                "error": {"type": "server_error", "code": "server_overloaded",
-                          "message": "overloaded"}}},
+            {"type": "response.failed", "sequence_number": 6,
+             "response": {
+                 "id": "resp_1", "object": "response", "status": "failed",
+                 "model": "gpt-5.4", "output": [],
+                 "error": {"type": "server_error", "code": "server_overloaded",
+                           "message": "overloaded"}}},
             ensure_ascii=ensure_ascii,
         ),
     ])
@@ -4367,51 +4369,52 @@ def _tool_failed_stream_bytes(*, ensure_ascii: bool) -> bytes:
     return b"".join([
         _sse(
             "response.created",
-            {"type": "response.created", "response": {
-                "id": "resp_1", "object": "response", "status": "in_progress",
-                "model": "gpt-5.4", "output": []}},
+            {"type": "response.created", "sequence_number": 1,
+             "response": {
+                 "id": "resp_1", "object": "response", "status": "in_progress",
+                 "model": "gpt-5.4", "output": []}},
             ensure_ascii=ensure_ascii,
         ),
         _sse(
             "response.in_progress",
-            {"type": "response.in_progress", "response": {
-                "id": "resp_1", "object": "response", "status": "in_progress",
-                "model": "gpt-5.4", "output": []}},
+            {"type": "response.in_progress", "sequence_number": 2,
+             "response": {
+                 "id": "resp_1", "object": "response", "status": "in_progress",
+                 "model": "gpt-5.4", "output": []}},
             ensure_ascii=ensure_ascii,
         ),
         _sse(
             "response.failed",
-            {"type": "response.failed", "response": {
-                "id": "resp_1", "object": "response", "status": "failed",
-                "model": "gpt-5.4",
-                "output": [{
-                    "id": "fc_1", "type": "function_call",
-                    "call_id": "call_1", "name": "get_weather",
-                    "arguments": '{"city":"%s"}' % _TOOL_CITY,
-                    "status": "completed",
-                }],
-                "error": {"type": "server_error",
-                          "code": "server_overloaded",
-                          "message": "overloaded"}}},
+            {"type": "response.failed", "sequence_number": 3,
+             "response": {
+                 "id": "resp_1", "object": "response", "status": "failed",
+                 "model": "gpt-5.4",
+                 "output": [{
+                     "id": "fc_1", "type": "function_call",
+                     "call_id": "call_1", "name": "get_weather",
+                     "arguments": '{"city":"%s"}' % _TOOL_CITY,
+                     "status": "completed",
+                 }],
+                 "error": {"type": "server_error",
+                           "code": "server_overloaded",
+                           "message": "overloaded"}}},
             ensure_ascii=ensure_ascii,
         ),
     ])
 
 
 def _reasoning_delta_utf8_split(buf: bytes) -> int:
-    """Split inside the UTF-8 encoding of \u2026 (e2 80 a6) in the reasoning delta."""
-    ellipsis = _RSON_REASONING_DELTA.encode("utf-8")
-    needle = ellipsis[ellipsis.find(b"\xe2\x80\xa6"):][:1]
-    offset = buf.find(needle)
+    """Split inside the UTF-8 encoding of \u2026 (e2 80 a6)."""
+    offset = buf.find("\u2026".encode("utf-8"))
     assert offset >= 0, "\u2026 byte not found in reasoning stream"
-    return offset + 1
+    return offset + 1  # after first byte; second byte is continuation
 
 
 def _tool_utf8_split(buf: bytes) -> int:
-    """Split inside the UTF-8 encoding of \u6771 (e6 9d b1) in tool arguments."""
+    """Split inside the UTF-8 encoding of \u6771 (e6 9d b1)."""
     offset = buf.find("\u6771".encode("utf-8"))
     assert offset >= 0, "\u6771 byte not found in tool-failed stream"
-    return offset + 1
+    return offset + 1  # after first byte; second byte is continuation
 
 
 def _chunks_for_read_mode(
@@ -4422,14 +4425,7 @@ def _chunks_for_read_mode(
     if read_mode == "utf8_split":
         return [buf[:utf8_split], buf[utf8_split:]]
     if read_mode == "delimiter_split":
-        second_sse = buf.find(b"\n\n", buf.find(b"\n\n") + 2)
-        return [buf[: second_sse + 2], buf[second_sse + 2 :]]
+        # Split between the two newline bytes of the second SSE delimiter.
+        second_nl = buf.find(b"\n\n", buf.find(b"\n\n") + 2)
+        return [buf[: second_nl + 1], buf[second_nl + 1 :]]
     raise ValueError(f"unknown read_mode: {read_mode}")
-
-
-async def _safe_aclose(peeked) -> None:
-    aclose = getattr(peeked, "aclose", None)
-    if callable(aclose):
-        result = aclose()
-        if hasattr(result, "__await__"):
-            await result
