@@ -32,8 +32,38 @@ _WIRE_REPLAY_BLOCKING_FLAGS = (
     "first_body_sent",
     "terminal_wire_committed",
     "done_wire_committed",
+    "precommit_replay_committed",
 )
 _WIRE_REPLAY_BLOCKING_DISPOSITIONS = frozenset({"cancelled", "disconnected"})
+
+# Ordered from lowest to highest commitment priority.  When the same read
+# produces multiple commitment reasons the highest-priority reason wins.
+_RESPONSES_REPLAY_COMMITMENT_REASONS = frozenset({
+    "assistant_output",
+    "client_tool_payload",
+    "provider_execution_possible",
+    "unknown_semantics",
+    "successful_terminal",
+    "terminal_marker",
+    "prefix_limit",
+    "event_limit",
+    "delivery_started",
+})
+
+_RESPONSES_REPLAY_COMMITMENT_PRIORITY = {
+    "delivery_started": 1,
+    "unknown_semantics": 2,
+    "prefix_limit": 3,
+    "event_limit": 3,
+    "terminal_marker": 4,
+    "client_tool_payload": 5,
+    "provider_execution_possible": 6,
+    "assistant_output": 7,
+    "successful_terminal": 8,
+}
+
+_RESPONSES_REPLAY_LATCH_REASON_KEY = "precommit_commitment_reason"
+_RESPONSES_REPLAY_LATCH_EVENT_KEY = "precommit_commitment_event_type"
 
 
 def _safe_context_value(value: Any, *, maximum: int = 128) -> Optional[str]:
@@ -551,6 +581,7 @@ def _safe_wire_commitment(
             "state",
             "response_start_sent",
             "first_body_sent",
+            "precommit_replay_committed",
             "commitment",
             "terminal_event_type",
             "disposition",
@@ -561,6 +592,8 @@ def _safe_wire_commitment(
             "done_wire_committed",
             "finalization_started",
             "finalized",
+            _RESPONSES_REPLAY_LATCH_REASON_KEY,
+            _RESPONSES_REPLAY_LATCH_EVENT_KEY,
         )
         if key in commitment
     }
@@ -760,6 +793,100 @@ async def close_active_upstream_response(request: Request) -> None:
                 close_fn()
     finally:
         setattr(state, _ACTIVE_RESPONSE_STATE_KEY, None)
+
+
+def publish_responses_replay_commitment(
+    request: Request,
+    *,
+    reason: str,
+    event_type: Optional[str] = None,
+) -> None:
+    """Set the monotonic replay-commit latch before any yield that could expose
+    committing data.
+
+    Once set the latch forbids every internal resend path through the existing
+    ``ensure_openai_wire_replay_allowed`` guard.  Callers must set it *before*
+    an ``await`` or ``yield`` that hands committed output to the client.
+    """
+
+    if reason not in _RESPONSES_REPLAY_COMMITMENT_REASONS:
+        raise ValueError(
+            f"Unknown precommit replay-commitment reason: {reason!r}"
+        )
+    state = _request_state(request)
+    if state is None:
+        return
+    commitment = getattr(state, _WIRE_COMMITMENT_STATE_KEY, None)
+    if not isinstance(commitment, dict):
+        commitment = {}
+        setattr(state, _WIRE_COMMITMENT_STATE_KEY, commitment)
+
+    existing_reason = commitment.get(_RESPONSES_REPLAY_LATCH_REASON_KEY)
+    if existing_reason is not None:
+        existing_priority = _RESPONSES_REPLAY_COMMITMENT_PRIORITY.get(
+            existing_reason, 0
+        )
+        new_priority = _RESPONSES_REPLAY_COMMITMENT_PRIORITY.get(reason, 0)
+        if new_priority <= existing_priority:
+            return
+
+    commitment["precommit_replay_committed"] = True
+    commitment[_RESPONSES_REPLAY_LATCH_REASON_KEY] = reason
+    if event_type is not None:
+        commitment[_RESPONSES_REPLAY_LATCH_EVENT_KEY] = event_type
+
+
+def get_responses_replay_commitment_reason(
+    request: Request,
+) -> Optional[str]:
+    """Return the replay-commit reason without asserting replay prohibition."""
+
+    state = _request_state(request)
+    commitment = (
+        getattr(state, _WIRE_COMMITMENT_STATE_KEY, None)
+        if state is not None
+        else None
+    )
+    if not isinstance(commitment, Mapping):
+        return None
+    reason = commitment.get(_RESPONSES_REPLAY_LATCH_REASON_KEY)
+    return reason if isinstance(reason, str) else None
+
+
+_PROVIDER_EXECUTABLE_TOOL_TYPES = frozenset({
+    "mcp",
+    "web_search",
+    "web_search_preview",
+    "code_interpreter",
+    "computer",
+    "image_generation",
+    "file_search",
+})
+
+
+def responses_effective_provider_tools_allowed(
+    provider_bound_body: Optional[Mapping[str, Any]],
+) -> bool:
+    """Return True when the final bound body includes provider-executable tools
+    that could produce remote effects without a client-visible tool event.
+
+    Inspects ``tools`` entries whose ``type`` is in the known provider-executable
+    set or whose ``type`` is absent/unknown (conservative).  Collaboration-injected
+    tools are also checked when the body carries the collaboration metadata key.
+    """
+
+    if not isinstance(provider_bound_body, Mapping):
+        return False
+    tools = provider_bound_body.get("tools")
+    if not isinstance(tools, list):
+        return False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        tool_type = str(tool.get("type", "")).lower()
+        if not tool_type or tool_type in _PROVIDER_EXECUTABLE_TOOL_TYPES:
+            return True
+    return False
 
 
 __all__ = [

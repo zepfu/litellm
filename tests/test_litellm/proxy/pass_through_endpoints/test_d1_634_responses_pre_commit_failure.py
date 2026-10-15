@@ -408,7 +408,7 @@ async def test_peek_classifies_native_codex_recovery_errors_before_commit(
     if fragmented:
         split_at = error_chunk.index(b'"message"') + len(b'"message"')
         error_chunks = [error_chunk[:split_at], error_chunk[split_at:]]
-        partial_decision, _, _ = (
+        partial_decision, _, _, _ = (
             PassThroughStreamingHandler._inspect_responses_pre_commit_chunks(
                 [error_chunks[0]]
             )
@@ -692,7 +692,7 @@ def test_no_replay_after_substantive_output():
             },
         ),
     ]
-    decision, error_payload, event_type = (
+    decision, error_payload, event_type, _ = (
         PassThroughStreamingHandler._inspect_responses_pre_commit_chunks(chunks)
     )
     assert decision == "substantive"
@@ -963,7 +963,7 @@ def test_inspect_pre_commit_chunks_does_not_raise_on_truncated_utf8_tail():
         },
     )
     chunks = [complete + b"\xe2\x82"]
-    decision, error_payload, event_type = (
+    decision, error_payload, event_type, _ = (
         PassThroughStreamingHandler._inspect_responses_pre_commit_chunks(chunks)
     )
     assert decision == "lifecycle"
@@ -994,7 +994,7 @@ def test_inspect_pre_commit_chunks_still_classifies_valid_utf8_sse():
             },
         ),
     ]
-    decision, error_payload, event_type = (
+    decision, error_payload, event_type, _ = (
         PassThroughStreamingHandler._inspect_responses_pre_commit_chunks(chunks)
     )
     assert decision == "substantive"
