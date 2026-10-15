@@ -601,6 +601,7 @@ async def _iterate_responses_sse_events(
     """Yield parsed SSE event dicts (RR-054 #27: no dict<->namespace round-trip)."""
     from litellm.llms.base_llm.base_model_iterator import BaseModelResponseIterator
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+        responses_emissions_from_chunk,
         responses_events_from_chunk,
     )
 
@@ -611,14 +612,27 @@ async def _iterate_responses_sse_events(
                 event_block, "aawm_parsed_responses_events", None
             )
         if isinstance(associated_events, list):
-            for parsed_event in associated_events:
+            associated_emissions = responses_emissions_from_chunk(event_block)
+            has_matching_emissions = (
+                associated_emissions is not None
+                and len(associated_emissions) == len(associated_events)
+            )
+            for index, parsed_event in enumerate(associated_events):
                 if (
                     parsed_event.is_malformed
                     or parsed_event.is_done_marker
                     or parsed_event.payload is None
                 ):
                     continue
-                yield parsed_event.payload
+                effective_payload = parsed_event.payload
+                if has_matching_emissions:
+                    emission = associated_emissions[index]
+                    if (
+                        emission.source_event is parsed_event
+                        and emission.effective_payload is not None
+                    ):
+                        effective_payload = emission.effective_payload
+                yield effective_payload
             continue
         for line in event_block.splitlines():
             parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(line)
