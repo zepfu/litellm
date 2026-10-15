@@ -50,15 +50,22 @@ Consumer-facing model names are LiteLLM aliases. The backing model and service p
 | Embedding | `tei-indus-v2` | `nasa-impact/nasa-smd-ibm-st-v2` | `tei-indus-v2` on `8091` | `$0.0056 / M tokens` |
 | Embedding | `tei-sapbert` | `cambridgeltl/SapBERT-from-PubMedBERT-fulltext` | `tei-sapbert` on `8088` | `$0.0046 / M tokens` |
 | Embedding | `tei-sapbert-source` | `cambridgeltl/SapBERT-from-PubMedBERT-fulltext` | `tei-sapbert-source` on `8092` | `$0.0046 / M tokens` |
-| Embedding | `nomic-embed-code` | `nomic-embed-code.Q8_0.gguf` | `nomic-embed-code` on `8082` | `$0.15 / M tokens` |
+| Embedding | `nomic-embed-code` | `nomic-embed-code.Q4_K_M.gguf` | Thoth `aawm-tap-nomic-code-gguf-dev:8080` | `$0.15 / M tokens` |
+| Embedding | `qwen3-embedding-8b` | `Qwen3-Embedding-8B-Q4_K_M.gguf` | Thoth `aawm-tap-qwen3-embedding-8b-dev:8080` | Not configured |
 | Rerank | `tei-reranker` | `BAAI/bge-reranker-v2-m3` | `tei-reranker` on `8090` | `$0.025 / M tokens` |
 
-Costs are estimated commercial-equivalent token prices for local services so LiteLLM spend and AAWM `session_history.response_cost_usd` remain populated.
+Listed costs are estimated commercial-equivalent token prices for local services so LiteLLM spend and AAWM `session_history.response_cost_usd` remain populated.
 
-The eight TAP routes use `AAWM_TAP_MODEL_HOST` for their upstream host. It
+The eight Mahaf TAP routes use `AAWM_TAP_MODEL_HOST` for their upstream host. It
 defaults to `mahaf.tailf1878c.ts.net` in the checked-in dev configuration and
 can be overridden in the LiteLLM service environment; ports and route paths
 remain fixed per alias.
+
+The two Thoth embedding routes use private Docker DNS. Their host publications
+remain loopback-only. See [local embedding operations](docs/aawm-local-embeddings.md)
+for backend identities, vector dimensions, deployment connectivity, and
+acceptance checks. The local `qwen3-embedding-8b` alias is separate from
+`openrouter/qwen/qwen3-embedding-8b`.
 
 ## Embeddings
 
@@ -76,6 +83,7 @@ Choose the model alias that matches the retrieval domain:
 - Use `tei-sapbert` for biomedical entity and concept text.
 - Use `tei-sapbert-source` for the distinct source-backed SapBERT route.
 - Use `nomic-embed-code` for code-oriented embeddings.
+- Use `qwen3-embedding-8b` for local Qwen3 embeddings.
 
 ```bash
 curl -sS "$LITELLM_BASE_URL/v1/embeddings" \

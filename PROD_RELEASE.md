@@ -360,6 +360,16 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
    configuration. Do not route these TAP entries through a Docker bridge IP
    such as `172.20.0.1`.
 
+   For the Thoth Nomic Code and Qwen3 Embedding routes, connect the backend
+   containers to the proxy's existing private Docker network and use their
+   stable container DNS names on port 8080. Preserve the loopback-only host
+   publications. Network connections survive restart and reboot; reconnect
+   after backend recreation. See [local embedding operations](docs/aawm-local-embeddings.md)
+   for the exact container names and acceptance checks. Inspect the running
+   proxy's actual configuration bind source before changing a template:
+   Thoth's `aawm-litellm` currently loads repository-root
+   `litellm-dev-config.yaml` at `/app/litellm-config.yaml`.
+
    Prod error-log mirroring also requires a writable mount from this repo's
    `.analysis` directory to the container path named by
    `LITELLM_AAWM_ERROR_LOG_DIR`, normally `/app/.analysis`.
@@ -436,7 +446,7 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
 
    ```bash
    docker exec aawm-litellm sh -lc \
-     "grep -En 'openrouter/qwen/qwen3-embedding-8b|openrouter/cohere/rerank-4-pro|openrouter/google/gemini-embedding-2-preview|nvidia_nim/nvidia/rerank-qa-mistral-4b|nvidia_nim/nvidia/nv-embed-v1|local_embed/nomic-embed-code.Q8_0.gguf|local_rerank/BAAI/bge-reranker-v2-m3' /etc/litellm/config.yaml"
+     "grep -En 'openrouter/qwen/qwen3-embedding-8b|openrouter/cohere/rerank-4-pro|openrouter/google/gemini-embedding-2-preview|nvidia_nim/nvidia/rerank-qa-mistral-4b|nvidia_nim/nvidia/nv-embed-v1|local_embed/nomic-embed-code|local_embed/qwen3-embedding-8b|local_rerank/BAAI/bge-reranker-v2-m3' /app/litellm-config.yaml"
    ```
 
    For local TAP route promotions, also verify the rendered config includes the
