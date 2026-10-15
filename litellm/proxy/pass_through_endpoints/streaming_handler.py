@@ -271,6 +271,9 @@ class _PrefixedHttpxByteStream:
         return getattr(self._response, name)
 
     def _close_prefix(self) -> None:
+        if getattr(self, "_prefix_closed", False):
+            return
+        self._prefix_closed = True
         close = getattr(self._prefix, "close", None)
         if callable(close):
             close()
@@ -325,6 +328,9 @@ class _PrefixedHttpxByteStream:
                     if live_suffix:
                         async for live_chunk in _iter_live_chunk(live_suffix):
                             yield live_chunk
+            # Retire prefix storage before pulling the live remainder so
+            # spooled files are closed during streaming, not after.
+            self._close_prefix()
             if self._remainder is None:
                 return
             if self._aawm_responses_event_pipeline is not None:
