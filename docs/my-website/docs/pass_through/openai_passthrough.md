@@ -52,7 +52,7 @@ the defaults below use binary MiB (`1 MiB = 1,048,576 bytes`).
 | `AAWM_RESPONSES_MAX_STREAM_BYTES` | 128 MiB | Total admitted stream bytes |
 | `AAWM_RESPONSES_MAX_STREAM_EVENTS` | 100,000 | Admitted events |
 | `AAWM_RESPONSES_MAX_HELD_EVENTS` | 256 | Retained parsed events |
-| `AAWM_RESPONSES_MAX_HELD_BYTES` | 8 MiB | Retained parsed-event wire bytes |
+| `AAWM_RESPONSES_MAX_HELD_BYTES` | 8 MiB | Wire bytes plus JSON bytes of retained payloads |
 | `AAWM_RESPONSES_MAX_OUTPUT_BYTES` | 8 MiB | Reconstructed output retained for summaries |
 | `AAWM_RESPONSES_MAX_OUTPUT_ITEMS` | 128 | Reconstructed output items |
 | `AAWM_RESPONSES_MAX_RAW_EVENTS` | 64 | Diagnostic raw-event history |
