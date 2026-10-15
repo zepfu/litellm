@@ -4515,8 +4515,8 @@ async def test_openai_responses_successful_terminal_shapes_finish_once(
 async def test_openai_responses_unsafe_admission_shapes_do_not_replay(
     monkeypatch, scenario: str
 ):
-    """Unknown schema, conflicting identities, and malformed SSE cannot turn a
-    later provider overload into permission for another send."""
+    """Unknown shapes veto replay; conflicting SSE metadata terminates locally
+    before its trailing provider overload."""
     monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
     stream_bytes = _unsafe_admission_overload_stream_bytes(scenario)
     result, client, sent_requests, upstream_streams = await _start_openai_responses_stream(
@@ -4529,7 +4529,20 @@ async def test_openai_responses_unsafe_admission_shapes_do_not_replay(
         body = b"".join(
             [bytes(chunk) async for chunk in result.body_iterator]
         )
-        assert _assert_provider_overload_terminal(body)
+        if scenario == "conflicting_event_payload_type":
+            terminal_payloads = [
+                payload
+                for payload in _responses_sse_payloads(body)
+                if payload.get("type")
+                in {"response.completed", "response.failed", "response.incomplete"}
+            ]
+            assert len(terminal_payloads) == 1
+            assert terminal_payloads[0]["type"] == "response.failed"
+            malformed_response = terminal_payloads[0]["response"]
+            assert malformed_response["status"] == "failed"
+            assert malformed_response["error"]["code"] == "malformed_sse_frame"
+        else:
+            assert _assert_provider_overload_terminal(body)
     finally:
         iterator = getattr(result, "body_iterator", None)
         close_iterator = getattr(iterator, "aclose", None)
@@ -4621,21 +4634,18 @@ async def test_openai_responses_private_prefix_bound_preserves_admitted_events(
             "error",
             {
                 "type": "error",
-                "error": {
-                    "type": "server_error",
-                    "code": "server_overloaded",
-                    "message": "The selected model is at capacity.",
-                },
+                "sequence_number": 3,
+                "code": "server_is_overloaded",
+                "message": "The selected model is at capacity.",
             },
         ),
         _response_event(
             "response.failed",
-            3,
+            4,
             response_id=response_id,
             status="failed",
             error={
-                "type": "server_error",
-                "code": "server_overloaded",
+                "code": "server_error",
                 "message": "The selected model is at capacity.",
             },
         ),
@@ -4884,26 +4894,26 @@ def _successful_responses_stream_bytes(
             )
         )
         if overload_after_terminal:
-            overload = {
-                "type": "server_error",
-                "code": "server_overloaded",
-                "message": "The selected model is at capacity.",
-            }
             frames.extend(
                 [
                     _sse(
                         "error",
                         {
                             "type": "error",
-                            "error": overload,
+                            "sequence_number": 3,
+                            "code": "server_is_overloaded",
+                            "message": "The selected model is at capacity.",
                         },
                     ),
                     _response_event(
                         "response.failed",
-                        3,
+                        4,
                         response_id=response_id,
                         status="failed",
-                        error=overload,
+                        error={
+                            "code": "server_error",
+                            "message": "The selected model is at capacity.",
+                        },
                     ),
                 ]
             )
@@ -4943,6 +4953,7 @@ def _successful_responses_stream_bytes(
                     output_index=0,
                     content_index=0,
                     text=text,
+                    logprobs=[],
                 ),
                 _responses_event(
                     "response.output_item.done",
@@ -4975,8 +4986,7 @@ def _unsafe_admission_overload_stream_bytes(scenario: str) -> bytes:
         )
     ]
     overload = {
-        "type": "server_error",
-        "code": "server_overloaded",
+        "code": "server_error",
         "message": "The selected model is at capacity.",
     }
     if scenario == "unsupported_lifecycle_extension":
@@ -4991,6 +5001,10 @@ def _unsafe_admission_overload_stream_bytes(scenario: str) -> bytes:
                         "status": "in_progress",
                         "model": "gpt-5.4",
                         "output": [],
+                        "created_at": 0,
+                        "parallel_tool_calls": False,
+                        "tool_choice": "auto",
+                        "tools": [],
                         "future_lifecycle_state": {"opaque": "not admitted"},
                     },
                 ),
@@ -5027,6 +5041,10 @@ def _unsafe_admission_overload_stream_bytes(scenario: str) -> bytes:
                             "status": "in_progress",
                             "model": "gpt-5.4",
                             "output": [],
+                            "created_at": 0,
+                            "parallel_tool_calls": False,
+                            "tool_choice": "auto",
+                            "tools": [],
                         },
                     },
                 ),
@@ -5067,9 +5085,11 @@ def _response_event(
         "status": status,
         "model": "gpt-5.4",
         "output": output or [],
+        "created_at": 0,
+        "parallel_tool_calls": False,
+        "tool_choice": "auto",
+        "tools": [],
     }
-    if event_type == "response.created":
-        response["created_at"] = 0
     if error is not None:
         response["error"] = error
     return _responses_event(event_type, sequence, response=response)
@@ -5078,8 +5098,7 @@ def _response_event(
 def _committed_overload_stream_bytes(scenario: str) -> tuple[bytes, str]:
     response_id = "resp_committed"
     overload = {
-        "type": "server_error",
-        "code": "server_overloaded",
+        "code": "server_error",
         "message": "The selected model is at capacity.",
     }
     frames = [
@@ -5181,6 +5200,10 @@ def _committed_overload_stream_bytes(scenario: str) -> tuple[bytes, str]:
             output = [{
                 "id": marker, "type": "web_search_call",
                 "status": "completed",
+                "action": {
+                    "type": "search",
+                    "query": "weather in Tokyo",
+                },
             }]
         frames.append(failed(2, output))
     elif scenario == "unknown_event":
@@ -5313,13 +5336,21 @@ def _failed_snapshot_output_items(
 
 
 def _assert_provider_overload_terminal(body: bytes) -> bool:
-    return any(
-        payload.get("type") == "response.failed"
-        and isinstance(payload.get("response"), dict)
-        and isinstance(payload["response"].get("error"), dict)
-        and payload["response"]["error"].get("code") == "server_overloaded"
-        for payload in _responses_sse_payloads(body)
-    )
+    for payload in _responses_sse_payloads(body):
+        if payload.get("type") != "response.failed":
+            continue
+        response = payload.get("response")
+        if not isinstance(response, dict):
+            continue
+        error = response.get("error")
+        if (
+            isinstance(error, dict)
+            and error.get("code") == "server_error"
+            and "selected model is at capacity"
+            in str(error.get("message", "")).lower()
+        ):
+            return True
+    return False
 
 
 def _reasoning_overload_stream_bytes(*, ensure_ascii: bool) -> bytes:
