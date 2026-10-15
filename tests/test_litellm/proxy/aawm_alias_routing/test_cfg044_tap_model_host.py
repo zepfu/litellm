@@ -1,4 +1,4 @@
-"""CFG-044: one host override drives the eight TAP routes."""
+"""CFG-044: one host override drives configurable TAP routes."""
 
 from __future__ import annotations
 
@@ -18,7 +18,8 @@ TAP_ROUTES: Dict[str, Dict[str, Any]] = {
         "model": "local_embed/tei-medcpt-article",
         "mode": "embedding",
         "base_model": "ncbi/MedCPT-Article-Encoder",
-        "port": 8083,
+        "fixed_host": "aawm-tap-tei-medcpt-article-dev",
+        "port": 80,
         "suffix": "/v1",
         "input_cost_per_token": 4.6e-09,
         "output_cost_per_token": 0.0,
@@ -27,7 +28,8 @@ TAP_ROUTES: Dict[str, Dict[str, Any]] = {
         "model": "local_embed/tei-medcpt-query",
         "mode": "embedding",
         "base_model": "ncbi/MedCPT-Query-Encoder",
-        "port": 8084,
+        "fixed_host": "aawm-tap-tei-medcpt-query-dev",
+        "port": 80,
         "suffix": "/v1",
         "input_cost_per_token": 2.8e-09,
         "output_cost_per_token": 0.0,
@@ -36,7 +38,8 @@ TAP_ROUTES: Dict[str, Dict[str, Any]] = {
         "model": "local_embed/allenai/specter2",
         "mode": "embedding",
         "base_model": "allenai/specter2_base",
-        "port": 8086,
+        "fixed_host": "aawm-tap-specter2-adapter-dev",
+        "port": 80,
         "suffix": "/v1",
         "input_cost_per_token": 4.6e-09,
         "output_cost_per_token": 0.0,
@@ -109,10 +112,13 @@ def _deployment(config: dict, model_name: str) -> dict:
 
 
 def _expected_source_api_base(route: Dict[str, Any]) -> str:
-    return f"http://{ENV_REFERENCE}:{route['port']}{route['suffix']}"
+    host = route.get("fixed_host", ENV_REFERENCE)
+    return f"http://{host}:{route['port']}{route['suffix']}"
 
 
 def _expected_api_base(host: str, route: Dict[str, Any]) -> str:
+    if "fixed_host" in route:
+        return _expected_source_api_base(route)
     return f"http://{host}:{route['port']}{route['suffix']}"
 
 
@@ -138,7 +144,7 @@ def test_tap_route_source_contract(model_name: str) -> None:
             assert model_info[cost_key] == route[cost_key]
 
 
-def test_default_render_uses_mahaf_for_all_tap_routes(
+def test_default_render_uses_mahaf_for_configurable_tap_routes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("AAWM_TAP_MODEL_HOST", raising=False)
@@ -153,7 +159,7 @@ def test_default_render_uses_mahaf_for_all_tap_routes(
         assert "host.docker.internal" not in api_base
 
 
-def test_one_override_renders_all_tap_hosts_without_source_entry_edits(
+def test_one_override_renders_configurable_tap_hosts_without_source_entry_edits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source_before = _load_dev_config()
