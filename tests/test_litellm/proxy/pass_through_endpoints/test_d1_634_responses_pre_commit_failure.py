@@ -4278,7 +4278,9 @@ async def test_peek_safe_reasoning_overload_must_be_retry_eligible(read_mode: st
             openai_alpha_capacity_retry_enabled=True,
         )
         assert failure is not None
-        assert failure.error_class is not None
+        assert failure.error_class == "server_overloaded"
+        assert failure.classification == "transient_capacity"
+        assert failure.retryable is True
     finally:
         if peeked is not None:
             await peeked.aclose()
@@ -4286,9 +4288,9 @@ async def test_peek_safe_reasoning_overload_must_be_retry_eligible(read_mode: st
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("read_mode", ["coalesced", "utf8_split", "delimiter_split"])
-async def test_peek_failed_with_tool_output_must_veto_replay(read_mode: str):
-    """response.failed carrying completed tool output commits the attempt;
-    replay must be vetoed."""
+async def test_peek_failed_with_tool_output_commits_stream(read_mode: str):
+    """response.failed carrying completed tool output produces no
+    retryable precommit failure and hands off the stream intact."""
     buf = _tool_failed_stream_bytes(ensure_ascii=False)
     chunks = _chunks_for_read_mode(buf, read_mode, _tool_utf8_split(buf))
     peeked = None
@@ -4317,16 +4319,22 @@ def _reasoning_overload_stream_bytes(*, ensure_ascii: bool) -> bytes:
             "response.created",
             {"type": "response.created", "sequence_number": 1,
              "response": {
-                 "id": "resp_1", "object": "response", "status": "in_progress",
-                 "model": "gpt-5.4", "output": []}},
+                 "id": "resp_1", "object": "response",
+                 "status": "in_progress", "model": "gpt-5.4",
+                 "output": [],
+                 "created_at": 0, "parallel_tool_calls": False,
+                 "tool_choice": "auto", "tools": []}},
             ensure_ascii=ensure_ascii,
         ),
         _sse(
             "response.in_progress",
             {"type": "response.in_progress", "sequence_number": 2,
              "response": {
-                 "id": "resp_1", "object": "response", "status": "in_progress",
-                 "model": "gpt-5.4", "output": []}},
+                 "id": "resp_1", "object": "response",
+                 "status": "in_progress", "model": "gpt-5.4",
+                 "output": [],
+                 "created_at": 0, "parallel_tool_calls": False,
+                 "tool_choice": "auto", "tools": []}},
             ensure_ascii=ensure_ascii,
         ),
         _sse(
@@ -4348,18 +4356,21 @@ def _reasoning_overload_stream_bytes(*, ensure_ascii: bool) -> bytes:
         _sse(
             "error",
             {"type": "error", "sequence_number": 5,
-             "error": {"type": "server_error", "code": "server_overloaded",
-                       "message": "overloaded"}},
+             "code": "server_is_overloaded",
+             "message": "The selected model is at capacity."},
             ensure_ascii=ensure_ascii,
         ),
         _sse(
             "response.failed",
             {"type": "response.failed", "sequence_number": 6,
              "response": {
-                 "id": "resp_1", "object": "response", "status": "failed",
-                 "model": "gpt-5.4", "output": [],
-                 "error": {"type": "server_error", "code": "server_overloaded",
-                           "message": "overloaded"}}},
+                 "id": "resp_1", "object": "response",
+                 "status": "failed", "model": "gpt-5.4",
+                 "output": [],
+                 "created_at": 0, "parallel_tool_calls": False,
+                 "tool_choice": "auto", "tools": [],
+                 "error": {"code": "server_error",
+                           "message": "The selected model is at capacity."}}},
             ensure_ascii=ensure_ascii,
         ),
     ])
@@ -4371,33 +4382,40 @@ def _tool_failed_stream_bytes(*, ensure_ascii: bool) -> bytes:
             "response.created",
             {"type": "response.created", "sequence_number": 1,
              "response": {
-                 "id": "resp_1", "object": "response", "status": "in_progress",
-                 "model": "gpt-5.4", "output": []}},
+                 "id": "resp_1", "object": "response",
+                 "status": "in_progress", "model": "gpt-5.4",
+                 "output": [],
+                 "created_at": 0, "parallel_tool_calls": False,
+                 "tool_choice": "auto", "tools": []}},
             ensure_ascii=ensure_ascii,
         ),
         _sse(
             "response.in_progress",
             {"type": "response.in_progress", "sequence_number": 2,
              "response": {
-                 "id": "resp_1", "object": "response", "status": "in_progress",
-                 "model": "gpt-5.4", "output": []}},
+                 "id": "resp_1", "object": "response",
+                 "status": "in_progress", "model": "gpt-5.4",
+                 "output": [],
+                 "created_at": 0, "parallel_tool_calls": False,
+                 "tool_choice": "auto", "tools": []}},
             ensure_ascii=ensure_ascii,
         ),
         _sse(
             "response.failed",
             {"type": "response.failed", "sequence_number": 3,
              "response": {
-                 "id": "resp_1", "object": "response", "status": "failed",
-                 "model": "gpt-5.4",
+                 "id": "resp_1", "object": "response",
+                 "status": "failed", "model": "gpt-5.4",
                  "output": [{
                      "id": "fc_1", "type": "function_call",
                      "call_id": "call_1", "name": "get_weather",
                      "arguments": '{"city":"%s"}' % _TOOL_CITY,
                      "status": "completed",
                  }],
-                 "error": {"type": "server_error",
-                           "code": "server_overloaded",
-                           "message": "overloaded"}}},
+                 "created_at": 0, "parallel_tool_calls": False,
+                 "tool_choice": "auto", "tools": [],
+                 "error": {"code": "server_error",
+                           "message": "The selected model is at capacity."}}},
             ensure_ascii=ensure_ascii,
         ),
     ])
@@ -4407,14 +4425,14 @@ def _reasoning_delta_utf8_split(buf: bytes) -> int:
     """Split inside the UTF-8 encoding of \u2026 (e2 80 a6)."""
     offset = buf.find("\u2026".encode("utf-8"))
     assert offset >= 0, "\u2026 byte not found in reasoning stream"
-    return offset + 1  # after first byte; second byte is continuation
+    return offset + 1
 
 
 def _tool_utf8_split(buf: bytes) -> int:
     """Split inside the UTF-8 encoding of \u6771 (e6 9d b1)."""
     offset = buf.find("\u6771".encode("utf-8"))
     assert offset >= 0, "\u6771 byte not found in tool-failed stream"
-    return offset + 1  # after first byte; second byte is continuation
+    return offset + 1
 
 
 def _chunks_for_read_mode(
