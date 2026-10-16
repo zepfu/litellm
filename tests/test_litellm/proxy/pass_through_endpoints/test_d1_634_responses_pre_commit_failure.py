@@ -4718,6 +4718,7 @@ async def test_openai_responses_incomplete_terminal_freezes_before_later_overloa
         "conflicting_event_payload_type",
         "malformed_failed_snapshot_non_list",
         "malformed_failed_snapshot_null_item",
+        "unhashable_output_item_type",
     ],
 )
 async def test_openai_responses_unsafe_admission_shapes_do_not_replay(
@@ -4765,6 +4766,13 @@ async def test_openai_responses_unsafe_admission_shapes_do_not_replay(
             assert failed_payloads[0]["response"]["error"]["code"] == "server_error"
         else:
             assert _assert_provider_overload_terminal(body)
+            if scenario == "unhashable_output_item_type":
+                payloads = _responses_sse_payloads(body)
+                event_types = [payload.get("type") for payload in payloads]
+                assert "response.output_item.added" in event_types
+                assert event_types.index(
+                    "response.output_item.added"
+                ) < event_types.index("response.failed")
     finally:
         iterator = getattr(result, "body_iterator", None)
         close_iterator = getattr(iterator, "aclose", None)
@@ -5007,11 +5015,196 @@ async def test_openai_responses_replay_commitment_survives_wire_snapshots():
 
     publish_responses_replay_commitment(
         request,
-        reason="delivery_started",
-        event_type="response.created",
+        reason="successful_terminal",
+        event_type="response.completed",
     )
     trace.publish_request_commitment()
     assert get_request_openai_wire_commitment(request) == commitment
+    assert request.state.aawm_openai_send_ledger_snapshot[
+        "wire_commitment"
+    ] == commitment
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_type", "completion_payload"),
+    [
+        (
+            "response.function_call_arguments.delta",
+            {"item_id": "fc_1", "output_index": 0, "delta": "{}"},
+        ),
+        (
+            "response.output_item.done",
+            {
+                "output_index": 0,
+                "item": {
+                    "id": "fc_1",
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": "",
+                    "status": "completed",
+                },
+            },
+        ),
+    ],
+    ids=["function-arguments", "function-item-completion"],
+)
+async def test_responses_tool_commitment_records_actual_event_reason(
+    event_type: str, completion_payload: dict[str, Any]
+):
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        get_request_openai_wire_commitment,
+    )
+
+    request_body = {
+        "model": "gpt-5.4",
+        "input": "continue",
+        "tools": [
+            {
+                "type": "function",
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+    }
+    request = _responses_request(request_body)
+    response_id = "resp_tool_boundary"
+    chunks = [
+        _response_event(
+            "response.created",
+            1,
+            response_id=response_id,
+            status="in_progress",
+        ),
+        _responses_event(
+            "response.output_item.added",
+            2,
+            output_index=0,
+            item={
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "lookup",
+                "arguments": "",
+                "status": "in_progress",
+            },
+        ),
+        _responses_event(event_type, 3, **completion_payload),
+    ]
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        stream=_ClosableAsyncByteStream([b"".join(chunks)]),
+        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+    )
+
+    prefixed, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+        response,
+        request=request,
+        provider_bound_body=request_body,
+    )
+    try:
+        assert failure is None
+        commitment = get_request_openai_wire_commitment(request)
+        assert commitment is not None
+        assert commitment["precommit_commitment_reason"] == "client_tool_payload"
+        assert commitment["precommit_commitment_event_type"] == event_type
+        async for _chunk in prefixed.aiter_bytes():
+            pass
+    finally:
+        await prefixed.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_shape",
+    ["error_item_extension", "failed_status_mismatch"],
+)
+async def test_openai_responses_unknown_failure_shapes_keep_original_failure_once(
+    monkeypatch, failure_shape: str
+):
+    response_id = "resp_unknown_failure_shape"
+    failure_message = "recognized capacity failure"
+    frames = [
+        _response_event(
+            "response.created",
+            1,
+            response_id=response_id,
+            status="in_progress",
+        )
+    ]
+    if failure_shape == "error_item_extension":
+        frames.append(
+            _sse(
+                "error",
+                {
+                    "type": "error",
+                    "sequence_number": 2,
+                    "code": "server_overloaded",
+                    "message": failure_message,
+                    "item": {"type": "function_call", "arguments": "opaque"},
+                },
+            )
+        )
+        frames.append(
+            _response_event(
+                "response.failed",
+                3,
+                response_id=response_id,
+                status="failed",
+                error={
+                    "type": "server_error",
+                    "code": "server_overloaded",
+                    "message": failure_message,
+                },
+            )
+        )
+    else:
+        frames.append(
+            _response_event(
+                "response.failed",
+                2,
+                response_id=response_id,
+                status="in_progress",
+                error={
+                    "type": "server_error",
+                    "code": "server_overloaded",
+                    "message": failure_message,
+                },
+            )
+        )
+
+    result, client, sent_requests, upstream_streams = await _start_openai_responses_stream(
+        monkeypatch,
+        [_ClosableAsyncByteStream([b"".join(frames)])],
+    )
+    try:
+        assert not isinstance(result, Exception)
+        assert len(sent_requests) == 1
+        body = b"".join(
+            [bytes(chunk) async for chunk in result.body_iterator]
+        )
+        failed_events = [
+            payload
+            for payload in _responses_sse_payloads(body)
+            if payload.get("type") == "response.failed"
+        ]
+        assert failed_events
+        assert any(
+            isinstance(payload.get("response"), dict)
+            and isinstance(payload["response"].get("error"), dict)
+            and payload["response"]["error"].get("message") == failure_message
+            for payload in failed_events
+        )
+    finally:
+        iterator = getattr(result, "body_iterator", None)
+        close_iterator = getattr(iterator, "aclose", None)
+        if callable(close_iterator):
+            await close_iterator()
+        for upstream_stream in upstream_streams:
+            await upstream_stream.aclose()
+        await client.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -5403,6 +5596,37 @@ def _unsafe_admission_overload_stream_bytes(scenario: str) -> bytes:
                 _response_event(
                     "response.failed",
                     5,
+                    response_id=response_id,
+                    status="failed",
+                    error=overload,
+                ),
+            ]
+        )
+    elif scenario == "unhashable_output_item_type":
+        frames.extend(
+            [
+                _responses_event(
+                    "response.output_item.added",
+                    2,
+                    output_index=0,
+                    item={
+                        "id": "fc_1",
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "lookup",
+                        "arguments": "",
+                        "status": "in_progress",
+                    },
+                ),
+                _responses_event(
+                    "response.output_item.done",
+                    3,
+                    output_index=0,
+                    item={"id": "fc_1", "type": []},
+                ),
+                _response_event(
+                    "response.failed",
+                    4,
                     response_id=response_id,
                     status="failed",
                     error=overload,
