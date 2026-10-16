@@ -67,6 +67,76 @@ _RESPONSES_REPLAY_LATCH_EVENT_KEY = "precommit_commitment_event_type"
 _RESPONSES_REPLAY_PUBLISHED_LATCH_REASON_KEY = (
     "precommit_published_replay_reason"
 )
+_RESPONSES_REPLAY_EVENT_LABELS = frozenset(
+    {
+        "[DONE]",
+        "error",
+        "response.created",
+        "response.in_progress",
+        "response.completed",
+        "response.failed",
+        "response.incomplete",
+        "response.output_item.added",
+        "response.output_item.done",
+        "response.content_part.added",
+        "response.content_part.done",
+        "response.reasoning_summary_part.added",
+        "response.reasoning_summary_part.done",
+        "response.reasoning_summary_text.delta",
+        "response.reasoning_summary_text.done",
+        "response.reasoning_text.delta",
+        "response.reasoning_text.done",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.output_text.annotation.added",
+        "response.refusal.delta",
+        "response.refusal.done",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.custom_tool_call_input.delta",
+        "response.custom_tool_call_input.done",
+        "response.mcp_call.in_progress",
+        "response.mcp_call.completed",
+        "response.mcp_call.failed",
+        "response.web_search_call.in_progress",
+        "response.web_search_call.searching",
+        "response.web_search_call.completed",
+        "response.file_search_call.in_progress",
+        "response.file_search_call.searching",
+        "response.file_search_call.completed",
+        "response.code_interpreter_call.in_progress",
+        "response.code_interpreter_call.interpreting",
+        "response.code_interpreter_call.completed",
+        "response.computer_call.in_progress",
+        "response.computer_call.completed",
+        "response.image_generation_call.in_progress",
+        "response.image_generation_call.generating",
+        "response.image_generation_call.completed",
+        "response.shell_call.in_progress",
+        "response.shell_call.completed",
+        "response.shell_call_output.done",
+        "response.apply_patch_call.in_progress",
+        "response.apply_patch_call.completed",
+    }
+)
+
+
+def _responses_replay_event_label(
+    event_type: Optional[str],
+    *,
+    reason: Optional[str] = None,
+) -> str:
+    if event_type is None:
+        return (
+            "provider_dispatch"
+            if reason == "provider_execution_possible"
+            else "unknown_event"
+        )
+    if event_type == "[DONE]":
+        return event_type
+    if event_type in _RESPONSES_REPLAY_EVENT_LABELS:
+        return event_type
+    return "unknown_event"
 
 
 def _safe_context_value(value: Any, *, maximum: int = 128) -> Optional[str]:
@@ -604,7 +674,26 @@ def _safe_wire_commitment(
         if key in commitment
     }
     if isinstance(published_reason, str):
-        safe_commitment[_RESPONSES_REPLAY_LATCH_REASON_KEY] = published_reason
+        safe_commitment[_RESPONSES_REPLAY_LATCH_REASON_KEY] = (
+            published_reason
+            if published_reason in _RESPONSES_REPLAY_COMMITMENT_REASONS
+            else "unknown_semantics"
+        )
+    if _RESPONSES_REPLAY_LATCH_REASON_KEY in safe_commitment:
+        reason = safe_commitment[_RESPONSES_REPLAY_LATCH_REASON_KEY]
+        if not isinstance(reason, str) or reason not in _RESPONSES_REPLAY_COMMITMENT_REASONS:
+            safe_commitment[_RESPONSES_REPLAY_LATCH_REASON_KEY] = (
+                "unknown_semantics"
+            )
+    if _RESPONSES_REPLAY_LATCH_EVENT_KEY in safe_commitment:
+        event_type = safe_commitment[_RESPONSES_REPLAY_LATCH_EVENT_KEY]
+        reason = safe_commitment.get(_RESPONSES_REPLAY_LATCH_REASON_KEY)
+        safe_commitment[_RESPONSES_REPLAY_LATCH_EVENT_KEY] = (
+            _responses_replay_event_label(
+                event_type if isinstance(event_type, str) else None,
+                reason=reason if isinstance(reason, str) else None,
+            )
+        )
     return safe_commitment
 
 
@@ -842,8 +931,9 @@ def publish_responses_replay_commitment(
     commitment["precommit_replay_committed"] = True
     commitment[_RESPONSES_REPLAY_LATCH_REASON_KEY] = reason
     commitment[_RESPONSES_REPLAY_PUBLISHED_LATCH_REASON_KEY] = reason
-    if event_type is not None:
-        commitment[_RESPONSES_REPLAY_LATCH_EVENT_KEY] = event_type
+    commitment[_RESPONSES_REPLAY_LATCH_EVENT_KEY] = (
+        _responses_replay_event_label(event_type, reason=reason)
+    )
 
 
 def get_responses_replay_commitment_reason(
@@ -877,25 +967,57 @@ _PROVIDER_EXECUTABLE_TOOL_TYPES = frozenset({
 def responses_effective_provider_tools_allowed(
     provider_bound_body: Optional[Mapping[str, Any]],
 ) -> bool:
-    """Return True when the final bound body includes provider-executable tools
-    that could produce remote effects without a client-visible tool event.
-
-    Inspects ``tools`` entries whose ``type`` is in the known provider-executable
-    set or whose ``type`` is absent/unknown (conservative).  Collaboration-injected
-    tools are also checked when the body carries the collaboration metadata key.
-    """
-
+    """Return whether a body is unsafe to replay because tool capability is unknown."""
     if not isinstance(provider_bound_body, Mapping):
+        return True
+    if "tools" not in provider_bound_body:
         return False
     tools = provider_bound_body.get("tools")
     if not isinstance(tools, list):
-        return False
+        return True
     for tool in tools:
-        if not isinstance(tool, dict):
-            continue
-        tool_type = str(tool.get("type", "")).lower()
-        if not tool_type or tool_type in _PROVIDER_EXECUTABLE_TOOL_TYPES:
+        if not isinstance(tool, Mapping):
             return True
+        tool_type = tool.get("type")
+        if not isinstance(tool_type, str):
+            return True
+        if tool_type in _PROVIDER_EXECUTABLE_TOOL_TYPES:
+            return True
+        if tool_type == "function":
+            if not isinstance(tool.get("name"), str) or not tool.get("name"):
+                return True
+            if "description" in tool and not isinstance(
+                tool.get("description"), str
+            ):
+                return True
+            if "parameters" in tool and not isinstance(
+                tool.get("parameters"), Mapping
+            ):
+                return True
+            if "strict" in tool and not isinstance(tool.get("strict"), bool):
+                return True
+            if not set(tool).issubset(
+                {"type", "name", "description", "parameters", "strict"}
+            ):
+                return True
+            continue
+        if tool_type == "custom":
+            if not isinstance(tool.get("name"), str) or not tool.get("name"):
+                return True
+            if "description" in tool and not isinstance(
+                tool.get("description"), str
+            ):
+                return True
+            if "format" in tool and not isinstance(tool.get("format"), Mapping):
+                return True
+            if not set(tool).issubset(
+                {"type", "name", "description", "format"}
+            ):
+                return True
+            continue
+        # Any capability not explicitly known to be client-executed commits
+        # before dispatch; this includes provider-executable and future tools.
+        return True
     return False
 
 

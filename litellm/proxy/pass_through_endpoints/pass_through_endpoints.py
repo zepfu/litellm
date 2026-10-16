@@ -272,6 +272,7 @@ from .aawm_adapter_runtime.openai_responses_events import (
 )
 from .streaming_handler import (
     RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS,
+    RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS,
     PassThroughStreamingHandler,
     ResponsesStreamPreCommitFailure,
     _RESPONSES_ORDINARY_RETRY_CLASSES,
@@ -3769,12 +3770,11 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                 and not getattr(exc, "aawm_call_ledger_exhausted", False)
                 and not getattr(exc, "aawm_openai_wire_replay_blocked", False)
             )
-            # OPENAI-080 (R7): when the replay-commit latch is already set,
-            # do not retry regardless of error class — the original pre-commit
-            # failure must surface, not a downstream ProviderCallReplayBlocked.
+            # A commitment vetoes every resend class, including raw status
+            # failures and the ordinary retry path without a capacity owner.
+            # Keep the current attempt's exception as the terminal failure.
             if (
                 request is not None
-                and isinstance(exc, ResponsesStreamPreCommitFailure)
                 and get_responses_replay_commitment_reason(request) is not None
             ):
                 if openai_capacity_coordinator is not None:
@@ -3785,6 +3785,7 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     )
                 capacity_failure = False
                 ordinary_stream_retry = False
+                should_retry = False
             if (
                 openai_capacity_coordinator is not None
                 and capacity_failure
@@ -7534,6 +7535,11 @@ async def _finalize_native_openai_responses_owner_wire_disposition(  # noqa: PLR
         state = getattr(request, "state", None)
         if state is not None:
             try:
+                existing_commitment = getattr(
+                    state,
+                    "_aawm_openai_responses_wire_commitment",
+                    None,
+                )
                 commitment = {
                     "commitment": "done",
                     "disposition": disposition.value,
@@ -7541,6 +7547,14 @@ async def _finalize_native_openai_responses_owner_wire_disposition(  # noqa: PLR
                     "done_wire_committed": True,
                     "finalized": False,
                 }
+                if isinstance(existing_commitment, dict):
+                    for key in (
+                        "precommit_replay_committed",
+                        "precommit_commitment_reason",
+                        "precommit_commitment_event_type",
+                    ):
+                        if key in existing_commitment:
+                            commitment[key] = existing_commitment[key]
                 setattr(
                     state,
                     "_aawm_openai_responses_wire_commitment",
@@ -9435,23 +9449,6 @@ async def pass_through_request(  # noqa: PLR0915
                 prepared_request: httpx.Request,
                 send_stream: bool,
             ) -> httpx.Response:
-                # OPENAI-080: publish the provider-execution latch before the
-                # first replay guard. A raw capacity response arrives only
-                # after dispatch; publishing after that response cannot undo
-                # the retry authorization made on the way out.
-                if isinstance(provider_bound_body, dict):
-                    if responses_effective_provider_tools_allowed(
-                        provider_bound_body
-                    ):
-                        publish_responses_replay_commitment(
-                            request,
-                            reason="provider_execution_possible",
-                        )
-                elif provider_bound_body is not None:
-                    publish_responses_replay_commitment(
-                        request,
-                        reason="provider_execution_possible",
-                    )
                 ensure_openai_wire_replay_allowed(
                     request,
                     ledger=openai_call_ledger,
@@ -9725,6 +9722,25 @@ async def pass_through_request(  # noqa: PLR0915
                         )
                     if validate_prepared_request_fn is not None:
                         validate_prepared_request_fn(prepared_request)
+                    if is_native_openai_responses_route:
+                        try:
+                            prepared_body = prepared_request.content
+                            if not isinstance(prepared_body, (bytes, str)):
+                                prepared_body = None
+                            effective_body = (
+                                json.loads(prepared_body)
+                                if prepared_body is not None
+                                else None
+                            )
+                        except Exception:
+                            effective_body = None
+                        if responses_effective_provider_tools_allowed(
+                            effective_body
+                        ):
+                            publish_responses_replay_commitment(
+                                request,
+                                reason="provider_execution_possible",
+                            )
                     if managed_xai_oauth_request:
                         record_managed_xai_actual_send(
                             request,
