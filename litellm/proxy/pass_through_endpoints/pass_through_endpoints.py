@@ -3791,7 +3791,14 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
             ):
                 last_capacity_exception = exc
                 remaining_seconds = openai_capacity_coordinator.remaining_seconds
-                if remaining_seconds <= 0.0:
+                try:
+                    remaining_seconds_value = float(remaining_seconds)
+                except (TypeError, ValueError):
+                    remaining_seconds_value = None
+                if (
+                    remaining_seconds_value is not None
+                    and remaining_seconds_value <= 0.0
+                ):
                     terminal_exception = (
                         _mark_passthrough_capacity_exception_terminal(exc)
                     )
@@ -3834,10 +3841,15 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         elapsed_seconds=openai_capacity_coordinator.elapsed_seconds,
                     )
                     raise terminal_exception
-                wait_seconds = min(
-                    openai_capacity_coordinator.next_wait_seconds(),
-                    remaining_seconds,
-                )
+                next_wait_seconds = openai_capacity_coordinator.next_wait_seconds()
+                try:
+                    next_wait_seconds = float(next_wait_seconds)
+                except (TypeError, ValueError):
+                    next_wait_seconds = RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS
+                if remaining_seconds_value is not None:
+                    wait_seconds = min(next_wait_seconds, remaining_seconds_value)
+                else:
+                    wait_seconds = next_wait_seconds
                 should_retry = True
             elif (
                 openai_capacity_coordinator is not None
@@ -9423,6 +9435,23 @@ async def pass_through_request(  # noqa: PLR0915
                 prepared_request: httpx.Request,
                 send_stream: bool,
             ) -> httpx.Response:
+                # OPENAI-080: publish the provider-execution latch before the
+                # first replay guard. A raw capacity response arrives only
+                # after dispatch; publishing after that response cannot undo
+                # the retry authorization made on the way out.
+                if isinstance(provider_bound_body, dict):
+                    if responses_effective_provider_tools_allowed(
+                        provider_bound_body
+                    ):
+                        publish_responses_replay_commitment(
+                            request,
+                            reason="provider_execution_possible",
+                        )
+                elif provider_bound_body is not None:
+                    publish_responses_replay_commitment(
+                        request,
+                        reason="provider_execution_possible",
+                    )
                 ensure_openai_wire_replay_allowed(
                     request,
                     ledger=openai_call_ledger,
@@ -9704,23 +9733,6 @@ async def pass_through_request(  # noqa: PLR0915
                                 expected_target_family
                                 or egress_credential_family
                             ),
-                        )
-                    # OPENAI-080: commit provider-execution latch at dispatch
-                    # so no internal resend can proceed regardless of response.
-                    # R5: treat opaque/malformed non-dict bodies as committing
-                    # conservatively — the payload is unvalidatable.
-                    if isinstance(provider_bound_body, dict):
-                        if responses_effective_provider_tools_allowed(
-                            provider_bound_body
-                        ):
-                            publish_responses_replay_commitment(
-                                request,
-                                reason="provider_execution_possible",
-                            )
-                    elif provider_bound_body is not None:
-                        publish_responses_replay_commitment(
-                            request,
-                            reason="provider_execution_possible",
                         )
                     ensure_precommit_send_active()
                     response = await wait_for(

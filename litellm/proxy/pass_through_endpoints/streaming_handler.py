@@ -1369,7 +1369,9 @@ class PassThroughStreamingHandler:
         for event in events:
             parser._consume_event(event)
         decision = parser.decision()
-        return decision[0], decision[1], decision[2], parser.commitment_reason
+        parsed_reason = parser.commitment_reason
+        effective_reason = parsed_reason or "unknown_semantics"
+        return decision[0], decision[1], decision[2], effective_reason
 
 
     @staticmethod
