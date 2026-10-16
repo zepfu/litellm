@@ -1518,14 +1518,21 @@ class ResponsesEventSummaryReducer:
         return True
 
     def _record_event_type(self, event_type: Optional[str]) -> None:
-        if not event_type:
-            return
-        if event_type not in self._event_counts and len(self._event_counts) >= self._EVENT_TYPE_LIMIT:
+        normalized_event_type = event_type if event_type else "unknown_event"
+        if (
+            normalized_event_type not in self._event_counts
+            and len(self._event_counts) >= self._EVENT_TYPE_LIMIT
+        ):
             self._overflow = True
             return
-        self._event_counts[event_type] = self._event_counts.get(event_type, 0) + 1
-        if event_type not in self._event_types and len(self._event_types) < self._EVENT_TYPE_LIMIT:
-            self._event_types.append(event_type)
+        self._event_counts[normalized_event_type] = (
+            self._event_counts.get(normalized_event_type, 0) + 1
+        )
+        if (
+            normalized_event_type not in self._event_types
+            and len(self._event_types) < self._EVENT_TYPE_LIMIT
+        ):
+            self._event_types.append(normalized_event_type)
 
     def _bounded_copy(self, value: Any, limit: int) -> Optional[Any]:
         size = _json_size(value)
@@ -1546,7 +1553,7 @@ class ResponsesEventSummaryReducer:
         response_payload = payload.get("response")
         if not isinstance(response_payload, dict):
             return
-        self._terminal_event_type = event_type
+        self._terminal_event_type = event_type or "unknown_event"
         copied = self._bounded_copy(response_payload, self.max_output_bytes)
         if isinstance(copied, dict):
             self._terminal_response_payload = copied

@@ -64,6 +64,9 @@ _RESPONSES_REPLAY_COMMITMENT_PRIORITY = {
 
 _RESPONSES_REPLAY_LATCH_REASON_KEY = "precommit_commitment_reason"
 _RESPONSES_REPLAY_LATCH_EVENT_KEY = "precommit_commitment_event_type"
+_RESPONSES_REPLAY_PUBLISHED_LATCH_REASON_KEY = (
+    "precommit_published_replay_reason"
+)
 
 
 def _safe_context_value(value: Any, *, maximum: int = 128) -> Optional[str]:
@@ -575,7 +578,10 @@ def _safe_wire_commitment(
 ) -> dict[str, Any]:
     """Copy only bounded, non-secret wire lifecycle fields."""
 
-    return {
+    published_reason = commitment.get(
+        _RESPONSES_REPLAY_PUBLISHED_LATCH_REASON_KEY
+    )
+    safe_commitment = {
         key: commitment.get(key)
         for key in (
             "state",
@@ -597,6 +603,9 @@ def _safe_wire_commitment(
         )
         if key in commitment
     }
+    if isinstance(published_reason, str):
+        safe_commitment[_RESPONSES_REPLAY_LATCH_REASON_KEY] = published_reason
+    return safe_commitment
 
 
 def get_request_openai_wire_commitment(
@@ -832,6 +841,7 @@ def publish_responses_replay_commitment(
 
     commitment["precommit_replay_committed"] = True
     commitment[_RESPONSES_REPLAY_LATCH_REASON_KEY] = reason
+    commitment[_RESPONSES_REPLAY_PUBLISHED_LATCH_REASON_KEY] = reason
     if event_type is not None:
         commitment[_RESPONSES_REPLAY_LATCH_EVENT_KEY] = event_type
 

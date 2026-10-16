@@ -152,6 +152,9 @@ class OpenAIResponsesWireTrace:
         state = getattr(request, "state", None)
         if state is None:
             return
+        from .provider_call_ledger import get_responses_replay_commitment_reason
+
+        published_replay_reason = get_responses_replay_commitment_reason(request)
         try:
             setattr(state, "_aawm_openai_responses_wire_trace", self)
             setattr(
@@ -161,6 +164,19 @@ class OpenAIResponsesWireTrace:
             )
         except Exception:
             return
+        else:
+            if published_replay_reason is not None:
+                try:
+                    from .provider_call_ledger import (
+                        publish_responses_replay_commitment,
+                    )
+
+                    publish_responses_replay_commitment(
+                        request,
+                        reason=published_replay_reason,
+                    )
+                except Exception:
+                    pass
         try:
             from .provider_call_ledger import publish_wire_commitment_snapshot
 
