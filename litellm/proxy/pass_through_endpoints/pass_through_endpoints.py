@@ -305,10 +305,13 @@ from .aawm_adapter_runtime.provider_call_ledger import (
     get_or_create_openai_provider_call_ledger,
     get_request_provider_call_ledger,
     get_request_provider_call_ledger_snapshot,
+    get_responses_replay_commitment_reason,
     publish_reservation_metadata,
+    publish_responses_replay_commitment,
     publish_wire_commitment_snapshot,
     record_transport_connection_attempt,
     register_active_upstream_response,
+    responses_effective_provider_tools_allowed,
     clear_active_upstream_response,
 )
 from .aawm_alias_routing.durable import get_aawm_alias_routing_state_namespace
@@ -3766,6 +3769,22 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                 and not getattr(exc, "aawm_call_ledger_exhausted", False)
                 and not getattr(exc, "aawm_openai_wire_replay_blocked", False)
             )
+            # OPENAI-080 (R7): when the replay-commit latch is already set,
+            # do not retry regardless of error class — the original pre-commit
+            # failure must surface, not a downstream ProviderCallReplayBlocked.
+            if (
+                request is not None
+                and isinstance(exc, ResponsesStreamPreCommitFailure)
+                and get_responses_replay_commitment_reason(request) is not None
+            ):
+                if openai_capacity_coordinator is not None:
+                    openai_capacity_coordinator.record_terminal(
+                        "wire_replay_committed",
+                        error_class=failure_class,
+                        status_code=status_code,
+                    )
+                capacity_failure = False
+                ordinary_stream_retry = False
             if (
                 openai_capacity_coordinator is not None
                 and capacity_failure
@@ -9685,6 +9704,23 @@ async def pass_through_request(  # noqa: PLR0915
                                 expected_target_family
                                 or egress_credential_family
                             ),
+                        )
+                    # OPENAI-080: commit provider-execution latch at dispatch
+                    # so no internal resend can proceed regardless of response.
+                    # R5: treat opaque/malformed non-dict bodies as committing
+                    # conservatively — the payload is unvalidatable.
+                    if isinstance(provider_bound_body, dict):
+                        if responses_effective_provider_tools_allowed(
+                            provider_bound_body
+                        ):
+                            publish_responses_replay_commitment(
+                                request,
+                                reason="provider_execution_possible",
+                            )
+                    elif provider_bound_body is not None:
+                        publish_responses_replay_commitment(
+                            request,
+                            reason="provider_execution_possible",
                         )
                     ensure_precommit_send_active()
                     response = await wait_for(
