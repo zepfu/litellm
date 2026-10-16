@@ -3453,6 +3453,8 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
     ] = None,
 ) -> Any:
     if caller_managed_hidden_retry:
+        # The alias loop owns retries here and must preserve this operation's
+        # failure while checking the request-scoped wire commitment.
         if openai_capacity_coordinator is not None:
             return await _await_passthrough_pre_first_byte_operation(
                 operation,
