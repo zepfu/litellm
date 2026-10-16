@@ -122,6 +122,18 @@ _RECOGNIZED_TERMINAL_METADATA_EVENTS = frozenset(
         "error",
     }
 )
+_RESPONSES_RESPONSE_ENVELOPE_FIELDS = {
+    "id", "created_at", "error", "incomplete_details",
+    "instructions", "metadata", "model", "object", "output",
+    "parallel_tool_calls", "temperature", "tool_choice", "tools",
+    "top_p", "max_output_tokens", "previous_response_id",
+    "reasoning", "status", "text", "truncation", "usage", "user",
+    "store", "background", "billing", "context_management",
+    "conversation", "max_tool_calls", "prompt",
+    "prompt_cache_key", "prompt_cache_retention",
+    "safety_identifier", "service_tier", "top_logprobs",
+}
+_RESPONSES_ERROR_FIELDS = {"type", "code", "message", "param"}
 # OPENAI-080: Oracle-frozen exact typed allowlist for replay-safe private events.
 # These are exact event-name-and-shape gates, not prefix matching.
 _RESPONSES_SAFE_ITEM_ADDED_TYPES = frozenset({"message", "function_call", "custom_tool_call", "reasoning"})
@@ -1215,19 +1227,8 @@ class PassThroughStreamingHandler:
                 payload, {"type", "sequence_number", "response"}
             ):
                 return False
-            response_fields = {
-                "id", "created_at", "error", "incomplete_details",
-                "instructions", "metadata", "model", "object", "output",
-                "parallel_tool_calls", "temperature", "tool_choice", "tools",
-                "top_p", "max_output_tokens", "previous_response_id",
-                "reasoning", "status", "text", "truncation", "usage", "user",
-                "store", "background", "billing", "context_management",
-                "conversation", "max_tool_calls", "prompt",
-                "prompt_cache_key", "prompt_cache_retention",
-                "safety_identifier", "service_tier", "top_logprobs",
-            }
             if not PassThroughStreamingHandler._has_only_fields(
-                response_payload, response_fields
+                response_payload, _RESPONSES_RESPONSE_ENVELOPE_FIELDS
             ):
                 return False
             if not PassThroughStreamingHandler._is_nonempty_string(
@@ -1766,6 +1767,96 @@ class PassThroughStreamingHandler:
         return None
 
     @staticmethod
+    def _is_responses_error_details_shape(error_payload: Any) -> bool:
+        if (
+            not isinstance(error_payload, dict)
+            or not error_payload
+            or not PassThroughStreamingHandler._has_only_fields(
+                error_payload, _RESPONSES_ERROR_FIELDS
+            )
+            or not isinstance(error_payload.get("message"), str)
+        ):
+            return False
+        for field in _RESPONSES_ERROR_FIELDS:
+            value = error_payload.get(field)
+            if field == "message":
+                continue
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                return False
+        return True
+
+    @staticmethod
+    def _is_responses_pre_commit_failure_shape(
+        event_type: Optional[str],
+        payload: Any,
+    ) -> bool:
+        """Admit only the supported error envelopes before failure classification."""
+        if (
+            not isinstance(payload, dict)
+            or payload.get("type") != event_type
+        ):
+            return False
+        sequence_number = payload.get("sequence_number")
+        if sequence_number is not None and not (
+            PassThroughStreamingHandler._is_nonnegative_index(sequence_number)
+        ):
+            return False
+
+        if event_type == "error":
+            if not PassThroughStreamingHandler._has_only_fields(
+                payload,
+                {"type", "sequence_number", "error", "code", "message", "param"},
+            ):
+                return False
+            nested_error = payload.get("error")
+            if nested_error is not None:
+                if any(
+                    field in payload for field in ("code", "message", "param")
+                ):
+                    return False
+                return PassThroughStreamingHandler._is_responses_error_details_shape(
+                    nested_error
+                )
+            direct_error = {
+                field: payload[field]
+                for field in ("code", "message", "param")
+                if field in payload
+            }
+            return PassThroughStreamingHandler._is_responses_error_details_shape(
+                direct_error
+            )
+
+        if event_type != "response.failed" or not (
+            PassThroughStreamingHandler._has_only_fields(
+                payload, {"type", "sequence_number", "response"}
+            )
+        ):
+            return False
+        response_payload = payload.get("response")
+        if (
+            not isinstance(response_payload, dict)
+            or not PassThroughStreamingHandler._has_only_fields(
+                response_payload, _RESPONSES_RESPONSE_ENVELOPE_FIELDS
+            )
+            or not PassThroughStreamingHandler._is_nonempty_string(
+                response_payload.get("id")
+            )
+            or response_payload.get("status") != "failed"
+            or not isinstance(response_payload.get("output"), list)
+        ):
+            return False
+        if response_payload.get("object") not in (None, "response"):
+            return False
+        error_payload = response_payload.get("error")
+        return error_payload is None or (
+            PassThroughStreamingHandler._is_responses_error_details_shape(
+                error_payload
+            )
+        )
+
+    @staticmethod
     def _inspect_responses_events(
         parsed_event: ParsedResponsesEvent,
     ) -> tuple[str, Optional[Dict[str, Any]], Optional[str], Optional[str]]:
@@ -1792,6 +1883,13 @@ class PassThroughStreamingHandler:
             # Empty event with no type: treat as unknown semantics
             return "substantive", None, event_type, "unknown_semantics"
 
+        if event_type in _RESPONSES_PRE_COMMIT_FAILURE_EVENTS and not (
+            PassThroughStreamingHandler._is_responses_pre_commit_failure_shape(
+                event_type, payload
+            )
+        ):
+            commitment_reason = "unknown_semantics"
+
         # [DONE] is handled above via is_done_marker
 
         # Unknown / unrecognised event -> commit
@@ -1812,19 +1910,26 @@ class PassThroughStreamingHandler:
             ):
                 # Inspect output items for assistant output vs client tool
                 item = payload.get("item") if isinstance(payload, dict) else None
-                if isinstance(item, dict) and item.get("type") == "message":
+                item_type = item.get("type") if isinstance(item, dict) else None
+                if item_type == "message":
                     commitment_reason = "assistant_output"
+                elif item_type in {"function_call", "custom_tool_call"}:
+                    commitment_reason = "client_tool_payload"
+                elif item_type in _PROVIDER_EXECUTABLE_TOOL_TYPES_HINT:
+                    commitment_reason = "provider_execution_possible"
+                elif item_type is not None:
+                    commitment_reason = "unknown_semantics"
                 elif (
                     event_type.startswith("response.output_text.")
                     or event_type.startswith("response.refusal.")
                 ):
                     commitment_reason = "assistant_output"
-                elif event_type == "response.output_item.done":
-                    commitment_reason = "assistant_output"
                 else:
-                    commitment_reason = "assistant_output"
+                    commitment_reason = "unknown_semantics"
             elif event_type and (
-                event_type.startswith("response.function_call.")
+                event_type.startswith("response.function_call_arguments.")
+                or event_type.startswith("response.custom_tool_call_input.")
+                or event_type.startswith("response.function_call.")
                 or event_type.startswith("response.custom_tool_call.")
             ):
                 commitment_reason = "client_tool_payload"
@@ -1854,7 +1959,7 @@ class PassThroughStreamingHandler:
                 event_type=event_type,
             )
         )
-        if hidden_reason is not None:
+        if hidden_reason is not None and commitment_reason is None:
             commitment_reason = hidden_reason
 
         # --- Step 3: extract error payload ---

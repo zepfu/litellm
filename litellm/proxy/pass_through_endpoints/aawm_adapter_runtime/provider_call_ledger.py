@@ -36,8 +36,6 @@ _WIRE_REPLAY_BLOCKING_FLAGS = (
 )
 _WIRE_REPLAY_BLOCKING_DISPOSITIONS = frozenset({"cancelled", "disconnected"})
 
-# Ordered from lowest to highest commitment priority.  When the same read
-# produces multiple commitment reasons the highest-priority reason wins.
 _RESPONSES_REPLAY_COMMITMENT_REASONS = frozenset({
     "assistant_output",
     "client_tool_payload",
@@ -49,18 +47,6 @@ _RESPONSES_REPLAY_COMMITMENT_REASONS = frozenset({
     "event_limit",
     "delivery_started",
 })
-
-_RESPONSES_REPLAY_COMMITMENT_PRIORITY = {
-    "delivery_started": 1,
-    "unknown_semantics": 2,
-    "prefix_limit": 3,
-    "event_limit": 3,
-    "terminal_marker": 4,
-    "client_tool_payload": 5,
-    "provider_execution_possible": 6,
-    "assistant_output": 7,
-    "successful_terminal": 8,
-}
 
 _RESPONSES_REPLAY_LATCH_REASON_KEY = "precommit_commitment_reason"
 _RESPONSES_REPLAY_LATCH_EVENT_KEY = "precommit_commitment_event_type"
@@ -902,9 +888,9 @@ def publish_responses_replay_commitment(
     """Set the monotonic replay-commit latch before any yield that could expose
     committing data.
 
-    Once set the latch forbids every internal resend path through the existing
-    ``ensure_openai_wire_replay_allowed`` guard.  Callers must set it *before*
-    an ``await`` or ``yield`` that hands committed output to the client.
+    The first reason and event record the boundary that ended replay
+    eligibility. Callers must set it *before* an ``await`` or ``yield`` that
+    hands committed output to the client.
     """
 
     if reason not in _RESPONSES_REPLAY_COMMITMENT_REASONS:
@@ -921,12 +907,7 @@ def publish_responses_replay_commitment(
 
     existing_reason = commitment.get(_RESPONSES_REPLAY_LATCH_REASON_KEY)
     if existing_reason is not None:
-        existing_priority = _RESPONSES_REPLAY_COMMITMENT_PRIORITY.get(
-            existing_reason, 0
-        )
-        new_priority = _RESPONSES_REPLAY_COMMITMENT_PRIORITY.get(reason, 0)
-        if new_priority <= existing_priority:
-            return
+        return
 
     commitment["precommit_replay_committed"] = True
     commitment[_RESPONSES_REPLAY_LATCH_REASON_KEY] = reason
