@@ -39,6 +39,45 @@ affinity remain request-scoped while the stream is active. A completed terminal
 can promote the owner and commit affinity. Failed, incomplete, cancelled, or
 disconnected streams release the reservation and do not write new affinity.
 
+### Responses stream limits
+
+Native Responses streams share one attempt-scoped event pipeline across
+precommit inspection, delivery, logging, usage and response policies. Configure
+its limits through process environment variables. Byte limits use bytes;
+the defaults below use binary MiB (`1 MiB = 1,048,576 bytes`).
+
+| Environment variable | Default | Bounds |
+| --- | --- | --- |
+| `AAWM_RESPONSES_MAX_EVENT_BYTES` | 2 MiB | One SSE event, including an unfinished event |
+| `AAWM_RESPONSES_MAX_STREAM_BYTES` | 128 MiB | Total admitted stream bytes |
+| `AAWM_RESPONSES_MAX_STREAM_EVENTS` | 100,000 | Admitted events |
+| `AAWM_RESPONSES_MAX_HELD_EVENTS` | 256 | Retained parsed events |
+| `AAWM_RESPONSES_MAX_HELD_BYTES` | 8 MiB | Wire bytes plus JSON bytes of retained payloads |
+| `AAWM_RESPONSES_MAX_OUTPUT_BYTES` | 8 MiB | Reconstructed output retained for summaries |
+| `AAWM_RESPONSES_MAX_OUTPUT_ITEMS` | 128 | Reconstructed output items |
+| `AAWM_RESPONSES_MAX_RAW_EVENTS` | 64 | Diagnostic raw-event history |
+| `AAWM_RESPONSES_MAX_RAW_BYTES` | 2 MiB | Diagnostic raw-event history bytes |
+
+Values must be integers. Held-event and raw-history limits accept zero; other
+limits must be positive. Missing, invalid or below-minimum values use the
+defaults. Raw-event retention is off unless
+`AAWM_RESPONSES_EVENT_RAW_DIAGNOSTICS` is `1`, `true`, `yes` or `on`
+(case-insensitive); either raw-history limit set to zero disables it.
+
+Event, stream and retained-event overflow follows the existing stream-failure
+handling. Already admitted complete events retain their order. Output-summary
+overflow records omitted or truncated summary data; it does not truncate
+otherwise valid client output. These retention budgets bound specific stream
+state, rather than the Python process's total memory.
+
+Audit-only response policies process events incrementally. Watermark
+`buffer_response` deliberately waits for the response and rejects buffering
+above `general_settings.openai_passthrough_text_watermark.limits.max_sse_stream_bytes`
+(128 MiB by default). Its text budget is separately controlled by
+`limits.max_text_bytes_per_direction` (1 MiB by default).
+
+### Delivery and attribution
+
 Route rollups attribute a managed request to the explicitly dispatched agent
 name from structured `agent_name` metadata, including the canonical Codex name
 inside the JSON string at `client_metadata["x-codex-turn-metadata"]`, or the

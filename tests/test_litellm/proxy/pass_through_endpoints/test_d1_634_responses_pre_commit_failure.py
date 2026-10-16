@@ -33,6 +33,10 @@ from litellm.proxy.pass_through_endpoints.streaming_handler import (
     PassThroughStreamingHandler,
     ResponsesStreamPreCommitFailure,
 )
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+    ResponsesBoundFailure,
+    ResponsesEventPipeline,
+)
 from litellm.proxy.pass_through_endpoints.success_handler import (
     PassThroughEndpointLogging,
 )
@@ -656,6 +660,49 @@ async def test_peek_replays_substantive_prefix_then_remainder():
     assert failure is None
     replayed = [chunk async for chunk in peeked.aiter_bytes()]
     assert replayed == chunks
+
+
+@pytest.mark.asyncio
+async def test_peek_replays_accepted_prefix_before_oversized_coalesced_suffix():
+    accepted = _sse(
+        "response.output_text.delta",
+        {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "delta": "accepted-prefix",
+        },
+    )
+    rejected = _sse(
+        "response.output_text.delta",
+        {
+            "type": "response.output_text.delta",
+            "item_id": "msg_2",
+            "delta": "rejected-suffix-" + ("x" * 2048),
+        },
+    )
+    pipeline = ResponsesEventPipeline(
+        max_event_bytes=len(accepted),
+        max_stream_bytes=len(accepted) + len(rejected),
+        max_stream_events=10,
+        retain_events=True,
+    )
+    response = _FakeUpstreamStream([accepted + rejected])
+
+    peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+        response,
+        event_pipeline=pipeline,
+    )
+
+    assert failure is None
+    emitted: list[bytes] = []
+    with pytest.raises(ResponsesBoundFailure):
+        async for chunk in peeked.aiter_bytes():
+            emitted.append(bytes(chunk))
+
+    rendered = b"".join(emitted)
+    assert rendered.count(b'"delta":"accepted-prefix"') == 1
+    assert b"rejected-suffix-" not in rendered
+    assert rendered == accepted
 
 
 def test_no_replay_after_substantive_output():
