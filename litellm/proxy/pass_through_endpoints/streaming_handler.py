@@ -258,6 +258,38 @@ class ResponsesStreamPreCommitFailure(Exception):
         return http_exception
 
 
+class _CloseAwareHttpxAsyncByteStream(httpx.AsyncByteStream):
+    """Close an active HTTPX stream iterator when its response is retired."""
+
+    def __init__(self, stream: httpx.AsyncByteStream) -> None:
+        self._stream = stream
+        self._iterator: Any = None
+        self._closed = False
+
+    def __aiter__(self):
+        self._iterator = self._stream.__aiter__()
+        return self._iterator
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        iterator = self._iterator
+        self._iterator = None
+        close_iterator = getattr(iterator, "aclose", None)
+        try:
+            if callable(close_iterator):
+                result = close_iterator()
+                if inspect.isawaitable(result):
+                    await wait_for("resource_cleanup", result)
+        finally:
+            close_stream = getattr(self._stream, "aclose", None)
+            if callable(close_stream):
+                result = close_stream()
+                if inspect.isawaitable(result):
+                    await wait_for("resource_cleanup", result)
+
+
 class _PrefixedHttpxByteStream:
     """Replay peeked SSE bytes, then continue the original upstream iterator."""
 
@@ -373,6 +405,16 @@ class _PrefixedHttpxByteStream:
 
     async def aclose(self) -> None:
         self._close_prefix()
+        remainder = self._remainder
+        self._remainder = None
+        close_iterator = getattr(remainder, "aclose", None)
+        if callable(close_iterator):
+            try:
+                result = close_iterator()
+                if inspect.isawaitable(result):
+                    await wait_for("resource_cleanup", result)
+            except Exception:
+                pass
         close = getattr(self._response, "aclose", None)
         if not callable(close):
             return
@@ -2054,6 +2096,11 @@ class PassThroughStreamingHandler:
         parser = _ResponsesPreCommitSSEParser(prefix, pipeline)
         iterator: Any = None
         retired = False
+        response_stream = getattr(response, "stream", None)
+        if isinstance(response_stream, httpx.AsyncByteStream) and not isinstance(
+            response_stream, _CloseAwareHttpxAsyncByteStream
+        ):
+            response.stream = _CloseAwareHttpxAsyncByteStream(response_stream)
 
         async def _close_precommit_resources() -> None:
             nonlocal retired
@@ -2832,6 +2879,7 @@ class PassThroughStreamingHandler:
         responses_tracking_finalized = False
         metadata: Dict[str, Any] = {}
         transfer_identity: Dict[str, Any] = {}
+        response_byte_iterator: Any = None
 
         async def _finalize_transfer_if_needed(
             identity: Dict[str, Any],
@@ -3274,8 +3322,9 @@ class PassThroughStreamingHandler:
                 if isinstance(extensions, dict):
                     extensions["aawm_openai_responses_terminal_pending"] = True
 
+            response_byte_iterator = response.aiter_bytes()
             async for chunk in wait_iterator(
-                "upstream_stream_read", response.aiter_bytes()
+                "upstream_stream_read", response_byte_iterator
             ):
                 current_chunk_at = datetime.now()
                 chunk_count += 1
@@ -3931,6 +3980,15 @@ class PassThroughStreamingHandler:
                 extra=exception_context,
             )
             raise
+        finally:
+            close_iterator = getattr(response_byte_iterator, "aclose", None)
+            if callable(close_iterator):
+                try:
+                    result = close_iterator()
+                    if inspect.isawaitable(result):
+                        await wait_for("resource_cleanup", result)
+                except Exception:
+                    pass
 
     @staticmethod
     async def _finalize_unstarted_native_stream(

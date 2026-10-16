@@ -3618,14 +3618,31 @@ async def test_alpha_openai_sse_precommit_overload_closes_and_propagates(
     mock_request.headers = {"content-type": "application/json"}
     mock_request.query_params = {}
     mock_request.state = SimpleNamespace()
+    mock_request.is_disconnected = AsyncMock(return_value=False)
     custom_body = {"model": "gpt-5.4"}
     error = {"code": error_code, "type": "server_error", "message": "Try again."}
-    payload = (
-        {"type": event_type, "response": {"status": "failed", "error": error}}
-        if event_type == "response.failed"
-        else {"type": event_type, "error": error}
-    )
-    stream = _ClosableAsyncByteStream([_sse(event_type, payload)])
+    if event_type == "response.failed":
+        response_id = "resp_overloaded"
+        chunks = [
+            _response_event(
+                "response.created",
+                1,
+                response_id=response_id,
+                status="in_progress",
+            ),
+            _response_event(
+                "response.failed",
+                2,
+                response_id=response_id,
+                status="failed",
+                error=error,
+            ),
+        ]
+    else:
+        chunks = [
+            _sse(event_type, {"type": event_type, "error": error})
+        ]
+    stream = _ClosableAsyncByteStream(chunks)
     upstream_response = httpx.Response(
         status_code=200,
         headers={"content-type": "text/event-stream"},
@@ -3681,21 +3698,40 @@ async def test_alpha_openai_sse_precommit_overload_closes_and_propagates(
         mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
         mock_logging_obj.post_call_failure_hook = AsyncMock(return_value=None)
 
-        with pytest.raises(ProxyException):
-            await pass_through_request(
+        if stream_request:
+            passthrough_response = await pass_through_request(
                 request=mock_request,
                 target=target,
                 custom_headers={},
                 user_api_key_dict=MagicMock(),
                 custom_body=custom_body,
                 custom_llm_provider="openai",
-                stream=stream_request,
+                stream=True,
             )
+            forwarded_body = b"".join(
+                [
+                    bytes(chunk)
+                    async for chunk in passthrough_response.body_iterator
+                ]
+            )
+            assert error_code.encode() in forwarded_body
+            assert "exception" not in captured
+        else:
+            with pytest.raises(ProxyException):
+                await pass_through_request(
+                    request=mock_request,
+                    target=target,
+                    custom_headers={},
+                    user_api_key_dict=MagicMock(),
+                    custom_body=custom_body,
+                    custom_llm_provider="openai",
+                    stream=False,
+                )
+            assert isinstance(captured["exception"], ResponsesStreamPreCommitFailure)
+            assert captured["exception"].error_class == "server_overloaded"
+            assert captured["exception"].retryable is True
+            assert captured["exception"].error_code == error_code
 
-    assert isinstance(captured["exception"], ResponsesStreamPreCommitFailure)
-    assert captured["exception"].error_class == "server_overloaded"
-    assert captured["exception"].retryable is True
-    assert captured["exception"].error_code == error_code
     assert stream.close_calls == 1
     assert upstream_response.is_closed is True
 
@@ -3716,21 +3752,31 @@ async def test_alpha_openai_sse_precommit_overload_closes_and_propagates(
 async def test_exact_capacity_sse_codes_preserve_peek_exclusions_and_bytes(
     error_code, enabled, error_type, message, substantive,
 ):
-    chunks = []
+    response_id = "resp_exact_capacity"
+    chunks = [
+        _response_event(
+            "response.created",
+            1,
+            response_id=response_id,
+            status="in_progress",
+        )
+    ]
     if substantive:
-        chunks.append(_sse(
+        chunks.append(_responses_event(
             "response.output_text.delta",
-            {"type": "response.output_text.delta", "delta": "hello"},
+            2,
+            item_id="msg_1",
+            output_index=0,
+            content_index=0,
+            delta="hello",
         ))
-    chunks.append(_sse(
+    failed_sequence = 3 if substantive else 2
+    chunks.append(_response_event(
         "response.failed",
-        {
-            "type": "response.failed",
-            "response": {
-                "status": "failed",
-                "error": {"code": error_code, "type": error_type, "message": message},
-            },
-        },
+        failed_sequence,
+        response_id=response_id,
+        status="failed",
+        error={"code": error_code, "type": error_type, "message": message},
     ))
     response = httpx.Response(
         200,
