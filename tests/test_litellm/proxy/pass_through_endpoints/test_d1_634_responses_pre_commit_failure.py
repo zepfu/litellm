@@ -4696,6 +4696,7 @@ async def test_openai_responses_incomplete_terminal_freezes_before_later_overloa
         "conflicting_event_payload_type",
         "malformed_failed_snapshot_non_list",
         "malformed_failed_snapshot_null_item",
+        "unhashable_output_item_type",
     ],
 )
 async def test_openai_responses_unsafe_admission_shapes_do_not_replay(
@@ -4743,6 +4744,13 @@ async def test_openai_responses_unsafe_admission_shapes_do_not_replay(
             assert failed_payloads[0]["response"]["error"]["code"] == "server_error"
         else:
             assert _assert_provider_overload_terminal(body)
+            if scenario == "unhashable_output_item_type":
+                payloads = _responses_sse_payloads(body)
+                event_types = [payload.get("type") for payload in payloads]
+                assert "response.output_item.added" in event_types
+                assert event_types.index(
+                    "response.output_item.added"
+                ) < event_types.index("response.failed")
     finally:
         iterator = getattr(result, "body_iterator", None)
         close_iterator = getattr(iterator, "aclose", None)
@@ -5566,6 +5574,37 @@ def _unsafe_admission_overload_stream_bytes(scenario: str) -> bytes:
                 _response_event(
                     "response.failed",
                     5,
+                    response_id=response_id,
+                    status="failed",
+                    error=overload,
+                ),
+            ]
+        )
+    elif scenario == "unhashable_output_item_type":
+        frames.extend(
+            [
+                _responses_event(
+                    "response.output_item.added",
+                    2,
+                    output_index=0,
+                    item={
+                        "id": "fc_1",
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "lookup",
+                        "arguments": "",
+                        "status": "in_progress",
+                    },
+                ),
+                _responses_event(
+                    "response.output_item.done",
+                    3,
+                    output_index=0,
+                    item={"id": "fc_1", "type": []},
+                ),
+                _response_event(
+                    "response.failed",
+                    4,
                     response_id=response_id,
                     status="failed",
                     error=overload,

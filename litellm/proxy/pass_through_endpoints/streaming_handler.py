@@ -1913,9 +1913,15 @@ class PassThroughStreamingHandler:
                 item_type = item.get("type") if isinstance(item, dict) else None
                 if item_type == "message":
                     commitment_reason = "assistant_output"
-                elif item_type in {"function_call", "custom_tool_call"}:
+                elif isinstance(item_type, str) and item_type in {
+                    "function_call",
+                    "custom_tool_call",
+                }:
                     commitment_reason = "client_tool_payload"
-                elif item_type in _PROVIDER_EXECUTABLE_TOOL_TYPES_HINT:
+                elif (
+                    isinstance(item_type, str)
+                    and item_type in _PROVIDER_EXECUTABLE_TOOL_TYPES_HINT
+                ):
                     commitment_reason = "provider_execution_possible"
                 elif item_type is not None:
                     commitment_reason = "unknown_semantics"
