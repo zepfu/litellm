@@ -249,23 +249,21 @@ class _PrefixedHttpxByteStream:
         remainder: Any = None,
         *,
         event_pipeline: Optional[ResponsesEventPipeline] = None,
+        bound_failure: Optional[ResponsesBoundFailure] = None,
     ) -> None:
         self._response = response
         self._prefix = prefix
         self._remainder = remainder
         self._aawm_responses_event_pipeline = event_pipeline
+        self._bound_failure = bound_failure
         if event_pipeline is not None:
             prepare_replay = getattr(event_pipeline, "prepare_replay", None)
-            prefix_bytes = getattr(prefix, "byte_count", 0)
             if callable(prepare_replay):
-                # feed_until may stop in the middle of a coalesced HTTPX
-                # read. Replay only the bytes the parser has already admitted;
-                # the wrapper routes the stored suffix through live admission
-                # after the accepted prefix has been yielded.
+                prefix_bytes = int(getattr(prefix, "byte_count", 0))
                 admitted_bytes = int(
                     getattr(event_pipeline, "total_stream_bytes", prefix_bytes)
                 )
-                prepare_replay(min(int(prefix_bytes), admitted_bytes))
+                prepare_replay(min(prefix_bytes, admitted_bytes))
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._response, name)
@@ -331,6 +329,8 @@ class _PrefixedHttpxByteStream:
             # Retire prefix storage before pulling the live remainder so
             # spooled files are closed during streaming, not after.
             self._close_prefix()
+            if self._bound_failure is not None:
+                raise self._bound_failure
             if self._remainder is None:
                 return
             if self._aawm_responses_event_pipeline is not None:
@@ -501,6 +501,17 @@ class _ResponsesPreCommitSSEParser:
 
     def finish(self) -> tuple[str, Optional[Dict[str, Any]], Optional[str]]:
         for parsed_event in self._pipeline.finish():
+            self._consume_event(parsed_event)
+        return self.decision()
+
+    def finish_without_pipeline_finish(self) -> tuple[
+        str,
+        Optional[Dict[str, Any]],
+        Optional[str],
+    ]:
+        """Compute a parser decision without discarding a complete EOF frame."""
+        completed = self._pipeline.finish()
+        for parsed_event in completed:
             self._consume_event(parsed_event)
         return self.decision()
 
@@ -1416,6 +1427,9 @@ class PassThroughStreamingHandler:
                 if not chunk:
                     continue
                 chunk = bytes(chunk)
+                stream_bytes_before_feed = int(
+                    getattr(pipeline, "total_stream_bytes", 0)
+                )
                 try:
                     decision, error_payload, event_type = parser.feed(chunk)
                     prefix.append(chunk)
@@ -1424,9 +1438,51 @@ class PassThroughStreamingHandler:
                     ResponsesEventTooLarge,
                     ResponsesStreamTooLarge,
                 ) as exc:
+                    bound_failure = ResponsesBoundFailure.from_exception(exc)
                     admitted_bytes = max(
                         0,
-                        int(getattr(pipeline, "last_feed_admitted_bytes", 0)),
+                        int(getattr(pipeline, "total_stream_bytes", 0))
+                        - stream_bytes_before_feed,
+                    )
+                    prior_safe = bool(
+                        getattr(pipeline, "held_event_count", 0)
+                        or bound_failure.accepted_events
+                    )
+                    if prior_safe:
+                        if admitted_bytes:
+                            try:
+                                prefix.append(chunk[:admitted_bytes])
+                            except (
+                                ResponsesBoundFailure,
+                                ResponsesEventTooLarge,
+                                ResponsesStreamTooLarge,
+                            ):
+                                await _close_precommit_resources()
+                                return response, _bound_failure(exc)
+                        prefixed = _PrefixedHttpxByteStream(
+                            response,
+                            prefix,
+                            iterator,
+                            event_pipeline=pipeline,
+                            bound_failure=bound_failure,
+                        )
+                        pipeline.attach_to_response(prefixed)
+                        if parser._first_terminal_decision == "failed":
+                            return (
+                                prefixed,
+                                PassThroughStreamingHandler._build_responses_pre_commit_failure(
+                                    error_payload=parser._first_error_payload,
+                                    event_type=parser._first_error_event,
+                                    openai_alpha_capacity_retry_enabled=(
+                                        openai_alpha_capacity_retry_enabled
+                                    ),
+                                ),
+                            )
+                        return prefixed, None
+                    admitted_bytes = max(
+                        0,
+                        int(getattr(pipeline, "total_stream_bytes", 0))
+                        - stream_bytes_before_feed,
                     )
                     # A decisive event earlier in this stored read is already
                     # accepted and observed. Save only the parser-admitted
@@ -1448,6 +1504,7 @@ class PassThroughStreamingHandler:
                             prefix,
                             iterator,
                             event_pipeline=pipeline,
+                            bound_failure=bound_failure,
                         )
                         pipeline.attach_to_response(prefixed)
                         return prefixed, None
@@ -1480,6 +1537,43 @@ class PassThroughStreamingHandler:
             leftover_incomplete = pipeline.buffered_event_bytes > 0
             try:
                 decision, error_payload, event_type = parser.finish()
+            except (
+                ResponsesBoundFailure,
+                ResponsesEventTooLarge,
+                ResponsesStreamTooLarge,
+            ) as exc:
+                await _close_precommit_resources()
+                return response, _bound_failure(exc)
+            if decision in {"failed", "substantive"}:
+                # A complete CR-only frame is accepted through the same
+                # pipeline admission path. Keep it in replay/delivery
+                # association with its source event instead of synthesizing a
+                # different terminal from its buffered bytes.
+                prefixed = _PrefixedHttpxByteStream(
+                    response,
+                    prefix,
+                    iterator,
+                    event_pipeline=pipeline,
+                )
+                pipeline.attach_to_response(prefixed)
+                if decision == "failed":
+                    return (
+                        prefixed,
+                        PassThroughStreamingHandler._build_responses_pre_commit_failure(
+                            error_payload=error_payload,
+                            event_type=event_type,
+                            openai_alpha_capacity_retry_enabled=(
+                                openai_alpha_capacity_retry_enabled
+                            ),
+                        ),
+                    )
+                return prefixed, None
+            try:
+                (
+                    decision,
+                    error_payload,
+                    event_type,
+                ) = parser.finish_without_pipeline_finish()
             except (
                 ResponsesBoundFailure,
                 ResponsesEventTooLarge,
@@ -2303,13 +2397,11 @@ class PassThroughStreamingHandler:
                 ):
                     return None
                 responses_tracking_finalized = True
-                if responses_sse_event_buffer or (
-                    responses_event_pipeline.buffered_event_bytes
-                ):
+                if responses_sse_event_buffer:
                     OpenAIPassthroughLoggingHandler._mark_responses_sse_partial_frame(
                         responses_sse_tracker
                     )
-                else:
+                elif responses_event_pipeline.buffered_event_bytes:
                     for parsed_event in responses_event_pipeline.finish():
                         _consume_responses_event(parsed_event)
 
@@ -2590,6 +2682,10 @@ class PassThroughStreamingHandler:
                         if parsed_event.forward_event is not None:
                             delivered_event_chunks.append(parsed_event.forward_event)
                             delivered_events.append(parsed_event)
+                            if parsed_event.event_type in (
+                                PassThroughStreamingHandler._RESPONSES_TERMINAL_EVENTS
+                            ):
+                                responses_terminal_seen = True
 
                     if delivered_event_chunks:
                         complete_chunk = attach_responses_events(

@@ -541,8 +541,9 @@ class ResponsesBoundFailure(Exception):
         accepted_bytes: int = 0,
     ) -> None:
         self.cause = cause
-        self.accepted_events = list(accepted_events or ())
-        self.accepted_bytes = max(0, int(accepted_bytes))
+        self.accepted_events: List["ParsedResponsesEvent"] = list(accepted_events or ())
+        self.accepted_bytes_known = accepted_bytes is not None
+        self.accepted_bytes = max(0, int(accepted_bytes or 0))
         if isinstance(cause, ResponsesEventTooLarge):
             self.kind = "event_too_large"
             self.code = "openai_responses_stream_event_too_large"
@@ -679,6 +680,8 @@ class ResponsesEventPipeline:
         self._raw_event_bytes = 0
         self._held_events: Deque[ParsedResponsesEvent] = deque()
         self._held_event_bytes = 0
+        self._replay_handoff_events: Deque[ParsedResponsesEvent] = deque()
+        self.held_limit_exhausted = False
         self._replay_remaining_bytes = 0
         self._replay_consumed_bytes = 0
         self._replay_consumed_event_bytes = 0
@@ -844,18 +847,43 @@ class ResponsesEventPipeline:
         *,
         accepted_events: List[ParsedResponsesEvent],
         admitted_bytes: int,
+        accepted_bytes_before_event: int,
         inspect_event: Optional[Callable[[ParsedResponsesEvent], bool]] = None,
     ) -> None:
-        try:
+        is_decisive = bool(inspect_event(event)) if inspect_event is not None else False
+        batch_bytes = self._held_representation_bytes(event)
+        hold_would_overflow = self.retain_events and (
+            self.max_held_events == 0
+            or self.max_held_bytes == 0
+            or len(self._held_events) + 1 > self.max_held_events
+            or self._held_event_bytes + batch_bytes > self.max_held_bytes
+        )
+        if hold_would_overflow:
+            if inspect_event is None:
+                self._hold_event(event)
+            elif is_decisive:
+                raise ResponsesBoundFailure(
+                    ResponsesEventRetentionTooLarge(
+                        "Responses typed-event replay retention exceeded configured bound"
+                    ),
+                    accepted_events=accepted_events,
+                    accepted_bytes=accepted_bytes_before_event,
+                )
+            operator = ResponsesBoundFailure(
+                ResponsesEventRetentionTooLarge(
+                    "Responses typed-event replay retention exceeded configured bound"
+                ),
+            )
+            self._hold_event(event, operator=operator)
+            accepted_events[:] = operator.accepted_events
+            self._replay_handoff_events.extend(operator.accepted_events)
+            self.held_limit_exhausted = True
+        else:
             self._hold_event(event)
-        except ResponsesEventRetentionTooLarge as exception:
-            raise ResponsesBoundFailure(
-                exception,
-                accepted_events=accepted_events,
-                accepted_bytes=admitted_bytes,
-            ) from exception
-        accepted_events.append(event)
-        if inspect_event is not None and inspect_event(event):
+            accepted_events.append(event)
+        if is_decisive:
+            raise _ResponsesEventInspectionComplete
+        if self.held_limit_exhausted and inspect_event is not None:
             raise _ResponsesEventInspectionComplete
 
     def _emit(self, event: ParsedResponsesEvent) -> None:
@@ -1000,6 +1028,9 @@ class ResponsesEventPipeline:
             return []
         events: list[ParsedResponsesEvent] = []
         admitted_bytes = 0
+        event_start_admitted_bytes: Optional[int] = (
+            0 if self._buffer else None
+        )
         self._last_feed_admitted_bytes = 0
         try:
             for value in chunk:
@@ -1013,8 +1044,12 @@ class ResponsesEventPipeline:
                             completed,
                             accepted_events=events,
                             admitted_bytes=admitted_bytes,
+                            accepted_bytes_before_event=(
+                                event_start_admitted_bytes or 0
+                            ),
                             inspect_event=inspect_event,
                         )
+                    event_start_admitted_bytes = None
                     continue
                 if self._pending_cr:
                     self._pending_cr = False
@@ -1024,21 +1059,31 @@ class ResponsesEventPipeline:
                             completed,
                             accepted_events=events,
                             admitted_bytes=admitted_bytes,
+                            accepted_bytes_before_event=(
+                                event_start_admitted_bytes or 0
+                            ),
                             inspect_event=inspect_event,
                         )
+                        event_start_admitted_bytes = None
                 self._admit_byte(value, count_stream_bytes=count_stream_bytes)
                 admitted_bytes += 1
                 self._pending_cr = value == 13
                 if self._pending_cr:
                     continue
+                if not self._buffer:
+                    event_start_admitted_bytes = admitted_bytes
                 completed = self._emit_if_separator_at_end()
                 if completed is not None:
                     self._accept_parsed_event(
                         completed,
                         accepted_events=events,
                         admitted_bytes=admitted_bytes,
+                        accepted_bytes_before_event=(
+                            event_start_admitted_bytes or 0
+                        ),
                         inspect_event=inspect_event,
                     )
+                    event_start_admitted_bytes = None
         except _ResponsesEventInspectionComplete:
             self._last_feed_admitted_bytes = admitted_bytes
             return events
@@ -1051,8 +1096,9 @@ class ResponsesEventPipeline:
             # before constructing a terminal for the rejected suffix.
             bound_failure = ResponsesBoundFailure.from_exception(exception)
             bound_failure.accepted_events = events
-            if not bound_failure.accepted_bytes:
+            if not bound_failure.accepted_bytes_known:
                 bound_failure.accepted_bytes = admitted_bytes
+                bound_failure.accepted_bytes_known = True
             self._last_feed_admitted_bytes = admitted_bytes
             raise bound_failure from exception
         self._last_feed_admitted_bytes = admitted_bytes
@@ -1101,6 +1147,12 @@ class ResponsesEventPipeline:
             self._pending_cr = False
             completed = self._emit_if_separator_at_end()
             if completed is not None:
+                self._accept_parsed_event(
+                    completed,
+                    accepted_events=[],
+                    admitted_bytes=0,
+                    accepted_bytes_before_event=0,
+                )
                 leftover = self.finish()
                 return [completed, *leftover]
         if not self._buffer:
@@ -1208,13 +1260,19 @@ class ResponsesEventPipeline:
 
     def _drain_replayed_events(self) -> list[ParsedResponsesEvent]:
         ready: list[ParsedResponsesEvent] = []
-        while self._held_events:
-            event = self._held_events[0]
+        while self._replay_handoff_events or self._held_events:
+            events = (
+                self._replay_handoff_events
+                if self._replay_handoff_events
+                else self._held_events
+            )
+            event = events[0]
             next_bytes = self._replay_consumed_event_bytes + event.byte_count
             if next_bytes > self._replay_consumed_bytes:
                 break
-            ready.append(self._held_events.popleft())
-            self._held_event_bytes -= self._held_representation_bytes(event)
+            ready.append(events.popleft())
+            if events is self._held_events:
+                self._held_event_bytes -= self._held_representation_bytes(event)
             self._replay_consumed_event_bytes = next_bytes
         return ready
 

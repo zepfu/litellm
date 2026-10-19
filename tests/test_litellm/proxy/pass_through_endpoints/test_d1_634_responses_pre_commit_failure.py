@@ -36,6 +36,7 @@ from litellm.proxy.pass_through_endpoints.streaming_handler import (
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
     ResponsesBoundFailure,
     ResponsesEventPipeline,
+    responses_events_from_chunk,
 )
 from litellm.proxy.pass_through_endpoints.success_handler import (
     PassThroughEndpointLogging,
@@ -119,6 +120,7 @@ class _FakeUpstreamStream:
     def __init__(self, chunks: list[bytes]) -> None:
         self._chunks = chunks
         self.aiter_calls = 0
+        self.yielded_chunks = 0
         self.status_code = 200
         self.headers = httpx.Headers({"content-type": "text/event-stream"})
         self.request = httpx.Request(
@@ -129,6 +131,7 @@ class _FakeUpstreamStream:
     async def aiter_bytes(self):
         self.aiter_calls += 1
         for chunk in self._chunks:
+            self.yielded_chunks += 1
             yield chunk
 
 
@@ -703,6 +706,134 @@ async def test_peek_replays_accepted_prefix_before_oversized_coalesced_suffix():
     assert rendered.count(b'"delta":"accepted-prefix"') == 1
     assert b"rejected-suffix-" not in rendered
     assert rendered == accepted
+
+
+@pytest.mark.asyncio
+async def test_peek_preserves_storage_bound_failure_after_accepted_prefix_without_live_read():
+    """A rejected coalesced suffix keeps its typed terminal after replay."""
+    accepted = _sse(
+        "response.output_text.delta",
+        {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "delta": "accepted-prefix",
+        },
+    )
+    rejected = b"x"
+    pipeline = ResponsesEventPipeline(
+        max_event_bytes=len(accepted),
+        max_stream_bytes=len(accepted),
+        max_stream_events=10,
+        retain_events=True,
+    )
+    response = _FakeUpstreamStream([accepted + rejected, b"later-live-read"])
+
+    peeked, failure = (
+        await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+            response,
+            event_pipeline=pipeline,
+        )
+    )
+
+    assert failure is None
+    emitted: list[Any] = []
+    with pytest.raises(ResponsesBoundFailure):
+        async for chunk in peeked.aiter_bytes():
+            emitted.append(chunk)
+
+    assert response.yielded_chunks == 1
+    assert b"".join(bytes(chunk) for chunk in emitted) == accepted
+    replayed = responses_events_from_chunk(emitted[0])
+    assert replayed is not None
+    assert replayed[0].event_type == "response.output_text.delta"
+
+
+@pytest.mark.asyncio
+async def test_peek_replays_complete_cr_eof_without_partial_substitution():
+    """A CR-only event completed at EOF uses the normal replay association."""
+    accepted = _sse(
+        "response.created",
+        {
+            "type": "response.created",
+            "response": {
+                "id": "resp_cr",
+                "status": "in_progress",
+                "model": "gpt-5.4",
+                "output": [],
+            },
+        },
+    )
+    completed = (
+        b"event: response.completed\r\n"
+        b'data: {"type":"response.completed","response":{"id":"resp_cr"}}\r\r'
+    )
+    pipeline = ResponsesEventPipeline(retain_events=True)
+    response = _FakeUpstreamStream([accepted + completed])
+
+    peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+        response,
+        event_pipeline=pipeline,
+    )
+
+    assert failure is None
+    replayed = [chunk async for chunk in peeked.aiter_bytes()]
+    assert b"".join(replayed) == accepted + completed
+
+    associated = [
+        event
+        for chunk in replayed
+        for event in (responses_events_from_chunk(chunk) or [])
+    ]
+    event = next(event for event in associated if event.event_type == "response.completed")
+    assert event.event_type == "response.completed"
+    assert event.is_malformed is False
+    assert event.separator == b"\r\r"
+    assert pipeline.finish() == []
+
+
+@pytest.mark.asyncio
+async def test_peek_delivers_live_complete_cr_eof_with_shared_event():
+    """A CR-only terminal split into the live remainder is not partial."""
+    accepted = _sse(
+        "response.created",
+        {
+            "type": "response.created",
+            "response": {
+                "id": "resp_cr_live",
+                "status": "in_progress",
+                "model": "gpt-5.4",
+                "output": [],
+            },
+        },
+    )
+    completed = (
+        b"event: response.completed\r\n"
+        b'data: {"type":"response.completed","response":{"id":"resp_cr_live"}}\r\r'
+    )
+    pipeline = ResponsesEventPipeline(retain_events=True)
+    response = _FakeUpstreamStream([accepted, completed])
+
+    peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+        response,
+        event_pipeline=pipeline,
+    )
+
+    assert failure is None
+    emitted = [chunk async for chunk in peeked.aiter_bytes()]
+    assert b"".join(emitted) == accepted + completed
+
+    associated = [
+        event
+        for chunk in emitted
+        for event in (responses_events_from_chunk(chunk) or [])
+    ]
+    event = next(
+        event for event in associated if event.event_type == "response.completed"
+    )
+    assert event.event_type == "response.completed"
+    assert event.is_malformed is False
+    assert event.separator == b"\r\r"
+    assert pipeline.finish() == []
 
 
 def test_no_replay_after_substantive_output():
