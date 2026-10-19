@@ -830,15 +830,21 @@ def _build_repetitive_output_failed_chunks(
             "route_family": request_context.route_family,
             "terminal_metadata": local_payload["response"]["metadata"],
         }
-        chunks = PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
-            endpoint_type=EndpointType.OPENAI,
-            url_route=request_context.ingress_path or "/openai_passthrough/v1/responses",
-            custom_llm_provider=request_context.custom_llm_provider,
-            failure_context=failure_context,
-            exc=None,
+        chunks, structured_payload = (
+            PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
+                endpoint_type=EndpointType.OPENAI,
+                url_route=(
+                    request_context.ingress_path
+                    or "/openai_passthrough/v1/responses"
+                ),
+                custom_llm_provider=request_context.custom_llm_provider,
+                failure_context=failure_context,
+                exc=None,
+            )
         )
     except Exception:
         chunks = []
+        structured_payload = None
     if chunks and _chunks_include_response_failed(chunks):
         generated = chunks
     else:
@@ -850,7 +856,7 @@ def _build_repetitive_output_failed_chunks(
     carried = list(generated)
     try:
         terminal_event = event_pipeline.adopt_event(
-            local_payload,
+            structured_payload if generated is chunks else local_payload,
             event_type="response.failed",
             wire_event=carried[0],
             control=True,
