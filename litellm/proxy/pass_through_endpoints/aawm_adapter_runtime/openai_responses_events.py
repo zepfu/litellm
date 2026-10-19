@@ -211,9 +211,6 @@ def bounded_identity_key(value: Any, *, limit: int = 1024) -> Optional[str]:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
-_CHARGED_FIELD_SENTINEL = "\0charged\0"
-
-
 def _charged_size(value: str) -> int:
     """Return the JSON-escaped UTF-8 byte size of a streamed field fragment."""
     if not value:
@@ -578,14 +575,13 @@ class _ResponsesDeltaField:
     """Bounded fragments for one not-yet-committed streamed string field."""
 
     parts: Deque[str]
+    base_value: str
     byte_count: int
 
     @property
     def value(self) -> str:
-        """Return accumulated text, excluding an already-committed marker."""
-        return "".join(
-            part for part in self.parts if part is not _CHARGED_FIELD_SENTINEL
-        )
+        """Return the item's committed value followed by streamed fragments."""
+        return self.base_value + "".join(self.parts)
 
 
 class _ResponsesEventInspectionComplete(Exception):
@@ -1332,7 +1328,6 @@ class ResponsesEventSummaryReducer:
         self._delta_key_order: Deque[str] = deque()
         self._delta_key_payloads: dict[str, dict[str, Any]] = {}
         self._delta_key_base_sizes: dict[str, int] = {}
-        self._delta_keys_with_charged_base: set[str] = set()
         self._delta_key_payload_sizes: dict[str, int] = {}
         self._delta_key_fields: dict[str, dict[str, _ResponsesDeltaField]] = {}
         self._stream_text_parts: list[str] = []
@@ -1449,10 +1444,7 @@ class ResponsesEventSummaryReducer:
             payload.setdefault("id", key)
             payload.setdefault("type", default_type)
             self._delta_key_payloads[key] = payload
-            base_size = self._delta_key_base_sizes.get(key, 0)
-            if key in self._output_items:
-                base_size = _json_size(self._output_items[key]) or 0
-                self._delta_keys_with_charged_base.add(key)
+            base_size = _json_size(payload) or 0
             self._delta_key_base_sizes[key] = base_size
             self._delta_key_payload_sizes[key] = base_size
         return payload, self._delta_key_payload_sizes[key]
@@ -1461,7 +1453,6 @@ class ResponsesEventSummaryReducer:
         self._delta_key_payloads.pop(key, None)
         self._delta_key_base_sizes.pop(key, None)
         self._delta_key_payload_sizes.pop(key, None)
-        self._delta_keys_with_charged_base.discard(key)
         self._delta_key_fields.pop(key, None)
 
     @staticmethod
@@ -1503,7 +1494,8 @@ class ResponsesEventSummaryReducer:
         current = target.get(field, "")
         current = current if isinstance(current, str) else ""
         return target, _ResponsesDeltaField(
-            parts=deque((_CHARGED_FIELD_SENTINEL,) if current else ()),
+            parts=deque(),
+            base_value=current,
             byte_count=_charged_size(current),
         )
 
@@ -1530,7 +1522,10 @@ class ResponsesEventSummaryReducer:
         payload = self._materialize_delta_payload(key)
         if payload is None:
             return False
-        previous_size = self._delta_key_base_sizes.get(key, _json_size(payload) or 0)
+        previous_size = self._delta_key_payload_sizes.get(
+            key,
+            _json_size(payload) or 0,
+        )
         candidate = {**payload, **copy.deepcopy(item)}
         candidate_size = _json_size(candidate)
         if not self._charge_delta(previous_size, candidate_size):
@@ -1551,11 +1546,7 @@ class ResponsesEventSummaryReducer:
             current = target.get(field, "")
             current = current if isinstance(current, str) else ""
             state.parts.clear()
-            if current:
-                # This replacement came from an item event and is charged
-                # through the item's JSON size.  Keep a marker so materializing
-                # another field does not replace this field with an empty value.
-                state.parts.append(_CHARGED_FIELD_SENTINEL)
+            state.base_value = current
             state.byte_count = _charged_size(current)
         return True
 
@@ -1664,7 +1655,6 @@ class ResponsesEventSummaryReducer:
         self._output_items[key] = payload
         self._delta_key_base_sizes[key] = new_size
         self._delta_key_payload_sizes[key] = new_size
-        self._delta_keys_with_charged_base.add(key)
 
     def _merge_item(self, payload: dict[str, Any]) -> None:
         item = payload.get("item")
@@ -1724,21 +1714,17 @@ class ResponsesEventSummaryReducer:
                 field="text",
                 create_target=self._output_text_target,
             )
-            current = _output_text_value(payload)
             payload_size = self._delta_key_base_sizes.get(
                 key,
                 _json_size(payload) or 0,
             )
-            if key not in self._delta_keys_with_charged_base:
-                payload_size = max(
-                    0,
-                    payload_size - _charged_size(current),
-                )
         assert state is not None
         first_delta = key not in self._output_items and key not in self._delta_keys_seen
         old_bytes = state.byte_count
         encoded = value.encode("utf-8")
-        next_bytes = _charged_size(value)
+        next_bytes = (
+            old_bytes + _charged_size(value) if not done else _charged_size(value)
+        )
         new_size = payload_size - old_bytes + next_bytes
         admitted = (
             self._charge_delta(0, new_size)
@@ -1810,21 +1796,16 @@ class ResponsesEventSummaryReducer:
                 delta_payload,
                 field="arguments",
             )
-            current = delta_payload.get("arguments", "")
-            current = current if isinstance(current, str) else ""
             payload_size = self._delta_key_base_sizes.get(
                 key,
                 _json_size(delta_payload) or 0,
             )
-            if key not in self._delta_keys_with_charged_base:
-                payload_size = max(
-                    0,
-                    payload_size - _charged_size(current),
-                )
         assert state is not None
         first_delta = key not in self._output_items and key not in self._delta_keys_seen
         old_bytes = state.byte_count
-        next_bytes = _charged_size(value)
+        next_bytes = (
+            old_bytes + _charged_size(value) if not done else _charged_size(value)
+        )
         new_size = payload_size - old_bytes + next_bytes
         admitted = (
             self._charge_delta(0, new_size)

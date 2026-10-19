@@ -73,7 +73,7 @@ def test_output_budget_rejects_new_item_exceeding_remaining_space() -> None:
 
 
 @pytest.mark.parametrize("field", ["text", "arguments"])
-def test_escaped_delta_then_done_replaces_incremental_charge(field: str) -> None:
+def test_repeated_escaped_deltas_charge_cumulative_value(field: str) -> None:
     summary = ResponsesEventSummaryReducer(max_output_bytes=1024)
     escaped_value = 'a\\"b'
     base_item = _function_call_item("")
@@ -90,23 +90,56 @@ def test_escaped_delta_then_done_replaces_incremental_charge(field: str) -> None
 
     if field == "text":
         summary.consume({"type": "response.output_text.delta", "item_id": "msg_1", "output_index": 0, "delta": escaped_value})
+        summary.consume({"type": "response.output_text.delta", "item_id": "msg_1", "output_index": 0, "delta": escaped_value})
     else:
+        summary.consume(
+            {"type": "response.function_call_arguments.delta", "item_id": "fc_1", "output_index": 0, "delta": escaped_value}
+        )
         summary.consume(
             {"type": "response.function_call_arguments.delta", "item_id": "fc_1", "output_index": 0, "delta": escaped_value}
         )
 
     escaped_bytes = len(json.dumps(escaped_value, ensure_ascii=False).encode("utf-8")) - 2
-    assert summary.snapshot()["output_bytes"] == after_add + escaped_bytes
-
-    if field == "text":
-        summary.consume({"type": "response.output_text.done", "item_id": "msg_1", "output_index": 0, "text": escaped_value})
-    else:
-        summary.consume(
-            {"type": "response.function_call_arguments.done", "item_id": "fc_1", "output_index": 0, "arguments": escaped_value}
-        )
+    assert summary.snapshot()["output_bytes"] == after_add + escaped_bytes * 2
 
     snapshot = summary.snapshot()
     output = _snapshot_output(snapshot)
-    assert output["content"][0]["text"] if field == "text" else output["arguments"] == escaped_value
+    if field == "text":
+        assert output["content"][0]["text"] == escaped_value * 2
+    else:
+        assert output["arguments"] == escaped_value * 2
+    assert snapshot["output_bytes"] == after_add + escaped_bytes * 2
+    assert snapshot["overflow"] is False
+
+
+@pytest.mark.parametrize("field", ["text", "arguments"])
+def test_delta_then_output_item_done_replaces_active_field(field: str) -> None:
+    summary = ResponsesEventSummaryReducer(max_output_bytes=1024)
+    base_item = _function_call_item("")
+    base_item["type"] = "message" if field == "text" else "function_call"
+    if field == "text":
+        base_item["id"] = "msg_1"
+        base_item["content"] = [{"type": "output_text", "text": ""}]
+    else:
+        base_item["arguments"] = ""
+
+    summary.consume(_item_added(base_item))
+    if field == "text":
+        summary.consume({"type": "response.output_text.delta", "item_id": "msg_1", "output_index": 0, "delta": "streamed"})
+        replacement = dict(base_item, content=[{"type": "output_text", "text": "final"}])
+    else:
+        summary.consume(
+            {"type": "response.function_call_arguments.delta", "item_id": "fc_1", "output_index": 0, "delta": "streamed"}
+        )
+        replacement = dict(base_item, arguments="final")
+
+    summary.consume(_item_added(replacement, 0))
+
+    snapshot = summary.snapshot()
+    output = _snapshot_output(snapshot)
+    if field == "text":
+        assert output["content"][0]["text"] == "final"
+    else:
+        assert output["arguments"] == "final"
     assert snapshot["output_bytes"] == len(_compact_json(output))
     assert snapshot["overflow"] is False
