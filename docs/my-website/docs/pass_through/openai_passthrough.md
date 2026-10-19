@@ -64,11 +64,13 @@ defaults. Raw-event retention is off unless
 `AAWM_RESPONSES_EVENT_RAW_DIAGNOSTICS` is `1`, `true`, `yes` or `on`
 (case-insensitive); either raw-history limit set to zero disables it.
 
-Event, stream and retained-event overflow follows the existing stream-failure
-handling. Already admitted complete events retain their order. Output-summary
-overflow records omitted or truncated summary data; it does not truncate
-otherwise valid client output. These retention budgets bound specific stream
-state, rather than the Python process's total memory.
+Event, stream, retained-event and output-summary overflow rejects admission of
+required state and follows the existing stream-failure handling. Already
+admitted complete events retain their order; subsequent provider output is not
+forwarded after the bound failure. Diagnostic raw-event history instead evicts
+older entries within its limits without terminating delivery. These retention
+budgets bound specific stream state, rather than the Python process's total
+memory.
 
 Audit-only response policies process events incrementally. Watermark
 `buffer_response` deliberately waits for the response and rejects buffering
