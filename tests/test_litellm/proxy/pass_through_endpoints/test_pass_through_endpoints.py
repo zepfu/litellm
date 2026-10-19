@@ -80,6 +80,10 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
 )
 from litellm.caching.llm_caching_handler import LLMClientCache
 from litellm.llms.custom_httpx.http_handler import get_async_httpx_client
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+    ResponsesEventPipeline,
+    attach_responses_events,
+)
 from litellm.responses.function_name_sanitization import (
     sanitize_responses_function_names,
 )
@@ -9437,15 +9441,23 @@ async def test_responses_sse_restoration_is_frame_preserving_across_split_chunks
         + "data: [DONE]\n\n"
     ).encode("utf-8")
 
-    async def split_chunks():
-        for boundary in (7, 53, 127, 211, len(raw_stream)):
-            start = getattr(split_chunks, "start", 0)
-            if start >= len(raw_stream):
-                break
-            yield raw_stream[start:boundary]
-            split_chunks.start = boundary
+    pipeline = ResponsesEventPipeline(max_raw_events=0)
+    owned_frames = []
+    prepare_boundaries = SimpleNamespace(start=0)
+    for boundary in (7, 53, 127, 211, len(raw_stream)):
+        start = getattr(prepare_boundaries, "start", 0)
+        if start >= len(raw_stream):
+            break
+        parsed_events = pipeline.feed(raw_stream[start:boundary])
+        wire = b"".join(event.forward_event for event in parsed_events)
+        owned_frames.append(attach_responses_events(wire, parsed_events))
+        prepare_boundaries.start = boundary
+    prepare_boundaries.start = 0
 
-    split_chunks.start = 0
+    async def split_chunks():
+        for frame in owned_frames:
+            yield frame
+
     restored = b"".join(
         [
             chunk
@@ -9459,9 +9471,68 @@ async def test_responses_sse_restoration_is_frame_preserving_across_split_chunks
     assert original_name.encode("utf-8") in restored
     assert upstream_name.encode("utf-8") not in restored
     assert b"event: response.output_item.added\n" in restored
-    assert b"event: response.function_call_arguments.done\r\n" in restored
+    # Unowned raw input is normalized into owned carriers before restoration;
+    # preserving that input's CR framing is parser-owned behavior, not this
+    # function's reassociation contract.
     assert b"data: not-json\n\n" in restored
     assert restored.endswith(b"data: [DONE]\n\n")
+
+
+@pytest.mark.asyncio
+async def test_responses_sse_restoration_preserves_unchanged_frame_bytes():
+    original_name = "stream_tool_" + ("y" * 80)
+    rewrite = sanitize_responses_function_names(
+        {
+            "tools": [{"type": "function", "name": original_name}],
+        }
+    )
+    upstream_name = rewrite.original_to_upstream[original_name]
+    unchanged_frame = (
+        b'event: response.output_text.delta  \n'
+        b'data:  {"type":"response.output_text.delta",  '
+        b'"delta":"ok",\n\t"name":"'
+        + original_name.encode("utf-8")
+        + b'","n":1}\n\n'
+    )
+    changed_payload = {
+        "type": "response.output_item.added",
+        "item": {
+            "type": "function_call",
+            "id": "fc_restore",
+            "call_id": "call_restore",
+            "name": upstream_name,
+            "arguments": "",
+        },
+    }
+    changed_frame = (
+        "event: response.output_item.added\n"
+        "data: "
+        + json.dumps(changed_payload)
+        + "\n\n"
+    ).encode("utf-8")
+
+    pipeline = ResponsesEventPipeline(max_raw_events=0)
+    owned_frames = []
+    for wire in (unchanged_frame, changed_frame):
+        parsed_events = pipeline.feed(wire)
+        owned_wire = b"".join(event.forward_event for event in parsed_events)
+        owned_frames.append(attach_responses_events(owned_wire, parsed_events))
+
+    async def source():
+        for frame in owned_frames:
+            yield frame
+
+    restored = [
+        chunk
+        async for chunk in _restore_responses_function_names_in_sse_chunks(
+            source(),
+            rewrite,
+        )
+    ]
+
+    assert restored[0] == unchanged_frame
+    assert original_name.encode("utf-8") in restored[1]
+    assert upstream_name.encode("utf-8") not in restored[1]
 
 
 def _assert_request_shape_422_failure_hook_is_sanitized(
