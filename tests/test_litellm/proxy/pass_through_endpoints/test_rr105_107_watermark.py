@@ -207,6 +207,30 @@ def _completed_event(visible: str) -> bytes:
     )
 
 
+def _item_snapshot_event(visible: str) -> list[bytes]:
+    item = {
+        "id": "msg_snapshot",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": visible}],
+    }
+    return [
+        _sse_event(
+            "response.content_part.done",
+            {
+                "item_id": "msg_snapshot",
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": visible},
+            },
+        ),
+        _sse_event(
+            "response.output_item.done",
+            {"item_id": "msg_snapshot", "output_index": 0, "item": item},
+        ),
+    ]
+
+
 def _watermarked_sse_chunks(*, visible: str | None = None) -> list[bytes]:
     text = f"hello{ZWSP}world" if visible is None else visible
     return [
@@ -410,6 +434,51 @@ async def test_rr105_streaming_enforce_with_buffer_response_does_not_deliver_car
         status = getattr(blocked, "status_code", None)
         assert status in {400, 403, 409, 422, None} or "watermark" in str(blocked).lower()
 
+
+@pytest.mark.asyncio
+async def test_rr105_buffer_response_sanitizes_snapshot_output_text() -> None:
+    visible = f"snapshot{ZWSP}text"
+    chunks = [*_item_snapshot_event(visible), b"data: [DONE]\n\n"]
+    kwargs = _empty_success_handler_kwargs()
+
+    async def _gen() -> Any:
+        for chunk in chunks:
+            yield chunk
+
+    config = _load_text_watermark_config(
+        {
+            "mode": "sanitize",
+            "unicode": {
+                "enabled": True,
+                "policy": "conservative",
+                "normalize_spaces": True,
+                "nfkc": False,
+            },
+            "removal": {
+                "enabled": True,
+                "stream_policy": "buffer_response",
+                "on_unremovable": "allow",
+            },
+            "statistical_detectors": [],
+        }
+    )
+    wrapped = _wrap_stream_hook(
+        _gen(),
+        config=config,
+        success_handler_kwargs=kwargs,
+        endpoint="responses",
+    )
+    yielded = await _collect_wrapped(wrapped)
+    joined = b"".join(yielded)
+
+    assert ZWSP_UTF8 not in joined
+    assert b"snapshot" in joined
+    assert b"text" in joined
+    assert _field(_field(config, "removal"), "stream_policy") == "buffer_response"
+    audit = _metadata_from_kwargs(kwargs).get("watermark_output_audit")
+    assert audit is not None
+    assert _field(audit, "signal_detected") is True
+    assert _field(audit, "transformation")["result"] == "removed_verified"
 
 @pytest.mark.asyncio
 async def test_rr105_detect_audit_only_still_forwards_live_sse_unchanged() -> None:

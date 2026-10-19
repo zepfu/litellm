@@ -36,6 +36,7 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_
 )
 
 _OUTPUT_AUDIT_KEY = "watermark_output_audit"
+_TEXT_ITEM_EVENT_TYPES = frozenset({"response.content_part.done", "response.output_item.done"})
 _VISIBLE_DELTA_TYPES = frozenset(
     {
         "response.output_text.delta",
@@ -125,6 +126,24 @@ def _visible_texts_from_event(payload: Mapping[str, Any], event_type: str) -> li
     return texts
 
 
+def _text_item_payloads_from_event(
+    payload: Mapping[str, Any], event_type: str
+) -> list[dict[str, Any]]:
+    """Return supported visible-text item carriers for done snapshot events."""
+
+    if event_type not in _TEXT_ITEM_EVENT_TYPES:
+        return []
+    nested_key = "item" if event_type == "response.output_item.done" else "part"
+    nested = payload.get(nested_key)
+    if not isinstance(nested, dict):
+        return []
+    content = nested.get("content")
+    has_text = isinstance(nested.get("text"), str)
+    if not has_text and not isinstance(content, list):
+        return []
+    return [nested]
+
+
 def _event_payload_and_type(event: Any) -> tuple[Optional[Mapping[str, Any]], str]:
     if isinstance(event, ParsedResponsesEvent):
         return event.payload, event.event_type or ""
@@ -152,8 +171,22 @@ def _visible_texts_from_sse_block(
             if (
                 not isinstance(payload, Mapping)
                 or not event_type
-                or event_type not in _VISIBLE_DELTA_TYPES
+                or (
+                    event_type not in _VISIBLE_DELTA_TYPES
+                    and event_type not in _TEXT_ITEM_EVENT_TYPES
+                )
             ):
+                continue
+            if event_type in _TEXT_ITEM_EVENT_TYPES:
+                for item in _text_item_payloads_from_event(payload, event_type):
+                    content = item.get("content")
+                    if isinstance(item.get("text"), str):
+                        texts.append(item["text"])
+                    if not isinstance(content, list):
+                        continue
+                    for part in content:
+                        if isinstance(part, Mapping) and isinstance(part.get("text"), str):
+                            texts.append(part["text"])
                 continue
             texts.extend(_visible_texts_from_event(payload, event_type))
         return texts
@@ -226,19 +259,53 @@ def _rewrite_visible_sse_payload(
     return payload
 
 
+def _rewrite_visible_text_item_payload(
+    payload: dict[str, Any],
+    event_type: str,
+    config: OpenAIPassthroughTextWatermarkSettings,
+) -> dict[str, Any]:
+    """Rewrite output_text text carried by an existing done-snapshot item."""
+
+    nested_key = "item" if event_type == "response.output_item.done" else "part"
+    nested = payload.get(nested_key)
+    if not isinstance(nested, dict):
+        return payload
+
+    if isinstance(nested.get("text"), str):
+        nested["text"] = _sanitize_visible_payload_text(nested["text"], config)
+
+    content = nested.get("content")
+    if not isinstance(content, list):
+        return payload
+    for part in content:
+        if isinstance(part, dict) and isinstance(part.get("text"), str):
+            part["text"] = _sanitize_visible_payload_text(part["text"], config)
+    return payload
+
+
 def _rewrite_visible_sse_emission(
     emission: Any,
     config: OpenAIPassthroughTextWatermarkSettings,
 ) -> Any:
     payload = emission.effective_payload
     event_type = emission.source_event.event_type or ""
-    if not isinstance(payload, dict) or event_type not in _VISIBLE_DELTA_TYPES:
+    if not isinstance(payload, dict) or (
+        event_type not in _VISIBLE_DELTA_TYPES
+        and event_type not in _TEXT_ITEM_EVENT_TYPES
+    ):
         return emission
-    rewritten_payload = _rewrite_visible_sse_payload(
-        copy.deepcopy(payload),
-        event_type,
-        config,
-    )
+    if event_type in _TEXT_ITEM_EVENT_TYPES:
+        rewritten_payload = _rewrite_visible_text_item_payload(
+            copy.deepcopy(payload),
+            event_type,
+            config,
+        )
+    else:
+        rewritten_payload = _rewrite_visible_sse_payload(
+            copy.deepcopy(payload),
+            event_type,
+            config,
+        )
     if rewritten_payload == payload:
         return emission
     return emission.transformed(rewritten_payload)
