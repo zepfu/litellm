@@ -7,7 +7,8 @@ import struct
 import tempfile
 import traceback
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from collections.abc import Mapping
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import httpx
@@ -3926,8 +3927,11 @@ class PassThroughStreamingHandler:
         exc: Optional[Exception] = None,
         incomplete_reason: Optional[str] = None,
         responses_event_pipeline: Optional[ResponsesEventPipeline] = None,
-    ) -> List[bytes]:
-        legacy_terminal_metadata = {
+    ) -> Tuple[
+        List[bytes],
+        Union[Dict[str, Any], Mapping[str, Any]],
+    ]:
+        legacy_terminal_metadata: Dict[str, Any] = {
             "stream_failure_stage": failure_context.get("stream_failure_stage"),
             "stream_chunks_seen": failure_context.get("stream_chunks_seen"),
             "stream_bytes_seen": failure_context.get("stream_bytes_seen"),
@@ -3979,7 +3983,7 @@ class PassThroughStreamingHandler:
                 event_pipeline=responses_event_pipeline,
                 event_type="response.incomplete",
                 payload=payload,
-            )
+            ), payload
 
         custom_error_payload = failure_context.get("terminal_error_payload")
         if isinstance(custom_error_payload, dict):
@@ -4015,13 +4019,14 @@ class PassThroughStreamingHandler:
                     "message": message,
                 },
             }
-            return [
+            chunks = [
                 (
                     "event: error\ndata: "
                     + json.dumps(payload, separators=(",", ":"))
                     + "\n\n"
                 ).encode("utf-8")
             ]
+            return chunks, payload
 
         if failure_context.get("responses_api_terminal") or (
             endpoint_type == EndpointType.OPENAI
@@ -4049,17 +4054,18 @@ class PassThroughStreamingHandler:
                 event_pipeline=responses_event_pipeline,
                 event_type="response.failed",
                 payload=payload,
-            )
+            ), payload
 
         payload = {
             "error": error_payload,
             "aawm_stream_terminal": legacy_terminal_metadata,
         }
-        return [
+        chunks = [
             (
                 "data: " + json.dumps(payload, separators=(",", ":")) + "\n\n"
             ).encode("utf-8")
         ]
+        return chunks, payload
 
     @staticmethod
     def _record_post_first_byte_stream_terminal_rollup(

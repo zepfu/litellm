@@ -8,13 +8,12 @@ Do not hardcode model names. Do not hook direct /grok/v1/responses.
 from __future__ import annotations
 
 import ast
-import asyncio
 import hashlib
 import inspect
 import json
 from pathlib import Path
-from typing import Any, Optional
-from unittest.mock import AsyncMock, MagicMock
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -31,6 +30,13 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
 )
 from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     grok_proxy_route,
+)
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+    ResponsesEventPipeline,
+    responses_emissions_from_chunk,
+)
+from litellm.proxy.pass_through_endpoints.streaming_handler import (
+    PassThroughStreamingHandler,
 )
 from litellm.responses.litellm_completion_transformation.function_call_identity import (
     resolve_responses_function_call_identity,
@@ -474,6 +480,68 @@ def test_failure_kind_is_not_capacity_quota_or_cooldown() -> None:
     assert action not in {"cooldown", "retry_same", "failover", "redispatch"}
     shadow_coolable = is_coolable(event) and action == "cooldown"
     assert shadow_coolable is False
+
+
+@pytest.mark.asyncio
+async def test_repetition_terminal_payload_matches_builder_wire_bytes() -> None:
+    policy = _default_policy()
+    looping = _looping_text(repeats=12)
+
+    async def _finite_stream():
+        yield _output_text_delta(looping)
+        yield _output_text_delta(_RR096_LEFTOVER)
+
+    pipeline = ResponsesEventPipeline(max_raw_events=0, retain_events=True)
+    upstream = AsyncMock()
+    upstream.aclose = AsyncMock()
+    calls: list[tuple[Any, Any]] = []
+    original_build_terminal = (
+        PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks
+    )
+
+    def _build_terminal(**kwargs: Any):
+        result = original_build_terminal(**kwargs)
+        calls.append((kwargs, result))
+        return result
+
+    with patch.object(
+        PassThroughStreamingHandler,
+        "_build_post_first_byte_terminal_stream_chunks",
+        staticmethod(_build_terminal),
+    ):
+        chunks: list[bytes] = []
+        async for chunk in ro.wrap_responses_sse_with_repetitive_output_guard(
+            _finite_stream(),
+            policy=policy,
+            request_context=_xai_passthrough_context(),
+            upstream_response=upstream,
+            event_pipeline=pipeline,
+        ):
+            chunks.append(
+                chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8")
+            )
+
+    assert calls
+    builder_kwargs, (builder_chunks, structured_payload) = calls[-1]
+    assert chunks == builder_chunks
+    assert len(chunks) == 2
+
+    events = _decode_sse_events(chunks)
+    assert events[0]["type"] == "response.failed"
+    assert events[1]["type"] == "[DONE]"
+    assert upstream.aclose.await_count == 1
+
+    emissions = responses_emissions_from_chunk(chunks[0])
+    assert emissions is not None
+    assert emissions[0].effective_payload is structured_payload
+    parsed_wire_payload = json.loads(
+        chunks[0].decode("utf-8").split("data: ", 1)[1].split("\n\n", 1)[0]
+    )
+    assert parsed_wire_payload == emissions[0].effective_payload
+    metadata = parsed_wire_payload["response"]["metadata"]
+    assert metadata["model"] == "grok-native-placeholder"
+    assert metadata["failure_kind"] == FAILURE_KIND
+    assert metadata["visible_delta_forwarded"] is False
 
 
 # ---------------------------------------------------------------------------
