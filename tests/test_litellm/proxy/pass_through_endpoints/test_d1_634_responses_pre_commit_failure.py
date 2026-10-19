@@ -122,6 +122,7 @@ class _FakeUpstreamStream:
         self._chunks = chunks
         self.aiter_calls = 0
         self.yielded_chunks = 0
+        self.close_calls = 0
         self.status_code = 200
         self.headers = httpx.Headers({"content-type": "text/event-stream"})
         self.request = httpx.Request(
@@ -134,6 +135,9 @@ class _FakeUpstreamStream:
         for chunk in self._chunks:
             self.yielded_chunks += 1
             yield chunk
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
 
 
 class _ClosableAsyncByteStream(httpx.AsyncByteStream):
@@ -794,7 +798,7 @@ async def test_peek_replays_complete_cr_eof_without_partial_substitution():
 
 @pytest.mark.asyncio
 async def test_peek_delivers_live_complete_cr_eof_with_shared_event():
-    """A CR-only terminal split into the live remainder is not partial."""
+    """Post-handoff CR-only EOF completion reaches the native live processor."""
     accepted = _sse(
         "response.created",
         {
@@ -807,12 +811,20 @@ async def test_peek_delivers_live_complete_cr_eof_with_shared_event():
             },
         },
     )
+    substantive = _sse(
+        "response.output_text.delta",
+        {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "delta": "visible",
+        },
+    )
     completed = (
         b"event: response.completed\r\n"
         b'data: {"type":"response.completed","response":{"id":"resp_cr_live"}}\r\r'
     )
     pipeline = ResponsesEventPipeline(retain_events=True)
-    response = _FakeUpstreamStream([accepted, completed])
+    response = _FakeUpstreamStream([accepted, substantive, completed])
 
     peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
         response,
@@ -820,8 +832,37 @@ async def test_peek_delivers_live_complete_cr_eof_with_shared_event():
     )
 
     assert failure is None
-    emitted = [chunk async for chunk in peeked.aiter_bytes()]
-    assert b"".join(emitted) == accepted + completed
+    assert response.yielded_chunks == 2
+    logging_obj = MagicMock()
+    logging_obj.model_call_details = {}
+    success_handler_kwargs = _route_kwargs()
+    finalized = AsyncMock()
+    with patch.object(
+        PassThroughStreamingHandler,
+        "_route_streaming_logging_to_handler",
+        new=finalized,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.emit_aawm_route_status_event"
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.record_aawm_route_rollup"
+    ):
+        emitted = [
+            chunk
+            async for chunk in PassThroughStreamingHandler.chunk_processor(
+                response=peeked,
+                request_body={"model": "gpt-5.4", "stream": True},
+                litellm_logging_obj=logging_obj,
+                endpoint_type=EndpointType.OPENAI,
+                start_time=datetime.now(),
+                passthrough_success_handler_obj=MagicMock(
+                    spec=PassThroughEndpointLogging
+                ),
+                url_route="https://chatgpt.com/backend-api/codex/responses",
+                custom_llm_provider="openai",
+                success_handler_kwargs=success_handler_kwargs,
+                responses_event_pipeline=pipeline,
+            )
+        ]
 
     associated = [
         event
@@ -834,7 +875,19 @@ async def test_peek_delivers_live_complete_cr_eof_with_shared_event():
     assert event.event_type == "response.completed"
     assert event.is_malformed is False
     assert event.separator == b"\r\r"
+    assert event.payload["type"] == "response.completed"
+    assert event.payload["response"]["id"] == "resp_cr_live"
+    rendered = b"".join(bytes(chunk) for chunk in emitted)
+    assert accepted in rendered
+    assert substantive in rendered
+    assert b"event: response.completed" in rendered
+    assert b'"delta":"visible"' in rendered
+    assert b'"type":"response.completed"' in rendered
+    assert b'"type":"response.incomplete"' not in rendered
     assert pipeline.finish() == []
+    assert response.yielded_chunks == 3
+    assert response.close_calls == 1
+    finalized.assert_called_once()
 
 
 def test_no_replay_after_substantive_output():

@@ -397,15 +397,28 @@ class _PrefixedHttpxByteStream:
                 bound_failure = self._bound_failure
                 self._bound_failure = None
                 raise ResponsesBoundFailure(bound_failure.cause) from bound_failure
+            pipeline = self._aawm_responses_event_pipeline
             if self._remainder is None:
                 return
-            if self._aawm_responses_event_pipeline is not None:
-                self._aawm_responses_event_pipeline.retain_events = False
-            async for chunk in self._remainder:
-                if not chunk:
-                    continue
-                async for live_chunk in _iter_live_chunk(bytes(chunk)):
-                    yield live_chunk
+            if self._remainder is not None:
+                if pipeline is not None:
+                    pipeline.retain_events = False
+                async for chunk in self._remainder:
+                    if not chunk:
+                        continue
+                    async for live_chunk in _iter_live_chunk(bytes(chunk)):
+                        yield live_chunk
+            if pipeline is not None:
+                for event in pipeline.finish():
+                    if (
+                        event.forward_event is not None
+                        and event.separator
+                        and not event.is_malformed
+                    ):
+                        yield attach_responses_events(
+                            event.forward_event,
+                            [event],
+                        )
         except BaseException:
             await self.aclose()
             raise
@@ -3476,10 +3489,11 @@ class PassThroughStreamingHandler:
                 if isinstance(extensions, dict):
                     extensions["aawm_openai_responses_terminal_pending"] = True
 
-            response_byte_iterator = response.aiter_bytes()
-            async for chunk in wait_iterator(
-                "upstream_stream_read", response_byte_iterator
-            ):
+            response_chunks = response.aiter_bytes()
+            upstream_chunks = wait_iterator(
+                "upstream_stream_read", response_chunks
+            )
+            async for chunk in upstream_chunks:
                 current_chunk_at = datetime.now()
                 chunk_count += 1
                 total_stream_bytes += len(chunk)
@@ -3835,6 +3849,13 @@ class PassThroughStreamingHandler:
                     and downstream_chunk_count == 1
                 )
                 yield chunk
+
+            await upstream_chunks.aclose()
+            close_response_chunks = getattr(response_chunks, "aclose", None)
+            if callable(close_response_chunks):
+                close_result = close_response_chunks()
+                if inspect.isawaitable(close_result):
+                    await close_result
 
             if responses_event_pipeline is not None:
                 synthetic_terminal = _finalize_responses_tracking()
