@@ -4027,6 +4027,302 @@ async def test_candidate_loop_capacity_expiry_preserves_upstream_failure(  # noq
 
 
 @pytest.mark.asyncio
+async def test_candidate_loop_preserves_committed_raw_openai_overload_without_replay(  # noqa: PLR0915
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+    from unittest.mock import AsyncMock, MagicMock
+
+    from litellm.proxy import proxy_server
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        get_request_openai_wire_commitment,
+        is_openai_wire_replay_prohibited,
+    )
+
+    monkeypatch.setattr(
+        lpe,
+        "_codex_auto_agent_request_has_continuation_state",
+        lambda _body: False,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_get_codex_auto_agent_native_grok_continuation_transient_max_attempts",
+        lambda: 1,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_is_auto_agent_alias_in_flight_cooldown_http_exception",
+        lambda _exc: False,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_get_safe_kimi_code_probe_failure_metadata",
+        lambda _exc, *, candidate: None,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_classify_kimi_code_auto_agent_probe_failure",
+        lambda _metadata: None,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_classify_codex_auto_agent_retryable_exhaustion",
+        lambda _exc, **_kwargs: "capacity_exhausted",
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_is_codex_auto_agent_grok_account_quota_exhaustion",
+        lambda _exc, *, candidate: False,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_get_codex_auto_agent_cooldown_seconds",
+        lambda _exc, *, candidate: 0.0,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_codex_failure_evidence",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    monkeypatch.setenv(
+        "AAWM_ALIAS_ROUTING_STATE_NAMESPACE",
+        "openai080-committed-alias-retry",
+    )
+    monkeypatch.setattr(
+        pte,
+        "_is_openai_alpha_capacity_retry_target",
+        lambda **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        candidate_loop._error_signals,
+        "_is_openai_alpha_capacity_retry_enabled",
+        lambda **_kwargs: False,
+    )
+    planner_calls: list[dict[str, Any]] = []
+
+    def _plan_retry(**kwargs: Any) -> dict[str, Any]:
+        planner_calls.append(kwargs)
+        raise AssertionError("committed requests must bypass retry planning")
+
+    monkeypatch.setattr(
+        candidate_loop._error_signals,
+        "plan_responses_pre_commit_retry",
+        _plan_retry,
+    )
+
+    async def _unexpected_retry_wait(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError(
+            f"committed requests must not wait before retry: {args!r} {kwargs!r}"
+        )
+
+    monkeypatch.setattr(
+        candidate_loop.asyncio,
+        "sleep",
+        _unexpected_retry_wait,
+    )
+    request = _starlette_request()
+    request.scope["raw_path"] = b"/openai_passthrough/v1/responses"
+    request.scope["headers"] = [
+        (b"content-type", b"application/json"),
+        (b"user-agent", b"codex-cli/1.0"),
+    ]
+    monkeypatch.setattr(request, "is_disconnected", AsyncMock(return_value=False))
+    candidate = {
+        "provider": "openai",
+        "model": "gpt-5.4",
+        "route_family": "codex_responses",
+    }
+    prepared_body = {
+        "model": "work",
+        "input": "search for current conditions",
+        "tools": [
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "server_url": "https://mcp.example.test",
+            }
+        ],
+    }
+    upstream_detail = {
+        "error": {
+            "type": "server_error",
+            "code": "server_overloaded",
+            "message": "The selected model is at capacity.",
+        }
+    }
+    sent_requests: list[httpx.Request] = []
+
+    async def _dispatch(upstream_request: httpx.Request) -> httpx.Response:
+        if sent_requests:
+            raise AssertionError("committed request must not be sent twice")
+        sent_requests.append(upstream_request)
+        return httpx.Response(
+            status_code=529,
+            headers={
+                "content-type": "application/json",
+                "retry-after": "17",
+            },
+            json=upstream_detail,
+            request=upstream_request,
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_dispatch),
+        timeout=2.0,
+    )
+    monkeypatch.setattr(
+        pte,
+        "get_async_httpx_client",
+        lambda *_args, **_kwargs: SimpleNamespace(client=client),
+    )
+    monkeypatch.setattr(pte, "_aawm_session_owner_pre_send_guard", AsyncMock())
+
+    async def _run_with_renewal(*, request: Any, operation: Any) -> Any:
+        _ = request
+        return await operation()
+
+    monkeypatch.setattr(
+        pte,
+        "_aawm_run_with_session_owner_lease_renewal",
+        _run_with_renewal,
+    )
+    monkeypatch.setattr(
+        pte,
+        "_aawm_session_owner_on_upstream_result",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        proxy_server,
+        "proxy_logging_obj",
+        SimpleNamespace(
+            pre_call_hook=AsyncMock(return_value=prepared_body),
+            post_call_failure_hook=AsyncMock(return_value=None),
+        ),
+    )
+
+    session_owner_seam = _session_owner_no_redis_seam()
+
+    class _Admission:
+        async def admit_selected_candidate(self, **_kwargs: Any) -> object:
+            return SimpleNamespace(allowed=True, lease=None)
+
+        async def release_provider_lane_admission(
+            self,
+            _lease: object,
+        ) -> None:
+            return None
+
+    monkeypatch.setattr(
+        candidate_loop,
+        "alias_routing_state",
+        AliasRoutingStateManager(),
+    )
+    monkeypatch.setattr(
+        candidate_loop,
+        "_session_affinity_mod",
+        lambda: session_owner_seam,
+    )
+    monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    selection_calls: list[None] = []
+    provider_attempts: list[None] = []
+    failure_records: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_failure",
+        lambda **kwargs: failure_records.append(kwargs),
+    )
+
+    async def _select(**_kwargs: Any) -> dict[str, Any]:
+        if selection_calls:
+            raise AssertionError(
+                "committed request must not re-enter alias selection"
+            )
+        selection_calls.append(None)
+        return {
+            "candidate": dict(candidate),
+            "lane_key": "openai",
+            "cooldown_key": "openai:gpt-5.4",
+            "selection_reason": "first_available",
+            "skipped": [],
+        }
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> object:
+        if provider_attempts:
+            raise AssertionError(
+                "committed request must not re-enter provider dispatch"
+            )
+        provider_attempts.append(None)
+        return await pte.pass_through_request(
+            request=request,
+            target="https://api.openai.com/v1/responses",
+            custom_headers={},
+            user_api_key_dict=MagicMock(),
+            custom_body={**candidate_body, "model": candidate["model"]},
+            custom_llm_provider="openai",
+            stream=True,
+            caller_managed_hidden_retry=True,
+        )
+
+    async def _zero_cooldown(_key: str) -> tuple[float, str]:
+        return 0.0, "memory"
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    services = SimpleNamespace(
+        select_candidate_fn=_select,
+        perform_candidate_request_fn=_perform,
+        resolve_cooldown_publication_fn=lambda **_kwargs: (
+            candidate_loop.CooldownPublicationPlan()
+        ),
+        publish_cooldown_memory_fn=_noop_async,
+        persist_cooldown_fn=_noop_async,
+        set_session_affinity_fn=_noop_async,
+        add_alias_metadata_fn=lambda body, **_kwargs: body,
+        raise_redispatch_fn=lambda **_kwargs: None,
+    )
+
+    try:
+        with pytest.raises(HTTPException) as caught:
+            await candidate_loop.handle_alias_route(
+                services,
+                alias_family="codex_auto_agent",
+                alias_model="work",
+                request=request,
+                prepared_request_body=prepared_body,
+                max_candidate_attempts=2,
+                get_active_cooldown_state_fn=_zero_cooldown,
+                attempts_metadata_key="codex_auto_agent_attempts",
+                skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+                no_candidate_detail="no candidates",
+                log_label="Codex",
+            )
+
+        assert len(selection_calls) == 1
+        assert len(provider_attempts) == 1
+        assert len(sent_requests) == 1
+        assert planner_calls == []
+        assert caught.value.status_code == 529
+        assert caught.value.detail == upstream_detail
+        assert caught.value.detail["error"]["code"] == "server_overloaded"
+        assert getattr(caught.value, "_aawm_provider_returned", False) is True
+        assert len(failure_records) == 1
+        wire_commitment = get_request_openai_wire_commitment(request)
+        assert is_openai_wire_replay_prohibited(wire_commitment)
+        assert wire_commitment["precommit_commitment_reason"] == (
+            "provider_execution_possible"
+        )
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_candidate_loop_capacity_expiry_without_prior_failure_returns_504(  # noqa: PLR0915
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

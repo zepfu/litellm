@@ -152,21 +152,52 @@ class OpenAIResponsesWireTrace:
         state = getattr(request, "state", None)
         if state is None:
             return
+        from .provider_call_ledger import (
+            get_request_openai_wire_commitment,
+            get_responses_replay_commitment_reason,
+        )
+
+        existing_commitment = get_request_openai_wire_commitment(request) or {}
+        published_replay_reason = get_responses_replay_commitment_reason(request)
+        commitment_snapshot = self.snapshot()
+        for key in (
+            "precommit_replay_committed",
+            "precommit_commitment_reason",
+            "precommit_commitment_event_type",
+        ):
+            if key in existing_commitment:
+                commitment_snapshot[key] = existing_commitment[key]
         try:
             setattr(state, "_aawm_openai_responses_wire_trace", self)
             setattr(
                 state,
                 "_aawm_openai_responses_wire_commitment",
-                self.snapshot(),
+                commitment_snapshot,
             )
         except Exception:
             return
+        else:
+            if published_replay_reason is not None:
+                try:
+                    from .provider_call_ledger import (
+                        publish_responses_replay_commitment,
+                    )
+
+                    publish_responses_replay_commitment(
+                        request,
+                        reason=published_replay_reason,
+                        event_type=existing_commitment.get(
+                            "precommit_commitment_event_type"
+                        ),
+                    )
+                except Exception:
+                    pass
         try:
             from .provider_call_ledger import publish_wire_commitment_snapshot
 
             publish_wire_commitment_snapshot(
                 request,
-                commitment=self.snapshot(),
+                commitment=commitment_snapshot,
             )
         except Exception:
             return

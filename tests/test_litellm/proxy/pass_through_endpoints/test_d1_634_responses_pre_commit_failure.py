@@ -44,10 +44,11 @@ from litellm.proxy.pass_through_endpoints.success_handler import (
 from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
 
 
-def _sse(event_type: str, payload: dict[str, Any]) -> bytes:
+def _sse(event_type: str, payload: dict[str, Any], *, ensure_ascii: bool = True) -> bytes:
     return (
         f"event: {event_type}\ndata: "
-        + json.dumps(payload, separators=(",", ":"))
+        + json.dumps(payload, separators=(",", ":"),
+                     ensure_ascii=ensure_ascii)
         + "\n\n"
     ).encode("utf-8")
 
@@ -415,7 +416,7 @@ async def test_peek_classifies_native_codex_recovery_errors_before_commit(
     if fragmented:
         split_at = error_chunk.index(b'"message"') + len(b'"message"')
         error_chunks = [error_chunk[:split_at], error_chunk[split_at:]]
-        partial_decision, _, _ = (
+        partial_decision, _, _, _ = (
             PassThroughStreamingHandler._inspect_responses_pre_commit_chunks(
                 [error_chunks[0]]
             )
@@ -870,7 +871,7 @@ def test_no_replay_after_substantive_output():
             },
         ),
     ]
-    decision, error_payload, event_type = (
+    decision, error_payload, event_type, _ = (
         PassThroughStreamingHandler._inspect_responses_pre_commit_chunks(chunks)
     )
     assert decision == "substantive"
@@ -1141,7 +1142,7 @@ def test_inspect_pre_commit_chunks_does_not_raise_on_truncated_utf8_tail():
         },
     )
     chunks = [complete + b"\xe2\x82"]
-    decision, error_payload, event_type = (
+    decision, error_payload, event_type, _ = (
         PassThroughStreamingHandler._inspect_responses_pre_commit_chunks(chunks)
     )
     assert decision == "lifecycle"
@@ -1172,7 +1173,7 @@ def test_inspect_pre_commit_chunks_still_classifies_valid_utf8_sse():
             },
         ),
     ]
-    decision, error_payload, event_type = (
+    decision, error_payload, event_type, _ = (
         PassThroughStreamingHandler._inspect_responses_pre_commit_chunks(chunks)
     )
     assert decision == "substantive"
@@ -3748,14 +3749,31 @@ async def test_alpha_openai_sse_precommit_overload_closes_and_propagates(
     mock_request.headers = {"content-type": "application/json"}
     mock_request.query_params = {}
     mock_request.state = SimpleNamespace()
+    mock_request.is_disconnected = AsyncMock(return_value=False)
     custom_body = {"model": "gpt-5.4"}
     error = {"code": error_code, "type": "server_error", "message": "Try again."}
-    payload = (
-        {"type": event_type, "response": {"status": "failed", "error": error}}
-        if event_type == "response.failed"
-        else {"type": event_type, "error": error}
-    )
-    stream = _ClosableAsyncByteStream([_sse(event_type, payload)])
+    if event_type == "response.failed":
+        response_id = "resp_overloaded"
+        chunks = [
+            _response_event(
+                "response.created",
+                1,
+                response_id=response_id,
+                status="in_progress",
+            ),
+            _response_event(
+                "response.failed",
+                2,
+                response_id=response_id,
+                status="failed",
+                error=error,
+            ),
+        ]
+    else:
+        chunks = [
+            _sse(event_type, {"type": event_type, "error": error})
+        ]
+    stream = _ClosableAsyncByteStream(chunks)
     upstream_response = httpx.Response(
         status_code=200,
         headers={"content-type": "text/event-stream"},
@@ -3811,21 +3829,40 @@ async def test_alpha_openai_sse_precommit_overload_closes_and_propagates(
         mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
         mock_logging_obj.post_call_failure_hook = AsyncMock(return_value=None)
 
-        with pytest.raises(ProxyException):
-            await pass_through_request(
+        if stream_request:
+            passthrough_response = await pass_through_request(
                 request=mock_request,
                 target=target,
                 custom_headers={},
                 user_api_key_dict=MagicMock(),
                 custom_body=custom_body,
                 custom_llm_provider="openai",
-                stream=stream_request,
+                stream=True,
             )
+            forwarded_body = b"".join(
+                [
+                    bytes(chunk)
+                    async for chunk in passthrough_response.body_iterator
+                ]
+            )
+            assert error_code.encode() in forwarded_body
+            assert "exception" not in captured
+        else:
+            with pytest.raises(ProxyException):
+                await pass_through_request(
+                    request=mock_request,
+                    target=target,
+                    custom_headers={},
+                    user_api_key_dict=MagicMock(),
+                    custom_body=custom_body,
+                    custom_llm_provider="openai",
+                    stream=False,
+                )
+            assert isinstance(captured["exception"], ResponsesStreamPreCommitFailure)
+            assert captured["exception"].error_class == "server_overloaded"
+            assert captured["exception"].retryable is True
+            assert captured["exception"].error_code == error_code
 
-    assert isinstance(captured["exception"], ResponsesStreamPreCommitFailure)
-    assert captured["exception"].error_class == "server_overloaded"
-    assert captured["exception"].retryable is True
-    assert captured["exception"].error_code == error_code
     assert stream.close_calls == 1
     assert upstream_response.is_closed is True
 
@@ -4137,21 +4174,31 @@ async def test_failed_precommit_prefix_retired_before_retry_handoff(monkeypatch)
 async def test_exact_capacity_sse_codes_preserve_peek_exclusions_and_bytes(
     error_code, enabled, error_type, message, substantive,
 ):
-    chunks = []
+    response_id = "resp_exact_capacity"
+    chunks = [
+        _response_event(
+            "response.created",
+            1,
+            response_id=response_id,
+            status="in_progress",
+        )
+    ]
     if substantive:
-        chunks.append(_sse(
+        chunks.append(_responses_event(
             "response.output_text.delta",
-            {"type": "response.output_text.delta", "delta": "hello"},
+            2,
+            item_id="msg_1",
+            output_index=0,
+            content_index=0,
+            delta="hello",
         ))
-    chunks.append(_sse(
+    failed_sequence = 3 if substantive else 2
+    chunks.append(_response_event(
         "response.failed",
-        {
-            "type": "response.failed",
-            "response": {
-                "status": "failed",
-                "error": {"code": error_code, "type": error_type, "message": message},
-            },
-        },
+        failed_sequence,
+        response_id=response_id,
+        status="failed",
+        error={"code": error_code, "type": error_type, "message": message},
     ))
     response = httpx.Response(
         200,
@@ -4720,3 +4767,1824 @@ async def test_stream_read_retry_admits_ordinary_replacement_sends(monkeypatch):
     assert ledger.snapshot()["logical_provider_calls"] == 3
     coordinator.sleep_with_wakeup.assert_not_called()
     coordinator.record_retry.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# OPENAI-080: replay-safety boundary public-contract specs
+# ---------------------------------------------------------------------------
+
+
+_RSON_REASONING_DELTA = "Let me think\u2026"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read_mode", ["coalesced", "utf8_split", "delimiter_split"])
+async def test_openai_responses_replays_safe_reasoning_prefix_once(
+    monkeypatch, read_mode: str
+):
+    """The real send owner retries one safe failed attempt and delivers only
+    the replacement response, including output before its terminal arrives."""
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    failed_bytes = _reasoning_overload_stream_bytes(ensure_ascii=False)
+    failed_chunks = _chunks_for_read_mode(
+        failed_bytes,
+        read_mode,
+        _reasoning_delta_utf8_split(failed_bytes),
+    )
+    terminal_gate = asyncio.Event()
+    replacement_stream = _GateBeforeChunkAsyncByteStream(
+        _replacement_success_stream_chunks(),
+        gate_before_index=3,
+        gate=terminal_gate,
+    )
+    result, client, sent_requests, upstream_streams = await _start_openai_responses_stream(
+        monkeypatch,
+        [
+            _ClosableAsyncByteStream(failed_chunks),
+            replacement_stream,
+        ],
+    )
+    try:
+        assert not isinstance(result, Exception)
+        assert len(sent_requests) == 2
+
+        iterator = result.body_iterator
+        observed: list[bytes] = []
+        while not any(
+            payload.get("type") == "response.output_text.delta"
+            and payload.get("delta") == "Recovered \u6771\u4eac"
+            for payload in _responses_sse_payloads(b"".join(observed))
+        ):
+            observed.append(bytes(await asyncio.wait_for(iterator.__anext__(), timeout=1)))
+        assert not terminal_gate.is_set()
+
+        terminal_gate.set()
+        async for chunk in iterator:
+            observed.append(bytes(chunk))
+        body = b"".join(observed)
+        payloads = _responses_sse_payloads(body)
+        response_ids = {
+            response.get("id")
+            for payload in payloads
+            for response in [payload.get("response")]
+            if isinstance(response, dict)
+        }
+        assert "resp_1" not in response_ids
+        assert not any(
+            payload.get("type") == "response.reasoning_text.delta"
+            and payload.get("item_id") == "rsn_1"
+            and payload.get("delta") == _RSON_REASONING_DELTA
+            for payload in payloads
+        )
+        assert not any(
+            payload.get("type") == "response.output_item.added"
+            and isinstance(payload.get("item"), dict)
+            and payload["item"].get("id") in {"msg_empty", "fc_empty"}
+            for payload in payloads
+        )
+        assert sum(
+            payload.get("type") == "response.output_text.delta"
+            and payload.get("delta") == "Recovered \u6771\u4eac"
+            for payload in payloads
+        ) == 1
+        assert "resp_replacement" in response_ids
+        assert any(
+            payload.get("type") == "response.completed"
+            and isinstance(payload.get("response"), dict)
+            and payload["response"].get("id") == "resp_replacement"
+            for payload in payloads
+        )
+        assert b"event: response.completed\n" in body
+        assert b"data: [DONE]\n\n" in body
+    finally:
+        terminal_gate.set()
+        iterator = getattr(result, "body_iterator", None)
+        close_iterator = getattr(iterator, "aclose", None)
+        if callable(close_iterator):
+            await close_iterator()
+        for upstream_stream in upstream_streams:
+            await upstream_stream.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scenario", "provider_tools", "read_mode"),
+    [
+        ("text", False, "coalesced"),
+        ("text", False, "utf8_split"),
+        ("text", False, "delimiter_split"),
+        ("tool_arguments", False, "coalesced"),
+        ("failed_snapshot_text", False, "coalesced"),
+        ("failed_snapshot_tool", False, "coalesced"),
+        ("failed_snapshot_empty_tool", False, "coalesced"),
+        ("failed_snapshot_provider_item", False, "coalesced"),
+        ("unknown_event", False, "coalesced"),
+        ("provider_execution_event", False, "coalesced"),
+        ("provider_execution_capability", True, "coalesced"),
+    ],
+)
+async def test_openai_responses_committed_prefix_is_not_replayed(
+    monkeypatch, scenario: str, provider_tools: bool, read_mode: str
+):
+    """Committed output, effects, or unknown semantics must retain one send and
+    the provider-attributed failure on the returned Responses stream."""
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    stream_bytes, marker = _committed_overload_stream_bytes(scenario)
+    split_offset = (
+        _utf8_split_offset(stream_bytes, "\u6771")
+        if read_mode == "utf8_split"
+        else 0
+    )
+    stream_chunks = _chunks_for_read_mode(stream_bytes, read_mode, split_offset)
+    request_body: dict[str, Any] = {"model": "gpt-5.4", "input": "continue"}
+    if scenario in {
+        "tool_arguments",
+        "failed_snapshot_tool",
+        "failed_snapshot_empty_tool",
+    }:
+        request_body["tools"] = [
+            {
+                "type": "function",
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": False,
+                },
+            }
+        ]
+    elif provider_tools:
+        request_body["tools"] = [
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "server_url": "https://mcp.example.test",
+            }
+        ]
+    result, client, sent_requests, upstream_streams = await _start_openai_responses_stream(
+        monkeypatch,
+        [_ClosableAsyncByteStream(stream_chunks)],
+        custom_body=request_body,
+    )
+    try:
+        assert not isinstance(result, Exception)
+        assert len(sent_requests) == 1
+        body_chunks = []
+        async for chunk in result.body_iterator:
+            body_chunks.append(bytes(chunk))
+        body = b"".join(body_chunks)
+        payloads = _responses_sse_payloads(body)
+        _assert_committed_marker_is_preserved(payloads, scenario, marker)
+        assert _assert_provider_overload_terminal(body)
+    finally:
+        iterator = getattr(result, "body_iterator", None)
+        close_iterator = getattr(iterator, "aclose", None)
+        if callable(close_iterator):
+            await close_iterator()
+        for upstream_stream in upstream_streams:
+            await upstream_stream.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_committed_failed_snapshot_without_coordinator(
+    monkeypatch,
+):
+    stream_bytes, marker = _committed_overload_stream_bytes("failed_snapshot_text")
+    result, client, sent_requests, upstream_streams = await _start_openai_responses_stream(
+        monkeypatch,
+        [_ClosableAsyncByteStream([stream_bytes])],
+        enable_alpha_capacity_retry=False,
+    )
+    try:
+        assert not isinstance(result, Exception)
+        assert len(sent_requests) == 1
+        body = b"".join(
+            [bytes(chunk) async for chunk in result.body_iterator]
+        )
+        payloads = _responses_sse_payloads(body)
+        _assert_committed_marker_is_preserved(
+            payloads,
+            "failed_snapshot_text",
+            marker,
+        )
+        assert _assert_provider_overload_terminal(body)
+    finally:
+        iterator = getattr(result, "body_iterator", None)
+        close_iterator = getattr(iterator, "aclose", None)
+        if callable(close_iterator):
+            await close_iterator()
+        for upstream_stream in upstream_streams:
+            await upstream_stream.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scenario", "overload_after_terminal"),
+    [
+        ("reasoning_only", True),
+        ("done_only_output", False),
+    ],
+    ids=["reasoning-only-terminal-first", "done-only-output"],
+)
+async def test_openai_responses_successful_terminal_shapes_finish_once(
+    monkeypatch, scenario: str, overload_after_terminal: bool
+):
+    """Reasoning-only completion and done-only output finish without replay."""
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    stream_bytes = _successful_responses_stream_bytes(
+        scenario,
+        overload_after_terminal=overload_after_terminal,
+    )
+    result, client, sent_requests, upstream_streams = await _start_openai_responses_stream(
+        monkeypatch,
+        [_ClosableAsyncByteStream([stream_bytes])],
+    )
+    try:
+        assert not isinstance(result, Exception)
+        assert len(sent_requests) == 1
+        body = b"".join(
+            [bytes(chunk) async for chunk in result.body_iterator]
+        )
+        payloads = _responses_sse_payloads(body)
+        terminal_payloads = [
+            payload
+            for payload in payloads
+            if payload.get("type")
+            in {"response.completed", "response.failed", "response.incomplete"}
+        ]
+        assert len(terminal_payloads) == 1
+        assert terminal_payloads[0]["type"] == "response.completed"
+        completed_response = terminal_payloads[0]["response"]
+        assert completed_response["status"] == "completed"
+        assert body.count(b"data: [DONE]\n\n") == 1
+
+        if scenario == "reasoning_only":
+            assert completed_response["id"] == "resp_reasoning_only"
+            assert [
+                item.get("type")
+                for item in completed_response["output"]
+                if isinstance(item, dict)
+            ] == ["reasoning"]
+            assert not any(payload.get("type") == "error" for payload in payloads)
+        else:
+            assert completed_response["id"] == "resp_done_only"
+            assert any(
+                payload.get("type") == "response.output_text.done"
+                and payload.get("text") == "done-only output"
+                for payload in payloads
+            )
+            assert not any(
+                payload.get("type") == "response.output_text.delta"
+                for payload in payloads
+            )
+    finally:
+        iterator = getattr(result, "body_iterator", None)
+        close_iterator = getattr(iterator, "aclose", None)
+        if callable(close_iterator):
+            await close_iterator()
+        for upstream_stream in upstream_streams:
+            await upstream_stream.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_incomplete_terminal_freezes_before_later_overload(
+    monkeypatch,
+):
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    response_id = "resp_incomplete_first"
+    stream_bytes = b"".join(
+        [
+            _response_event(
+                "response.created",
+                1,
+                response_id=response_id,
+                status="in_progress",
+            ),
+            _responses_event(
+                "response.incomplete",
+                2,
+                response={
+                    "id": response_id,
+                    "object": "response",
+                    "status": "incomplete",
+                    "model": "gpt-5.4",
+                    "output": [],
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                },
+            ),
+            _sse(
+                "error",
+                {
+                    "type": "error",
+                    "sequence_number": 3,
+                    "code": "server_is_overloaded",
+                    "message": "The selected model is at capacity.",
+                },
+            ),
+            _response_event(
+                "response.failed",
+                4,
+                response_id=response_id,
+                status="failed",
+                error={
+                    "code": "server_error",
+                    "message": "The selected model is at capacity.",
+                },
+            ),
+        ]
+    )
+    result, client, sent_requests, upstream_streams = await _start_openai_responses_stream(
+        monkeypatch,
+        [_ClosableAsyncByteStream([stream_bytes])],
+    )
+    try:
+        assert not isinstance(result, Exception)
+        assert len(sent_requests) == 1
+        body = b"".join(
+            [bytes(chunk) async for chunk in result.body_iterator]
+        )
+        payloads = _responses_sse_payloads(body)
+        terminals = [
+            payload
+            for payload in payloads
+            if payload.get("type")
+            in {"response.completed", "response.failed", "response.incomplete"}
+        ]
+        assert len(terminals) == 1
+        assert terminals[0]["type"] == "response.incomplete"
+        assert terminals[0]["response"]["id"] == response_id
+        assert terminals[0]["response"]["output"] == []
+        assert not any(payload.get("type") == "error" for payload in payloads)
+    finally:
+        iterator = getattr(result, "body_iterator", None)
+        close_iterator = getattr(iterator, "aclose", None)
+        if callable(close_iterator):
+            await close_iterator()
+        for upstream_stream in upstream_streams:
+            await upstream_stream.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "unsupported_lifecycle_extension",
+        "mismatched_response_identity",
+        "mismatched_output_index",
+        "conflicting_event_payload_type",
+        "malformed_failed_snapshot_non_list",
+        "malformed_failed_snapshot_null_item",
+        "unhashable_output_item_type",
+    ],
+)
+async def test_openai_responses_unsafe_admission_shapes_do_not_replay(
+    monkeypatch, scenario: str
+):
+    """Unknown shapes veto replay; conflicting SSE metadata terminates locally
+    before its trailing provider overload."""
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    stream_bytes = _unsafe_admission_overload_stream_bytes(scenario)
+    result, client, sent_requests, upstream_streams = await _start_openai_responses_stream(
+        monkeypatch,
+        [_ClosableAsyncByteStream([stream_bytes])],
+    )
+    try:
+        assert not isinstance(result, Exception)
+        assert len(sent_requests) == 1
+        body = b"".join(
+            [bytes(chunk) async for chunk in result.body_iterator]
+        )
+        if scenario == "conflicting_event_payload_type":
+            terminal_payloads = [
+                payload
+                for payload in _responses_sse_payloads(body)
+                if payload.get("type")
+                in {"response.completed", "response.failed", "response.incomplete"}
+            ]
+            assert len(terminal_payloads) == 1
+            assert terminal_payloads[0]["type"] == "response.failed"
+            malformed_response = terminal_payloads[0]["response"]
+            assert malformed_response["status"] == "failed"
+            assert malformed_response["error"]["code"] == "malformed_sse_frame"
+        elif scenario.startswith("malformed_failed_snapshot"):
+            failed_payloads = [
+                payload
+                for payload in _responses_sse_payloads(body)
+                if payload.get("type") == "response.failed"
+            ]
+            assert len(failed_payloads) == 1
+            expected_output = (
+                None
+                if scenario == "malformed_failed_snapshot_non_list"
+                else [None]
+            )
+            assert failed_payloads[0]["response"]["output"] == expected_output
+            assert failed_payloads[0]["response"]["error"]["code"] == "server_error"
+        else:
+            assert _assert_provider_overload_terminal(body)
+            if scenario == "unhashable_output_item_type":
+                payloads = _responses_sse_payloads(body)
+                event_types = [payload.get("type") for payload in payloads]
+                assert "response.output_item.added" in event_types
+                assert event_types.index(
+                    "response.output_item.added"
+                ) < event_types.index("response.failed")
+    finally:
+        iterator = getattr(result, "body_iterator", None)
+        close_iterator = getattr(iterator, "aclose", None)
+        if callable(close_iterator):
+            await close_iterator()
+        for upstream_stream in upstream_streams:
+            await upstream_stream.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("alpha_capacity_retry", [True, False])
+@pytest.mark.parametrize(
+    "tool_shape",
+    ["provider_executable", "unknown_capability", "malformed_tool_entry"],
+)
+async def test_openai_responses_provider_capability_blocks_raw_http_replay(
+    monkeypatch,
+    alpha_capacity_retry: bool,
+    tool_shape: str,
+):
+    """A provider-executable tool in the final request body commits dispatch
+    before a raw HTTP capacity response can authorize replay."""
+    if tool_shape == "provider_executable":
+        tools = [
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "server_url": "https://mcp.example.test",
+            }
+        ]
+    elif tool_shape == "unknown_capability":
+        tools = [{"type": "future_hosted_tool", "name": "weather"}]
+    else:
+        tools = ["opaque"]
+    body = {
+        "model": "gpt-5.4",
+        "input": "search for current conditions",
+        "tools": tools,
+    }
+    result, client, sent_requests, upstream_streams = await _start_openai_responses_stream(
+        monkeypatch,
+        [],
+        custom_body=body,
+        raw_http_error=(
+            503,
+            {
+                "error": {
+                    "type": "server_error",
+                    "code": "server_overloaded",
+                    "message": "The selected model is at capacity.",
+                }
+            },
+        ),
+        enable_alpha_capacity_retry=alpha_capacity_retry,
+    )
+    try:
+        assert isinstance(result, BaseException)
+        assert sent_requests
+        sent_body = json.loads(sent_requests[0].content)
+        assert sent_body["tools"] == tools
+        assert len(sent_requests) == 1
+        assert upstream_streams == []
+        assert getattr(result, "_aawm_provider_returned", False) is True
+        assert getattr(result, "aawm_openai_wire_replay_blocked", False) is False
+        assert getattr(result, "type", None) != "openai_wire_replay_blocked"
+        status_code = getattr(result, "status_code", None) or getattr(
+            result, "code", None
+        )
+        assert int(status_code) == 503
+        detail = json.dumps(getattr(result, "detail", None), default=str)
+        assert "server_overloaded" in detail
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_private_prefix_bound_preserves_admitted_events(
+    monkeypatch,
+):
+    """Exhausting the configured private-event hold releases accepted events
+    and leaves the later overload unable to authorize replay."""
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    monkeypatch.setenv("AAWM_RESPONSES_MAX_HELD_EVENTS", "1")
+    response_id = "resp_private_prefix"
+    chunks = [
+        _response_event(
+            "response.created",
+            1,
+            response_id=response_id,
+            status="in_progress",
+        ),
+        _response_event(
+            "response.in_progress",
+            2,
+            response_id=response_id,
+            status="in_progress",
+        ),
+        _sse(
+            "error",
+            {
+                "type": "error",
+                "sequence_number": 3,
+                "code": "server_is_overloaded",
+                "message": "The selected model is at capacity.",
+            },
+        ),
+        _response_event(
+            "response.failed",
+            4,
+            response_id=response_id,
+            status="failed",
+            error={
+                "code": "server_error",
+                "message": "The selected model is at capacity.",
+            },
+        ),
+    ]
+    result, client, sent_requests, upstream_streams = await _start_openai_responses_stream(
+        monkeypatch,
+        [_ClosableAsyncByteStream([b"".join(chunks)])],
+    )
+    try:
+        assert not isinstance(result, Exception)
+        assert len(sent_requests) == 1
+        body = b"".join(
+            [bytes(chunk) async for chunk in result.body_iterator]
+        )
+        payloads = _responses_sse_payloads(body)
+        event_types = [payload.get("type") for payload in payloads]
+        created_index = event_types.index("response.created")
+        progress_index = event_types.index("response.in_progress")
+        failed_index = event_types.index("response.failed")
+        assert created_index < progress_index < failed_index
+        assert payloads[created_index]["response"]["id"] == response_id
+        assert _assert_provider_overload_terminal(body)
+    finally:
+        iterator = getattr(result, "body_iterator", None)
+        close_iterator = getattr(iterator, "aclose", None)
+        if callable(close_iterator):
+            await close_iterator()
+        for upstream_stream in upstream_streams:
+            await upstream_stream.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", ["committing_frame", "malformed_frame"])
+@pytest.mark.parametrize("read_mode", ["coalesced", "split_inside_frame"])
+async def test_openai_responses_unsafe_held_overflow_emits_local_bound_failure(
+    monkeypatch, scenario: str, read_mode: str
+):
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    monkeypatch.setenv("AAWM_RESPONSES_MAX_HELD_EVENTS", "2")
+    stream_bytes = _unsafe_held_overflow_stream_bytes(scenario)
+    if read_mode == "split_inside_frame":
+        frame_start = stream_bytes.index(b"event: response.output_text.delta")
+        data_start = stream_bytes.index(b"data: ", frame_start)
+        split_at = data_start + len(b"data: ") + 2
+        chunks = [stream_bytes[:split_at], stream_bytes[split_at:]]
+    else:
+        chunks = [stream_bytes]
+    result, client, sent_requests, upstream_streams = await _start_openai_responses_stream(
+        monkeypatch,
+        [_ClosableAsyncByteStream(chunks)],
+    )
+    try:
+        assert not isinstance(result, Exception)
+        assert len(sent_requests) == 1
+        body = b"".join(
+            [bytes(chunk) async for chunk in result.body_iterator]
+        )
+        payloads = _responses_sse_payloads(body)
+        event_types = [payload.get("type") for payload in payloads]
+        assert event_types[:2] == [
+            "response.created",
+            "response.output_item.added",
+        ]
+        assert event_types.count("response.failed") == 1
+        failed = next(
+            payload for payload in payloads if payload.get("type") == "response.failed"
+        )
+        assert (
+            failed["response"]["error"]["code"]
+            == "openai_responses_stream_retention_too_large"
+        )
+        assert not any(
+            payload.get("type") == "response.output_text.delta"
+            and payload.get("delta") == "must_not_escape"
+            for payload in payloads
+        )
+        assert not any(
+            payload.get("type") == "error"
+            and payload.get("code") == "server_is_overloaded"
+            for payload in payloads
+        )
+    finally:
+        iterator = getattr(result, "body_iterator", None)
+        close_iterator = getattr(iterator, "aclose", None)
+        if callable(close_iterator):
+            await close_iterator()
+        for upstream_stream in upstream_streams:
+            await upstream_stream.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_replay_commitment_survives_wire_snapshots():
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+        OpenAIResponsesWireTrace,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        get_or_create_openai_provider_call_ledger,
+        get_request_openai_wire_commitment,
+        publish_responses_replay_commitment,
+    )
+
+    request = MagicMock(spec=Request)
+    request.state = SimpleNamespace()
+    get_or_create_openai_provider_call_ledger(
+        request,
+        custom_llm_provider="openai",
+        target="https://api.openai.com/v1/responses",
+    )
+    publish_responses_replay_commitment(
+        request,
+        reason="unknown_semantics",
+        event_type="response.future_event",
+    )
+    trace = OpenAIResponsesWireTrace(_request=request)
+    trace.publish_request_commitment()
+
+    commitment = get_request_openai_wire_commitment(request)
+    assert commitment is not None
+    assert commitment["precommit_replay_committed"] is True
+    assert commitment["precommit_commitment_reason"] == "unknown_semantics"
+    assert commitment["precommit_commitment_event_type"] == "unknown_event"
+    ledger_snapshot = request.state.aawm_openai_send_ledger_snapshot
+    assert ledger_snapshot["wire_commitment"] == commitment
+
+    publish_responses_replay_commitment(
+        request,
+        reason="successful_terminal",
+        event_type="response.completed",
+    )
+    trace.publish_request_commitment()
+    assert get_request_openai_wire_commitment(request) == commitment
+    assert request.state.aawm_openai_send_ledger_snapshot[
+        "wire_commitment"
+    ] == commitment
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_type", "completion_payload"),
+    [
+        (
+            "response.function_call_arguments.delta",
+            {"item_id": "fc_1", "output_index": 0, "delta": "{}"},
+        ),
+        (
+            "response.output_item.done",
+            {
+                "output_index": 0,
+                "item": {
+                    "id": "fc_1",
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": "",
+                    "status": "completed",
+                },
+            },
+        ),
+    ],
+    ids=["function-arguments", "function-item-completion"],
+)
+async def test_responses_tool_commitment_records_actual_event_reason(
+    event_type: str, completion_payload: dict[str, Any]
+):
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        get_request_openai_wire_commitment,
+    )
+
+    request_body = {
+        "model": "gpt-5.4",
+        "input": "continue",
+        "tools": [
+            {
+                "type": "function",
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+    }
+    request = _responses_request(request_body)
+    response_id = "resp_tool_boundary"
+    chunks = [
+        _response_event(
+            "response.created",
+            1,
+            response_id=response_id,
+            status="in_progress",
+        ),
+        _responses_event(
+            "response.output_item.added",
+            2,
+            output_index=0,
+            item={
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "lookup",
+                "arguments": "",
+                "status": "in_progress",
+            },
+        ),
+        _responses_event(event_type, 3, **completion_payload),
+    ]
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        stream=_ClosableAsyncByteStream([b"".join(chunks)]),
+        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+    )
+
+    prefixed, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+        response,
+        request=request,
+        provider_bound_body=request_body,
+    )
+    try:
+        assert failure is None
+        commitment = get_request_openai_wire_commitment(request)
+        assert commitment is not None
+        assert commitment["precommit_commitment_reason"] == "client_tool_payload"
+        assert commitment["precommit_commitment_event_type"] == event_type
+        async for _chunk in prefixed.aiter_bytes():
+            pass
+    finally:
+        await prefixed.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_shape",
+    ["error_item_extension", "failed_status_mismatch"],
+)
+async def test_openai_responses_unknown_failure_shapes_keep_original_failure_once(
+    monkeypatch, failure_shape: str
+):
+    response_id = "resp_unknown_failure_shape"
+    failure_message = "recognized capacity failure"
+    frames = [
+        _response_event(
+            "response.created",
+            1,
+            response_id=response_id,
+            status="in_progress",
+        )
+    ]
+    if failure_shape == "error_item_extension":
+        frames.append(
+            _sse(
+                "error",
+                {
+                    "type": "error",
+                    "sequence_number": 2,
+                    "code": "server_overloaded",
+                    "message": failure_message,
+                    "item": {"type": "function_call", "arguments": "opaque"},
+                },
+            )
+        )
+        frames.append(
+            _response_event(
+                "response.failed",
+                3,
+                response_id=response_id,
+                status="failed",
+                error={
+                    "type": "server_error",
+                    "code": "server_overloaded",
+                    "message": failure_message,
+                },
+            )
+        )
+    else:
+        frames.append(
+            _response_event(
+                "response.failed",
+                2,
+                response_id=response_id,
+                status="in_progress",
+                error={
+                    "type": "server_error",
+                    "code": "server_overloaded",
+                    "message": failure_message,
+                },
+            )
+        )
+
+    result, client, sent_requests, upstream_streams = await _start_openai_responses_stream(
+        monkeypatch,
+        [_ClosableAsyncByteStream([b"".join(frames)])],
+    )
+    try:
+        assert not isinstance(result, Exception)
+        assert len(sent_requests) == 1
+        body = b"".join(
+            [bytes(chunk) async for chunk in result.body_iterator]
+        )
+        failed_events = [
+            payload
+            for payload in _responses_sse_payloads(body)
+            if payload.get("type") == "response.failed"
+        ]
+        assert failed_events
+        assert any(
+            isinstance(payload.get("response"), dict)
+            and isinstance(payload["response"].get("error"), dict)
+            and payload["response"]["error"].get("message") == failure_message
+            for payload in failed_events
+        )
+    finally:
+        iterator = getattr(result, "body_iterator", None)
+        close_iterator = getattr(iterator, "aclose", None)
+        if callable(close_iterator):
+            await close_iterator()
+        for upstream_stream in upstream_streams:
+            await upstream_stream.aclose()
+        await client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+class _GateBeforeChunkAsyncByteStream(_ClosableAsyncByteStream):
+    def __init__(
+        self,
+        chunks: list[bytes],
+        *,
+        gate_before_index: int,
+        gate: asyncio.Event,
+    ) -> None:
+        super().__init__(chunks)
+        self._gate_before_index = gate_before_index
+        self._gate = gate
+
+    async def __aiter__(self):
+        for index, chunk in enumerate(self._chunks):
+            if index == self._gate_before_index:
+                await self._gate.wait()
+            yield chunk
+
+
+async def _start_openai_responses_stream(
+    monkeypatch,
+    streams: list[_ClosableAsyncByteStream],
+    *,
+    custom_body: Optional[dict[str, Any]] = None,
+    raw_http_error: Optional[tuple[int, dict[str, Any]]] = None,
+    enable_alpha_capacity_retry: bool = True,
+) -> tuple[
+    Any,
+    httpx.AsyncClient,
+    list[httpx.Request],
+    list[_ClosableAsyncByteStream],
+]:
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+    from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+        pass_through_request,
+    )
+
+    monkeypatch.setenv(
+        "AAWM_ALIAS_ROUTING_STATE_NAMESPACE", "openai080-public-contract"
+    )
+    monkeypatch.setenv(
+        "AAWM_LITELLM_ENVIRONMENT",
+        "litellm-alpha" if enable_alpha_capacity_retry else "litellm-dev",
+    )
+    request = MagicMock(spec=Request)
+    request.method = "POST"
+    request.url = SimpleNamespace(path="/openai_passthrough/v1/responses")
+    request.headers = {"content-type": "application/json"}
+    request.query_params = {}
+    request.state = SimpleNamespace()
+    request.is_disconnected = AsyncMock(return_value=False)
+    outgoing_requests: list[httpx.Request] = []
+    used_streams: list[_ClosableAsyncByteStream] = []
+
+    async def dispatch(outgoing_request: httpx.Request) -> httpx.Response:
+        index = len(outgoing_requests)
+        outgoing_requests.append(outgoing_request)
+        if index == 0 and raw_http_error is not None:
+            status_code, payload = raw_http_error
+            return httpx.Response(
+                status_code=status_code,
+                headers={"content-type": "application/json"},
+                json=payload,
+                request=outgoing_request,
+            )
+        if index >= len(streams):
+            raise AssertionError("unexpected additional OpenAI send")
+        used_streams.append(streams[index])
+        return httpx.Response(
+            status_code=200,
+            headers={"content-type": "text/event-stream"},
+            stream=streams[index],
+            request=outgoing_request,
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(dispatch), timeout=2)
+    monkeypatch.setattr(
+        pte,
+        "get_async_httpx_client",
+        lambda *_args, **_kwargs: SimpleNamespace(client=client),
+    )
+    monkeypatch.setattr(pte, "_aawm_session_owner_pre_send_guard", AsyncMock())
+
+    async def run_with_renewal(_lease: Any, operation: Any) -> Any:
+        return await operation()
+
+    monkeypatch.setattr(sa, "get_request_session_owner_lease", lambda *_args: None)
+    monkeypatch.setattr(sa, "run_with_session_owner_lease_renewal", run_with_renewal)
+    monkeypatch.setattr(sa, "finalize_request_session_owner_lease", AsyncMock())
+    monkeypatch.setattr(
+        sa,
+        "finalize_session_owner_lease_on_wire_disposition",
+        AsyncMock(return_value=SimpleNamespace(outcome=SimpleNamespace(value="not_held"))),
+    )
+    monkeypatch.setattr(
+        pte.OpenAIAlphaCapacityRetryCoordinator,
+        "sleep_with_wakeup",
+        AsyncMock(return_value="timer"),
+    )
+    monkeypatch.setattr(
+        pte.OpenAIAlphaCapacityRetryCoordinator,
+        "signal_success",
+        AsyncMock(),
+    )
+
+    from litellm.proxy import proxy_server
+    logging_obj = MagicMock()
+    body = custom_body or {"model": "gpt-5.4", "input": "continue"}
+    logging_obj.pre_call_hook = AsyncMock(return_value=body)
+    logging_obj.post_call_success_hook = AsyncMock()
+    logging_obj.post_call_failure_hook = AsyncMock(return_value=None)
+    monkeypatch.setattr(proxy_server, "proxy_logging_obj", logging_obj)
+    monkeypatch.setattr(
+        pte.pass_through_endpoint_logging,
+        "pass_through_async_success_handler",
+        AsyncMock(),
+    )
+
+    try:
+        result = await pass_through_request(
+            request=request,
+            target="https://api.openai.com/v1/responses",
+            custom_headers={},
+            user_api_key_dict=MagicMock(),
+            custom_body=body,
+            custom_llm_provider="openai",
+            stream=True,
+        )
+    except Exception as exc:
+        result = exc
+    return result, client, outgoing_requests, used_streams
+
+
+def _replacement_success_stream_chunks() -> list[bytes]:
+    marker = "Recovered \u6771\u4eac"
+    return [
+        _response_event(
+            "response.created", 1,
+            response_id="resp_replacement", status="in_progress",
+        ),
+        _responses_event(
+            "response.output_item.added",
+            2,
+            output_index=0,
+            item={
+                "id": "msg_replacement", "type": "message", "role": "assistant",
+                "status": "in_progress", "content": [],
+            },
+        ),
+        _responses_event(
+            "response.output_text.delta",
+            3,
+            item_id="msg_replacement",
+            output_index=0,
+            content_index=0,
+            delta=marker,
+        ),
+        _response_event(
+            "response.completed",
+            4,
+            response_id="resp_replacement",
+            status="completed",
+            output=[{
+                "id": "msg_replacement", "type": "message", "role": "assistant",
+                "status": "completed",
+                "content": [{
+                    "type": "output_text", "text": marker, "annotations": [],
+                }],
+            }],
+        ),
+        b"data: [DONE]\n\n",
+    ]
+
+
+def _successful_responses_stream_bytes(
+    scenario: str,
+    *,
+    overload_after_terminal: bool,
+) -> bytes:
+    response_id = (
+        "resp_reasoning_only" if scenario == "reasoning_only" else "resp_done_only"
+    )
+    frames = [
+        _response_event(
+            "response.created",
+            1,
+            response_id=response_id,
+            status="in_progress",
+        )
+    ]
+    if scenario == "reasoning_only":
+        frames.append(
+            _response_event(
+                "response.completed",
+                2,
+                response_id=response_id,
+                status="completed",
+                output=[
+                    {
+                        "id": "rsn_completed",
+                        "type": "reasoning",
+                        "status": "completed",
+                        "summary": [
+                            {
+                                "type": "summary_text",
+                                "text": "Reasoning without assistant text.",
+                            }
+                        ],
+                    }
+                ],
+            )
+        )
+        if overload_after_terminal:
+            frames.extend(
+                [
+                    _sse(
+                        "error",
+                        {
+                            "type": "error",
+                            "sequence_number": 3,
+                            "code": "server_is_overloaded",
+                            "message": "The selected model is at capacity.",
+                        },
+                    ),
+                    _response_event(
+                        "response.failed",
+                        4,
+                        response_id=response_id,
+                        status="failed",
+                        error={
+                            "code": "server_error",
+                            "message": "The selected model is at capacity.",
+                        },
+                    ),
+                ]
+            )
+    elif scenario == "done_only_output":
+        text = "done-only output"
+        output_item = {
+            "id": "msg_done_only",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": text,
+                    "annotations": [],
+                }
+            ],
+        }
+        frames.extend(
+            [
+                _responses_event(
+                    "response.output_item.added",
+                    2,
+                    output_index=0,
+                    item={
+                        "id": "msg_done_only",
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "in_progress",
+                        "content": [],
+                    },
+                ),
+                _responses_event(
+                    "response.output_text.done",
+                    3,
+                    item_id="msg_done_only",
+                    output_index=0,
+                    content_index=0,
+                    text=text,
+                    logprobs=[],
+                ),
+                _responses_event(
+                    "response.output_item.done",
+                    4,
+                    output_index=0,
+                    item=output_item,
+                ),
+                _response_event(
+                    "response.completed",
+                    5,
+                    response_id=response_id,
+                    status="completed",
+                    output=[output_item],
+                ),
+            ]
+        )
+    else:
+        raise ValueError(f"unknown successful stream scenario: {scenario}")
+    return b"".join(frames)
+
+
+def _unsafe_admission_overload_stream_bytes(scenario: str) -> bytes:
+    response_id = "resp_unsafe_admission"
+    frames = [
+        _response_event(
+            "response.created",
+            1,
+            response_id=response_id,
+            status="in_progress",
+        )
+    ]
+    overload = {
+        "code": "server_error",
+        "message": "The selected model is at capacity.",
+    }
+    if scenario == "unsupported_lifecycle_extension":
+        frames.extend(
+            [
+                _responses_event(
+                    "response.in_progress",
+                    2,
+                    response={
+                        "id": response_id,
+                        "object": "response",
+                        "status": "in_progress",
+                        "model": "gpt-5.4",
+                        "output": [],
+                        "created_at": 0,
+                        "parallel_tool_calls": False,
+                        "tool_choice": "auto",
+                        "tools": [],
+                        "future_lifecycle_state": {"opaque": "not admitted"},
+                    },
+                ),
+                _response_event(
+                    "response.failed",
+                    3,
+                    response_id=response_id,
+                    status="failed",
+                    error=overload,
+                ),
+            ]
+        )
+    elif scenario == "mismatched_response_identity":
+        frames.append(
+            _response_event(
+                "response.failed",
+                2,
+                response_id="resp_other",
+                status="failed",
+                error=overload,
+            )
+        )
+    elif scenario == "mismatched_output_index":
+        frames.extend(
+            [
+                _responses_event(
+                    "response.output_item.added",
+                    2,
+                    output_index=0,
+                    item={
+                        "id": "rsn_associated",
+                        "type": "reasoning",
+                        "status": "in_progress",
+                        "summary": [],
+                        "content": [],
+                    },
+                ),
+                _responses_event(
+                    "response.reasoning_text.delta",
+                    3,
+                    item_id="rsn_associated",
+                    output_index=1,
+                    content_index=0,
+                    delta="unassociated",
+                ),
+                _sse(
+                    "error",
+                    {
+                        "type": "error",
+                        "sequence_number": 4,
+                        "code": "server_is_overloaded",
+                        "message": "The selected model is at capacity.",
+                    },
+                ),
+                _response_event(
+                    "response.failed",
+                    5,
+                    response_id=response_id,
+                    status="failed",
+                    error=overload,
+                ),
+            ]
+        )
+    elif scenario == "unhashable_output_item_type":
+        frames.extend(
+            [
+                _responses_event(
+                    "response.output_item.added",
+                    2,
+                    output_index=0,
+                    item={
+                        "id": "fc_1",
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "lookup",
+                        "arguments": "",
+                        "status": "in_progress",
+                    },
+                ),
+                _responses_event(
+                    "response.output_item.done",
+                    3,
+                    output_index=0,
+                    item={"id": "fc_1", "type": []},
+                ),
+                _response_event(
+                    "response.failed",
+                    4,
+                    response_id=response_id,
+                    status="failed",
+                    error=overload,
+                ),
+            ]
+        )
+    elif scenario in {
+        "malformed_failed_snapshot_non_list",
+        "malformed_failed_snapshot_null_item",
+    }:
+        failed_response = {
+            "id": response_id,
+            "object": "response",
+            "status": "failed",
+            "model": "gpt-5.4",
+            "output": (
+                None
+                if scenario == "malformed_failed_snapshot_non_list"
+                else [None]
+            ),
+            "error": overload,
+        }
+        frames.append(
+            _responses_event(
+                "response.failed",
+                2,
+                response=failed_response,
+            )
+        )
+    elif scenario == "conflicting_event_payload_type":
+        frames.extend(
+            [
+                _sse(
+                    "response.in_progress",
+                    {
+                        "type": "response.created",
+                        "sequence_number": 2,
+                        "response": {
+                            "id": response_id,
+                            "object": "response",
+                            "status": "in_progress",
+                            "model": "gpt-5.4",
+                            "output": [],
+                            "created_at": 0,
+                            "parallel_tool_calls": False,
+                            "tool_choice": "auto",
+                            "tools": [],
+                        },
+                    },
+                ),
+                _response_event(
+                    "response.failed",
+                    3,
+                    response_id=response_id,
+                    status="failed",
+                    error=overload,
+                ),
+            ]
+        )
+    else:
+        raise ValueError(f"unknown unsafe admission scenario: {scenario}")
+    return b"".join(frames)
+
+
+def _unsafe_held_overflow_stream_bytes(scenario: str) -> bytes:
+    response_id = "resp_held_overflow"
+    frames = [
+        _response_event(
+            "response.created",
+            1,
+            response_id=response_id,
+            status="in_progress",
+        ),
+        _responses_event(
+            "response.output_item.added",
+            2,
+            output_index=0,
+            item={
+                "id": "msg_held_overflow",
+                "type": "message",
+                "role": "assistant",
+                "status": "in_progress",
+                "content": [],
+            },
+        ),
+    ]
+    if scenario == "committing_frame":
+        frames.append(
+            _responses_event(
+                "response.output_text.delta",
+                3,
+                item_id="msg_held_overflow",
+                output_index=0,
+                content_index=0,
+                delta="must_not_escape",
+            )
+        )
+    elif scenario == "malformed_frame":
+        frames.append(
+            b"event: response.output_text.delta\ndata: {malformed}\n\n"
+        )
+    else:
+        raise ValueError(f"unknown held-overflow scenario: {scenario}")
+    frames.extend(
+        [
+            _sse(
+                "error",
+                {
+                    "type": "error",
+                    "sequence_number": 4,
+                    "code": "server_is_overloaded",
+                    "message": "The selected model is at capacity.",
+                },
+            ),
+            _response_event(
+                "response.failed",
+                5,
+                response_id=response_id,
+                status="failed",
+                error={
+                    "code": "server_error",
+                    "message": "The selected model is at capacity.",
+                },
+            ),
+        ]
+    )
+    return b"".join(frames)
+
+
+def _responses_event(event_type: str, sequence: int, **fields: Any) -> bytes:
+    return _sse(
+        event_type,
+        {"type": event_type, "sequence_number": sequence, **fields},
+        ensure_ascii=False,
+    )
+
+
+def _response_event(
+    event_type: str,
+    sequence: int,
+    *,
+    response_id: str,
+    status: str,
+    output: Optional[list[dict[str, Any]]] = None,
+    error: Optional[dict[str, Any]] = None,
+) -> bytes:
+    response: dict[str, Any] = {
+        "id": response_id,
+        "object": "response",
+        "status": status,
+        "model": "gpt-5.4",
+        "output": output or [],
+        "created_at": 0,
+        "parallel_tool_calls": False,
+        "tool_choice": "auto",
+        "tools": [],
+    }
+    if error is not None:
+        response["error"] = error
+    return _responses_event(event_type, sequence, response=response)
+
+
+def _committed_overload_stream_bytes(scenario: str) -> tuple[bytes, str]:
+    response_id = "resp_committed"
+    overload = {
+        "code": "server_error",
+        "message": "The selected model is at capacity.",
+    }
+    frames = [
+        _response_event(
+            "response.created", 1,
+            response_id=response_id, status="in_progress",
+        )
+    ]
+
+    def failed(sequence: int, output: Optional[list[dict[str, Any]]] = None) -> bytes:
+        return _response_event(
+            "response.failed",
+            sequence,
+            response_id=response_id,
+            status="failed",
+            output=output,
+            error=overload,
+        )
+
+    if scenario == "text":
+        marker = "Committed \u6771\u4eac"
+        frames += [
+            _responses_event(
+                "response.output_item.added",
+                2,
+                output_index=0,
+                item={
+                    "id": "msg_committed", "type": "message",
+                    "role": "assistant", "status": "in_progress", "content": [],
+                },
+            ),
+            _responses_event(
+                "response.output_text.delta",
+                3,
+                item_id="msg_committed",
+                output_index=0,
+                content_index=0,
+                delta=marker,
+            ),
+            failed(4),
+        ]
+    elif scenario == "tool_arguments":
+        marker = '{"city":"\u6771'
+        frames += [
+            _responses_event(
+                "response.output_item.added",
+                2,
+                output_index=0,
+                item={
+                    "id": "fc_committed", "type": "function_call",
+                    "call_id": "call_committed", "name": "get_weather",
+                    "arguments": "", "status": "in_progress",
+                },
+            ),
+            _responses_event(
+                "response.function_call_arguments.delta",
+                3,
+                item_id="fc_committed", output_index=0, delta=marker,
+            ),
+            _responses_event(
+                "response.function_call_arguments.done",
+                4,
+                item_id="fc_committed", output_index=0,
+                arguments='{"city":"\u6771\u4eac"}',
+            ),
+            failed(5),
+        ]
+    elif scenario in {
+        "failed_snapshot_text",
+        "failed_snapshot_tool",
+        "failed_snapshot_empty_tool",
+        "failed_snapshot_provider_item",
+    }:
+        if scenario == "failed_snapshot_text":
+            marker = "Snapshot \u6771\u4eac"
+            output = [{
+                "id": "msg_snapshot", "type": "message", "role": "assistant",
+                "status": "completed",
+                "content": [{
+                    "type": "output_text", "text": marker, "annotations": [],
+                }],
+            }]
+        elif scenario == "failed_snapshot_tool":
+            marker = '{"city":"\u6771\u4eac"}'
+            output = [{
+                "id": "fc_snapshot", "type": "function_call",
+                "call_id": "call_snapshot", "name": "get_weather",
+                "arguments": marker, "status": "completed",
+            }]
+        elif scenario == "failed_snapshot_empty_tool":
+            marker = "call_empty_snapshot"
+            output = [{
+                "id": "fc_empty_snapshot", "type": "function_call",
+                "call_id": marker, "name": "get_weather",
+                "arguments": "", "status": "completed",
+            }]
+        elif scenario == "failed_snapshot_provider_item":
+            marker = "web_search_snapshot"
+            output = [{
+                "id": marker, "type": "web_search_call",
+                "status": "completed",
+                "action": {
+                    "type": "search",
+                    "query": "weather in Tokyo",
+                },
+            }]
+        frames.append(failed(2, output))
+    elif scenario == "unknown_event":
+        marker = "opaque \u6771\u4eac"
+        frames += [
+            _responses_event(
+                "response.future_event", 2,
+                response_id=response_id, opaque=marker,
+            ),
+            failed(3),
+        ]
+    elif scenario == "provider_execution_event":
+        marker = "mcp_1"
+        frames += [
+            _responses_event(
+                "response.mcp_call.in_progress", 2,
+                item_id=marker, output_index=0, server_label="weather",
+            ),
+            failed(3),
+        ]
+    elif scenario == "provider_execution_capability":
+        marker = response_id
+        frames.append(failed(2))
+    else:
+        raise ValueError(f"unknown committed stream scenario: {scenario}")
+    return b"".join(frames), marker
+
+
+def _responses_sse_payloads(body: bytes) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for line in body.splitlines():
+        if not line.startswith(b"data: "):
+            continue
+        data = line[len(b"data: ") :]
+        if data == b"[DONE]":
+            continue
+        try:
+            payload = json.loads(data)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict):
+            payloads.append(payload)
+    return payloads
+
+
+def _assert_committed_marker_is_preserved(
+    payloads: list[dict[str, Any]], scenario: str, marker: str
+) -> None:
+    if scenario == "text":
+        assert any(
+            payload.get("type") == "response.output_text.delta"
+            and payload.get("delta") == marker
+            for payload in payloads
+        )
+    elif scenario == "tool_arguments":
+        assert any(
+            payload.get("type") == "response.function_call_arguments.delta"
+            and payload.get("delta") == marker
+            for payload in payloads
+        )
+        assert any(
+            payload.get("type") == "response.function_call_arguments.done"
+            and payload.get("arguments") == '{"city":"\u6771\u4eac"}'
+            for payload in payloads
+        )
+    elif scenario == "failed_snapshot_text":
+        assert any(
+            item.get("type") == "message"
+            and any(
+                isinstance(content, dict) and content.get("text") == marker
+                for content in item.get("content", [])
+            )
+            for item in _failed_snapshot_output_items(payloads)
+        )
+    elif scenario == "failed_snapshot_tool":
+        assert any(
+            item.get("type") == "function_call"
+            and item.get("arguments") == marker
+            for item in _failed_snapshot_output_items(payloads)
+        )
+    elif scenario == "failed_snapshot_empty_tool":
+        assert any(
+            item.get("type") == "function_call"
+            and item.get("call_id") == marker
+            and item.get("arguments") == ""
+            and item.get("status") == "completed"
+            for item in _failed_snapshot_output_items(payloads)
+        )
+    elif scenario == "failed_snapshot_provider_item":
+        assert any(
+            item.get("type") == "web_search_call"
+            and item.get("id") == marker
+            and item.get("status") == "completed"
+            for item in _failed_snapshot_output_items(payloads)
+        )
+    elif scenario == "unknown_event":
+        assert any(
+            payload.get("type") == "response.future_event"
+            and payload.get("opaque") == marker
+            for payload in payloads
+        )
+    elif scenario == "provider_execution_event":
+        assert any(
+            payload.get("type") == "response.mcp_call.in_progress"
+            and payload.get("item_id") == marker
+            for payload in payloads
+        )
+    elif scenario == "provider_execution_capability":
+        assert any(
+            payload.get("type") == "response.failed"
+            and isinstance(payload.get("response"), dict)
+            and payload["response"].get("id") == marker
+            for payload in payloads
+        )
+    else:
+        raise AssertionError(f"unknown committed marker scenario: {scenario}")
+
+
+def _failed_snapshot_output_items(
+    payloads: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        item
+        for payload in payloads
+        if payload.get("type") == "response.failed"
+        and isinstance(payload.get("response"), dict)
+        for item in payload["response"].get("output", [])
+        if isinstance(item, dict)
+    ]
+
+
+def _assert_provider_overload_terminal(body: bytes) -> bool:
+    for payload in _responses_sse_payloads(body):
+        if payload.get("type") != "response.failed":
+            continue
+        response = payload.get("response")
+        if not isinstance(response, dict):
+            continue
+        error = response.get("error")
+        if (
+            isinstance(error, dict)
+            and error.get("code") == "server_error"
+            and "selected model is at capacity"
+            in str(error.get("message", "")).lower()
+        ):
+            return True
+    return False
+
+
+def _reasoning_overload_stream_bytes(*, ensure_ascii: bool) -> bytes:
+    return b"".join([
+        _sse(
+            "response.created",
+            {"type": "response.created", "sequence_number": 1,
+             "response": {
+                 "id": "resp_1", "object": "response",
+                 "status": "in_progress", "model": "gpt-5.4",
+                 "output": [],
+                 "created_at": 0, "parallel_tool_calls": False,
+                 "tool_choice": "auto", "tools": []}},
+            ensure_ascii=ensure_ascii,
+        ),
+        _sse(
+            "response.in_progress",
+            {"type": "response.in_progress", "sequence_number": 2,
+             "response": {
+                 "id": "resp_1", "object": "response",
+                 "status": "in_progress", "model": "gpt-5.4",
+                 "output": [],
+                 "created_at": 0, "parallel_tool_calls": False,
+                 "tool_choice": "auto", "tools": []}},
+            ensure_ascii=ensure_ascii,
+        ),
+        _sse(
+            "response.output_item.added",
+            {"type": "response.output_item.added", "sequence_number": 3,
+             "output_index": 0, "item": {
+                 "id": "msg_empty", "type": "message", "role": "assistant",
+                 "status": "in_progress", "content": []}},
+            ensure_ascii=ensure_ascii,
+        ),
+        _sse(
+            "response.output_item.added",
+            {"type": "response.output_item.added", "sequence_number": 4,
+             "output_index": 1, "item": {
+                 "id": "fc_empty", "type": "function_call",
+                 "call_id": "call_empty", "name": "get_weather",
+                 "arguments": "", "status": "in_progress"}},
+            ensure_ascii=ensure_ascii,
+        ),
+        _sse(
+            "response.output_item.added",
+            {"type": "response.output_item.added", "sequence_number": 5,
+             "output_index": 2,
+             "item": {"id": "rsn_1", "type": "reasoning",
+                      "status": "in_progress", "summary": [],
+                      "content": []}},
+            ensure_ascii=ensure_ascii,
+        ),
+        _sse(
+            "response.reasoning_text.delta",
+            {"type": "response.reasoning_text.delta", "sequence_number": 6,
+             "item_id": "rsn_1", "output_index": 2, "content_index": 0,
+             "delta": _RSON_REASONING_DELTA},
+            ensure_ascii=ensure_ascii,
+        ),
+        _sse(
+            "response.reasoning_summary_part.added",
+            {
+                "type": "response.reasoning_summary_part.added",
+                "sequence_number": 7,
+                "item_id": "rsn_1",
+                "output_index": 2,
+                "summary_index": 0,
+                "part": {
+                    "type": "summary_text",
+                    "text": "A valid summary part has no part id.",
+                },
+            },
+            ensure_ascii=ensure_ascii,
+        ),
+        _sse(
+            "error",
+            {"type": "error", "sequence_number": 8,
+             "code": "server_is_overloaded",
+             "message": "The selected model is at capacity."},
+            ensure_ascii=ensure_ascii,
+        ),
+        _sse(
+            "response.failed",
+            {"type": "response.failed", "sequence_number": 9,
+             "response": {
+                 "id": "resp_1", "object": "response",
+                 "status": "failed", "model": "gpt-5.4",
+                 "output": [],
+                 "created_at": 0, "parallel_tool_calls": False,
+                 "tool_choice": "auto", "tools": [],
+                 "error": {"code": "server_error",
+                           "message": "The selected model is at capacity."}}},
+            ensure_ascii=ensure_ascii,
+        ),
+    ])
+
+
+def _reasoning_delta_utf8_split(buf: bytes) -> int:
+    """Split inside the UTF-8 encoding of \u2026 (e2 80 a6)."""
+    return _utf8_split_offset(buf, "\u2026")
+
+
+def _utf8_split_offset(buf: bytes, value: str) -> int:
+    encoded = value.encode("utf-8")
+    offset = buf.find(encoded)
+    assert offset >= 0, f"{value!r} byte sequence not found in stream"
+    return offset + 1
+
+
+def _chunks_for_read_mode(
+    buf: bytes, read_mode: str, utf8_split: int,
+) -> list[bytes]:
+    if read_mode == "coalesced":
+        return [buf]
+    if read_mode == "utf8_split":
+        return [buf[:utf8_split], buf[utf8_split:]]
+    if read_mode == "delimiter_split":
+        # Split between the two newline bytes of the second SSE delimiter.
+        second_nl = buf.find(b"\n\n", buf.find(b"\n\n") + 2)
+        return [buf[: second_nl + 1], buf[second_nl + 1 :]]
+    raise ValueError(f"unknown read_mode: {read_mode}")

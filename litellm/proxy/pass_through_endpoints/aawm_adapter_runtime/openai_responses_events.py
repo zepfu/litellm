@@ -538,12 +538,14 @@ class ResponsesBoundFailure(Exception):
         cause: BaseException,
         *,
         accepted_events: Optional[Iterable["ParsedResponsesEvent"]] = None,
-        accepted_bytes: int = 0,
+        accepted_bytes: Optional[int] = None,
     ) -> None:
         self.cause = cause
-        self.accepted_events: List["ParsedResponsesEvent"] = list(accepted_events or ())
+        self.accepted_events = list(accepted_events or ())
         self.accepted_bytes_known = accepted_bytes is not None
-        self.accepted_bytes = max(0, int(accepted_bytes or 0))
+        self.accepted_bytes = (
+            max(0, int(accepted_bytes)) if accepted_bytes is not None else 0
+        )
         if isinstance(cause, ResponsesEventTooLarge):
             self.kind = "event_too_large"
             self.code = "openai_responses_stream_event_too_large"
@@ -570,7 +572,7 @@ class ResponsesBoundFailure(Exception):
         return cls(
             exc,
             accepted_events=getattr(exc, "accepted_events", ()),
-            accepted_bytes=int(getattr(exc, "accepted_bytes", 0) or 0),
+            accepted_bytes=getattr(exc, "accepted_bytes", None),
         )
 
 
@@ -1049,7 +1051,7 @@ class ResponsesEventPipeline:
                             ),
                             inspect_event=inspect_event,
                         )
-                    event_start_admitted_bytes = None
+                        event_start_admitted_bytes = None
                     continue
                 if self._pending_cr:
                     self._pending_cr = False
@@ -1065,6 +1067,8 @@ class ResponsesEventPipeline:
                             inspect_event=inspect_event,
                         )
                         event_start_admitted_bytes = None
+                if not self._buffer:
+                    event_start_admitted_bytes = admitted_bytes
                 self._admit_byte(value, count_stream_bytes=count_stream_bytes)
                 admitted_bytes += 1
                 self._pending_cr = value == 13
@@ -1618,14 +1622,21 @@ class ResponsesEventSummaryReducer:
         return True
 
     def _record_event_type(self, event_type: Optional[str]) -> None:
-        if not event_type:
-            return
-        if event_type not in self._event_counts and len(self._event_counts) >= self._EVENT_TYPE_LIMIT:
+        normalized_event_type = event_type if event_type else "unknown_event"
+        if (
+            normalized_event_type not in self._event_counts
+            and len(self._event_counts) >= self._EVENT_TYPE_LIMIT
+        ):
             self._overflow = True
             return
-        self._event_counts[event_type] = self._event_counts.get(event_type, 0) + 1
-        if event_type not in self._event_types and len(self._event_types) < self._EVENT_TYPE_LIMIT:
-            self._event_types.append(event_type)
+        self._event_counts[normalized_event_type] = (
+            self._event_counts.get(normalized_event_type, 0) + 1
+        )
+        if (
+            normalized_event_type not in self._event_types
+            and len(self._event_types) < self._EVENT_TYPE_LIMIT
+        ):
+            self._event_types.append(normalized_event_type)
 
     def _bounded_copy(self, value: Any, limit: int) -> Optional[Any]:
         size = _json_size(value)
@@ -1646,7 +1657,7 @@ class ResponsesEventSummaryReducer:
         response_payload = payload.get("response")
         if not isinstance(response_payload, dict):
             return
-        self._terminal_event_type = event_type
+        self._terminal_event_type = event_type or "unknown_event"
         copied = self._bounded_copy(response_payload, self.max_output_bytes)
         if isinstance(copied, dict):
             self._terminal_response_payload = copied

@@ -78,6 +78,49 @@ above `general_settings.openai_passthrough_text_watermark.limits.max_sse_stream_
 (128 MiB by default). Its text budget is separately controlled by
 `limits.max_text_bytes_per_direction` (1 MiB by default).
 
+### Capacity recovery before output
+
+Native Responses routes keep explicitly allowlisted lifecycle events, empty
+message and client-tool headers, and validated reasoning events private to the
+current provider attempt. Reasoning content may be nonempty; client-tool
+arguments or custom input must be exactly empty to qualify as a header.
+Unknown events or payload extensions end replay eligibility.
+
+This private-prefix behavior requires validated effective request capabilities
+that exclude independent provider execution. When provider-executed actions
+are possible, replay eligibility ends at dispatch. The absence of a tool event
+or visible text does not prove that no provider-side action occurred.
+
+A recognized overload while replay remains safe discards the failed attempt's
+events, identities and reasoning, then retries through the existing capacity
+coordinator. The surviving prefix is released in order at the first useful
+assistant output or client-tool payload, without another upstream read or a
+wait for completion. Text or tool payloads in a failure snapshot also prohibit
+replay. Events after the attempt's first terminal event cannot change its
+disposition, whether received together or in separate reads.
+
+The shared stream owner enforces hard prefix and event bounds. Prefix
+exhaustion ends replay eligibility and releases accepted events. Event
+exhaustion preserves accepted complete events before terminating under the
+normal malformed-stream policy. Neither condition permits overload recovery.
+Prefix storage is released before consuming the live remainder.
+
+The request-wide capacity deadline and progressive backoff remain in effect
+across attempts. Cancellation ends buffering or backoff and prevents later
+sends. Retry eligibility does not authorize an account change: direct and
+alias routes retain their existing credential, endpoint and continuation
+ownership rules. A valid `response.completed` releases reasoning-only or
+empty-output responses. Output present only in a completion event is preserved.
+`[DONE]` ends replay eligibility; the terminal owner determines validity, and
+the marker alone does not establish success.
+
+Diagnostics identify the event and reason that ended replay eligibility,
+the retry disposition and actual send counts. Elapsed waiting is reported
+separately from a timeout or exhausted retry budget; conservative commitment
+does not mean the retry budget was consumed. Diagnostic event and reason labels
+come from closed sets; unknown event names use a fixed label. Diagnostics
+exclude raw reasoning, tool names, arguments, user payloads and credentials.
+
 ### Delivery and attribution
 
 Route rollups attribute a managed request to the explicitly dispatched agent

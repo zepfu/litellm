@@ -82,6 +82,11 @@ from .aawm_adapter_runtime.openai_responses_events import (
     responses_event_pipeline_from_response,
     responses_events_from_chunk,
 )
+from .aawm_adapter_runtime.provider_call_ledger import (
+    get_responses_replay_commitment_reason,
+    publish_responses_replay_commitment,
+    responses_effective_provider_tools_allowed,
+)
 from .success_handler import PassThroughEndpointLogging
 
 
@@ -102,12 +107,38 @@ _RESPONSES_NON_SUBSTANTIVE_LIFECYCLE_EVENTS = frozenset(
 _RESPONSES_PRE_COMMIT_FAILURE_EVENTS = frozenset({"response.failed", "error"})
 _RECOGNIZED_PROVIDER_TERMINAL_EVENTS = frozenset(
     {
+        "response.failed",
+        "response.incomplete",
+        "error",
+    }
+)
+
+# Recognized terminals for metadata (includes response.completed, which
+# is committed separately in _inspect_responses_events).
+_RECOGNIZED_TERMINAL_METADATA_EVENTS = frozenset(
+    {
         "response.completed",
         "response.failed",
         "response.incomplete",
         "error",
     }
 )
+_RESPONSES_RESPONSE_ENVELOPE_FIELDS = {
+    "id", "created_at", "error", "incomplete_details",
+    "instructions", "metadata", "model", "object", "output",
+    "parallel_tool_calls", "temperature", "tool_choice", "tools",
+    "top_p", "max_output_tokens", "previous_response_id",
+    "reasoning", "status", "text", "truncation", "usage", "user",
+    "store", "background", "billing", "context_management",
+    "conversation", "max_tool_calls", "prompt",
+    "prompt_cache_key", "prompt_cache_retention",
+    "safety_identifier", "service_tier", "top_logprobs",
+}
+_RESPONSES_ERROR_FIELDS = {"type", "code", "message", "param"}
+# OPENAI-080: Oracle-frozen exact typed allowlist for replay-safe private events.
+# These are exact event-name-and-shape gates, not prefix matching.
+_RESPONSES_SAFE_ITEM_ADDED_TYPES = frozenset({"message", "function_call", "custom_tool_call", "reasoning"})
+_RESPONSES_SAFE_CONTENT_PART_ADDED_TYPES = frozenset({"output_text", "refusal", "reasoning_text"})
 _RESPONSES_SUBSTANTIVE_EVENT_PREFIXES = (
     "response.output_text",
     "response.output_item",
@@ -240,6 +271,38 @@ class ResponsesStreamPreCommitFailure(Exception):
         return http_exception
 
 
+class _CloseAwareHttpxAsyncByteStream(httpx.AsyncByteStream):
+    """Close an active HTTPX stream iterator when its response is retired."""
+
+    def __init__(self, stream: httpx.AsyncByteStream) -> None:
+        self._stream = stream
+        self._iterator: Any = None
+        self._closed = False
+
+    def __aiter__(self):
+        self._iterator = self._stream.__aiter__()
+        return self._iterator
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        iterator = self._iterator
+        self._iterator = None
+        close_iterator = getattr(iterator, "aclose", None)
+        try:
+            if callable(close_iterator):
+                result = close_iterator()
+                if inspect.isawaitable(result):
+                    await wait_for("resource_cleanup", result)
+        finally:
+            close_stream = getattr(self._stream, "aclose", None)
+            if callable(close_stream):
+                result = close_stream()
+                if inspect.isawaitable(result):
+                    await wait_for("resource_cleanup", result)
+
+
 class _PrefixedHttpxByteStream:
     """Replay peeked SSE bytes, then continue the original upstream iterator."""
 
@@ -331,7 +394,9 @@ class _PrefixedHttpxByteStream:
             # spooled files are closed during streaming, not after.
             self._close_prefix()
             if self._bound_failure is not None:
-                raise self._bound_failure
+                bound_failure = self._bound_failure
+                self._bound_failure = None
+                raise ResponsesBoundFailure(bound_failure.cause) from bound_failure
             if self._remainder is None:
                 return
             if self._aawm_responses_event_pipeline is not None:
@@ -349,6 +414,16 @@ class _PrefixedHttpxByteStream:
 
     async def aclose(self) -> None:
         self._close_prefix()
+        remainder = self._remainder
+        self._remainder = None
+        close_iterator = getattr(remainder, "aclose", None)
+        if callable(close_iterator):
+            try:
+                result = close_iterator()
+                if inspect.isawaitable(result):
+                    await wait_for("resource_cleanup", result)
+            except Exception:
+                pass
         close = getattr(self._response, "aclose", None)
         if not callable(close):
             return
@@ -461,11 +536,24 @@ class _ResponsesPreCommitSSEParser:
         self._saw_substantive = False
         self._substantive_event: Optional[str] = None
         self._first_terminal_decision: Optional[str] = None
+        self._commitment_reason: Optional[str] = None
+        self._response_id: Optional[str] = None
+        self._output_items: Dict[int, tuple[str, str]] = {}
 
     def _consume_event(self, parsed_event: ParsedResponsesEvent) -> None:
-        decision, error_payload, event_type = PassThroughStreamingHandler._inspect_responses_events(
-            parsed_event
+        decision, error_payload, event_type, commitment_reason = (
+            PassThroughStreamingHandler._inspect_responses_events(
+                parsed_event
+            )
         )
+        association_valid = self._validate_event_association(
+            parsed_event,
+            record=decision == "lifecycle",
+        )
+        if not association_valid:
+            commitment_reason = "unknown_semantics"
+            if decision != "failed":
+                decision = "substantive"
         if decision in {"failed", "substantive"}:
             # The first terminal/substantive event wins. A later event in the
             # same HTTPX read must not erase the earlier precommit outcome.
@@ -474,11 +562,159 @@ class _ResponsesPreCommitSSEParser:
         if decision == "substantive" and not self._saw_substantive:
             self._saw_substantive = True
             self._substantive_event = event_type
+            self._commitment_reason = commitment_reason
         elif decision == "failed" and self._first_error_payload is None:
             self._first_error_payload = error_payload
             self._first_error_event = event_type
+            self._commitment_reason = commitment_reason
         if decision == "lifecycle":
             self._saw_lifecycle = True
+
+    @staticmethod
+    def _is_nonnegative_index(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+    def _validate_event_association(
+        self,
+        parsed_event: ParsedResponsesEvent,
+        *,
+        record: bool,
+    ) -> bool:
+        event_type = parsed_event.event_type
+        payload = parsed_event.payload
+        if parsed_event.is_malformed or not isinstance(payload, dict):
+            return event_type not in {
+                "response.created",
+                "response.in_progress",
+                "response.failed",
+                "response.incomplete",
+                "response.output_item.added",
+                "response.output_item.done",
+                "response.content_part.added",
+                "response.content_part.done",
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_part.done",
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.done",
+                "response.reasoning_text.delta",
+                "response.reasoning_text.done",
+            }
+
+        response = payload.get("response")
+        if event_type in {
+            "response.created",
+            "response.in_progress",
+            "response.failed",
+            "response.incomplete",
+            "response.completed",
+        }:
+            if not isinstance(response, dict):
+                return event_type not in {
+                    "response.created",
+                    "response.in_progress",
+                    "response.failed",
+                    "response.incomplete",
+                    "response.completed",
+                }
+            response_id = response.get("id")
+            if not isinstance(response_id, str) or not response_id:
+                return False
+            if self._response_id is not None and response_id != self._response_id:
+                return False
+            if (
+                event_type in {"response.created", "response.in_progress"}
+                and record
+            ):
+                self._response_id = response_id
+            if event_type == "response.failed":
+                output = response.get("output")
+                if not isinstance(output, list):
+                    return False
+                for output_index, item in enumerate(output):
+                    known_item = self._output_items.get(output_index)
+                    if known_item is not None and (
+                        not isinstance(item, dict)
+                        or (item.get("id"), item.get("type")) != known_item
+                    ):
+                        return False
+                    if known_item is None and self._output_items:
+                        return False
+            return True
+
+        if event_type not in {
+            "response.output_item.added",
+            "response.output_item.done",
+            "response.content_part.added",
+            "response.content_part.done",
+            "response.reasoning_summary_part.added",
+            "response.reasoning_summary_part.done",
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_summary_text.done",
+            "response.reasoning_text.delta",
+            "response.reasoning_text.done",
+        }:
+            return True
+        if self._response_id is None:
+            return False
+
+        output_index = payload.get("output_index")
+        if not self._is_nonnegative_index(output_index):
+            return False
+        if event_type == "response.output_item.added":
+            item = payload.get("item")
+            if not isinstance(item, dict):
+                return False
+            item_id = item.get("id")
+            item_type = item.get("type")
+            if not isinstance(item_id, str) or not item_id:
+                return False
+            if not isinstance(item_type, str) or not item_type:
+                return False
+            existing = self._output_items.get(output_index)
+            if existing is not None:
+                return False
+            if any(existing_id == item_id for existing_id, _ in self._output_items.values()):
+                return False
+            if record:
+                self._output_items[output_index] = (item_id, item_type)
+            return True
+
+        item_id = payload.get("item_id")
+        item = payload.get("item") if event_type == "response.output_item.done" else None
+        if item is not None:
+            if not isinstance(item, dict):
+                return False
+            item_id = item.get("id")
+        if not isinstance(item_id, str) or not item_id:
+            return False
+        associated_item = self._output_items.get(output_index)
+        if associated_item is None or associated_item[0] != item_id:
+            return False
+        if item is not None and item.get("type") != associated_item[1]:
+            return False
+
+        expected_item_type: Optional[str] = None
+        if event_type in {
+            "response.reasoning_summary_part.added",
+            "response.reasoning_summary_part.done",
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_summary_text.done",
+            "response.reasoning_text.delta",
+            "response.reasoning_text.done",
+        }:
+            expected_item_type = "reasoning"
+        elif event_type in {
+            "response.content_part.added",
+            "response.content_part.done",
+        }:
+            part = payload.get("part")
+            part_type = part.get("type") if isinstance(part, dict) else None
+            expected_item_type = (
+                "reasoning" if part_type == "reasoning_text" else "message"
+            )
+        if expected_item_type is not None and associated_item[1] != expected_item_type:
+            return False
+        return True
 
     def feed(
         self,
@@ -486,19 +722,15 @@ class _ResponsesPreCommitSSEParser:
     ) -> tuple[str, Optional[Dict[str, Any]], Optional[str]]:
         if not chunk:
             return self.decision()
-        events, _stopped = self._pipeline.feed_until(
+        self._pipeline.feed_until(
             chunk,
-            inspect_event=self._inspect_event_is_decisive,
+            inspect_event=self._consume_until_decisive,
         )
-        for parsed_event in events:
-            self._consume_event(parsed_event)
         return self.decision()
 
-    def _inspect_event_is_decisive(self, parsed_event: ParsedResponsesEvent) -> bool:
-        decision, _error_payload, _event_type = (
-            PassThroughStreamingHandler._inspect_responses_events(parsed_event)
-        )
-        return decision in {"failed", "substantive"}
+    def _consume_until_decisive(self, parsed_event: ParsedResponsesEvent) -> bool:
+        self._consume_event(parsed_event)
+        return self._first_terminal_decision is not None
 
     def finish(self) -> tuple[str, Optional[Dict[str, Any]], Optional[str]]:
         for parsed_event in self._pipeline.finish():
@@ -530,6 +762,10 @@ class _ResponsesPreCommitSSEParser:
         if self._saw_lifecycle:
             return "lifecycle", None, None
         return "empty", None, None
+
+    @property
+    def commitment_reason(self) -> Optional[str]:
+        return self._commitment_reason
 
 
 class _PassThroughStreamLineAccumulator:
@@ -585,6 +821,16 @@ class _PassThroughStreamLineAccumulator:
 
 def _strip_chunk_line(raw_line: str) -> str:
     return raw_line.strip()
+_PROVIDER_EXECUTABLE_TOOL_TYPES_HINT = frozenset({
+    "mcp",
+    "web_search",
+    "web_search_preview",
+    "web_search_call",
+    "code_interpreter",
+    "computer",
+    "image_generation",
+    "file_search",
+})
 
 
 class PassThroughStreamingHandler:
@@ -614,6 +860,8 @@ class PassThroughStreamingHandler:
     _XAI_OAUTH_RATE_LIMIT_SOURCE = "xai_oauth_response_headers"
     _XAI_GROK_OIDC_RATE_LIMIT_SOURCE = "xai_grok_oidc_response_headers"
     _CLEAN_EOF_INCOMPLETE_REASON = "upstream_stream_ended_without_terminal_event"
+
+
     _RESPONSES_TERMINAL_EVENTS = {
         "response.completed",
         "response.failed",
@@ -835,25 +1083,356 @@ class PassThroughStreamingHandler:
         return False
 
     @staticmethod
+    def _has_only_fields(value: Dict[str, Any], fields: set[str]) -> bool:
+        return set(value).issubset(fields)
+
+    @staticmethod
+    def _is_nonnegative_index(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+    @staticmethod
+    def _is_nonempty_string(value: Any) -> bool:
+        return isinstance(value, str) and bool(value)
+
+    @staticmethod
+    def _is_safe_reasoning_item(
+        item: Any,
+        *,
+        allowed_statuses: set[Optional[str]],
+    ) -> bool:
+        if not isinstance(item, dict) or item.get("type") != "reasoning":
+            return False
+        if not PassThroughStreamingHandler._is_nonempty_string(item.get("id")):
+            return False
+        if item.get("status") not in allowed_statuses:
+            return False
+        if not PassThroughStreamingHandler._has_only_fields(
+            item,
+            {"id", "type", "status", "summary", "content", "encrypted_content"},
+        ):
+            return False
+        summary = item.get("summary", [])
+        if not isinstance(summary, list) or not all(
+            isinstance(part, dict)
+            and set(part) == {"type", "text"}
+            and part.get("type") == "summary_text"
+            and isinstance(part.get("text"), str)
+            for part in summary
+        ):
+            return False
+        content = item.get("content", [])
+        if not isinstance(content, list) or not all(
+            isinstance(part, dict)
+            and set(part) == {"type", "text"}
+            and part.get("type") == "reasoning_text"
+            and isinstance(part.get("text"), str)
+            for part in content
+        ):
+            return False
+        encrypted_content = item.get("encrypted_content")
+        return encrypted_content is None or isinstance(encrypted_content, str)
+
+    @staticmethod
+    def _is_safe_output_item_added_shape(item: Any) -> bool:
+        """Return True when *item* is one of the four permitted safe-private
+        ``response.output_item.added`` shapes (OPENAI-080 closed set)."""
+        if not isinstance(item, dict):
+            return False
+        item_type = item.get("type")
+        if item_type not in _RESPONSES_SAFE_ITEM_ADDED_TYPES:
+            return False
+
+        if item_type == "message":
+            return (
+                PassThroughStreamingHandler._has_only_fields(
+                    item, {"id", "type", "role", "status", "content"}
+                )
+                and PassThroughStreamingHandler._is_nonempty_string(
+                    item.get("id")
+                )
+                and item.get("role") == "assistant"
+                and item.get("status") == "in_progress"
+                and item.get("content") == []
+            )
+
+        if item_type == "function_call":
+            return (
+                PassThroughStreamingHandler._has_only_fields(
+                    item,
+                    {
+                        "id", "type", "status", "call_id", "name", "arguments",
+                    },
+                )
+                and PassThroughStreamingHandler._is_nonempty_string(
+                    item.get("id")
+                )
+                and PassThroughStreamingHandler._is_nonempty_string(
+                    item.get("call_id")
+                )
+                and PassThroughStreamingHandler._is_nonempty_string(
+                    item.get("name")
+                )
+                and item.get("arguments") == ""
+                and item.get("status") in (None, "in_progress")
+            )
+
+        if item_type == "custom_tool_call":
+            return (
+                PassThroughStreamingHandler._has_only_fields(
+                    item,
+                    {"id", "type", "status", "call_id", "name", "input"},
+                )
+                and PassThroughStreamingHandler._is_nonempty_string(
+                    item.get("id")
+                )
+                and PassThroughStreamingHandler._is_nonempty_string(
+                    item.get("call_id")
+                )
+                and PassThroughStreamingHandler._is_nonempty_string(
+                    item.get("name")
+                )
+                and item.get("input") == ""
+                and item.get("status") in (None, "in_progress")
+            )
+
+        if item_type == "reasoning":
+            return PassThroughStreamingHandler._is_safe_reasoning_item(
+                item,
+                allowed_statuses={None, "in_progress"},
+            )
+
+        return False
+
+    @staticmethod
+    def _is_safe_content_part_added_shape(part: Any) -> bool:
+        """Return True when *part* is one of the three permitted safe-private
+        ``response.content_part.added`` shapes (OPENAI-080 closed set)."""
+        if not isinstance(part, dict):
+            return False
+        part_type = part.get("type")
+        if part_type not in _RESPONSES_SAFE_CONTENT_PART_ADDED_TYPES:
+            return False
+
+        if part_type == "output_text":
+            if not PassThroughStreamingHandler._has_only_fields(
+                part, {"type", "text", "annotations", "logprobs"}
+            ) or part.get("text") != "":
+                return False
+            annotations = part.get("annotations")
+            if annotations not in (None, []) or (
+                annotations is not None and not isinstance(annotations, list)
+            ):
+                return False
+            logprobs = part.get("logprobs")
+            if logprobs not in (None, []) or (
+                logprobs is not None and not isinstance(logprobs, list)
+            ):
+                return False
+            return True
+
+        if part_type == "refusal":
+            return (
+                PassThroughStreamingHandler._has_only_fields(
+                    part, {"type", "refusal"}
+                )
+                and part.get("refusal") == ""
+            )
+
+        if part_type == "reasoning_text":
+            return (
+                PassThroughStreamingHandler._has_only_fields(
+                    part, {"type", "text"}
+                )
+                and isinstance(part.get("text"), str)
+            )
+
+        return False
+
+    @staticmethod
     def _is_responses_non_substantive_lifecycle_event(
         event_type: Optional[str],
         payload: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        if event_type in _RESPONSES_NON_SUBSTANTIVE_LIFECYCLE_EVENTS:
-            if not isinstance(payload, dict):
-                return True
-            response_payload = payload.get("response")
-            if isinstance(response_payload, dict):
-                if response_payload.get("status") in {"failed", "incomplete"}:
-                    return False
-                if response_payload.get("error") is not None:
-                    return False
-                output = response_payload.get("output")
-                if isinstance(output, list) and any(output):
-                    return False
-            return True
-        if event_type == "response.completed":
+        """Frozen Oracle allowlist: return True only when the exact event name and
+        full semantic shape are unconditionally safe to discard on a precommit failure.
+
+        This is the OPENAI-080 closed set.  Any unrecognised event, unexpected field,
+        or schema conflict commits the attempt.
+        """
+        if event_type is None or not isinstance(payload, dict):
             return False
+        if payload.get("type") != event_type:
+            return False
+        sequence_number = payload.get("sequence_number")
+        if sequence_number is not None and not (
+            PassThroughStreamingHandler._is_nonnegative_index(sequence_number)
+        ):
+            return False
+
+        if event_type in ("response.created", "response.in_progress"):
+            response_payload = payload.get("response")
+            if not isinstance(response_payload, dict):
+                return False
+            if not PassThroughStreamingHandler._has_only_fields(
+                payload, {"type", "sequence_number", "response"}
+            ):
+                return False
+            if not PassThroughStreamingHandler._has_only_fields(
+                response_payload, _RESPONSES_RESPONSE_ENVELOPE_FIELDS
+            ):
+                return False
+            if not PassThroughStreamingHandler._is_nonempty_string(
+                response_payload.get("id")
+            ):
+                return False
+            if response_payload.get("status") != "in_progress":
+                return False
+            if response_payload.get("error") is not None or response_payload.get(
+                "incomplete_details"
+            ) is not None:
+                return False
+            output = response_payload.get("output")
+            if not isinstance(output, list) or output:
+                return False
+            created_at = response_payload.get("created_at")
+            if created_at is not None and not (
+                PassThroughStreamingHandler._is_nonnegative_index(created_at)
+            ):
+                return False
+            if response_payload.get("object") not in (None, "response"):
+                return False
+            model = response_payload.get("model")
+            if model is not None and not isinstance(model, str):
+                return False
+            return True
+
+        if event_type == "response.output_item.added":
+            return (
+                PassThroughStreamingHandler._has_only_fields(
+                    payload, {"type", "sequence_number", "output_index", "item"}
+                )
+                and PassThroughStreamingHandler._is_nonnegative_index(
+                    payload.get("output_index")
+                )
+                and PassThroughStreamingHandler._is_safe_output_item_added_shape(
+                    payload.get("item")
+                )
+            )
+
+        if event_type == "response.output_item.done":
+            if not PassThroughStreamingHandler._has_only_fields(
+                payload, {"type", "sequence_number", "output_index", "item"}
+            ) or not PassThroughStreamingHandler._is_nonnegative_index(
+                payload.get("output_index")
+            ):
+                return False
+            item = payload.get("item")
+            return PassThroughStreamingHandler._is_safe_reasoning_item(
+                item,
+                allowed_statuses={"completed"},
+            )
+
+        if event_type in {
+            "response.content_part.added",
+            "response.content_part.done",
+        }:
+            if not PassThroughStreamingHandler._has_only_fields(
+                payload,
+                {
+                    "type", "sequence_number", "item_id", "output_index",
+                    "content_index", "part",
+                },
+            ):
+                return False
+            if not (
+                PassThroughStreamingHandler._is_nonnegative_index(
+                    payload.get("output_index")
+                )
+                and PassThroughStreamingHandler._is_nonnegative_index(
+                    payload.get("content_index")
+                )
+                and PassThroughStreamingHandler._is_nonempty_string(
+                    payload.get("item_id")
+                )
+            ):
+                return False
+            part = payload.get("part")
+            if event_type == "response.content_part.added":
+                return PassThroughStreamingHandler._is_safe_content_part_added_shape(
+                    part
+                )
+            return (
+                isinstance(part, dict)
+                and set(part) == {"type", "text"}
+                and part.get("type") == "reasoning_text"
+                and isinstance(part.get("text"), str)
+            )
+
+        if event_type in {
+            "response.reasoning_summary_part.added",
+            "response.reasoning_summary_part.done",
+        }:
+            if not PassThroughStreamingHandler._has_only_fields(
+                payload,
+                {
+                    "type", "sequence_number", "item_id", "output_index",
+                    "summary_index", "part",
+                },
+            ):
+                return False
+            if not (
+                PassThroughStreamingHandler._is_nonnegative_index(
+                    payload.get("output_index")
+                )
+                and PassThroughStreamingHandler._is_nonnegative_index(
+                    payload.get("summary_index")
+                )
+                and PassThroughStreamingHandler._is_nonempty_string(
+                    payload.get("item_id")
+                )
+            ):
+                return False
+            part = payload.get("part")
+            if (
+                not isinstance(part, dict)
+                or set(part) != {"type", "text"}
+                or part.get("type") != "summary_text"
+                or not isinstance(part.get("text"), str)
+            ):
+                return False
+            return True
+
+        if event_type in {
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_summary_text.done",
+            "response.reasoning_text.delta",
+            "response.reasoning_text.done",
+        }:
+            is_summary = "summary" in event_type
+            value_field = "delta" if event_type.endswith(".delta") else "text"
+            fields = {
+                "type", "sequence_number", "item_id", "output_index",
+                "summary_index" if is_summary else "content_index",
+                value_field,
+            }
+            if not PassThroughStreamingHandler._has_only_fields(payload, fields):
+                return False
+            index_field = "summary_index" if is_summary else "content_index"
+            if not (
+                PassThroughStreamingHandler._is_nonnegative_index(
+                    payload.get("output_index")
+                )
+                and PassThroughStreamingHandler._is_nonnegative_index(
+                    payload.get(index_field)
+                )
+                and PassThroughStreamingHandler._is_nonempty_string(
+                    payload.get("item_id")
+                )
+                and isinstance(payload.get(value_field), str)
+            ):
+                return False
+            return True
+
         return False
 
     @staticmethod
@@ -861,13 +1440,28 @@ class PassThroughStreamingHandler:
         event_type: Optional[str],
         payload: Optional[Dict[str, Any]] = None,
     ) -> bool:
+        """Normal-delivery taxonomy: return True when the event carries
+        client-visible content (text, tool data, media, effects).
+
+        Uses the original prefix-based classification, separate from the
+        OPENAI-080 precommit replay-commit allowlist.  Callers using
+        precommit replay decisions must go through
+        _inspect_responses_events or
+        _is_responses_non_substantive_lifecycle_event directly.
+        """
         if event_type is None or event_type == "[DONE]":
             return False
         if event_type in _RESPONSES_PRE_COMMIT_FAILURE_EVENTS:
+            # Failure events carry their own classification; they are
+            # not substantive for delivery-tracking purposes.
             return False
         if event_type in PassThroughStreamingHandler._RESPONSES_TERMINAL_EVENTS:
+            # response.completed is a substantive delivery marker;
+            # response.failed / response.incomplete are not.
             return event_type == "response.completed"
         if event_type in _RESPONSES_NON_SUBSTANTIVE_LIFECYCLE_EVENTS:
+            # Lifecycle events that are unconditionally safe: check the
+            # OPENAI-080 frozen-shape allowlist for shape-level safety.
             return not PassThroughStreamingHandler._is_responses_non_substantive_lifecycle_event(
                 event_type,
                 payload,
@@ -1152,7 +1746,8 @@ class PassThroughStreamingHandler:
     @staticmethod
     def _inspect_responses_pre_commit_chunks(
         chunks: List[bytes],
-    ) -> tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+    ) -> tuple[str, Optional[Dict[str, Any]], Optional[str], Optional[str]]:
+        """OPENAI-080: return (decision, error_payload, event_type, commitment_reason)."""
         buffered = b"".join(chunks)
         pipeline = ResponsesEventPipeline(
             max_raw_events=0,
@@ -1161,48 +1756,285 @@ class PassThroughStreamingHandler:
         if pipeline.buffered_event_bytes:
             events.extend(pipeline.finish())
         if not events:
-            return "empty", None, None
+            return "empty", None, None, None
         parser = _ResponsesPreCommitSSEParser(
             _ResponsesPreCommitPrefixStore(0),
             pipeline,
         )
         for event in events:
             parser._consume_event(event)
-        return parser.decision()
+        decision = parser.decision()
+        parsed_reason = parser.commitment_reason
+        effective_reason = parsed_reason or "unknown_semantics"
+        return decision[0], decision[1], decision[2], effective_reason
+
+
+    @staticmethod
+    def _inspect_failure_snapshot_for_hidden_output(
+        payload: Optional[Dict[str, Any]],
+        *,
+        event_type: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return the commitment reason when *payload* carries output items
+        hidden inside a terminal or failure snapshot envelope (OPENAI-080)."""
+        if not isinstance(payload, dict):
+            return (
+                "unknown_semantics"
+                if event_type == "response.failed"
+                else None
+            )
+        response_payload = payload.get("response")
+        if not isinstance(response_payload, dict):
+            return (
+                "unknown_semantics"
+                if event_type == "response.failed"
+                else None
+            )
+        output = response_payload.get("output")
+        if not isinstance(output, list):
+            return "unknown_semantics"
+        if not output:
+            return None
+        for item in output:
+            if not isinstance(item, dict):
+                return "unknown_semantics"
+            item_type = item.get("type")
+            if not isinstance(item_type, str):
+                # Unknown type in snapshot: conservative commit
+                return "unknown_semantics"
+            if item_type == "message":
+                # Any message item in a snapshot commits — even empty content
+                # represents a structural completion.
+                return "assistant_output"
+            if item_type in ("function_call", "custom_tool_call"):
+                # Tool items in a failure/terminal snapshot always commit,
+                # even with empty arguments — structural completion evidence.
+                return "client_tool_payload"
+            if item_type in _PROVIDER_EXECUTABLE_TOOL_TYPES_HINT:
+                return "provider_execution_possible"
+            # Unknown item type in snapshot: conservative commit
+            return "unknown_semantics"
+        return None
+
+    @staticmethod
+    def _is_responses_error_details_shape(error_payload: Any) -> bool:
+        if (
+            not isinstance(error_payload, dict)
+            or not error_payload
+            or not PassThroughStreamingHandler._has_only_fields(
+                error_payload, _RESPONSES_ERROR_FIELDS
+            )
+            or not isinstance(error_payload.get("message"), str)
+        ):
+            return False
+        for field in _RESPONSES_ERROR_FIELDS:
+            value = error_payload.get(field)
+            if field == "message":
+                continue
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                return False
+        return True
+
+    @staticmethod
+    def _is_responses_pre_commit_failure_shape(
+        event_type: Optional[str],
+        payload: Any,
+    ) -> bool:
+        """Admit only the supported error envelopes before failure classification."""
+        if (
+            not isinstance(payload, dict)
+            or payload.get("type") != event_type
+        ):
+            return False
+        sequence_number = payload.get("sequence_number")
+        if sequence_number is not None and not (
+            PassThroughStreamingHandler._is_nonnegative_index(sequence_number)
+        ):
+            return False
+
+        if event_type == "error":
+            if not PassThroughStreamingHandler._has_only_fields(
+                payload,
+                {"type", "sequence_number", "error", "code", "message", "param"},
+            ):
+                return False
+            nested_error = payload.get("error")
+            if nested_error is not None:
+                if any(
+                    field in payload for field in ("code", "message", "param")
+                ):
+                    return False
+                return PassThroughStreamingHandler._is_responses_error_details_shape(
+                    nested_error
+                )
+            direct_error = {
+                field: payload[field]
+                for field in ("code", "message", "param")
+                if field in payload
+            }
+            return PassThroughStreamingHandler._is_responses_error_details_shape(
+                direct_error
+            )
+
+        if event_type != "response.failed" or not (
+            PassThroughStreamingHandler._has_only_fields(
+                payload, {"type", "sequence_number", "response"}
+            )
+        ):
+            return False
+        response_payload = payload.get("response")
+        if (
+            not isinstance(response_payload, dict)
+            or not PassThroughStreamingHandler._has_only_fields(
+                response_payload, _RESPONSES_RESPONSE_ENVELOPE_FIELDS
+            )
+            or not PassThroughStreamingHandler._is_nonempty_string(
+                response_payload.get("id")
+            )
+            or response_payload.get("status") != "failed"
+            or not isinstance(response_payload.get("output"), list)
+        ):
+            return False
+        if response_payload.get("object") not in (None, "response"):
+            return False
+        error_payload = response_payload.get("error")
+        return error_payload is None or (
+            PassThroughStreamingHandler._is_responses_error_details_shape(
+                error_payload
+            )
+        )
 
     @staticmethod
     def _inspect_responses_events(
         parsed_event: ParsedResponsesEvent,
-    ) -> tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+    ) -> tuple[str, Optional[Dict[str, Any]], Optional[str], Optional[str]]:
+        """OPENAI-080: evaluate replay safety before failure classification.
+
+        Returns (decision, error_payload, event_type, commitment_reason).
+        commitment_reason is None for safe-private (lifecycle) events and set
+        for every committing event.  The caller must set the monotonic replay
+        latch *before* yielding committed output.
+        """
         if parsed_event.is_malformed or parsed_event.is_done_marker:
-            return "empty", None, None
+            if parsed_event.is_done_marker:
+                return "substantive", None, "[DONE]", "terminal_marker"
+            # A malformed frame must veto replay; do not forward the bad bytes.
+            return "substantive", None, None, "unknown_semantics"
+
         event_type = parsed_event.event_type
         payload = parsed_event.payload
+
+        # --- Step 1: check if this event commits the attempt ---
+        commitment_reason: Optional[str] = None
+
+        if event_type in (None, ""):
+            # Empty event with no type: treat as unknown semantics
+            return "substantive", None, event_type, "unknown_semantics"
+
+        if event_type in _RESPONSES_PRE_COMMIT_FAILURE_EVENTS and not (
+            PassThroughStreamingHandler._is_responses_pre_commit_failure_shape(
+                event_type, payload
+            )
+        ):
+            commitment_reason = "unknown_semantics"
+
+        # [DONE] is handled above via is_done_marker
+
+        # Unknown / unrecognised event -> commit
+        if event_type == "response.incomplete":
+            commitment_reason = "unknown_semantics"
+        elif event_type not in _RECOGNIZED_PROVIDER_TERMINAL_EVENTS and not (
+            PassThroughStreamingHandler._is_responses_non_substantive_lifecycle_event(
+                event_type, payload
+            )
+        ):
+            # This event is not in the safe allowlist.  Classify the reason.
+            if event_type == "response.completed":
+                commitment_reason = "successful_terminal"
+            elif event_type and (
+                event_type.startswith("response.output_text.")
+                or event_type.startswith("response.refusal.")
+                or event_type.startswith("response.output_item.")
+            ):
+                # Inspect output items for assistant output vs client tool
+                item = payload.get("item") if isinstance(payload, dict) else None
+                item_type = item.get("type") if isinstance(item, dict) else None
+                if item_type == "message":
+                    commitment_reason = "assistant_output"
+                elif isinstance(item_type, str) and item_type in {
+                    "function_call",
+                    "custom_tool_call",
+                }:
+                    commitment_reason = "client_tool_payload"
+                elif (
+                    isinstance(item_type, str)
+                    and item_type in _PROVIDER_EXECUTABLE_TOOL_TYPES_HINT
+                ):
+                    commitment_reason = "provider_execution_possible"
+                elif item_type is not None:
+                    commitment_reason = "unknown_semantics"
+                elif (
+                    event_type.startswith("response.output_text.")
+                    or event_type.startswith("response.refusal.")
+                ):
+                    commitment_reason = "assistant_output"
+                else:
+                    commitment_reason = "unknown_semantics"
+            elif event_type and (
+                event_type.startswith("response.function_call_arguments.")
+                or event_type.startswith("response.custom_tool_call_input.")
+                or event_type.startswith("response.function_call.")
+                or event_type.startswith("response.custom_tool_call.")
+            ):
+                commitment_reason = "client_tool_payload"
+            elif event_type and event_type.startswith("response.mcp_call."):
+                commitment_reason = "provider_execution_possible"
+            elif event_type and (
+                event_type.startswith("response.web_search.")
+                or event_type.startswith("response.file_search.")
+                or event_type.startswith("response.code_interpreter.")
+                or event_type.startswith("response.computer.")
+                or event_type.startswith("response.image_generation.")
+            ):
+                commitment_reason = "provider_execution_possible"
+            elif event_type and event_type.startswith("response."):
+                # Any other response.* event (e.g. response.apply_patch,
+                # response.local_shell, response.shell, response.reasoning
+                # items that aren't in the safe allowlist, etc.)
+                commitment_reason = "unknown_semantics"
+            else:
+                commitment_reason = "unknown_semantics"
+
+        # --- Step 2: inspect semantic payload for hidden commits ---
+        # A failure envelope must not hide text, tool data, or possible effects.
+        hidden_reason = (
+            PassThroughStreamingHandler._inspect_failure_snapshot_for_hidden_output(
+                payload,
+                event_type=event_type,
+            )
+        )
+        if hidden_reason is not None and commitment_reason is None:
+            commitment_reason = hidden_reason
+
+        # --- Step 3: extract error payload ---
         error_payload = (
             PassThroughStreamingHandler._extract_responses_stream_error_payload(
                 event_type,
                 payload,
             )
         )
-        if error_payload is not None or event_type in (
-            _RESPONSES_PRE_COMMIT_FAILURE_EVENTS
-        ):
-            return "failed", error_payload or payload, event_type
-        if (
-            PassThroughStreamingHandler._is_responses_non_substantive_lifecycle_event(
-                event_type,
-                payload,
-            )
-        ):
-            return "lifecycle", None, None
-        if PassThroughStreamingHandler._is_responses_substantive_event(
-            event_type,
-            payload,
-        ):
-            return "substantive", None, event_type
-        if event_type not in {None, ""}:
-            return "substantive", None, event_type
-        return "empty", None, None
+
+        # --- Step 4: return decision ---
+        if error_payload is not None or event_type in _RESPONSES_PRE_COMMIT_FAILURE_EVENTS:
+            return "failed", error_payload or payload, event_type, commitment_reason
+
+        if commitment_reason is not None:
+            return "substantive", None, event_type, commitment_reason
+
+        # Safe private event
+        return "lifecycle", None, None, None
 
     @staticmethod
     def _iter_responses_sse_events(
@@ -1348,11 +2180,34 @@ class PassThroughStreamingHandler:
         max_buffer_bytes: int = _RESPONSES_PRE_COMMIT_MAX_BUFFER_BYTES,
         openai_alpha_capacity_retry_enabled: bool = False,
         event_pipeline: Optional[ResponsesEventPipeline] = None,
+        request: Any = None,
+        provider_bound_body: Optional[Dict[str, Any]] = None,
     ) -> tuple[httpx.Response, Optional[ResponsesStreamPreCommitFailure]]:
-        """Hold lifecycle-only Responses bytes until a commit or pre-SSE failure."""
+        """Hold safe-private Responses bytes until a commit or pre-SSE failure.
+
+        OPENAI-080: applies the Oracle-frozen semantic allowlist to classify
+        each event.  Sets the monotonic replay-commit latch on the request
+        *before* yielding any committed output.  When *request* is supplied
+        and a provider-executable tool body is detected, dispatch commits
+        at ``provider_execution_possible`` regardless of observed events.
+        """
         pipeline = event_pipeline or create_responses_event_pipeline(
             retain_events=True,
         )
+
+        # OPENAI-080: when the effective body carries provider-executable
+        # tools, lock the latch at dispatch so no internal resend can
+        # proceed regardless of what events arrive.
+        provider_tools_detected = (
+            request is not None
+            and responses_effective_provider_tools_allowed(provider_bound_body)
+        )
+        if provider_tools_detected:
+            publish_responses_replay_commitment(
+                request,
+                reason="provider_execution_possible",
+            )
+
         prefix = _ResponsesPreCommitPrefixStore(
             max_buffer_bytes,
             max_storage_bytes=pipeline.max_stream_bytes,
@@ -1360,6 +2215,11 @@ class PassThroughStreamingHandler:
         parser = _ResponsesPreCommitSSEParser(prefix, pipeline)
         iterator: Any = None
         retired = False
+        response_stream = getattr(response, "stream", None)
+        if isinstance(response_stream, httpx.AsyncByteStream) and not isinstance(
+            response_stream, _CloseAwareHttpxAsyncByteStream
+        ):
+            response.stream = _CloseAwareHttpxAsyncByteStream(response_stream)
 
         async def _close_precommit_resources() -> None:
             nonlocal retired
@@ -1428,9 +2288,7 @@ class PassThroughStreamingHandler:
                 if not chunk:
                     continue
                 chunk = bytes(chunk)
-                stream_bytes_before_feed = int(
-                    getattr(pipeline, "total_stream_bytes", 0)
-                )
+                event_type: Optional[str] = None
                 try:
                     decision, error_payload, event_type = parser.feed(chunk)
                     prefix.append(chunk)
@@ -1440,19 +2298,19 @@ class PassThroughStreamingHandler:
                     ResponsesStreamTooLarge,
                 ) as exc:
                     bound_failure = ResponsesBoundFailure.from_exception(exc)
-                    admitted_bytes = max(
-                        0,
-                        int(getattr(pipeline, "total_stream_bytes", 0))
-                        - stream_bytes_before_feed,
-                    )
+                    accepted_bytes = max(0, bound_failure.accepted_bytes)
                     prior_safe = bool(
                         getattr(pipeline, "held_event_count", 0)
                         or bound_failure.accepted_events
                     )
+                    # OPENAI-080 (R8): when the stream carried accepted safe
+                    # events and then hits a size/event bound, commit with
+                    # "event_limit" and preserve the prefix.  Only discard
+                    # when there is no accepted prefix at all.
                     if prior_safe:
-                        if admitted_bytes:
+                        if accepted_bytes:
                             try:
-                                prefix.append(chunk[:admitted_bytes])
+                                prefix.append(chunk[:accepted_bytes])
                             except (
                                 ResponsesBoundFailure,
                                 ResponsesEventTooLarge,
@@ -1468,50 +2326,33 @@ class PassThroughStreamingHandler:
                             bound_failure=bound_failure,
                         )
                         pipeline.attach_to_response(prefixed)
-                        if parser._first_terminal_decision == "failed":
-                            return (
-                                prefixed,
-                                PassThroughStreamingHandler._build_responses_pre_commit_failure(
-                                    error_payload=parser._first_error_payload,
-                                    event_type=parser._first_error_event,
-                                    openai_alpha_capacity_retry_enabled=(
-                                        openai_alpha_capacity_retry_enabled
-                                    ),
-                                ),
-                            )
-                        return prefixed, None
-                    admitted_bytes = max(
-                        0,
-                        int(getattr(pipeline, "total_stream_bytes", 0))
-                        - stream_bytes_before_feed,
-                    )
-                    # A decisive event earlier in this stored read is already
-                    # accepted and observed. Save only the parser-admitted
-                    # prefix so replay can forward it; never reconstruct the
-                    # rejected suffix or turn every fatal rejection into
-                    # recoverable output.
-                    if parser._first_terminal_decision == "substantive" and admitted_bytes:
-                        try:
-                            prefix.append(chunk[:admitted_bytes])
-                        except (
-                            ResponsesBoundFailure,
-                            ResponsesEventTooLarge,
-                            ResponsesStreamTooLarge,
-                        ):
-                            await _close_precommit_resources()
-                            return response, _bound_failure(exc)
-                        prefixed = _PrefixedHttpxByteStream(
-                            response,
-                            prefix,
-                            iterator,
-                            event_pipeline=pipeline,
-                            bound_failure=bound_failure,
+                        _maybe_set_replay_latch(
+                            request, "event_limit", event_type
                         )
-                        pipeline.attach_to_response(prefixed)
                         return prefixed, None
                     await _close_precommit_resources()
                     return response, _bound_failure(exc)
                 if decision == "failed":
+                    # OPENAI-080: a failure event commits when it carries
+                    # semantic payload (text, tool data, effects), or an
+                    # earlier dispatch-time capability already closed replay.
+                    commitment_reason = parser.commitment_reason or (
+                        get_responses_replay_commitment_reason(request)
+                        if request is not None
+                        else None
+                    )
+                    if commitment_reason is not None:
+                        _maybe_set_replay_latch(
+                            request, commitment_reason, event_type
+                        )
+                        committed = _PrefixedHttpxByteStream(
+                            response,
+                            prefix,
+                            iterator,
+                            event_pipeline=pipeline,
+                        )
+                        pipeline.attach_to_response(committed)
+                        return committed, None
                     return (
                         _PrefixedHttpxByteStream(response, prefix, iterator),
                         PassThroughStreamingHandler._build_responses_pre_commit_failure(
@@ -1530,10 +2371,28 @@ class PassThroughStreamingHandler:
                         event_pipeline=pipeline,
                     )
                     pipeline.attach_to_response(prefixed)
+                    # Set latch before yielding committed stream
+                    _maybe_set_replay_latch(
+                        request, parser.commitment_reason, event_type
+                    )
                     return (
                         prefixed,
                         None,
                     )
+                if pipeline.held_limit_exhausted:
+                    prefixed = _PrefixedHttpxByteStream(
+                        response,
+                        prefix,
+                        iterator,
+                        event_pipeline=pipeline,
+                    )
+                    pipeline.attach_to_response(prefixed)
+                    _maybe_set_replay_latch(
+                        request,
+                        "event_limit",
+                        event_type,
+                    )
+                    return prefixed, None
 
             leftover_incomplete = pipeline.buffered_event_bytes > 0
             try:
@@ -1583,6 +2442,11 @@ class PassThroughStreamingHandler:
                 await _close_precommit_resources()
                 return response, _bound_failure(exc)
             if decision == "failed":
+                commitment_reason = parser.commitment_reason
+                if commitment_reason is not None:
+                    _maybe_set_replay_latch(
+                        request, commitment_reason, event_type
+                    )
                 return (
                     _PrefixedHttpxByteStream(response, prefix, iterator),
                     PassThroughStreamingHandler._build_responses_pre_commit_failure(
@@ -1612,10 +2476,13 @@ class PassThroughStreamingHandler:
                         failure_origin="local_missing_terminal",
                     )
                 )
-                # T-4: a truncated UTF-8 remainder after a complete lifecycle
-                # frame is not itself a missing-terminal event. Replay the
+                # OPENAI-080 (R8): a truncated UTF-8 remainder after accepted
+                # safe events commits with "prefix_limit".  Replay the
                 # exact prefix and let the live pipeline finish.
                 if prefix.byte_count > 0 and leftover_incomplete:
+                    _maybe_set_replay_latch(
+                        request, "prefix_limit", event_type
+                    )
                     prefixed = _PrefixedHttpxByteStream(
                         response,
                         prefix,
@@ -1633,6 +2500,9 @@ class PassThroughStreamingHandler:
                 event_pipeline=pipeline,
             )
             pipeline.attach_to_response(prefixed)
+            _maybe_set_replay_latch(
+                request, parser.commitment_reason, event_type
+            )
             return prefixed, None
         except BaseException:
             prefix.close()
@@ -2165,6 +3035,7 @@ class PassThroughStreamingHandler:
         responses_tracking_finalized = False
         metadata: Dict[str, Any] = {}
         transfer_identity: Dict[str, Any] = {}
+        response_byte_iterator: Any = None
 
         async def _finalize_transfer_if_needed(
             identity: Dict[str, Any],
@@ -2605,8 +3476,9 @@ class PassThroughStreamingHandler:
                 if isinstance(extensions, dict):
                     extensions["aawm_openai_responses_terminal_pending"] = True
 
+            response_byte_iterator = response.aiter_bytes()
             async for chunk in wait_iterator(
-                "upstream_stream_read", response.aiter_bytes()
+                "upstream_stream_read", response_byte_iterator
             ):
                 current_chunk_at = datetime.now()
                 chunk_count += 1
@@ -3266,6 +4138,15 @@ class PassThroughStreamingHandler:
                 extra=exception_context,
             )
             raise
+        finally:
+            close_iterator = getattr(response_byte_iterator, "aclose", None)
+            if callable(close_iterator):
+                try:
+                    result = close_iterator()
+                    if inspect.isawaitable(result):
+                        await wait_for("resource_cleanup", result)
+                except Exception:
+                    pass
 
     @staticmethod
     async def _finalize_unstarted_native_stream(
@@ -4560,7 +5441,7 @@ class PassThroughStreamingHandler:
             responses_event_pipeline=responses_event_pipeline,
         )
         recognized_terminal = (
-            terminal_event_type in _RECOGNIZED_PROVIDER_TERMINAL_EVENTS
+            terminal_event_type in _RECOGNIZED_TERMINAL_METADATA_EVENTS
         )
         reconciled_provider_error = isinstance(error_payload, dict)
         metadata["aawm_provider_terminal_event_type"] = (
@@ -5254,3 +6135,26 @@ class PassThroughStreamingHandler:
         lines = [line.strip() for line in combined_str.split("\n") if line.strip()]
 
         return lines
+
+def _maybe_set_replay_latch(
+    request: Any,
+    commitment_reason: Optional[str],
+    event_type: Optional[str],
+) -> None:
+    """Set the monotonic replay-commit latch when the parser detected a
+    committing event and a Starlette request is available.
+
+    Must be called *before* any await or yield that could expose committed
+    data to the client.  Uses ``publish_responses_replay_commitment`` so the
+    latch is immediately visible to ``ensure_openai_wire_replay_allowed``.
+    """
+    if request is None or commitment_reason is None:
+        return
+    try:
+        publish_responses_replay_commitment(
+            request,
+            reason=commitment_reason,
+            event_type=event_type,
+        )
+    except Exception:
+        pass

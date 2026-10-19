@@ -9759,6 +9759,7 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
                 decision,
                 error_payload,
                 inspected_event_type,
+                _commitment_reason,
             ) = PassThroughStreamingHandler._inspect_responses_pre_commit_chunks(
                 [frame_bytes]
             )

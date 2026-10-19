@@ -32,8 +32,97 @@ _WIRE_REPLAY_BLOCKING_FLAGS = (
     "first_body_sent",
     "terminal_wire_committed",
     "done_wire_committed",
+    "precommit_replay_committed",
 )
 _WIRE_REPLAY_BLOCKING_DISPOSITIONS = frozenset({"cancelled", "disconnected"})
+
+_RESPONSES_REPLAY_COMMITMENT_REASONS = frozenset({
+    "assistant_output",
+    "client_tool_payload",
+    "provider_execution_possible",
+    "unknown_semantics",
+    "successful_terminal",
+    "terminal_marker",
+    "prefix_limit",
+    "event_limit",
+    "delivery_started",
+})
+
+_RESPONSES_REPLAY_LATCH_REASON_KEY = "precommit_commitment_reason"
+_RESPONSES_REPLAY_LATCH_EVENT_KEY = "precommit_commitment_event_type"
+_RESPONSES_REPLAY_PUBLISHED_LATCH_REASON_KEY = (
+    "precommit_published_replay_reason"
+)
+_RESPONSES_REPLAY_EVENT_LABELS = frozenset(
+    {
+        "[DONE]",
+        "error",
+        "response.created",
+        "response.in_progress",
+        "response.completed",
+        "response.failed",
+        "response.incomplete",
+        "response.output_item.added",
+        "response.output_item.done",
+        "response.content_part.added",
+        "response.content_part.done",
+        "response.reasoning_summary_part.added",
+        "response.reasoning_summary_part.done",
+        "response.reasoning_summary_text.delta",
+        "response.reasoning_summary_text.done",
+        "response.reasoning_text.delta",
+        "response.reasoning_text.done",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.output_text.annotation.added",
+        "response.refusal.delta",
+        "response.refusal.done",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.custom_tool_call_input.delta",
+        "response.custom_tool_call_input.done",
+        "response.mcp_call.in_progress",
+        "response.mcp_call.completed",
+        "response.mcp_call.failed",
+        "response.web_search_call.in_progress",
+        "response.web_search_call.searching",
+        "response.web_search_call.completed",
+        "response.file_search_call.in_progress",
+        "response.file_search_call.searching",
+        "response.file_search_call.completed",
+        "response.code_interpreter_call.in_progress",
+        "response.code_interpreter_call.interpreting",
+        "response.code_interpreter_call.completed",
+        "response.computer_call.in_progress",
+        "response.computer_call.completed",
+        "response.image_generation_call.in_progress",
+        "response.image_generation_call.generating",
+        "response.image_generation_call.completed",
+        "response.shell_call.in_progress",
+        "response.shell_call.completed",
+        "response.shell_call_output.done",
+        "response.apply_patch_call.in_progress",
+        "response.apply_patch_call.completed",
+    }
+)
+
+
+def _responses_replay_event_label(
+    event_type: Optional[str],
+    *,
+    reason: Optional[str] = None,
+) -> str:
+    if event_type is None:
+        return (
+            "provider_dispatch"
+            if reason == "provider_execution_possible"
+            else "unknown_event"
+        )
+    if event_type == "[DONE]":
+        return event_type
+    if event_type in _RESPONSES_REPLAY_EVENT_LABELS:
+        return event_type
+    return "unknown_event"
 
 
 def _safe_context_value(value: Any, *, maximum: int = 128) -> Optional[str]:
@@ -545,12 +634,16 @@ def _safe_wire_commitment(
 ) -> dict[str, Any]:
     """Copy only bounded, non-secret wire lifecycle fields."""
 
-    return {
+    published_reason = commitment.get(
+        _RESPONSES_REPLAY_PUBLISHED_LATCH_REASON_KEY
+    )
+    safe_commitment = {
         key: commitment.get(key)
         for key in (
             "state",
             "response_start_sent",
             "first_body_sent",
+            "precommit_replay_committed",
             "commitment",
             "terminal_event_type",
             "disposition",
@@ -561,9 +654,33 @@ def _safe_wire_commitment(
             "done_wire_committed",
             "finalization_started",
             "finalized",
+            _RESPONSES_REPLAY_LATCH_REASON_KEY,
+            _RESPONSES_REPLAY_LATCH_EVENT_KEY,
         )
         if key in commitment
     }
+    if isinstance(published_reason, str):
+        safe_commitment[_RESPONSES_REPLAY_LATCH_REASON_KEY] = (
+            published_reason
+            if published_reason in _RESPONSES_REPLAY_COMMITMENT_REASONS
+            else "unknown_semantics"
+        )
+    if _RESPONSES_REPLAY_LATCH_REASON_KEY in safe_commitment:
+        reason = safe_commitment[_RESPONSES_REPLAY_LATCH_REASON_KEY]
+        if not isinstance(reason, str) or reason not in _RESPONSES_REPLAY_COMMITMENT_REASONS:
+            safe_commitment[_RESPONSES_REPLAY_LATCH_REASON_KEY] = (
+                "unknown_semantics"
+            )
+    if _RESPONSES_REPLAY_LATCH_EVENT_KEY in safe_commitment:
+        event_type = safe_commitment[_RESPONSES_REPLAY_LATCH_EVENT_KEY]
+        reason = safe_commitment.get(_RESPONSES_REPLAY_LATCH_REASON_KEY)
+        safe_commitment[_RESPONSES_REPLAY_LATCH_EVENT_KEY] = (
+            _responses_replay_event_label(
+                event_type if isinstance(event_type, str) else None,
+                reason=reason if isinstance(reason, str) else None,
+            )
+        )
+    return safe_commitment
 
 
 def get_request_openai_wire_commitment(
@@ -760,6 +877,129 @@ async def close_active_upstream_response(request: Request) -> None:
                 close_fn()
     finally:
         setattr(state, _ACTIVE_RESPONSE_STATE_KEY, None)
+
+
+def publish_responses_replay_commitment(
+    request: Request,
+    *,
+    reason: str,
+    event_type: Optional[str] = None,
+) -> None:
+    """Set the monotonic replay-commit latch before any yield that could expose
+    committing data.
+
+    The first reason and event record the boundary that ended replay
+    eligibility. Callers must set it *before* an ``await`` or ``yield`` that
+    hands committed output to the client.
+    """
+
+    if reason not in _RESPONSES_REPLAY_COMMITMENT_REASONS:
+        raise ValueError(
+            f"Unknown precommit replay-commitment reason: {reason!r}"
+        )
+    state = _request_state(request)
+    if state is None:
+        return
+    commitment = getattr(state, _WIRE_COMMITMENT_STATE_KEY, None)
+    if not isinstance(commitment, dict):
+        commitment = {}
+        setattr(state, _WIRE_COMMITMENT_STATE_KEY, commitment)
+
+    existing_reason = commitment.get(_RESPONSES_REPLAY_LATCH_REASON_KEY)
+    if existing_reason is not None:
+        return
+
+    commitment["precommit_replay_committed"] = True
+    commitment[_RESPONSES_REPLAY_LATCH_REASON_KEY] = reason
+    commitment[_RESPONSES_REPLAY_PUBLISHED_LATCH_REASON_KEY] = reason
+    commitment[_RESPONSES_REPLAY_LATCH_EVENT_KEY] = (
+        _responses_replay_event_label(event_type, reason=reason)
+    )
+
+
+def get_responses_replay_commitment_reason(
+    request: Request,
+) -> Optional[str]:
+    """Return the replay-commit reason without asserting replay prohibition."""
+
+    state = _request_state(request)
+    commitment = (
+        getattr(state, _WIRE_COMMITMENT_STATE_KEY, None)
+        if state is not None
+        else None
+    )
+    if not isinstance(commitment, Mapping):
+        return None
+    reason = commitment.get(_RESPONSES_REPLAY_LATCH_REASON_KEY)
+    return reason if isinstance(reason, str) else None
+
+
+_PROVIDER_EXECUTABLE_TOOL_TYPES = frozenset({
+    "mcp",
+    "web_search",
+    "web_search_preview",
+    "code_interpreter",
+    "computer",
+    "image_generation",
+    "file_search",
+})
+
+
+def responses_effective_provider_tools_allowed(
+    provider_bound_body: Optional[Mapping[str, Any]],
+) -> bool:
+    """Return whether a body is unsafe to replay because tool capability is unknown."""
+    if not isinstance(provider_bound_body, Mapping):
+        return True
+    if "tools" not in provider_bound_body:
+        return False
+    tools = provider_bound_body.get("tools")
+    if not isinstance(tools, list):
+        return True
+    for tool in tools:
+        if not isinstance(tool, Mapping):
+            return True
+        tool_type = tool.get("type")
+        if not isinstance(tool_type, str):
+            return True
+        if tool_type in _PROVIDER_EXECUTABLE_TOOL_TYPES:
+            return True
+        if tool_type == "function":
+            if not isinstance(tool.get("name"), str) or not tool.get("name"):
+                return True
+            if "description" in tool and not isinstance(
+                tool.get("description"), str
+            ):
+                return True
+            if "parameters" in tool and not isinstance(
+                tool.get("parameters"), Mapping
+            ):
+                return True
+            if "strict" in tool and not isinstance(tool.get("strict"), bool):
+                return True
+            if not set(tool).issubset(
+                {"type", "name", "description", "parameters", "strict"}
+            ):
+                return True
+            continue
+        if tool_type == "custom":
+            if not isinstance(tool.get("name"), str) or not tool.get("name"):
+                return True
+            if "description" in tool and not isinstance(
+                tool.get("description"), str
+            ):
+                return True
+            if "format" in tool and not isinstance(tool.get("format"), Mapping):
+                return True
+            if not set(tool).issubset(
+                {"type", "name", "description", "format"}
+            ):
+                return True
+            continue
+        # Any capability not explicitly known to be client-executed commits
+        # before dispatch; this includes provider-executable and future tools.
+        return True
+    return False
 
 
 __all__ = [

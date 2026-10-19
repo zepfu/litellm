@@ -272,6 +272,7 @@ from .aawm_adapter_runtime.openai_responses_events import (
 )
 from .streaming_handler import (
     RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS,
+    RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS,
     PassThroughStreamingHandler,
     ResponsesStreamPreCommitFailure,
     _RESPONSES_ORDINARY_RETRY_CLASSES,
@@ -305,10 +306,13 @@ from .aawm_adapter_runtime.provider_call_ledger import (
     get_or_create_openai_provider_call_ledger,
     get_request_provider_call_ledger,
     get_request_provider_call_ledger_snapshot,
+    get_responses_replay_commitment_reason,
     publish_reservation_metadata,
+    publish_responses_replay_commitment,
     publish_wire_commitment_snapshot,
     record_transport_connection_attempt,
     register_active_upstream_response,
+    responses_effective_provider_tools_allowed,
     clear_active_upstream_response,
 )
 from .aawm_alias_routing.durable import get_aawm_alias_routing_state_namespace
@@ -3449,6 +3453,8 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
     ] = None,
 ) -> Any:
     if caller_managed_hidden_retry:
+        # The alias loop owns retries here and must preserve this operation's
+        # failure while checking the request-scoped wire commitment.
         if openai_capacity_coordinator is not None:
             return await _await_passthrough_pre_first_byte_operation(
                 operation,
@@ -3766,13 +3772,36 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                 and not getattr(exc, "aawm_call_ledger_exhausted", False)
                 and not getattr(exc, "aawm_openai_wire_replay_blocked", False)
             )
+            # A commitment vetoes every resend class, including raw status
+            # failures and the ordinary retry path without a capacity owner.
+            # Keep the current attempt's exception as the terminal failure.
+            if (
+                request is not None
+                and get_responses_replay_commitment_reason(request) is not None
+            ):
+                if openai_capacity_coordinator is not None:
+                    openai_capacity_coordinator.record_terminal(
+                        "wire_replay_committed",
+                        error_class=failure_class,
+                        status_code=status_code,
+                    )
+                capacity_failure = False
+                ordinary_stream_retry = False
+                should_retry = False
             if (
                 openai_capacity_coordinator is not None
                 and capacity_failure
             ):
                 last_capacity_exception = exc
                 remaining_seconds = openai_capacity_coordinator.remaining_seconds
-                if remaining_seconds <= 0.0:
+                try:
+                    remaining_seconds_value = float(remaining_seconds)
+                except (TypeError, ValueError):
+                    remaining_seconds_value = None
+                if (
+                    remaining_seconds_value is not None
+                    and remaining_seconds_value <= 0.0
+                ):
                     terminal_exception = (
                         _mark_passthrough_capacity_exception_terminal(exc)
                     )
@@ -3815,10 +3844,15 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         elapsed_seconds=openai_capacity_coordinator.elapsed_seconds,
                     )
                     raise terminal_exception
-                wait_seconds = min(
-                    openai_capacity_coordinator.next_wait_seconds(),
-                    remaining_seconds,
-                )
+                next_wait_seconds = openai_capacity_coordinator.next_wait_seconds()
+                try:
+                    next_wait_seconds = float(next_wait_seconds)
+                except (TypeError, ValueError):
+                    next_wait_seconds = RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS
+                if remaining_seconds_value is not None:
+                    wait_seconds = min(next_wait_seconds, remaining_seconds_value)
+                else:
+                    wait_seconds = next_wait_seconds
                 should_retry = True
             elif (
                 openai_capacity_coordinator is not None
@@ -7503,6 +7537,11 @@ async def _finalize_native_openai_responses_owner_wire_disposition(  # noqa: PLR
         state = getattr(request, "state", None)
         if state is not None:
             try:
+                existing_commitment = getattr(
+                    state,
+                    "_aawm_openai_responses_wire_commitment",
+                    None,
+                )
                 commitment = {
                     "commitment": "done",
                     "disposition": disposition.value,
@@ -7510,6 +7549,14 @@ async def _finalize_native_openai_responses_owner_wire_disposition(  # noqa: PLR
                     "done_wire_committed": True,
                     "finalized": False,
                 }
+                if isinstance(existing_commitment, dict):
+                    for key in (
+                        "precommit_replay_committed",
+                        "precommit_commitment_reason",
+                        "precommit_commitment_event_type",
+                    ):
+                        if key in existing_commitment:
+                            commitment[key] = existing_commitment[key]
                 setattr(
                     state,
                     "_aawm_openai_responses_wire_commitment",
@@ -9677,6 +9724,25 @@ async def pass_through_request(  # noqa: PLR0915
                         )
                     if validate_prepared_request_fn is not None:
                         validate_prepared_request_fn(prepared_request)
+                    if is_native_openai_responses_route:
+                        try:
+                            prepared_body = prepared_request.content
+                            if not isinstance(prepared_body, (bytes, str)):
+                                prepared_body = None
+                            effective_body = (
+                                json.loads(prepared_body)
+                                if prepared_body is not None
+                                else None
+                            )
+                        except Exception:
+                            effective_body = None
+                        if responses_effective_provider_tools_allowed(
+                            effective_body
+                        ):
+                            publish_responses_replay_commitment(
+                                request,
+                                reason="provider_execution_possible",
+                            )
                     if managed_xai_oauth_request:
                         record_managed_xai_actual_send(
                             request,
@@ -9983,6 +10049,8 @@ async def pass_through_request(  # noqa: PLR0915
                                 and response.status_code == status.HTTP_200_OK
                             ),
                             event_pipeline=responses_event_pipeline,
+                            request=request,
+                            provider_bound_body=provider_bound_body,
                         )
                         if pre_commit_failure is not None:
                             retired_response = raw_response
@@ -10489,6 +10557,8 @@ async def pass_through_request(  # noqa: PLR0915
                             response,
                             openai_alpha_capacity_retry_enabled=True,
                             event_pipeline=responses_event_pipeline,
+                            request=request,
+                            provider_bound_body=provider_bound_body,
                         )
                         if pre_commit_failure is not None:
                             retired_response = raw_response
