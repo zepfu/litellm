@@ -211,6 +211,32 @@ def bounded_identity_key(value: Any, *, limit: int = 1024) -> Optional[str]:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
+_CHARGED_FIELD_SENTINEL = "\0charged\0"
+
+
+def _charged_size(value: str) -> int:
+    """Return the JSON-escaped UTF-8 byte size of a streamed field fragment."""
+    if not value:
+        return 0
+    return len(json.dumps(value, ensure_ascii=False).encode("utf-8")) - 2
+
+
+def _output_text_value(payload: dict[str, Any]) -> str:
+    """Return the existing output-text snapshot on a retained payload."""
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return ""
+    current = next(
+        (
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "output_text"
+        ),
+        "",
+    )
+    return current if isinstance(current, str) else ""
+
+
 def _line_ending_from_bytes(line: bytes) -> tuple[bytes, bytes]:
     if line.endswith(b"\r\n"):
         return line[:-2], b"\r\n"
@@ -553,6 +579,13 @@ class _ResponsesDeltaField:
 
     parts: Deque[str]
     byte_count: int
+
+    @property
+    def value(self) -> str:
+        """Return accumulated text, excluding an already-committed marker."""
+        return "".join(
+            part for part in self.parts if part is not _CHARGED_FIELD_SENTINEL
+        )
 
 
 class _ResponsesEventInspectionComplete(Exception):
@@ -1299,6 +1332,7 @@ class ResponsesEventSummaryReducer:
         self._delta_key_order: Deque[str] = deque()
         self._delta_key_payloads: dict[str, dict[str, Any]] = {}
         self._delta_key_base_sizes: dict[str, int] = {}
+        self._delta_keys_with_charged_base: set[str] = set()
         self._delta_key_payload_sizes: dict[str, int] = {}
         self._delta_key_fields: dict[str, dict[str, _ResponsesDeltaField]] = {}
         self._stream_text_parts: list[str] = []
@@ -1415,14 +1449,19 @@ class ResponsesEventSummaryReducer:
             payload.setdefault("id", key)
             payload.setdefault("type", default_type)
             self._delta_key_payloads[key] = payload
-            self._delta_key_base_sizes[key] = _json_size(base) or 0
-            self._delta_key_payload_sizes[key] = _json_size(payload) or 0
+            base_size = self._delta_key_base_sizes.get(key, 0)
+            if key in self._output_items:
+                base_size = _json_size(self._output_items[key]) or 0
+                self._delta_keys_with_charged_base.add(key)
+            self._delta_key_base_sizes[key] = base_size
+            self._delta_key_payload_sizes[key] = base_size
         return payload, self._delta_key_payload_sizes[key]
 
     def _forget_delta_key(self, key: str) -> None:
         self._delta_key_payloads.pop(key, None)
         self._delta_key_base_sizes.pop(key, None)
         self._delta_key_payload_sizes.pop(key, None)
+        self._delta_keys_with_charged_base.discard(key)
         self._delta_key_fields.pop(key, None)
 
     @staticmethod
@@ -1464,8 +1503,8 @@ class ResponsesEventSummaryReducer:
         current = target.get(field, "")
         current = current if isinstance(current, str) else ""
         return target, _ResponsesDeltaField(
-            parts=deque((current,) if current else ()),
-            byte_count=len(current.encode("utf-8")),
+            parts=deque((_CHARGED_FIELD_SENTINEL,) if current else ()),
+            byte_count=_charged_size(current),
         )
 
     def _materialize_delta_payload(self, key: str) -> Optional[dict[str, Any]]:
@@ -1480,7 +1519,7 @@ class ResponsesEventSummaryReducer:
                 if not isinstance(materialized.get(field), str):
                     materialized[field] = ""
                 target = materialized
-            target[field] = "".join(state.parts)
+            target[field] = state.value
         return materialized
 
     def _merge_item_into_active_delta(
@@ -1491,7 +1530,7 @@ class ResponsesEventSummaryReducer:
         payload = self._materialize_delta_payload(key)
         if payload is None:
             return False
-        previous_size = _json_size(payload) or 0
+        previous_size = self._delta_key_base_sizes.get(key, _json_size(payload) or 0)
         candidate = {**payload, **copy.deepcopy(item)}
         candidate_size = _json_size(candidate)
         if not self._charge_delta(previous_size, candidate_size):
@@ -1513,8 +1552,11 @@ class ResponsesEventSummaryReducer:
             current = current if isinstance(current, str) else ""
             state.parts.clear()
             if current:
-                state.parts.append(current)
-            state.byte_count = len(current.encode("utf-8"))
+                # This replacement came from an item event and is charged
+                # through the item's JSON size.  Keep a marker so materializing
+                # another field does not replace this field with an empty value.
+                state.parts.append(_CHARGED_FIELD_SENTINEL)
+            state.byte_count = _charged_size(current)
         return True
 
     def _record_event_type(self, event_type: Optional[str]) -> None:
@@ -1610,9 +1652,6 @@ class ResponsesEventSummaryReducer:
     def _charge_new_output_item(self, candidate: dict[str, Any]) -> bool:
         return self._charge_delta(0, _json_size(candidate))
 
-    def _charge_new_output_item_size(self, new_size: Optional[int]) -> bool:
-        return self._charge_delta(0, new_size)
-
     def _commit_delta_item(
         self,
         key: str,
@@ -1625,6 +1664,7 @@ class ResponsesEventSummaryReducer:
         self._output_items[key] = payload
         self._delta_key_base_sizes[key] = new_size
         self._delta_key_payload_sizes[key] = new_size
+        self._delta_keys_with_charged_base.add(key)
 
     def _merge_item(self, payload: dict[str, Any]) -> None:
         item = payload.get("item")
@@ -1652,7 +1692,7 @@ class ResponsesEventSummaryReducer:
             if slot is None:
                 return
             target, created = slot
-            previous_size = _json_size(target) or 0
+            previous_size = 0 if created else (_json_size(target) or 0)
             candidate = {**copy.deepcopy(target), **copy.deepcopy(item)}
             if not self._charge_delta(previous_size, _json_size(candidate)):
                 return
@@ -1684,19 +1724,28 @@ class ResponsesEventSummaryReducer:
                 field="text",
                 create_target=self._output_text_target,
             )
-            payload_size = _json_size(payload) or 0
+            current = _output_text_value(payload)
+            payload_size = self._delta_key_base_sizes.get(
+                key,
+                _json_size(payload) or 0,
+            )
+            if key not in self._delta_keys_with_charged_base:
+                payload_size = max(
+                    0,
+                    payload_size - _charged_size(current),
+                )
         assert state is not None
         first_delta = key not in self._output_items and key not in self._delta_keys_seen
         old_bytes = state.byte_count
         encoded = value.encode("utf-8")
-        next_bytes = len(encoded) if done else old_bytes + len(encoded)
+        next_bytes = _charged_size(value)
         new_size = payload_size - old_bytes + next_bytes
-        if first_delta:
-            if not self._charge_new_output_item_size(new_size):
-                if created_payload:
-                    self._forget_delta_key(key)
-                return
-        elif not self._charge_delta(payload_size, new_size):
+        admitted = (
+            self._charge_delta(0, new_size)
+            if first_delta
+            else self._charge_delta(payload_size, new_size)
+        )
+        if not admitted:
             if created_payload:
                 self._forget_delta_key(key)
             return
@@ -1704,9 +1753,9 @@ class ResponsesEventSummaryReducer:
             self._delta_key_fields.setdefault(key, {})["text"] = state
         materialized_text: Optional[str] = None
         if done:
-            materialized_text = (
-                "".join(state.parts) + value if state.parts else value
-            )
+            # A terminal event is the final snapshot for its field, including
+            # when the item was prepopulated and had no preceding fragments.
+            materialized_text = value
             state.parts.clear()
         else:
             state.parts.append(value)
@@ -1761,19 +1810,28 @@ class ResponsesEventSummaryReducer:
                 delta_payload,
                 field="arguments",
             )
-            payload_size = _json_size(delta_payload) or 0
+            current = delta_payload.get("arguments", "")
+            current = current if isinstance(current, str) else ""
+            payload_size = self._delta_key_base_sizes.get(
+                key,
+                _json_size(delta_payload) or 0,
+            )
+            if key not in self._delta_keys_with_charged_base:
+                payload_size = max(
+                    0,
+                    payload_size - _charged_size(current),
+                )
         assert state is not None
         first_delta = key not in self._output_items and key not in self._delta_keys_seen
         old_bytes = state.byte_count
-        encoded = value.encode("utf-8")
-        next_bytes = len(encoded) if done else old_bytes + len(encoded)
+        next_bytes = _charged_size(value)
         new_size = payload_size - old_bytes + next_bytes
-        if first_delta:
-            if not self._charge_new_output_item_size(new_size):
-                if created_payload:
-                    self._forget_delta_key(key)
-                return
-        elif not self._charge_delta(payload_size, new_size):
+        admitted = (
+            self._charge_delta(0, new_size)
+            if first_delta
+            else self._charge_delta(payload_size, new_size)
+        )
+        if not admitted:
             if created_payload:
                 self._forget_delta_key(key)
             return
@@ -1781,9 +1839,9 @@ class ResponsesEventSummaryReducer:
             self._delta_key_fields.setdefault(key, {})["arguments"] = state
         materialized_arguments: Optional[str] = None
         if done:
-            materialized_arguments = (
-                "".join(state.parts) + value if state.parts else value
-            )
+            # A terminal event is the final snapshot for its field, including
+            # when the item was prepopulated and had no preceding fragments.
+            materialized_arguments = value
             state.parts.clear()
         else:
             state.parts.append(value)
