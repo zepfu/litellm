@@ -718,7 +718,7 @@ async def _restore_responses_function_names_in_sse_chunks(
                 else emission.effective_payload,
                 rewrite,
             )
-            if restored_payload is emission.effective_payload:
+            if restored_payload == emission.effective_payload:
                 restored_emissions.append(emission)
                 continue
             restored_emissions.append(emission.transformed(restored_payload))
@@ -9986,6 +9986,7 @@ async def pass_through_request(  # noqa: PLR0915
                         )
                         if pre_commit_failure is not None:
                             retired_response = raw_response
+                            await response.aclose()
                             response_retired = (
                                 await _retire_openai_precommit_response(raw_response)
                             )
@@ -10491,6 +10492,7 @@ async def pass_through_request(  # noqa: PLR0915
                         )
                         if pre_commit_failure is not None:
                             retired_response = raw_response
+                            await response.aclose()
                             response_retired = (
                                 await _retire_openai_precommit_response(raw_response)
                             )
@@ -10501,6 +10503,11 @@ async def pass_through_request(  # noqa: PLR0915
                                     retired_response,
                                 )
                             raise pre_commit_failure
+                    if (
+                        is_native_openai_responses_route
+                        and responses_event_pipeline is not None
+                    ):
+                        responses_event_pipeline.drain_held_events()
                     ensure_precommit_send_active()
                     return response
 
@@ -10555,6 +10562,7 @@ async def pass_through_request(  # noqa: PLR0915
                     )
                     if pre_commit_failure is not None:
                         retired_response = raw_response
+                        await response.aclose()
                         response_retired = (
                             await _retire_openai_precommit_response(raw_response)
                         )
