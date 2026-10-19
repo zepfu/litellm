@@ -9491,13 +9491,17 @@ def _bind_responses_stream_timeout_terminalizer(
                 chunks.append("data: [DONE]\n\n")
             return chunks
 
-        return PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
-            endpoint_type=EndpointType.OPENAI,
-            url_route="https://api.openai.com/v1/responses",
-            custom_llm_provider=provider,
-            failure_context=failure_context,
-            exc=exc,
+        terminal_chunks, _terminal_payload = (
+            PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
+                endpoint_type=EndpointType.OPENAI,
+                url_route="https://api.openai.com/v1/responses",
+                custom_llm_provider=provider,
+                failure_context=failure_context,
+                exc=exc,
+            )
         )
+
+        return terminal_chunks
 
     return _aawm_alias_streaming._bind_stream_timeout_terminalizer(
         response,

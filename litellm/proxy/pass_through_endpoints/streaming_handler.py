@@ -2741,7 +2741,7 @@ class PassThroughStreamingHandler:
                         held_responses_done_suffix = b""
                         responses_sse_event_buffer = b""
                         responses_terminal_seen = True
-                        terminal_chunks = (
+                        terminal_chunks, terminal_payload = (
                             PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
                                 endpoint_type=endpoint_type,
                                 url_route=url_route,
@@ -2807,7 +2807,7 @@ class PassThroughStreamingHandler:
                                 and downstream_chunk_count == 1
                             )
                             yield complete_chunk
-                        terminal_chunks = (
+                        terminal_chunks, _terminal_payload = (
                             PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
                                 endpoint_type=endpoint_type,
                                 url_route=url_route,
@@ -3212,7 +3212,7 @@ class PassThroughStreamingHandler:
                 metadata["aawm_stream_interrupted"] = True
                 metadata["aawm_stream_incomplete"] = True
                 metadata["aawm_route_rollup_turn_suppressed"] = True
-                terminal_chunks = (
+                terminal_chunks, _terminal_payload = (
                     PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
                         endpoint_type=endpoint_type,
                         url_route=url_route,
