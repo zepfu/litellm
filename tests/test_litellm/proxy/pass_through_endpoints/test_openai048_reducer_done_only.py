@@ -22,6 +22,17 @@ def _function_call_item(arguments: str) -> dict[str, Any]:
     return {"type": "function_call", "id": "fc_1", "name": "lookup", "arguments": arguments}
 
 
+def _delta_event(field: str, value: str) -> dict[str, Any]:
+    if field == "text":
+        return {"type": "response.output_text.delta", "item_id": "msg_1", "output_index": 0, "delta": value}
+    return {
+        "type": "response.function_call_arguments.delta",
+        "item_id": "fc_1",
+        "output_index": 0,
+        "delta": value,
+    }
+
+
 def _snapshot_output(summary: dict[str, Any]) -> dict[str, Any]:
     assert len(summary["output"]) == 1
     return summary["output"][0]
@@ -70,6 +81,46 @@ def test_output_budget_rejects_new_item_exceeding_remaining_space() -> None:
     assert snapshot["output_bytes"] == len(retained_json)
     assert snapshot["overflow"] is True
     assert snapshot["omitted_output_bytes"] > 0
+
+
+@pytest.mark.parametrize("field", ["text", "arguments"])
+@pytest.mark.parametrize("preadd_item", [True, False])
+def test_first_delta_charges_materialized_field_structure(field: str, preadd_item: bool) -> None:
+    escaped_value = 'a\\"b'
+    if field == "text":
+        base_item = {"type": "message", "id": "msg_1", "content": []}
+        complete_item = dict(base_item, content=[{"type": "output_text", "text": escaped_value}])
+    else:
+        base_item = {"type": "function_call", "id": "fc_1"}
+        complete_item = dict(base_item, arguments=escaped_value)
+
+    accepted = ResponsesEventSummaryReducer(max_output_bytes=4096)
+    if preadd_item:
+        accepted.consume(_item_added(base_item))
+    accepted.consume(_delta_event(field, escaped_value))
+
+    accepted_snapshot = accepted.snapshot()
+    accepted_output = _snapshot_output(accepted_snapshot)
+    assert accepted_output == complete_item
+    accepted_bytes = len(_compact_json(accepted_output))
+    assert accepted_snapshot["output_bytes"] == len(_compact_json(accepted_output))
+    assert accepted_snapshot["overflow"] is False
+
+    rejected = ResponsesEventSummaryReducer(max_output_bytes=accepted_bytes - 1)
+    if preadd_item:
+        rejected.consume(_item_added(base_item))
+        admitted_base_bytes = len(_compact_json(base_item))
+    rejected.consume(_delta_event(field, escaped_value))
+
+    rejected_snapshot = rejected.snapshot()
+    if preadd_item:
+        assert rejected_snapshot["output"] == [base_item]
+        assert rejected_snapshot["output_bytes"] == admitted_base_bytes
+    else:
+        assert rejected_snapshot["output"] == []
+        assert rejected_snapshot["output_bytes"] == 0
+    assert rejected_snapshot["overflow"] is True
+    assert rejected_snapshot["omitted_output_bytes"] == 1
 
 
 @pytest.mark.parametrize("field", ["text", "arguments"])

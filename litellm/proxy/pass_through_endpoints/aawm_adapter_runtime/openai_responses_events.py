@@ -1483,7 +1483,7 @@ class ResponsesEventSummaryReducer:
         *,
         field: str,
         create_target: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
-    ) -> tuple[dict[str, Any], _ResponsesDeltaField]:
+    ) -> tuple[dict[str, Any], _ResponsesDeltaField, dict[str, Any]]:
         template = copy.deepcopy(payload)
         if create_target is not None:
             target = create_target(template)
@@ -1493,10 +1493,14 @@ class ResponsesEventSummaryReducer:
             target = template
         current = target.get(field, "")
         current = current if isinstance(current, str) else ""
-        return target, _ResponsesDeltaField(
-            parts=deque(),
-            base_value=current,
-            byte_count=_charged_size(current),
+        return (
+            target,
+            _ResponsesDeltaField(
+                parts=deque(),
+                base_value=current,
+                byte_count=_charged_size(current),
+            ),
+            template,
         )
 
     def _materialize_delta_payload(self, key: str) -> Optional[dict[str, Any]]:
@@ -1708,15 +1712,16 @@ class ResponsesEventSummaryReducer:
         fields = self._delta_key_fields.get(key)
         state = fields.get("text") if fields is not None else None
         created_field = state is None
+        previous_payload_size = payload_size
         if created_field:
-            _output_text, state = self._delta_field(
+            target, state, materialized = self._delta_field(
                 payload,
                 field="text",
                 create_target=self._output_text_target,
             )
-            payload_size = self._delta_key_base_sizes.get(
-                key,
-                _json_size(payload) or 0,
+            payload_size = max(
+                payload_size,
+                _json_size(materialized) or 0,
             )
         assert state is not None
         first_delta = key not in self._output_items and key not in self._delta_keys_seen
@@ -1729,12 +1734,17 @@ class ResponsesEventSummaryReducer:
         admitted = (
             self._charge_delta(0, new_size)
             if first_delta
-            else self._charge_delta(payload_size, new_size)
+            else self._charge_delta(
+                previous_payload_size if created_field else payload_size,
+                new_size,
+            )
         )
         if not admitted:
             if created_payload:
                 self._forget_delta_key(key)
             return
+        self._delta_key_base_sizes[key] = new_size
+        self._delta_key_payload_sizes[key] = new_size
         if created_field:
             self._delta_key_fields.setdefault(key, {})["text"] = state
         materialized_text: Optional[str] = None
@@ -1791,14 +1801,15 @@ class ResponsesEventSummaryReducer:
         fields = self._delta_key_fields.get(key)
         state = fields.get("arguments") if fields is not None else None
         created_field = state is None
+        previous_payload_size = payload_size
         if created_field:
-            _arguments_target, state = self._delta_field(
+            target, state, materialized = self._delta_field(
                 delta_payload,
                 field="arguments",
             )
-            payload_size = self._delta_key_base_sizes.get(
-                key,
-                _json_size(delta_payload) or 0,
+            payload_size = max(
+                payload_size,
+                _json_size(materialized) or 0,
             )
         assert state is not None
         first_delta = key not in self._output_items and key not in self._delta_keys_seen
@@ -1810,12 +1821,17 @@ class ResponsesEventSummaryReducer:
         admitted = (
             self._charge_delta(0, new_size)
             if first_delta
-            else self._charge_delta(payload_size, new_size)
+            else self._charge_delta(
+                previous_payload_size if created_field else payload_size,
+                new_size,
+            )
         )
         if not admitted:
             if created_payload:
                 self._forget_delta_key(key)
             return
+        self._delta_key_base_sizes[key] = new_size
+        self._delta_key_payload_sizes[key] = new_size
         if created_field:
             self._delta_key_fields.setdefault(key, {})["arguments"] = state
         materialized_arguments: Optional[str] = None
