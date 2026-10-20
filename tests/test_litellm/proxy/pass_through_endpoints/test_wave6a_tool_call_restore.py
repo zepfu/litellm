@@ -1279,17 +1279,21 @@ class TestCustomStreamingResponse:
     ) -> None:
         from fastapi.responses import StreamingResponse
 
-        chunk, event = _typed_sse_chunk(
-            {"type": "response.output_text.delta", "delta": "unchanged"}
-        )
+        frames = [
+            _typed_sse_chunk({"type": "response.output_text.delta", "delta": delta})
+            for delta in ("unchanged", "adjacent")
+        ]
         from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
             responses_emissions_from_chunk,
         )
 
-        original_emission = responses_emissions_from_chunk(chunk)[0]
+        original_emissions = [
+            responses_emissions_from_chunk(chunk)[0] for chunk, _ in frames
+        ]
 
         async def gen():
-            yield chunk
+            for chunk, _ in frames:
+                yield chunk
 
         response = StreamingResponse(gen(), media_type="text/event-stream")
         if restoration == "custom":
@@ -1305,12 +1309,19 @@ class TestCustomStreamingResponse:
             raise AssertionError("associated event was reparsed")
 
         monkeypatch.setattr(mod.json, "loads", unexpected_json_decode)
-        chunks = asyncio.run(_collect_response_chunks(result))
+        chunks = []
 
-        assert len(chunks) == 1
-        assert sse_mod._sse_block_wire_bytes(chunks[0]) == chunk
-        assert sse_mod._sse_block_events(chunks[0]) == [event]
-        assert responses_emissions_from_chunk(chunks[0])[0] is original_emission
+        async def send(message: dict[str, Any]) -> None:
+            if message["type"] == "http.response.body" and message.get("body"):
+                chunks.append(message["body"])
+
+        asyncio.run(result.stream_response(send))
+
+        assert b"".join(chunks) == b"".join(chunk for chunk, _ in frames)
+        assert len(chunks) == len(frames)
+        for actual, (_, event), emission in zip(chunks, frames, original_emissions):
+            assert sse_mod._sse_block_events(actual) == [event]
+            assert responses_emissions_from_chunk(actual)[0] is emission
 
     def test_end_to_end_stream_restore(self, host_deps: None) -> None:
         """Full SSE stream with added/delta/done produces restored output."""

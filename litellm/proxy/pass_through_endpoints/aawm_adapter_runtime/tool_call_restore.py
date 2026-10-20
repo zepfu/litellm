@@ -910,6 +910,10 @@ async def _restore_adapted_custom_tool_stream_iterator(
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
         sse as sse_runtime,
     )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+        attach_responses_events,
+        responses_emissions_from_chunk,
+    )
 
     state_by_key: dict[str, dict[str, Any]] = {}
     async for event_block, has_trailing_separator in sse_runtime._iter_sse_event_blocks_with_separator(
@@ -936,7 +940,11 @@ async def _restore_adapted_custom_tool_stream_iterator(
             )
         if restored_block is not None:
             if sse_runtime._sse_block_events(restored_block) is not None:
-                yield restored_block
+                yield attach_responses_events(
+                    sse_runtime._sse_block_wire_bytes(restored_block),
+                    emissions=responses_emissions_from_chunk(restored_block) or (),
+                    replace=True,
+                )
             elif has_trailing_separator:
                 yield f"{restored_block}\n\n"
             else:
@@ -1116,6 +1124,10 @@ def _restore_adapted_namespace_tool_calls_in_streaming_response(
         from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
             sse as sse_runtime,
         )
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+            attach_responses_events,
+            responses_emissions_from_chunk,
+        )
 
         async for event_block, has_trailing_separator in sse_runtime._iter_sse_event_blocks_with_separator(original_iterator):
             if sse_runtime._sse_block_events(event_block) is not None:
@@ -1136,7 +1148,11 @@ def _restore_adapted_namespace_tool_calls_in_streaming_response(
             if restored_block is None:
                 continue
             if sse_runtime._sse_block_events(restored_block) is not None:
-                yield restored_block
+                yield attach_responses_events(
+                    sse_runtime._sse_block_wire_bytes(restored_block),
+                    emissions=responses_emissions_from_chunk(restored_block) or (),
+                    replace=True,
+                )
             elif has_trailing_separator:
                 yield f"{restored_block}\n\n"
             else:
