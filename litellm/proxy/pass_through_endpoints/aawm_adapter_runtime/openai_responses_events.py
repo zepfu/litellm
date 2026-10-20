@@ -906,7 +906,8 @@ class ResponsesEventPipeline:
             text = raw_event.decode("utf-8", errors="replace")
             is_malformed = True
 
-        for raw_line in text.splitlines(keepends=False):
+        lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        for raw_line in lines:
             line = raw_line.strip()
             if not line or line.startswith(":"):
                 continue
