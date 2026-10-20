@@ -567,6 +567,15 @@ intentionally ignore assistant history and tool-output items such as
 reasoning blocks, because those can contain stale worktree paths or fixture
 strings from earlier turns.
 
+Ohmypi Responses rollups and alias audit context share the same payload
+workspace extractor. Current instructions and user workspace context take
+precedence over static Ohmypi provider repository headers and stale assistant
+or tool-output paths. This includes `AGENTS.md instructions for`, `<cwd>`,
+`environment_context`, `repoRoot`, and `working_directory`. Without a conflicting
+current workspace, explicit repository headers remain usable; non-Ohmypi header
+precedence is unchanged. The HV2 synthetic `omp-alpha-workspace` repository
+retains its explicit `litellm` overlay label.
+
 Rows where repository was inferred from untrusted text may keep a diagnostic
 repository label, but file-like or cited-artifact candidates can remain
 `repository=NULL` rather than being promoted to a misleading workspace. These

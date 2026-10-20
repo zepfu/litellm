@@ -32,6 +32,9 @@ from litellm.integrations.aawm_review_decisions import (
     AawmReviewDecision,
     parse_aawm_review_decision,
 )
+from litellm.proxy.pass_through_endpoints.aawm_request_policy.observability_metadata import (
+    _extract_passthrough_repository,
+)
 
 _AAWM_ROUTE_ACCESS_LOG_SCOPE_KEY = "aawm_route_access_log_emitted"
 _AAWM_ROUTE_ACCESS_LOG_REPLACEMENT_SCOPE_KEY = (
@@ -3804,6 +3807,8 @@ def build_aawm_route_rollup_context(
         _AAWM_ROUTE_LOG_REPOSITORY_TENANT_HEADER_KEYS,
         normalizer=_normalize_aawm_route_log_tenant_repository_label,
     )
+    if client_product_label and client_product_label.split("/", 1)[0] == "Ohmypi":
+        repository = _extract_passthrough_repository(request, request_body) or repository
     _prepare_aawm_route_rollup_memory_workload(
         kwargs=kwargs,
         metadata=metadata,
