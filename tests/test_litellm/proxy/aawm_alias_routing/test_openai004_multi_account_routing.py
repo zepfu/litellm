@@ -4867,6 +4867,7 @@ async def test_priority_stability_ignores_stale_balancing_cadence(
 @pytest.mark.asyncio
 async def test_openai_proxy_route_direct_uses_inventory_without_diagnostic_read(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
         config_startup,
@@ -4882,6 +4883,20 @@ async def test_openai_proxy_route_direct_uses_inventory_without_diagnostic_read(
     request = _direct_request()
     body = {"model": "gpt-5.6-sol", "input": "hello"}
     startup_inventory_reads: list[None] = []
+    config_dir = tmp_path / "alias_config"
+    config_dir.mkdir()
+    (config_dir / "unrelated.yaml").write_text(
+        """
+aliases:
+  - name: unrelated-alias
+    candidates:
+      - provider: openai
+        model: gpt-5.3-codex
+        route_family: codex_responses
+        priority: 10
+""",
+        encoding="utf-8",
+    )
 
     def _read_startup_inventory():
         startup_inventory_reads.append(None)
@@ -4924,13 +4939,28 @@ async def test_openai_proxy_route_direct_uses_inventory_without_diagnostic_read(
         ),
     )
 
-    with _patch_dual(redis):
-        response = await lpe.openai_proxy_route(
-            endpoint="v1/responses",
-            request=request,
-            fastapi_response=Response(),
-            user_api_key_dict=object(),  # type: ignore[arg-type]
-        )
+    previous_snapshot = snapshot_select.get_active_routing_snapshot()
+    monkeypatch.setattr(
+        config_startup,
+        "_startup_state",
+        replace(config_startup._startup_state),
+    )
+    try:
+        config_startup.activate_alias_config_directory(config_dir)
+        assert config_startup.is_startup_healthy()
+        active_snapshot = snapshot_select.get_active_routing_snapshot()
+        assert active_snapshot is not None
+        assert set(active_snapshot.aliases) == {"unrelated-alias"}
+        assert body["model"] not in active_snapshot.aliases
+        with _patch_dual(redis):
+            response = await lpe.openai_proxy_route(
+                endpoint="v1/responses",
+                request=request,
+                fastapi_response=Response(),
+                user_api_key_dict=object(),  # type: ignore[arg-type]
+            )
+    finally:
+        snapshot_select.set_active_routing_snapshot(previous_snapshot)
     assert response.status_code == 200
     assert captured.get("api_key") is None
     assert captured.get("forward_headers") is False
