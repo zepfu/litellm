@@ -1684,7 +1684,10 @@ class ResponsesEventSummaryReducer:
             usage = response.get("usage") if isinstance(response, dict) else None
         if not isinstance(usage, dict):
             return
-        copied = self._bounded_copy(usage, self._USAGE_BYTES_LIMIT)
+        # Per-input attribution grows with request history. Preserve it in
+        # provider events and terminal snapshots; summarize token accounting here.
+        accounting_usage = {key: value for key, value in usage.items() if key != "attribution"}
+        copied = self._bounded_copy(accounting_usage, self._USAGE_BYTES_LIMIT)
         if isinstance(copied, dict):
             self._usage_payload = copied
 

@@ -72,6 +72,11 @@ older entries within its limits without terminating delivery. These retention
 budgets bound specific stream state, rather than the Python process's total
 memory.
 
+The accounting summary retains token counters and token-detail fields from
+provider usage. Per-input `usage.attribution` remains on the forwarded provider
+event and retained terminal response; it is excluded from the accounting
+summary so request-history attribution cannot exhaust its 16 KiB usage budget.
+
 Audit-only response policies process events incrementally. Watermark
 `buffer_response` deliberately waits for the response and rejects buffering
 above `general_settings.openai_passthrough_text_watermark.limits.max_sse_stream_bytes`

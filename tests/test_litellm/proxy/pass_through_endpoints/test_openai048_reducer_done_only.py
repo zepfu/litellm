@@ -7,6 +7,7 @@ import pytest
 
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
     ResponsesEventSummaryReducer,
+    create_responses_event_pipeline,
 )
 
 
@@ -81,6 +82,43 @@ def test_output_budget_rejects_new_item_exceeding_remaining_space() -> None:
     assert snapshot["output_bytes"] == len(retained_json)
     assert snapshot["overflow"] is True
     assert snapshot["omitted_output_bytes"] > 0
+
+
+def test_large_usage_attribution_preserves_completion_and_token_accounting() -> None:
+    usage = {
+        "input_tokens": 100_000,
+        "input_tokens_details": {"cached_tokens": 50_000, "cache_write_tokens": 0},
+        "output_tokens": 20,
+        "output_tokens_details": {"reasoning_tokens": 10},
+        "total_tokens": 100_020,
+    }
+    provider_usage = {
+        **usage,
+        "attribution": {
+            "items": {
+                f"item_{index}": {
+                    "input_tokens": 200,
+                    "cached_tokens": 100,
+                    "cache_write_tokens": 0,
+                    "output_tokens": 0,
+                }
+                for index in range(500)
+            },
+        },
+    }
+    response = {"id": "resp_usage", "status": "completed", "output": [], "usage": provider_usage}
+    wire = b"event: response.completed\ndata: " + _compact_json({"type": "response.completed", "response": response}) + b"\n\n"
+    pipeline = create_responses_event_pipeline()
+
+    events = pipeline.feed(wire)
+
+    assert len(events) == 1
+    assert events[0].emission().wire_bytes == wire
+    snapshot = pipeline.summary_snapshot()
+    assert snapshot["terminal_event_type"] == "response.completed"
+    assert snapshot["usage"] == usage
+    assert snapshot["terminal_response_payload"]["usage"] == provider_usage
+    assert snapshot["overflow"] is False
 
 
 @pytest.mark.parametrize("field", ["text", "arguments"])
