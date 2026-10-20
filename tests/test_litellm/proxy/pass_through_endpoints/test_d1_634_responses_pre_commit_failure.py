@@ -36,6 +36,7 @@ from litellm.proxy.pass_through_endpoints.streaming_handler import (
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
     ResponsesBoundFailure,
     ResponsesEventPipeline,
+    responses_emissions_from_chunk,
     responses_events_from_chunk,
 )
 from litellm.proxy.pass_through_endpoints.success_handler import (
@@ -1011,6 +1012,236 @@ async def test_peek_delivers_live_complete_cr_eof_with_shared_event():
     assert pipeline.finish() == []
     assert response.yielded_chunks == 3
     assert response.close_calls == 1
+    finalized.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_chunk_processor_delivers_unpeeked_cr_terminal_at_eof():
+    accepted = _sse(
+        "response.created",
+        {
+            "type": "response.created",
+            "response": {
+                "id": "resp_cr_unpeeked",
+                "status": "in_progress",
+                "model": "gpt-5.4",
+                "output": [],
+            },
+        },
+    )
+    substantive = _sse(
+        "response.output_text.delta",
+        {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "delta": "visible",
+        },
+    )
+    completed = (
+        b"event: response.completed\r\n"
+        b'data: {"type":"response.completed","response":{"id":"resp_cr_unpeeked"}}\r\r'
+    )
+    pipeline = ResponsesEventPipeline(retain_events=True)
+    response = _FakeUpstreamStream([accepted, substantive, completed])
+    logging_obj = MagicMock()
+    logging_obj.model_call_details = {}
+    finalized = AsyncMock()
+
+    with patch.object(
+        PassThroughStreamingHandler,
+        "_route_streaming_logging_to_handler",
+        new=finalized,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.emit_aawm_route_status_event"
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.record_aawm_route_rollup"
+    ):
+        emitted = [
+            chunk
+            async for chunk in PassThroughStreamingHandler.chunk_processor(
+                response=response,
+                request_body={"model": "gpt-5.4", "stream": True},
+                litellm_logging_obj=logging_obj,
+                endpoint_type=EndpointType.OPENAI,
+                start_time=datetime.now(),
+                passthrough_success_handler_obj=MagicMock(
+                    spec=PassThroughEndpointLogging
+                ),
+                url_route="https://chatgpt.com/backend-api/codex/responses",
+                custom_llm_provider="openai",
+                success_handler_kwargs=_route_kwargs(),
+                responses_event_pipeline=pipeline,
+            )
+        ]
+
+    rendered = b"".join(bytes(chunk) for chunk in emitted)
+    terminal_events = [
+        event
+        for chunk in emitted
+        for event in (responses_events_from_chunk(chunk) or [])
+        if event.event_type == "response.completed"
+    ]
+    assert len(terminal_events) == 1
+    assert terminal_events[0].separator == b"\r\r"
+    assert terminal_events[0].forward_event == completed
+    assert terminal_events[0].payload["response"]["id"] == "resp_cr_unpeeked"
+    terminal_emissions = [
+        emission
+        for chunk in emitted
+        for emission in (responses_emissions_from_chunk(chunk) or [])
+        if emission.source_event.event_type == "response.completed"
+    ]
+    assert len(terminal_emissions) == 1
+    assert terminal_emissions[0].wire_bytes in rendered
+    assert rendered == accepted + substantive + terminal_emissions[0].wire_bytes
+    assert terminal_emissions[0].source_event is terminal_events[0]
+    assert pipeline.finish() == []
+    finalized.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_chunk_processor_orders_done_after_late_terminal():
+    created = _sse(
+        "response.created",
+        {
+            "type": "response.created",
+            "response": {
+                "id": "resp_done_order",
+                "status": "in_progress",
+                "model": "gpt-5.4",
+                "output": [],
+            },
+        },
+    )
+    done = b"data: [DONE]\n\n"
+    completed = _sse(
+        "response.completed",
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_done_order",
+                "status": "completed",
+                "output": [],
+            },
+        },
+    )
+    response = _FakeUpstreamStream([created, done, completed])
+    logging_obj = MagicMock()
+    logging_obj.model_call_details = {}
+    finalized = AsyncMock()
+
+    with patch.object(
+        PassThroughStreamingHandler,
+        "_route_streaming_logging_to_handler",
+        new=finalized,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.emit_aawm_route_status_event"
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.record_aawm_route_rollup"
+    ):
+        emitted = [
+            chunk
+            async for chunk in PassThroughStreamingHandler.chunk_processor(
+                response=response,
+                request_body={"model": "gpt-5.4", "stream": True},
+                litellm_logging_obj=logging_obj,
+                endpoint_type=EndpointType.OPENAI,
+                start_time=datetime.now(),
+                passthrough_success_handler_obj=MagicMock(
+                    spec=PassThroughEndpointLogging
+                ),
+                url_route="https://chatgpt.com/backend-api/codex/responses",
+                custom_llm_provider="openai",
+                success_handler_kwargs=_route_kwargs(),
+            )
+        ]
+
+    rendered = b"".join(bytes(chunk) for chunk in emitted)
+    terminal_emissions = [
+        emission
+        for chunk in emitted
+        for emission in (responses_emissions_from_chunk(chunk) or [])
+        if emission.source_event.event_type == "response.completed"
+    ]
+    assert len(terminal_emissions) == 1
+    assert rendered == created + terminal_emissions[0].wire_bytes + done
+    assert rendered.count(b"data: [DONE]") == 1
+    assert rendered.index(b"event: response.completed") < rendered.index(done)
+    finalized.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_chunk_processor_terminalizes_committed_capacity_error_once():
+    created = _sse(
+        "response.created",
+        {
+            "type": "response.created",
+            "response": {
+                "id": "resp_capacity",
+                "status": "in_progress",
+                "model": "gpt-5.4",
+                "output": [],
+            },
+        },
+    )
+    substantive = _sse(
+        "response.output_text.delta",
+        {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "delta": "visible",
+        },
+    )
+    upstream_error = (
+        b"event: error\r\n"
+        b'data: {"type":"error","error":{"type":"server_error",'
+        b'"code":"server_overloaded","message":"capacity exhausted"}}\r\r'
+    )
+    response = _FakeUpstreamStream([created, substantive, upstream_error])
+    logging_obj = MagicMock()
+    logging_obj.model_call_details = {}
+    success_handler_kwargs = _route_kwargs()
+    finalized = AsyncMock()
+
+    with patch.object(
+        PassThroughStreamingHandler,
+        "_route_streaming_logging_to_handler",
+        new=finalized,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.emit_aawm_route_status_event"
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.record_aawm_route_rollup"
+    ):
+        emitted = [
+            chunk
+            async for chunk in PassThroughStreamingHandler.chunk_processor(
+                response=response,
+                request_body={"model": "gpt-5.4", "stream": True},
+                litellm_logging_obj=logging_obj,
+                endpoint_type=EndpointType.OPENAI,
+                start_time=datetime.now(),
+                passthrough_success_handler_obj=MagicMock(
+                    spec=PassThroughEndpointLogging
+                ),
+                url_route="https://chatgpt.com/backend-api/codex/responses",
+                custom_llm_provider="openai",
+                success_handler_kwargs=success_handler_kwargs,
+            )
+        ]
+
+    rendered = b"".join(bytes(chunk) for chunk in emitted)
+    assert rendered.count(b"event: response.failed") == 1
+    assert rendered.count(b"event: error") == 0
+    assert rendered.count(b"event: response.incomplete") == 0
+    assert rendered.count(b"data: [DONE]") == 1
+    assert rendered.index(b"event: response.failed") < rendered.index(
+        b"data: [DONE]"
+    )
+    assert b'"code":"server_overloaded"' in rendered
+    assert b'"delta":"visible"' in rendered
+    assert success_handler_kwargs["litellm_params"]["metadata"]["error_class"] == (
+        "server_overloaded"
+    )
     finalized.assert_called_once()
 
 

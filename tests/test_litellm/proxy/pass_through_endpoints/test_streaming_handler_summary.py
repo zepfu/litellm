@@ -904,7 +904,7 @@ async def test_chunk_processor_deduplicates_done_for_synthetic_terminal(monkeypa
     assert chunks[:2] == provider_chunks[:2]
     assert combined.count(b"data: [DONE]") == 1
     assert chunks[-1] == b"data: [DONE]\n\n"
-    assert b'"type":"response.completed"' in chunks[-2]
+    assert b'"type":"response.incomplete"' in chunks[-2]
     route_handler.assert_awaited_once()
 
 
