@@ -306,6 +306,44 @@ class _CloseAwareHttpxAsyncByteStream(httpx.AsyncByteStream):
 class _PrefixedHttpxByteStream:
     """Replay peeked SSE bytes, then continue the original upstream iterator."""
 
+    @staticmethod
+    def _accepted_frames(events: Any) -> list[bytes]:
+        return [
+            event.forward_event or event.raw_event or b""
+            for event in events
+            if (event.forward_event or event.raw_event)
+        ]
+
+    @staticmethod
+    def _prepare_prefix_bound_failure(
+        bound_failure: Optional[ResponsesBoundFailure],
+        prefix: Any,
+        event_pipeline: Optional[ResponsesEventPipeline],
+    ) -> Optional[ResponsesBoundFailure]:
+        if bound_failure is None:
+            return None
+        accepted_events = list(
+            getattr(bound_failure, "accepted_events", ()) or ()
+        )
+        accepted_frames = _PrefixedHttpxByteStream._accepted_frames(
+            accepted_events
+        )
+        if (
+            not accepted_frames
+            and not int(getattr(prefix, "byte_count", 0))
+            and event_pipeline is not None
+        ):
+            accepted_events = event_pipeline.drain_held_events()
+            accepted_frames = _PrefixedHttpxByteStream._accepted_frames(
+                accepted_events
+            )
+        if not accepted_frames:
+            return bound_failure
+        return ResponsesBoundFailure(
+            bound_failure.cause,
+            accepted_events=accepted_events,
+        )
+
     def __init__(
         self,
         response: httpx.Response,
@@ -320,6 +358,12 @@ class _PrefixedHttpxByteStream:
         self._remainder = remainder
         self._aawm_responses_event_pipeline = event_pipeline
         self._bound_failure = bound_failure
+        self._prefix_bound_failure = self._prepare_prefix_bound_failure(
+            bound_failure,
+            prefix,
+            event_pipeline,
+        )
+        self._bound_failure = None
         if event_pipeline is not None:
             prepare_replay = getattr(event_pipeline, "prepare_replay", None)
             if callable(prepare_replay):
@@ -340,90 +384,109 @@ class _PrefixedHttpxByteStream:
         if callable(close):
             close()
 
+    async def _iter_live_chunk(self, chunk: bytes):
+        pipeline = self._aawm_responses_event_pipeline
+        if pipeline is None:
+            yield chunk
+            return
+        try:
+            events = pipeline.feed(chunk)
+        except (
+            ResponsesBoundFailure,
+            ResponsesEventTooLarge,
+            ResponsesStreamTooLarge,
+        ) as exc:
+            bound_failure = ResponsesBoundFailure.from_exception(exc)
+            accepted_frames = self._accepted_frames(
+                bound_failure.accepted_events
+            )
+            if accepted_frames:
+                yield attach_responses_events(
+                    b"".join(accepted_frames),
+                    bound_failure.accepted_events,
+                )
+            raise bound_failure from exc
+        yield attach_responses_events(chunk, events)
+
     async def aiter_bytes(self):
-        async def _iter_live_chunk(chunk: bytes):
-            pipeline = self._aawm_responses_event_pipeline
-            if pipeline is None:
-                yield chunk
-                return
-            try:
-                events = pipeline.feed(chunk)
-            except (
-                ResponsesBoundFailure,
-                ResponsesEventTooLarge,
-                ResponsesStreamTooLarge,
-            ) as exc:
-                bound_failure = ResponsesBoundFailure.from_exception(exc)
-                accepted_frames = [
-                    event.forward_event or event.raw_event or b""
-                    for event in bound_failure.accepted_events
-                    if (event.forward_event or event.raw_event)
-                ]
+        async def _iter_prefix_chunks():
+            bound_failure = self._prefix_bound_failure
+            if (
+                bound_failure is not None
+                and not int(getattr(self._prefix, "byte_count", 0))
+            ):
+                accepted_frames = self._accepted_frames(
+                    bound_failure.accepted_events
+                )
                 if accepted_frames:
                     yield attach_responses_events(
                         b"".join(accepted_frames),
                         bound_failure.accepted_events,
                     )
-                raise bound_failure from exc
-            yield attach_responses_events(chunk, events)
-
-        try:
             if hasattr(self._prefix, "iter_chunks"):
                 prefix_chunks = self._prefix.iter_chunks()
             else:
                 prefix_chunks = iter(self._prefix)
             for chunk in prefix_chunks:
-                if chunk:
-                    pipeline = self._aawm_responses_event_pipeline
-                    if pipeline is None:
-                        yield chunk
-                        continue
-                    replay_length = min(
-                        len(chunk),
-                        int(getattr(pipeline, "replay_remaining_bytes", 0)),
-                    )
-                    replayed = chunk[:replay_length]
-                    if replayed:
-                        events = pipeline.feed_replayed(replayed)
-                        yield attach_responses_events(replayed, events)
-                    live_suffix = chunk[replay_length:]
-                    if live_suffix:
-                        async for live_chunk in _iter_live_chunk(live_suffix):
-                            yield live_chunk
+                if not chunk:
+                    continue
+                pipeline = self._aawm_responses_event_pipeline
+                if pipeline is None:
+                    yield chunk
+                    continue
+                replay_length = min(
+                    len(chunk),
+                    int(getattr(pipeline, "replay_remaining_bytes", 0)),
+                )
+                replayed = chunk[:replay_length]
+                if replayed:
+                    events = pipeline.feed_replayed(replayed)
+                    yield attach_responses_events(replayed, events)
+                live_suffix = chunk[replay_length:]
+                if live_suffix:
+                    async for live_chunk in self._iter_live_chunk(live_suffix):
+                        yield live_chunk
+
+        try:
+            async for chunk in _iter_prefix_chunks():
+                yield chunk
             # Retire prefix storage before pulling the live remainder so
             # spooled files are closed during streaming, not after.
             self._close_prefix()
-            if self._bound_failure is not None:
-                bound_failure = self._bound_failure
+            if self._prefix_bound_failure is not None:
+                bound_failure = self._prefix_bound_failure
                 self._bound_failure = None
                 raise ResponsesBoundFailure(bound_failure.cause) from bound_failure
-            pipeline = self._aawm_responses_event_pipeline
-            if self._remainder is None:
-                return
-            if self._remainder is not None:
-                if pipeline is not None:
-                    pipeline.retain_events = False
-                async for chunk in self._remainder:
-                    if not chunk:
-                        continue
-                    async for live_chunk in _iter_live_chunk(bytes(chunk)):
-                        yield live_chunk
-            if pipeline is not None:
-                for event in pipeline.finish():
-                    if (
-                        event.forward_event is not None
-                        and event.separator
-                        and not event.is_malformed
-                    ):
-                        yield attach_responses_events(
-                            event.forward_event,
-                            [event],
-                        )
+            async for chunk in self._iter_post_prefix_chunks():
+                yield chunk
         except BaseException:
             await self.aclose()
             raise
         finally:
             self._close_prefix()
+
+    async def _iter_post_prefix_chunks(self):
+        pipeline = self._aawm_responses_event_pipeline
+        if self._remainder is None:
+            return
+        if pipeline is not None:
+            pipeline.retain_events = False
+        async for chunk in self._remainder:
+            if not chunk:
+                continue
+            async for live_chunk in self._iter_live_chunk(bytes(chunk)):
+                yield live_chunk
+        if pipeline is not None:
+            for event in pipeline.finish():
+                if (
+                    event.forward_event is not None
+                    and event.separator
+                    and not event.is_malformed
+                ):
+                    yield attach_responses_events(
+                        event.forward_event,
+                        [event],
+                    )
 
     async def aclose(self) -> None:
         self._close_prefix()
@@ -503,6 +566,9 @@ class _ResponsesPreCommitPrefixStore:
 
     def iter_chunks(self):
         if self._closed:
+            return
+        if self._byte_count:
+            yield self.read_range(0, self._byte_count)
             return
         self._data.seek(0)
         self._lengths.seek(0)
@@ -2430,6 +2496,13 @@ class PassThroughStreamingHandler:
                 )
                 pipeline.attach_to_response(prefixed)
                 if decision == "failed":
+                    commitment_reason = parser.commitment_reason
+                    if commitment_reason is not None:
+                        _maybe_set_replay_latch(
+                            request,
+                            commitment_reason,
+                            event_type,
+                        )
                     return (
                         prefixed,
                         PassThroughStreamingHandler._build_responses_pre_commit_failure(
@@ -3229,6 +3302,7 @@ class PassThroughStreamingHandler:
                 parsed_event: ParsedResponsesEvent,
             ) -> Optional[ResponsesStreamPreCommitFailure]:
                 nonlocal responses_terminal_seen, responses_substantive_seen
+                nonlocal responses_tracking_finalized
                 if responses_sse_tracker is None:
                     return None
                 if parsed_event.is_malformed:
@@ -3240,6 +3314,17 @@ class PassThroughStreamingHandler:
                     PassThroughStreamingHandler._RESPONSES_TERMINAL_EVENTS
                 ):
                     responses_terminal_seen = True
+                if (
+                    responses_terminal_seen
+                    and parsed_event.forward_event is not None
+                    and not responses_tracking_finalized
+                ):
+                    # The unpeeked path has already accepted the complete
+                    # source frame. Drain its held terminal/DONE marker so
+                    # clean EOF does not emit a second synthetic terminal.
+                    responses_tracking_finalized = True
+                    for held_event in responses_event_pipeline.finish():
+                        _consume_responses_event(held_event)
                 decoded_event = parsed_event.payload
                 if decoded_event is None:
                     return None
@@ -3490,6 +3575,7 @@ class PassThroughStreamingHandler:
                     extensions["aawm_openai_responses_terminal_pending"] = True
 
             response_chunks = response.aiter_bytes()
+            response_byte_iterator = response_chunks
             upstream_chunks = wait_iterator(
                 "upstream_stream_read", response_chunks
             )
@@ -4423,14 +4509,17 @@ class PassThroughStreamingHandler:
                 exc=exc,
             )
 
-        return PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
-            endpoint_type=endpoint_type,
-            url_route=url_route,
-            custom_llm_provider=custom_llm_provider,
-            failure_context=failure_context,
-            exc=exc,
-            responses_event_pipeline=responses_event_pipeline,
+        terminal_chunks, _terminal_payload = (
+            PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
+                endpoint_type=endpoint_type,
+                url_route=url_route,
+                custom_llm_provider=custom_llm_provider,
+                failure_context=failure_context,
+                exc=exc,
+                responses_event_pipeline=responses_event_pipeline,
+            )
         )
+        return terminal_chunks
 
     @staticmethod
     async def _terminalize_post_first_byte_responses_clean_eof(
@@ -4558,14 +4647,17 @@ class PassThroughStreamingHandler:
             exc=clean_eof_exc,
         )
 
-        return PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
-            endpoint_type=endpoint_type,
-            url_route=url_route,
-            custom_llm_provider=custom_llm_provider,
-            failure_context=failure_context,
-            incomplete_reason=PassThroughStreamingHandler._CLEAN_EOF_INCOMPLETE_REASON,
-            responses_event_pipeline=responses_event_pipeline,
+        terminal_chunks, _terminal_payload = (
+            PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
+                endpoint_type=endpoint_type,
+                url_route=url_route,
+                custom_llm_provider=custom_llm_provider,
+                failure_context=failure_context,
+                incomplete_reason=PassThroughStreamingHandler._CLEAN_EOF_INCOMPLETE_REASON,
+                responses_event_pipeline=responses_event_pipeline,
+            )
         )
+        return terminal_chunks
 
     @staticmethod
     def _build_streaming_exception_log_context(
