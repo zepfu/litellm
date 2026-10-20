@@ -3399,7 +3399,8 @@ class PassThroughStreamingHandler:
                         candidate_failure.error_class
                         in _RESPONSES_STREAM_REDISPATCH_CLASSES
                         or (
-                            parsed_event.event_type == "error"
+                            parsed_event.event_type
+                            in {"error", "response.failed"}
                             and candidate_failure.error_class
                             in _RESPONSES_TRANSIENT_CAPACITY_CLASSES
                         )

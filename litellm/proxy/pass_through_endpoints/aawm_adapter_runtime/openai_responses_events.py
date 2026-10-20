@@ -1239,9 +1239,12 @@ class ResponsesEventPipeline:
         )
         if not control:
             self._hold_event(event)
-            self._emit(event)
-            if self.summary_reducer is not None and self.summary_reducer.overflow:
-                raise ResponsesEventRetentionTooLarge("Responses event summary retention exceeded configured bound")
+        # Reserved control admission changes which budgets apply, not event
+        # visibility. Reducers and other bounded observers still need to see
+        # generated terminals exactly once.
+        self._emit(event)
+        if self.summary_reducer is not None and self.summary_reducer.overflow:
+            raise ResponsesEventRetentionTooLarge("Responses event summary retention exceeded configured bound")
         return event
 
     def prepare_replay(self, prefix_bytes: int) -> None:
