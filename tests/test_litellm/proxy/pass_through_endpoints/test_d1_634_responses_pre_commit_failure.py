@@ -109,6 +109,28 @@ def _sse(event_type: str, payload: dict[str, Any], *, ensure_ascii: bool = True)
     ).encode("utf-8")
 
 
+def test_responses_event_pipeline_preserves_unicode_line_separators_in_json_strings():
+    delta = "before\u2028middle\u2029after"
+    pipeline = ResponsesEventPipeline()
+
+    events = pipeline.feed(
+        _sse(
+            "response.output_text.delta",
+            {
+                "type": "response.output_text.delta",
+                "item_id": "msg_unicode",
+                "delta": delta,
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    assert len(events) == 1
+    assert events[0].event_type == "response.output_text.delta"
+    assert events[0].is_malformed is False
+    assert events[0].payload["delta"] == delta
+
+
 def _failed_lifecycle_stream(
     *,
     code: str = "server_overloaded",
