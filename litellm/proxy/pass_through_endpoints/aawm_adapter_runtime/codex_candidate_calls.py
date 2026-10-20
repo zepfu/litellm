@@ -2286,7 +2286,6 @@ def _get_runtime_text_watermark_config() -> Any:
 if TYPE_CHECKING:
     import httpx
     import litellm as litellm
-    from fastapi import HTTPException
     from fastapi.responses import Response, StreamingResponse
     from starlette.requests import Request
 
@@ -6826,6 +6825,98 @@ def _cursor_responses_response_body(
     return body
 
 
+def _responses_body_for_fake_stream(responses_api_response: Any) -> dict[str, Any]:
+    serialize = globals().get("_serialize_responses_adapter_response")
+    if callable(serialize):
+        try:
+            loaded = json.loads(serialize(responses_api_response))
+        except (TypeError, ValueError):
+            loaded = None
+        if isinstance(loaded, dict):
+            return loaded
+    if isinstance(responses_api_response, dict):
+        return dict(responses_api_response)
+    dump = getattr(responses_api_response, "model_dump", None)
+    payload = dump(mode="json") if callable(dump) else None
+    return payload if isinstance(payload, dict) else {}
+
+
+def _codex_nvidia_completion_adapter_response(
+    *,
+    completion_response: Any,
+    upstream_model: str,
+    custom_llm_provider: str,
+    litellm_metadata: Payload,
+    request_input: Any,
+    responses_api_request: ResponsesAPIOptionalRequestParams,
+    prepared_request_body: Payload,
+    client_requested_stream: bool,
+    fake_stream: bool,
+) -> Response:
+    from litellm.responses.litellm_completion_transformation.streaming_iterator import (
+        LiteLLMCompletionStreamingIterator,
+    )
+    from litellm.responses.litellm_completion_transformation.transformation import (
+        LiteLLMCompletionResponsesConfig,
+    )
+
+    if client_requested_stream:
+        if fake_stream and getattr(completion_response, "choices", None) is not None:
+            responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+                chat_completion_response=completion_response,
+                request_input=request_input,
+                responses_api_request=responses_api_request,
+            )
+            response_body = _responses_body_for_fake_stream(responses_api_response)
+            fake_stream_body = (
+                prepared_request_body
+                if isinstance(prepared_request_body, dict)
+                else (
+                    {"litellm_metadata": litellm_metadata}
+                    if isinstance(litellm_metadata, dict)
+                    else None
+                )
+            )
+            return StreamingResponse(
+                _responses_sse_from_repaired_response_body(
+                    response_body,
+                    request_body=fake_stream_body,
+                ),
+                media_type="text/event-stream",
+            )
+        return StreamingResponse(
+            _responses_sse_from_iterator(
+                LiteLLMCompletionStreamingIterator(
+                    model=upstream_model,
+                    litellm_custom_stream_wrapper=completion_response,
+                    request_input=request_input,
+                    responses_api_request=responses_api_request,
+                    custom_llm_provider=custom_llm_provider,
+                    litellm_metadata=litellm_metadata,
+                )
+            ),
+            media_type="text/event-stream",
+        )
+
+    responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+        chat_completion_response=completion_response,
+        request_input=request_input,
+        responses_api_request=responses_api_request,
+    )
+    return _build_responses_response_from_adapter_response(
+        responses_api_response,
+        request_body=(
+            prepared_request_body
+            if isinstance(prepared_request_body, dict)
+            else (
+                {"litellm_metadata": litellm_metadata}
+                if isinstance(litellm_metadata, dict)
+                else None
+            )
+        ),
+    )
+
+
 def _validate_cursor_result_and_consume_replay_state(
     *,
     result: Any,
@@ -8550,40 +8641,74 @@ async def _perform_codex_nvidia_completion_adapter_call(
     from litellm.proxy.pass_through_endpoints.providers.nvidia import (
         runtime as _nvidia_runtime,
     )
-    from litellm.responses.litellm_completion_transformation.streaming_iterator import (
-        LiteLLMCompletionStreamingIterator,
-    )
-    from litellm.responses.litellm_completion_transformation.transformation import (
-        LiteLLMCompletionResponsesConfig,
-    )
+    def _prepare_adapted_request() -> tuple[
+        Payload,
+        dict[str, Any] | None,
+        Any | None,
+    ]:
+        _ = adapter_model
+        _annotate_request_scope_for_adapted_access_log(
+            request,
+            httpx.URL(str(target_url)),
+        )
+        watermark_intake = None
+        try:
+            watermark_intake = getattr(
+                getattr(request, "state", None), "watermark_intake", None
+            )
+        except Exception:
+            watermark_intake = None
+        watermark_metadata = (
+            litellm_metadata if isinstance(litellm_metadata, dict) else {}
+        )
+        watermark_egress = apply_request_watermark_egress(
+            body=completion_kwargs,
+            intake=watermark_intake,
+            config=_get_runtime_text_watermark_config(),
+            endpoint=_watermark_endpoint_from_path("chat/completions", target_url),
+            direction="request",
+            metadata=watermark_metadata,
+            litellm_metadata=watermark_metadata,
+        )
+        adapted_body = watermark_egress.body
+        adapted_completion_kwargs: Any = completion_kwargs
+        if isinstance(adapted_body, dict):
+            adapted_completion_kwargs = adapted_body
+        if isinstance(adapted_completion_kwargs, dict):
+            adapted_completion_kwargs["caller_managed_hidden_retry"] = True
+        if isinstance(litellm_metadata, dict):
+            litellm_metadata["caller_managed_hidden_retry"] = True
+        return prepared_request_body, litellm_metadata, adapted_completion_kwargs
+
+    def _stamp_nvidia_attempt_accounting(target: Any) -> None:
+        _nvidia_runtime._stamp_nvidia_attempt_accounting(
+            target,
+            logical_candidate_count=attempt_accounting.get(
+                "nvidia_logical_candidate_count", 1
+            ),
+            wire_attempt_count=attempt_accounting.get(
+                "nvidia_wire_attempt_count", 0
+            ),
+        )
+
+    def _stamp_nvidia_attempt_accounting_on_metadata() -> None:
+        if isinstance(litellm_metadata, dict):
+            _stamp_nvidia_attempt_accounting(litellm_metadata)
 
     _ = adapter_model
     custom_llm_provider = config.custom_llm_provider
-    _annotate_request_scope_for_adapted_access_log(request, httpx.URL(str(target_url)))
-    _watermark_intake = None
-    try:
-        _watermark_intake = getattr(getattr(request, "state", None), "watermark_intake", None)
-    except Exception:
-        _watermark_intake = None
-    _watermark_metadata = litellm_metadata if isinstance(litellm_metadata, dict) else {}
-    _watermark_egress = apply_request_watermark_egress(
-        body=completion_kwargs,
-        intake=_watermark_intake,
-        config=_get_runtime_text_watermark_config(),
-        endpoint=_watermark_endpoint_from_path("chat/completions", target_url),
-        direction="request",
-        metadata=_watermark_metadata,
-        litellm_metadata=_watermark_metadata,
-    )
-    if isinstance(getattr(_watermark_egress, "body", None), dict):
-        completion_kwargs = _watermark_egress.body
-    if isinstance(completion_kwargs, dict):
-        completion_kwargs["caller_managed_hidden_retry"] = True
-    if isinstance(litellm_metadata, dict):
-        litellm_metadata["caller_managed_hidden_retry"] = True
-    attempt_accounting: dict[str, int] = {}
 
     async def _operation() -> Any:
+        prepared_request_body, litellm_metadata, completion_kwargs = (
+            _prepare_adapted_request()
+        )
+
+        def _copy_nvidia_lower_level_http_attempts(target: Any) -> None:
+            _nvidia_runtime._copy_nvidia_lower_level_http_attempts(
+                litellm_metadata=target,
+                attempt_accounting=attempt_accounting,
+            )
+
         try:
             result = await litellm.acompletion(
                 **completion_kwargs,
@@ -8597,17 +8722,12 @@ async def _perform_codex_nvidia_completion_adapter_call(
                 shared_session=_get_proxy_shared_aiohttp_session(),
             )
         except Exception:
-            _nvidia_runtime._copy_nvidia_lower_level_http_attempts(
-                litellm_metadata=litellm_metadata,
-                attempt_accounting=attempt_accounting,
-            )
+            _copy_nvidia_lower_level_http_attempts(litellm_metadata)
             raise
-        _nvidia_runtime._copy_nvidia_lower_level_http_attempts(
-            litellm_metadata=litellm_metadata,
-            attempt_accounting=attempt_accounting,
-        )
+        _copy_nvidia_lower_level_http_attempts(litellm_metadata)
         return result
 
+    attempt_accounting: dict[str, int] = {}
     try:
         completion_response = (
             await _nvidia_runtime._perform_nvidia_completion_adapter_operation(
@@ -8617,107 +8737,22 @@ async def _perform_codex_nvidia_completion_adapter_call(
             )
         )
     except Exception as exc:
-        _nvidia_runtime._stamp_nvidia_attempt_accounting(
-            exc,
-            logical_candidate_count=attempt_accounting.get(
-                "nvidia_logical_candidate_count", 1
-            ),
-            wire_attempt_count=attempt_accounting.get(
-                "nvidia_wire_attempt_count", 0
-            ),
-        )
-        if isinstance(litellm_metadata, dict):
-            _nvidia_runtime._stamp_nvidia_attempt_accounting(
-                litellm_metadata,
-                logical_candidate_count=attempt_accounting.get(
-                    "nvidia_logical_candidate_count", 1
-                ),
-                wire_attempt_count=attempt_accounting.get(
-                    "nvidia_wire_attempt_count", 0
-                ),
-            )
+        _stamp_nvidia_attempt_accounting(exc)
+        _stamp_nvidia_attempt_accounting_on_metadata()
         raise
-    if isinstance(litellm_metadata, dict):
-        _nvidia_runtime._stamp_nvidia_attempt_accounting(
-            litellm_metadata,
-            logical_candidate_count=attempt_accounting.get(
-                "nvidia_logical_candidate_count", 1
-            ),
-            wire_attempt_count=attempt_accounting.get(
-                "nvidia_wire_attempt_count", 0
-            ),
-        )
-    if client_requested_stream:
-        if fake_stream and getattr(completion_response, "choices", None) is not None:
-            responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
-                chat_completion_response=completion_response,
-                request_input=request_input,
-                responses_api_request=responses_api_request,
-            )
-            response_body: dict[str, Any] = {}
-            serialize = globals().get("_serialize_responses_adapter_response")
-            if callable(serialize):
-                try:
-                    loaded = json.loads(serialize(responses_api_response))
-                except (TypeError, ValueError):
-                    loaded = None
-                if isinstance(loaded, dict):
-                    response_body = loaded
-            if not response_body and isinstance(responses_api_response, dict):
-                response_body = dict(responses_api_response)
-            if not response_body:
-                dump = getattr(responses_api_response, "model_dump", None)
-                payload = dump(mode="json") if callable(dump) else None
-                if isinstance(payload, dict):
-                    response_body = payload
-            fake_stream_body = (
-                prepared_request_body
-                if isinstance(prepared_request_body, dict)
-                else (
-                    {"litellm_metadata": litellm_metadata}
-                    if isinstance(litellm_metadata, dict)
-                    else None
-                )
-            )
-            return StreamingResponse(
-                _responses_sse_from_repaired_response_body(
-                    response_body,
-                    request_body=fake_stream_body,
-                ),
-                media_type="text/event-stream",
-            )
-        return StreamingResponse(
-            _responses_sse_from_iterator(
-                LiteLLMCompletionStreamingIterator(
-                    model=upstream_model,
-                    litellm_custom_stream_wrapper=completion_response,
-                    request_input=request_input,
-                    responses_api_request=responses_api_request,
-                    custom_llm_provider=custom_llm_provider,
-                    litellm_metadata=litellm_metadata,
-                )
-            ),
-            media_type="text/event-stream",
-        )
+    _stamp_nvidia_attempt_accounting_on_metadata()
 
-    responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
-        chat_completion_response=completion_response,
+    return _codex_nvidia_completion_adapter_response(
+        completion_response=completion_response,
+        upstream_model=upstream_model,
+        custom_llm_provider=custom_llm_provider,
+        litellm_metadata=litellm_metadata,
         request_input=request_input,
         responses_api_request=responses_api_request,
+        prepared_request_body=prepared_request_body,
+        client_requested_stream=client_requested_stream,
+        fake_stream=fake_stream,
     )
-    return _build_responses_response_from_adapter_response(
-        responses_api_response,
-        request_body=(
-            prepared_request_body
-            if isinstance(prepared_request_body, dict)
-            else (
-                {"litellm_metadata": litellm_metadata}
-                if isinstance(litellm_metadata, dict)
-                else None
-            )
-        ),
-    )
-
 
 async def _handle_codex_nvidia_completion_adapter_route(
     *,
@@ -9834,40 +9869,15 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
             text = text[:-1]
             deferred_trailing_cr = True
         normalized, new_original_widths = _normalize_sse_text(text)
-        leftover_text = parser_buffer
-        leftover_original_bytes = parser_original_bytes
-        leftover_chars = len(leftover_text)
-        pending = leftover_text + normalized
-        parser_buffer = ""
-        parser_original_bytes = 0
-        new_consumed_chars = 0
-        while pending:
-            delimiter_index = pending.find("\n\n")
-            if delimiter_index < 0:
-                parser_buffer = pending
-                parser_original_bytes = leftover_original_bytes + sum(
-                    new_original_widths[new_consumed_chars:]
-                )
-                break
-            event_block = pending[:delimiter_index]
-            frame_chars = delimiter_index + 2
-            from_new = frame_chars - leftover_chars
-            original_frame_bytes = leftover_original_bytes + sum(
-                new_original_widths[
-                    new_consumed_chars : new_consumed_chars + from_new
-                ]
+        parser_buffer, parser_original_bytes, deferred_trailing_cr = (
+            _split_complete_sse_frames(
+                text=normalized,
+                buffered_text=parser_buffer,
+                buffered_original_bytes=parser_original_bytes,
+                new_original_widths=new_original_widths,
+                deferred_trailing_cr=deferred_trailing_cr,
             )
-            leftover_chars = 0
-            leftover_original_bytes = 0
-            new_consumed_chars += from_new
-            pending = pending[frame_chars:]
-            _capture_complete_frame(event_block, original_frame_bytes)
-            if frozen_precommit_action in {"fail", "fail_empty"}:
-                parser_buffer = ""
-                parser_original_bytes = 0
-                pending = ""
-                deferred_trailing_cr = False
-                break
+        )
         if not final:
             trailing_cr = deferred_trailing_cr
             return
@@ -9884,6 +9894,45 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(  # noqa: PLR09
         parser_original_bytes = 0
         if leftover_event:
             _capture_complete_frame(leftover_event, leftover_bytes)
+
+    def _split_complete_sse_frames(
+        *,
+        text: str,
+        buffered_text: str,
+        buffered_original_bytes: int,
+        new_original_widths: list[int],
+        deferred_trailing_cr: bool,
+    ) -> tuple[str, int, bool]:
+        leftover_text = buffered_text
+        leftover_original_bytes = buffered_original_bytes
+        leftover_chars = len(leftover_text)
+        pending = leftover_text + text
+        new_consumed_chars = 0
+        while pending:
+            delimiter_index = pending.find("\n\n")
+            if delimiter_index < 0:
+                return (
+                    pending,
+                    leftover_original_bytes
+                    + sum(new_original_widths[new_consumed_chars:]),
+                    deferred_trailing_cr,
+                )
+            event_block = pending[:delimiter_index]
+            frame_chars = delimiter_index + 2
+            from_new = frame_chars - leftover_chars
+            original_frame_bytes = leftover_original_bytes + sum(
+                new_original_widths[
+                    new_consumed_chars : new_consumed_chars + from_new
+                ]
+            )
+            leftover_chars = 0
+            leftover_original_bytes = 0
+            new_consumed_chars += from_new
+            pending = pending[frame_chars:]
+            _capture_complete_frame(event_block, original_frame_bytes)
+            if frozen_precommit_action in {"fail", "fail_empty"}:
+                return "", 0, False
+        return "", 0, deferred_trailing_cr
 
     def _decode_chunk_text(raw_chunk: Any) -> str:
         nonlocal decoder_failed
