@@ -36,7 +36,6 @@ from litellm.llms.alibaba_token_plan.chat.transformation import (
 from litellm.secret_managers.codex_oauth_inventory import CodexOAuthInventory
 from litellm.utils import get_model_info
 
-from . import codex_oauth as _codex_oauth_inventory_loader
 from . import admission as _admission
 from . import cooldown_state as _cooldown_state
 from . import codex_quota_balance as _codex_quota_balance
@@ -3552,6 +3551,9 @@ async def _resolve_codex_oauth_account_candidate_contexts(
     inventory: Optional[CodexOAuthInventory] = None,
 ) -> list[dict[str, Any]]:
     """Resolve ordered, auth-checked account contexts without carrying secrets."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        codex_oauth as _codex_oauth_mod,
+    )
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
         _remove_proxy_owned_account_display_fields,
         _validated_codex_account_display,
@@ -3597,7 +3599,7 @@ async def _resolve_codex_oauth_account_candidate_contexts(
 
     try:
         if inventory is None:
-            inventory = await _codex_oauth_inventory_loader._load_request_codex_oauth_inventory(request)
+            inventory = await _codex_oauth_mod._load_request_codex_oauth_inventory(request)
         routing_fields = {
             "codex_oauth_credential_affinity": (inventory.routing.credential_affinity),
             "codex_oauth_selection_strategy": inventory.routing.strategy,
@@ -5926,7 +5928,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
 
     codex_oauth_inventory: Optional[CodexOAuthInventory] = None
     try:
-        codex_oauth_inventory = await _codex_oauth_inventory_loader._load_request_codex_oauth_inventory(request)
+        codex_oauth_inventory = await _codex_oauth_mod._load_request_codex_oauth_inventory(request)
     except _codex_oauth_mod.CodexOAuthInventoryError:
         codex_oauth_inventory = None
     codex_oauth_continuation = _codex_oauth_mod._get_codex_oauth_affinity_continuation_state(
