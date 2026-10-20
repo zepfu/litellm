@@ -1765,6 +1765,10 @@ verbose_logger = logging.getLogger("LiteLLM")
 verbose_aawm_route_logger = logging.getLogger("LiteLLM AAWM Route")
 verbose_aawm_route_logger.setLevel(logging.INFO)
 verbose_session_owner_logger = logging.getLogger("litellm.proxy.session_owner")
+aawm_route_rollup_observation_logger = logging.getLogger(
+    "litellm.proxy.aawm_route_rollup_observation"
+)
+aawm_route_rollup_observation_logger.setLevel(logging.INFO)
 
 _aawm_route_handler = logging.StreamHandler()
 _aawm_route_handler.setLevel(logging.INFO)
@@ -1791,6 +1795,8 @@ verbose_proxy_logger.addHandler(handler)
 verbose_logger.addHandler(handler)
 verbose_aawm_route_logger.addHandler(_aawm_route_handler)
 verbose_aawm_route_logger.propagate = False
+aawm_route_rollup_observation_logger.addHandler(_aawm_route_handler)
+aawm_route_rollup_observation_logger.propagate = False
 verbose_session_owner_logger.addHandler(_session_owner_handler)
 verbose_session_owner_logger.propagate = False
 
@@ -1818,6 +1824,7 @@ ALL_LOGGERS = [
     verbose_proxy_logger,
     verbose_aawm_route_logger,
     verbose_session_owner_logger,
+    aawm_route_rollup_observation_logger,
     logging.getLogger("uvicorn"),
     logging.getLogger("uvicorn.error"),
     logging.getLogger("uvicorn.access"),

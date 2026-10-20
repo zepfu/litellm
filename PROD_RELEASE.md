@@ -352,13 +352,28 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
    The fork image and model-config archive can contain the code and pricing, but
    prod will not expose the model until the compose-rendered config includes a
    `model_list` entry and the required upstream key is available in `.env`.
-   The eight TAP TEI embedding/rerank routes use the non-secret
+   The remaining Mahaf TAP embedding/rerank routes use the non-secret
    `AAWM_TAP_MODEL_HOST` environment value, defaulting to
    `mahaf.tailf1878c.ts.net`; their ports and route paths are fixed by the
    config template, with `/v1` on embeddings and no `/v1` suffix on the
    reranker. Other local services may retain their own host-gateway
    configuration. Do not route these TAP entries through a Docker bridge IP
    such as `172.20.0.1`.
+
+   For the Thoth Nomic Code and Qwen3 Embedding routes, connect the backend
+   containers to the proxy's existing private Docker network and use their
+   stable container DNS names on port 8080. Preserve the loopback-only host
+   publications. Network connections survive restart and reboot; reconnect
+   after backend recreation. See [local embedding operations](docs/aawm-local-embeddings.md)
+   for the exact container names and acceptance checks. Inspect the running
+   proxy's actual configuration bind source before changing a template:
+   Thoth's `aawm-litellm` currently loads repository-root
+   `litellm-dev-config.yaml` at `/app/litellm-config.yaml`.
+
+   SPECTER2 and both MedCPT encoders also run on Thoth, using private Docker
+   DNS on container port 80. Their three model entries must retain those
+   explicit endpoints rather than inheriting the Mahaf host setting. The local
+   Qwen container remains stopped while TAP uses its OpenRouter route.
 
    Prod error-log mirroring also requires a writable mount from this repo's
    `.analysis` directory to the container path named by
@@ -436,7 +451,7 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
 
    ```bash
    docker exec aawm-litellm sh -lc \
-     "grep -En 'openrouter/qwen/qwen3-embedding-8b|openrouter/cohere/rerank-4-pro|openrouter/google/gemini-embedding-2-preview|nvidia_nim/nvidia/rerank-qa-mistral-4b|nvidia_nim/nvidia/nv-embed-v1|local_embed/nomic-embed-code.Q8_0.gguf|local_rerank/BAAI/bge-reranker-v2-m3' /etc/litellm/config.yaml"
+     "grep -En 'openrouter/qwen/qwen3-embedding-8b|openrouter/cohere/rerank-4-pro|openrouter/google/gemini-embedding-2-preview|nvidia_nim/nvidia/rerank-qa-mistral-4b|nvidia_nim/nvidia/nv-embed-v1|local_embed/nomic-embed-code|local_embed/qwen3-embedding-8b|local_rerank/BAAI/bge-reranker-v2-m3' /app/litellm-config.yaml"
    ```
 
    For local TAP route promotions, also verify the rendered config includes the

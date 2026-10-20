@@ -426,6 +426,30 @@ async def _run_serialized_refresh(
     operation: Callable[..., dict[str, Any]],
     *args: Any,
 ) -> dict[str, Any]:
-    """Run one complete synchronous refresh transaction off the event loop."""
+    """Run one complete synchronous refresh transaction off the event loop.
+
+    Keep the process-local lock until the worker has finished, even if the
+    request task is cancelled. Native asyncio cancellation of the coroutine
+    awaiting ``run_in_threadpool`` can leave its synchronous callable running;
+    releasing the lock then could let a newer refresh publish first.
+    """
     async with _refresh_transaction_lock:
-        return await run_in_threadpool(operation, *args)
+        operation_task = asyncio.create_task(run_in_threadpool(operation, *args))
+        cancellation_error: Optional[asyncio.CancelledError] = None
+        while not operation_task.done():
+            try:
+                await asyncio.wait((operation_task,))
+            except asyncio.CancelledError as exc:
+                if cancellation_error is None:
+                    cancellation_error = exc
+
+        try:
+            result = operation_task.result()
+        except BaseException as operation_error:
+            if cancellation_error is not None:
+                raise cancellation_error from operation_error
+            raise
+
+        if cancellation_error is not None:
+            raise cancellation_error
+        return result

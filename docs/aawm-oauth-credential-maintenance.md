@@ -2,11 +2,16 @@
 
 ## MS-030/MS-031: managed Kimi contract boundary
 
-The authoritative native client for this contract is the WSL installation at
-`/home/zepfu/.kimi-code/bin/kimi`, version `0.29.1`. Older Thoth state is not
-authoritative. `MS-032`, the Thoth daily updater, is paused by operator
-decision and is not a prerequisite for this contract. Do not resume that
-updater or publish a Thoth-derived descriptor without separate authorization.
+The supported native client for this contract is the Thoth installation at
+`/home/zepfu/.kimi-code/bin/kimi`. Capture its current supported behavior
+locally; a historical WSL installation is not the client authority.
+
+`MS-032` installed the Thoth daily updater as `thoth-kimi-update.service` and
+`thoth-kimi-update.timer`. Both were disabled and inactive on October 20,
+2026. CLI self-update is separate from OAuth credential refresh and is not a
+prerequisite for the managed contract. Verify the installed client and unit
+state before maintenance; updater activation and descriptor publication require
+separate rollout authorization.
 
 All AAWM Moonshot traffic is OAuth-only through `kimi_code/*` and the Kimi Code
 `/coding/v1` upstream; no AAWM route uses a Moonshot API key. Generic upstream
@@ -33,6 +38,13 @@ without a restart. The host descriptor directory is configured by
 `/app/kimi-descriptor`; consumers read
 `/app/kimi-descriptor/native-contract.json`. The image contains the
 resolver, not a captured descriptor or OAuth credential.
+
+Alpha's verified October 10 deployment instead mounts
+`/home/zepfu/.kimi-code/native-contract-alpha` read-only at
+`/run/aawm/kimi-descriptor` and sets `LITELLM_KIMI_NATIVE_CONTRACT_PATH` to
+`/run/aawm/kimi-descriptor/native-contract.json`. Read the loaded descriptor
+to establish alpha's native client identity; other retained descriptor files
+are not evidence of that identity.
 
 The standalone image default
 `LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=false` is compatibility mode and does
@@ -523,15 +535,32 @@ Cooldown publication runs through the host-globals bindings installed by
 helper must be included in that binding set so an account-scoped failure can
 publish its cooldown before selecting an overflow account (OPENAI-073).
 
-Continuations are owner-first. Each continuation gets one owner-first attempt
-against the recorded upstream owner account and remains pinned unless the
-complete request is replay-safe, fully client-carried, still pre-commit, and
-that owner returns a real eligible account-scoped failure. At most one planned
-pre-commit move to an eligible overflow account is allowed. A transient
-pre-commit
-`capacity_exhausted`/overload retries once on the same account; if repeated,
-it returns the existing retryable pre-stream `503` without rotating accounts.
-After the first response byte, no account failover is planned.
+The required OpenAI continuation contract permits an established conversation
+to move between eligible managed accounts in either direction when its current
+account exhausts quota **or available capacity**. Capacity exhaustion alone is
+sufficient; quota exhaustion is not an additional gate. Each provider send
+must use the replacement account's matching token, account headers and
+ownership, preserve provider/model and supported conversation/tool history,
+avoid duplicate output or tool execution, and retain replacement-account
+affinity on later turns. The binding is fixed per send, not for the lifetime
+of the conversation.
+
+Current implementation and acceptance must be distinguished from that
+contract. `OPENAI-041` tracks the remaining binding and stock-client
+migration acceptance; documentation does not establish that all four
+direction/trigger combinations have passed. Current continuations are
+owner-first and require replay-safe, fully client-carried, pre-commit state
+and an eligible account-scoped failure before at most one planned overflow
+move. Nonportable upstream-owned state remains pinned as described below.
+
+Transient provider overload is distinct from an account exhausting available
+capacity. The current OpenAI Responses capacity-retry path uses bounded
+same-account retries with progressive waits and a request-wide deadline;
+deadline exhaustion returns a retryable `503`. Paths using the legacy
+transient policy retry once before returning a retryable pre-stream `503`.
+These retry policies do not establish a quota-only account-migration rule or
+prove that a transient overload is account exhaustion. Do not replay committed
+output or executed tools to recover availability.
 
 The configured `credential_affinity: interchangeable` pool keeps provider,
 model, route, endpoint, and encrypted-state-format session affinity while
@@ -732,10 +761,12 @@ The compose contract controls credential ownership and hot-reload visibility;
 it does not enable a Kimi route by itself. Managed-route behavior, exact model
 IDs, and `/models` capability gating are documented in
 [`moonshot.md`](my-website/docs/providers/moonshot.md#managed-kimi-code-oauth-aawm).
-Kimi Code `0.29.1` derives a separate OAuth storage slot for a custom
-`KIMI_CODE_BASE_URL`, so the CLI cannot currently use the local gateway while
-retaining this exact default credential file. Do not work around that client
-limitation by copying or symlinking the credential or enrolling another grant.
+Before using a custom `KIMI_CODE_BASE_URL`, verify that the installed
+Thoth client supports that endpoint with this exact default credential file.
+A separate environment-scoped OAuth slot does not meet the shared-credential
+contract. Keep the direct CLI on the official endpoint until that capability
+is verified. Do not copy or symlink the credential or enroll another grant to
+work around a client limitation.
 Any production-equivalent deployment must preserve the same read-only worker
 and single-writer sidecar contract, but production mutation remains a separate
 operator-authorized rollout.

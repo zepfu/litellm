@@ -158,6 +158,7 @@ from litellm.proxy.aawm_route_logging import (
     build_aawm_route_rollup_group_header_label,  # noqa: F401 - rollup install host binding
     emit_aawm_route_access_log,  # noqa: F401 - Wave 6F facade host binding
     emit_aawm_route_status_event,  # noqa: F401 - rollup install host binding
+    _get_aawm_route_log_codex_turn_metadata,  # noqa: F401 - audit-context install host binding
     record_aawm_route_rollup,  # noqa: F401 - rollup install host binding
     record_aawm_route_rollup_turn,  # noqa: F401 - Wave 6F facade host binding
     _register_aawm_route_access_log_replacement,
@@ -4255,6 +4256,35 @@ async def gemini_proxy_route(
     if "stream" in str(updated_url):
         is_streaming_request = True
 
+    # --- prompt-replacement hook (early, before passthrough) ---
+    _gemini_custom_body: Optional[dict] = None
+    if request.method == "POST":
+        try:
+            _gemini_raw_body = await get_request_body(request)
+            if isinstance(_gemini_raw_body, dict):
+                from litellm.proxy.pass_through_endpoints.aawm_request_policy.prompt_replacement_hooks import (
+                    apply_prompt_replacement_to_passthrough_body,
+                )
+                _gemini_custom_body = apply_prompt_replacement_to_passthrough_body(
+                    _gemini_raw_body,
+                    request=request,
+                    adapter="gemini",
+                )
+                # Only override the request-parsed body when replacement
+                # actually changed content or attached metadata.  When no
+                # rules matched the hook returns the original dict object
+                # unchanged; preserve the baseline body-extraction path so
+                # _parse_request_data_by_content_type selects the intended
+                # nested provider body (contents/systemInstruction) rather
+                # than always taking the outer envelope.
+                if _gemini_custom_body is _gemini_raw_body:
+                    _gemini_custom_body = None
+                elif isinstance(_gemini_custom_body.get("custom_body"), dict):
+                    _gemini_custom_body = _gemini_custom_body["custom_body"]
+        except Exception:
+            verbose_proxy_logger.exception("prompt_replacement: Gemini body hook failed")
+    # --- end prompt-replacement hook ---
+
     ## CREATE PASS-THROUGH
     endpoint_func = create_pass_through_route(
         endpoint=endpoint,
@@ -4267,6 +4297,7 @@ async def gemini_proxy_route(
         request,
         fastapi_response,
         user_api_key_dict,
+        custom_body=_gemini_custom_body,
     )
 
     return received_value
@@ -5050,6 +5081,24 @@ async def anthropic_proxy_route(  # noqa: PLR0915
                 sorted(hooks),
                 sorted(billing_header_fields),
             )
+
+        # --- prompt-replacement hook (early, before routing) ---
+        try:
+            from litellm.proxy.pass_through_endpoints.aawm_request_policy.prompt_replacement_hooks import (
+                apply_prompt_replacement_to_passthrough_body,
+            )
+            _pr_cc_version = billing_header_fields.get("cc_version")
+            prepared_request_body = apply_prompt_replacement_to_passthrough_body(
+                prepared_request_body,
+                request=request,
+                adapter="anthropic",
+                cc_version=_pr_cc_version if isinstance(_pr_cc_version, str) else None,
+            )
+            if prepared_request_body is not request_body:
+                _safe_set_request_parsed_body(request, prepared_request_body)
+        except Exception:
+            verbose_proxy_logger.exception("prompt_replacement: Anthropic body hook failed")
+        # --- end prompt-replacement hook ---
 
         anthropic_auto_agent_alias = _resolve_anthropic_auto_agent_alias_model(
             prepared_request_body,

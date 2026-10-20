@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import copy
 import json
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Any, Optional
 
 from fastapi import HTTPException
@@ -25,8 +26,17 @@ from litellm.proxy.pass_through_endpoints.aawm_text_watermark.unicode_detector i
     detect_unicode_carriers,
     sanitize_unicode_carriers,
 )
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+    ParsedResponsesEvent,
+    ResponsesEventPipeline,
+    attach_responses_emissions,
+    attach_responses_events,
+    responses_emissions_from_chunk,
+    responses_events_from_chunk,
+)
 
 _OUTPUT_AUDIT_KEY = "watermark_output_audit"
+_TEXT_ITEM_EVENT_TYPES = frozenset({"response.content_part.done", "response.output_item.done"})
 _VISIBLE_DELTA_TYPES = frozenset(
     {
         "response.output_text.delta",
@@ -116,29 +126,81 @@ def _visible_texts_from_event(payload: Mapping[str, Any], event_type: str) -> li
     return texts
 
 
-def _visible_texts_from_sse_block(block: str) -> list[str]:
+def _text_item_payloads_from_event(
+    payload: Mapping[str, Any], event_type: str
+) -> list[dict[str, Any]]:
+    """Return supported visible-text item carriers for done snapshot events."""
+
+    if event_type not in _TEXT_ITEM_EVENT_TYPES:
+        return []
+    nested_key = "item" if event_type == "response.output_item.done" else "part"
+    nested = payload.get(nested_key)
+    if not isinstance(nested, dict):
+        return []
+    content = nested.get("content")
+    has_text = isinstance(nested.get("text"), str)
+    if not has_text and not isinstance(content, list):
+        return []
+    return [nested]
+
+
+def _event_payload_and_type(event: Any) -> tuple[Optional[Mapping[str, Any]], str]:
+    if isinstance(event, ParsedResponsesEvent):
+        return event.payload, event.event_type or ""
+    if isinstance(event, Mapping):
+        event_type = event.get("type")
+        return event, event_type if isinstance(event_type, str) else ""
+    payload = getattr(event, "payload", None)
+    event_type = getattr(event, "event_type", None) or getattr(event, "type", None)
+    if isinstance(payload, Mapping):
+        return payload, event_type if isinstance(event_type, str) else ""
+    return None, ""
+
+
+def _visible_texts_from_sse_block(
+    block: Any,
+    *,
+    parse_sse_block: Optional[Callable[[str], list[Any]]] = None,
+) -> list[str]:
     texts: list[str] = []
-    event_type = ""
-    for raw_line in block.splitlines():
-        line = raw_line.strip()
-        if line.startswith("event:"):
-            event_type = line[6:].strip()
-            continue
-        if not line.startswith("data:"):
-            continue
-        payload_text = line[5:].strip()
-        if not payload_text or payload_text == "[DONE]":
-            continue
-        try:
-            payload = json.loads(payload_text)
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        parsed_type = payload.get("type")
-        if isinstance(parsed_type, str) and parsed_type:
-            event_type = parsed_type
-        if event_type not in _VISIBLE_DELTA_TYPES:
+    associated_emissions = responses_emissions_from_chunk(block)
+    if associated_emissions is not None:
+        for emission in associated_emissions:
+            payload = emission.effective_payload
+            event_type = emission.source_event.event_type or ""
+            if (
+                not isinstance(payload, Mapping)
+                or not event_type
+                or (
+                    event_type not in _VISIBLE_DELTA_TYPES
+                    and event_type not in _TEXT_ITEM_EVENT_TYPES
+                )
+            ):
+                continue
+            if event_type in _TEXT_ITEM_EVENT_TYPES:
+                for item in _text_item_payloads_from_event(payload, event_type):
+                    content = item.get("content")
+                    if isinstance(item.get("text"), str):
+                        texts.append(item["text"])
+                    if not isinstance(content, list):
+                        continue
+                    for part in content:
+                        if isinstance(part, Mapping) and isinstance(part.get("text"), str):
+                            texts.append(part["text"])
+                continue
+            texts.extend(_visible_texts_from_event(payload, event_type))
+        return texts
+    parser = parse_sse_block or _parse_responses_sse_block
+    for parsed_event in parser(block):
+        payload, event_type = _event_payload_and_type(parsed_event)
+        if (
+            not isinstance(payload, Mapping)
+            or event_type not in _VISIBLE_DELTA_TYPES
+            or (
+                isinstance(parsed_event, ParsedResponsesEvent)
+                and (parsed_event.is_malformed or parsed_event.is_done_marker)
+            )
+        ):
             continue
         texts.extend(_visible_texts_from_event(payload, event_type))
     return texts
@@ -197,55 +259,155 @@ def _rewrite_visible_sse_payload(
     return payload
 
 
-def _rewrite_visible_sse_block(
-    event_block: str, config: OpenAIPassthroughTextWatermarkSettings
-) -> str:
-    lines = event_block.splitlines(keepends=True)
-    event_type = ""
-    rewritten: list[str] = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("event:"):
-            event_type = stripped[6:].strip()
-            rewritten.append(line)
-            continue
-        if not stripped.startswith("data:"):
-            rewritten.append(line)
-            continue
-        prefix_len = line.find("data:") + 5
-        remainder = line[prefix_len:]
-        payload_text = remainder.strip()
-        newline = remainder[len(remainder.rstrip("\r\n")) :]
-        if not payload_text or payload_text == "[DONE]":
-            rewritten.append(line)
-            continue
-        try:
-            payload = json.loads(payload_text)
-        except (TypeError, ValueError):
-            rewritten.append(line)
-            continue
-        if not isinstance(payload, dict):
-            rewritten.append(line)
-            continue
-        parsed_type = payload.get("type")
-        if isinstance(parsed_type, str) and parsed_type:
-            event_type = parsed_type
-        if event_type in _VISIBLE_DELTA_TYPES:
-            payload = _rewrite_visible_sse_payload(payload, event_type, config)
-        rewritten.append(
-            line[:prefix_len]
-            + " "
-            + json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-            + newline
+def _rewrite_visible_text_item_payload(
+    payload: dict[str, Any],
+    event_type: str,
+    config: OpenAIPassthroughTextWatermarkSettings,
+) -> dict[str, Any]:
+    """Rewrite output_text text carried by an existing done-snapshot item."""
+
+    nested_key = "item" if event_type == "response.output_item.done" else "part"
+    nested = payload.get(nested_key)
+    if not isinstance(nested, dict):
+        return payload
+
+    if isinstance(nested.get("text"), str):
+        nested["text"] = _sanitize_visible_payload_text(nested["text"], config)
+
+    content = nested.get("content")
+    if not isinstance(content, list):
+        return payload
+    for part in content:
+        if isinstance(part, dict) and isinstance(part.get("text"), str):
+            part["text"] = _sanitize_visible_payload_text(part["text"], config)
+    return payload
+
+
+def _rewrite_visible_sse_emission(
+    emission: Any,
+    config: OpenAIPassthroughTextWatermarkSettings,
+) -> Any:
+    payload = emission.effective_payload
+    event_type = emission.source_event.event_type or ""
+    if not isinstance(payload, dict) or (
+        event_type not in _VISIBLE_DELTA_TYPES
+        and event_type not in _TEXT_ITEM_EVENT_TYPES
+    ):
+        return emission
+    if event_type in _TEXT_ITEM_EVENT_TYPES:
+        rewritten_payload = _rewrite_visible_text_item_payload(
+            copy.deepcopy(payload),
+            event_type,
+            config,
         )
-    return "".join(rewritten)
+    else:
+        rewritten_payload = _rewrite_visible_sse_payload(
+            copy.deepcopy(payload),
+            event_type,
+            config,
+        )
+    if rewritten_payload == payload:
+        return emission
+    return emission.transformed(rewritten_payload)
 
 
-def _encode_sse_block(event_block: str, had_separator: bool) -> bytes:
-    text = event_block
-    if had_separator and not text.endswith("\n\n"):
-        text = f"{event_block}\n\n"
-    return text.encode("utf-8")
+def _rewrite_visible_sse_block(
+    event_block: Any, config: OpenAIPassthroughTextWatermarkSettings
+) -> Any:
+    associated_emissions = responses_emissions_from_chunk(event_block)
+    if associated_emissions is None:
+        return event_block
+    rewritten = [
+        _rewrite_visible_sse_emission(emission, config)
+        for emission in associated_emissions
+    ]
+    if rewritten == associated_emissions:
+        return event_block
+    return attach_responses_emissions(b"", rewritten)
+
+
+def _parse_responses_sse_block(block: str) -> list[Any]:
+    """Parse one complete SSE block with configured event bounds."""
+    parsed_events = responses_events_from_chunk(block)
+    if parsed_events is None:
+        parsed_events = getattr(block, "aawm_parsed_responses_events", None)
+    if isinstance(parsed_events, list):
+        return parsed_events
+
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+        ResponsesEventPipeline,
+        resolve_responses_event_limits,
+    )
+
+    pipeline = ResponsesEventPipeline(
+        max_event_bytes=resolve_responses_event_limits()[0],
+        max_raw_events=0,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
+        _sse_block_wire_bytes,
+    )
+
+    encoded = _sse_block_wire_bytes(block)
+    if not encoded.endswith((b"\r\n\r\n", b"\n\n", b"\r\r")):
+        encoded += b"\n\n"
+    return pipeline.feed(encoded)
+
+
+def _associate_unassociated_watermark_iterator(
+    iterator: Any,
+    *,
+    event_pipeline: Optional[ResponsesEventPipeline],
+) -> Any:
+    """Require one parsing/association boundary before buffered mutation."""
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+        responses_events_from_chunk,
+    )
+
+    pipeline = event_pipeline
+
+    def _associated_frames(events: list[ParsedResponsesEvent]) -> bytes:
+        return attach_responses_events(
+            b"".join(
+                event.forward_event or event.raw_event or b""
+                for event in events
+            ),
+            events,
+        )
+
+    async def _wrapped():
+        nonlocal pipeline
+        async for chunk in iterator:
+            if responses_events_from_chunk(chunk) is not None:
+                yield chunk
+                continue
+            if pipeline is None:
+                pipeline = ResponsesEventPipeline(max_raw_events=0)
+            data = (
+                chunk
+                if isinstance(chunk, (bytes, bytearray))
+                else str(chunk).encode("utf-8")
+            )
+            events = pipeline.feed(bytes(data))
+            if events:
+                yield _associated_frames(events)
+        if pipeline is not None:
+            leftover = pipeline.finish()
+            if leftover:
+                yield _associated_frames(leftover)
+
+    return _wrapped()
+
+
+def _encode_sse_block(event_block: Any, had_separator: bool) -> bytes:
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
+        _sse_block_wire_bytes,
+    )
+
+    wire = _sse_block_wire_bytes(event_block, had_separator)
+    associated_emissions = responses_emissions_from_chunk(event_block)
+    if associated_emissions is None:
+        return wire
+    return attach_responses_emissions(wire, associated_emissions)
 
 
 def _append_bounded_visible_text(
@@ -264,6 +426,22 @@ def _append_bounded_visible_text(
         except UnicodeDecodeError:
             truncated = truncated[1:]
     return ""
+
+
+def _append_required_visible_text(
+    retained: str,
+    visible: str,
+    max_bytes: int,
+) -> str:
+    """Append required validation text or fail closed at the configured bound."""
+    if not visible:
+        return retained
+    combined = retained + visible
+    if max_bytes <= 0 or len(combined.encode("utf-8")) > max_bytes:
+        raise ValueError(
+            "Responses watermark visible-text validation exceeded configured bound"
+        )
+    return combined
 
 
 def _synthetic_visible_body(text: str) -> dict[str, Any]:
@@ -374,6 +552,7 @@ async def _wrap_passthrough_watermark_responses_stream_audit_only(
     endpoint: str,
     stream_policy: str,
     sse_iter: Any,
+    parse_sse_block: Optional[Callable[[str], list[Any]]] = None,
 ) -> AsyncIterator[Any]:
     """Yield original SSE blocks; attach bounded output audit during iteration."""
 
@@ -383,7 +562,10 @@ async def _wrap_passthrough_watermark_responses_stream_audit_only(
     max_bytes = config.limits.max_text_bytes_per_direction
     async for event_block, had_separator in sse_iter(iterator):
         if not attached and config.unicode.enabled:
-            for visible in _visible_texts_from_sse_block(event_block):
+            for visible in _visible_texts_from_sse_block(
+                event_block,
+                parse_sse_block=parse_sse_block,
+            ):
                 retained = _append_bounded_visible_text(
                     retained, visible, max_bytes
                 )
@@ -409,24 +591,57 @@ async def _wrap_passthrough_watermark_responses_stream_buffer_response(
     success_handler_kwargs: Any,
     endpoint: str,
     sse_iter: Any,
+    parse_sse_block: Optional[Callable[[str], list[Any]]] = None,
 ) -> AsyncIterator[Any]:
     """Buffer the complete SSE stream, sanitize/verify, then emit."""
 
-    buffered: list[tuple[str, bool]] = []
+    buffered: list[tuple[Any, bool]] = []
     retained = ""
     max_bytes = config.limits.max_text_bytes_per_direction
+    buffered_bytes = 0
+    max_stream_bytes = config.limits.max_sse_stream_bytes
     async for event_block, had_separator in sse_iter(iterator):
+        encoded_block = _encode_sse_block(event_block, had_separator)
+        buffered_bytes += len(encoded_block)
+        if buffered_bytes > max_stream_bytes:
+            raise ValueError("Responses watermark stream exceeded configured bound")
         buffered.append((event_block, had_separator))
-        for visible in _visible_texts_from_sse_block(event_block):
-            retained = _append_bounded_visible_text(retained, visible, max_bytes)
+        for visible in _visible_texts_from_sse_block(
+            event_block,
+            parse_sse_block=parse_sse_block,
+        ):
+            retained = _append_required_visible_text(retained, visible, max_bytes)
 
     audit = _audit_retained_visible_text(retained, config, endpoint)
     if audit is not None:
         _attach_output_audit(success_handler_kwargs, audit)
 
+    rewrite = _policy_mutates(config)
+    emitted_blocks: list[tuple[Any, bool]] = []
+    emitted_visible = ""
+    for event_block, had_separator in buffered:
+        emitted = (
+            _rewrite_visible_sse_block(event_block, config)
+            if rewrite
+            else event_block
+        )
+        for visible in _visible_texts_from_sse_block(
+            emitted,
+            parse_sse_block=parse_sse_block,
+        ):
+            emitted_visible = _append_required_visible_text(
+                emitted_visible, visible, max_bytes
+            )
+        emitted_blocks.append((emitted, had_separator))
+
     post_hits = 0
-    if retained and config.unicode.enabled:
-        cleaned = _sanitize_visible_payload_text(retained, config)
+    verification_text = emitted_visible if rewrite else retained
+    if verification_text and config.unicode.enabled:
+        cleaned = (
+            verification_text
+            if rewrite
+            else _sanitize_visible_payload_text(verification_text, config)
+        )
         post_hits = detect_unicode_carriers(
             cleaned,
             policy=config.unicode.policy,
@@ -436,13 +651,7 @@ async def _wrap_passthrough_watermark_responses_stream_buffer_response(
     if config.mode == "enforce" and post_hits > 0:
         _raise_unremovable_stream(audit)
 
-    rewrite = _policy_mutates(config)
-    for event_block, had_separator in buffered:
-        emitted = (
-            _rewrite_visible_sse_block(event_block, config)
-            if rewrite
-            else event_block
-        )
+    for emitted, had_separator in emitted_blocks:
         yield _encode_sse_block(emitted, had_separator)
 
 
@@ -451,6 +660,7 @@ def maybe_wrap_passthrough_watermark_responses_stream(
     config: Any = None,
     success_handler_kwargs: Any = None,
     endpoint: str = "responses",
+    event_pipeline: Optional[ResponsesEventPipeline] = None,
     **kwargs: Any,
 ) -> Any:
     """Wrap a Responses SSE iterator for detect/audit and buffered sanitize.
@@ -478,14 +688,18 @@ def maybe_wrap_passthrough_watermark_responses_stream(
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
         _iter_sse_event_blocks_with_separator,
     )
-
     if mutating and stream_policy == "buffer_response":
+        iterator = _associate_unassociated_watermark_iterator(
+            iterator,
+            event_pipeline=event_pipeline,
+        )
         return _wrap_passthrough_watermark_responses_stream_buffer_response(
             iterator,
             config=loaded,
             success_handler_kwargs=success_handler_kwargs,
             endpoint=endpoint,
             sse_iter=_iter_sse_event_blocks_with_separator,
+            parse_sse_block=_parse_responses_sse_block,
         )
 
     return _wrap_passthrough_watermark_responses_stream_audit_only(
@@ -495,4 +709,5 @@ def maybe_wrap_passthrough_watermark_responses_stream(
         endpoint=endpoint,
         stream_policy=stream_policy,
         sse_iter=_iter_sse_event_blocks_with_separator,
+        parse_sse_block=_parse_responses_sse_block,
     )

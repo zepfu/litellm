@@ -272,9 +272,6 @@ def _normalize_langfuse_host(host: Optional[str]) -> str:
     if not normalized.startswith(("http://", "https://")):
         normalized = f"http://{normalized}"
 
-    for internal_host in ("aawm-langfuse-web", "langfuse-web"):
-        normalized = normalized.replace(internal_host, "127.0.0.1")
-
     return normalized
 
 
@@ -577,6 +574,63 @@ async def _get_existing_call_ids(call_ids: Sequence[str]) -> Set[str]:
     }
 
 
+async def _reconcile_langfuse_call_ids(records: Sequence[Dict[str, Any]]) -> None:
+    """Resolve legacy observation IDs against exact retained proxy identities."""
+    candidates = [
+        record
+        for record in records
+        if record.get("trace_id")
+        and record.get("litellm_call_id")
+        == record.get("metadata", {}).get("source_observation_id")
+    ]
+    if not candidates or not _build_aawm_admin_dsn():
+        return
+    pool = await _get_session_history_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT litellm_call_id, session_id, trace_id, provider_response_id, start_time "
+            "FROM public.session_history WHERE session_id = ANY($1::text[]) "
+            "AND trace_id = ANY($2::text[])",
+            sorted({record["session_id"] for record in candidates}),
+            sorted({record["trace_id"] for record in candidates}),
+        )
+    for record in candidates:
+        response_id = record.get("provider_response_id")
+        start_time = _as_utc_aware_datetime(record.get("start_time"))
+        # Langfuse REST/ClickHouse retain millisecond timestamp precision.
+        if start_time is not None:
+            start_time = start_time.replace(
+                microsecond=start_time.microsecond // 1000 * 1000
+            )
+        matches = {
+            str(row["litellm_call_id"])
+            for row in rows
+            if row["trace_id"] == record["trace_id"]
+            and row["session_id"] == record["session_id"]
+            and (
+                row["provider_response_id"] == response_id
+                if response_id
+                else start_time is not None
+                and row["start_time"] is not None
+                and row["start_time"].replace(
+                    microsecond=row["start_time"].microsecond // 1000 * 1000
+                ) == start_time
+            )
+        }
+        if len(matches) > 1:
+            raise RuntimeError(
+                "Ambiguous proxy identity for Langfuse observation "
+                f"{record['metadata']['source_observation_id']}; reconcile before apply"
+            )
+        if matches:
+            record["litellm_call_id"] = matches.pop()
+            record["metadata"]["litellm_call_id_source"] = (
+                "session_history.trace_id+provider_response_id"
+                if response_id
+                else "session_history.trace_id+start_time"
+            )
+
+
 def _session_history_created_at_updates(
     records: Sequence[Dict[str, Any]],
 ) -> List[Tuple[datetime, str]]:
@@ -796,6 +850,7 @@ class LangfuseTraceSource:
         page: int,
         limit: int,
         observation_type: str = "GENERATION",
+        trace_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         return await asyncio.to_thread(
             self._request_json,
@@ -804,6 +859,7 @@ class LangfuseTraceSource:
                 "page": page,
                 "limit": limit,
                 "type": observation_type,
+                "traceId": trace_id,
                 "orderBy": "startTime.desc",
             },
         )
@@ -1675,13 +1731,16 @@ async def _run_langfuse_trace_backfill(  # noqa: PLR0915
     stats = BackfillStats()
     session_source_counts: Counter[str] = Counter()
     trace_source_counts: Counter[str] = Counter()
-    # Prefer on-demand fetch_trace_by_id for full history; only prefetch when a
-    # session_id can be pushed server-side (or a single trace_id is requested).
+    # Fetch a selected trace directly; do not scan the global trace catalogue.
     trace_core_lookup: Dict[str, Dict[str, Any]] = {}
     resume = _resume_cursor_from_args(args)
     processed_records = 0
 
-    if args.session_id or args.trace_id:
+    if args.trace_id:
+        trace_core_lookup[args.trace_id] = await langfuse_source.fetch_trace_by_id(
+            args.trace_id
+        )
+    elif args.session_id:
         trace_page = max(1, int(resume.get("trace_page") or 1))
         total_trace_pages: Optional[int] = None
         trace_page_size = max(50, min(args.batch_size * 4, 200))
@@ -1726,6 +1785,7 @@ async def _run_langfuse_trace_backfill(  # noqa: PLR0915
             page=page,
             limit=observation_page_size,
             observation_type="GENERATION",
+            **({"trace_id": args.trace_id} if args.trace_id else {}),
         )
         observations = response.get("data")
         meta = response.get("meta") or {}
@@ -1793,6 +1853,7 @@ async def _run_langfuse_trace_backfill(  # noqa: PLR0915
             if args.limit is not None and processed_records >= args.limit:
                 break
 
+        await _reconcile_langfuse_call_ids(records)
         existing_ids = await _get_existing_call_ids(
             [record["litellm_call_id"] for record in records]
         )
@@ -1970,6 +2031,7 @@ async def _run_langfuse_db_backfill(  # noqa: PLR0915
                     hit_limit = True
                     break
 
+            await _reconcile_langfuse_call_ids(records)
             existing_ids = await _get_existing_call_ids(
                 [record["litellm_call_id"] for record in records]
             )
@@ -2165,6 +2227,7 @@ async def _run_langfuse_clickhouse_backfill(  # noqa: PLR0915
                 hit_limit = True
                 break
 
+        await _reconcile_langfuse_call_ids(records)
         existing_ids = await _get_existing_call_ids(
             [record["litellm_call_id"] for record in records]
         )

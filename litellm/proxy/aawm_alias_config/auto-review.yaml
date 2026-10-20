@@ -1,5 +1,3 @@
-# CFG-041: auto-review and codex-auto-review in one document.
-# codex-auto-review is a public alias_reference into auto-review.
 defaults: {}
 
 aliases:
@@ -13,8 +11,3 @@ aliases:
         route_family: codex_responses
         priority: 90
         reasoning_effort: low
-
-  - name: codex-auto-review
-    candidates:
-      - alias_reference: auto-review
-        priority: 100

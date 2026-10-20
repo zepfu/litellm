@@ -68,6 +68,9 @@ _XAI_OAUTH_RATE_LIMIT_HEADERS_KEY = "xai_oauth_response_headers"
 _XAI_GROK_OIDC_RATE_LIMIT_HEADERS_KEY = "xai_grok_oidc_response_headers"
 _XAI_OAUTH_RATE_LIMIT_SOURCE = "xai_oauth_response_headers"
 _XAI_GROK_OIDC_RATE_LIMIT_SOURCE = "xai_grok_oidc_response_headers"
+_AAWM_VALIDATED_XAI_OAUTH_SERVER_ACCOUNT_METADATA_KEY = (
+    "aawm_validated_xai_oauth_server_account"
+)
 _COHERE_DIRECT_ROUTE_FAMILY = "codex_cohere_chat_completions_adapter"
 _COHERE_LOCAL_OBSERVATION_SOURCE = "locally_counted"
 
@@ -127,6 +130,47 @@ class PassThroughEndpointLogging:
             metadata = {}
             litellm_params["metadata"] = metadata
         return metadata
+
+    @staticmethod
+    def _record_validated_xai_oauth_server_account_metadata(
+        metadata: dict,
+        request: Optional[Any],
+    ) -> None:
+        if not isinstance(metadata, dict):
+            raise TypeError("metadata must be a dict")
+        validated_server_account = None
+        if request is not None:
+            from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
+                validated_xai_oauth_server_account_provenance,
+                validated_xai_oauth_server_account_metadata,
+            )
+
+            validated_server_account = validated_xai_oauth_server_account_metadata(
+                metadata,
+                request=request,
+            )
+            if validated_server_account is not None:
+                validated_server_account["aawm_server_provenance"] = (
+                    validated_xai_oauth_server_account_provenance()
+                )
+        else:
+            from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
+                validated_xai_oauth_server_account_provenance,
+            )
+
+            metadata.pop(
+                validated_xai_oauth_server_account_provenance(),
+                None,
+            )
+        if validated_server_account is not None:
+            metadata[
+                _AAWM_VALIDATED_XAI_OAUTH_SERVER_ACCOUNT_METADATA_KEY
+            ] = dict(validated_server_account)
+        else:
+            metadata.pop(
+                _AAWM_VALIDATED_XAI_OAUTH_SERVER_ACCOUNT_METADATA_KEY,
+                None,
+            )
 
     @staticmethod
     def _sync_failure_logging_evidence(
@@ -249,6 +293,7 @@ class PassThroughEndpointLogging:
         httpx_response: httpx.Response,
         url_route: str,
         custom_llm_provider: Optional[str],
+        request: Optional[Any] = None,
     ) -> None:
         metadata = self._ensure_metadata(kwargs)
         if custom_llm_provider == "xai":
@@ -265,6 +310,10 @@ class PassThroughEndpointLogging:
                 )
                 if sanitized_headers:
                     metadata[_XAI_OAUTH_RATE_LIMIT_HEADERS_KEY] = sanitized_headers
+                self._record_validated_xai_oauth_server_account_metadata(
+                    metadata,
+                    request,
+                )
             return
         if not (
             custom_llm_provider == "anthropic"
@@ -663,10 +712,14 @@ class PassThroughEndpointLogging:
         start_time: datetime,
         end_time: datetime,
         cache_hit: bool,
+        operational_request: Optional[Any] = None,
         **kwargs,
     ):
         """Run pass-through logging hooks using the same callback contracts as normal LiteLLM success handling."""
-        delivered_wire_disposition = get_delivered_wire_disposition(kwargs)
+        delivered_wire_disposition = get_delivered_wire_disposition(
+            kwargs,
+            request=operational_request,
+        )
         if (
             isinstance(delivered_wire_disposition, dict)
             and delivered_wire_disposition.get("delivered_disposition") != "completed"
@@ -988,6 +1041,7 @@ class PassThroughEndpointLogging:
         request_body: dict,
         passthrough_logging_payload: PassthroughStandardLoggingPayload,
         custom_llm_provider: Optional[str] = None,
+        operational_request: Optional[Any] = None,
         **kwargs,
     ):
         standard_logging_response_object: Optional[
@@ -1025,6 +1079,7 @@ class PassThroughEndpointLogging:
                 httpx_response=httpx_response,
                 url_route=url_route,
                 custom_llm_provider=custom_llm_provider,
+                request=operational_request,
             )
             normalized_llm_passthrough_logging_payload = (
                 self.normalize_llm_passthrough_logging_payload(
@@ -1058,7 +1113,10 @@ class PassThroughEndpointLogging:
             kwargs=kwargs,
         )
 
-        delivered_wire_disposition = get_delivered_wire_disposition(kwargs)
+        delivered_wire_disposition = get_delivered_wire_disposition(
+            kwargs,
+            request=operational_request,
+        )
         delivered_disposition = (
             delivered_wire_disposition.get("delivered_disposition")
             if isinstance(delivered_wire_disposition, dict)
@@ -1187,6 +1245,7 @@ class PassThroughEndpointLogging:
             start_time=start_time,
             end_time=end_time,
             cache_hit=cache_hit,
+            operational_request=operational_request,
             standard_pass_through_logging_payload=passthrough_logging_payload,
             **kwargs,
         )

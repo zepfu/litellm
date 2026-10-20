@@ -5,7 +5,9 @@ Do not import ``llm_passthrough_endpoints`` at module scope.
 
 This module owns:
 - Claude auto-memory section replacement (context replacement templates)
-- Claude prompt-patch manifest loading and application
+- Claude prompt-patch manifest loading and application (delegated to
+  ``prompt_replacement_engine`` for the shared matcher/loader/cache pipeline
+  required by CFG-073)
 - Metadata/logging helpers for both replacement families
 
 It uses the Wave 6D ``observability_metadata`` module for shared metadata
@@ -14,7 +16,6 @@ primitives via explicit imports.
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -25,6 +26,17 @@ from litellm.proxy.pass_through_endpoints.aawm_request_policy.observability_meta
     _build_langfuse_span_descriptor,
     _format_langfuse_span_timestamp,
     _merge_litellm_metadata,
+)
+from litellm.proxy.pass_through_endpoints.aawm_request_policy.prompt_replacement_engine import (  # CFG-073 shared engine
+    _DEFAULT_MANIFEST_CACHE,
+    _text_asset_cache,
+    apply_rules_to_text,
+    extract_markdown_section,
+    load_manifest_document,
+    load_text_asset,
+    render_section_template,
+    replace_template_section,
+    rules_from_manifest,
 )
 
 # ---------------------------------------------------------------------------
@@ -95,29 +107,26 @@ class ClaudePromptReplacementServices:
 # Caches
 # ---------------------------------------------------------------------------
 
-_claude_context_replacement_template_cache: dict[Path, str] = {}
-_claude_prompt_patch_manifest_cache: dict[Path, dict[str, Any]] = {}
+# Auto-memory template loading uses shared load_text_asset / _text_asset_cache;
+# the local cache alias is kept for the legacy re-export contract.
+_claude_context_replacement_template_cache = _text_asset_cache
+_claude_prompt_patch_manifest_cache = _DEFAULT_MANIFEST_CACHE
 
 # ---------------------------------------------------------------------------
 # Version parsing / template resolution
 # ---------------------------------------------------------------------------
+# _CLAUDE_CC_VERSION_PATTERN is kept for the legacy re-export contract
+# in this facade; actual version parsing is delegated to the
+# shared _parse_cc_version in prompt_replacement_engine.
 
 
 def _parse_claude_code_version(
     cc_version: Optional[str],
 ) -> Optional[tuple[int, int, int]]:
-    if not cc_version:
-        return None
-
-    match = _CLAUDE_CC_VERSION_PATTERN.match(cc_version.strip())
-    if match is None:
-        return None
-
-    return (
-        int(match.group("major")),
-        int(match.group("minor")),
-        int(match.group("patch")),
+    from litellm.proxy.pass_through_endpoints.aawm_request_policy.prompt_replacement_engine import (
+        _parse_cc_version,
     )
+    return _parse_cc_version(cc_version)
 
 
 def _candidate_context_replacement_dirs() -> tuple[Path, ...]:
@@ -176,71 +185,17 @@ def _resolve_claude_prompt_patch_manifest_path() -> Path:
 
 
 def _load_claude_context_replacement_template(template_path: Path) -> str:
-    cached_template = _claude_context_replacement_template_cache.get(template_path)
-    if cached_template is not None:
-        return cached_template
-
-    template_text = template_path.read_text(encoding="utf-8").strip()
-    if not template_text:
-        raise ValueError(
-            f"Claude context replacement template is empty: {template_path}"
-        )
-
-    cached_template = template_text + "\n"
-    _claude_context_replacement_template_cache[template_path] = cached_template
-    return cached_template
+    try:
+        return load_text_asset(template_path)
+    except ValueError as exc:
+        raise ValueError(f"Claude context replacement template is empty: {template_path}") from exc
 
 
-def _load_claude_prompt_patch_manifest(template_path: Path) -> dict[str, Any]:
-    cached_manifest = _claude_prompt_patch_manifest_cache.get(template_path)
-    if cached_manifest is not None:
-        return cached_manifest
-
-    manifest = json.loads(template_path.read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict):
-        raise ValueError(f"Invalid Claude prompt patch manifest: {template_path}")
-
-    patches = manifest.get("patches")
-    if not isinstance(patches, list) or not patches:
-        raise ValueError(
-            f"Claude prompt patch manifest has no patches: {template_path}"
-        )
-
-    normalized_patches: list[dict[str, str]] = []
-    for patch_descriptor in patches:
-        if not isinstance(patch_descriptor, dict):
-            raise ValueError(
-                f"Invalid Claude prompt patch descriptor in {template_path}"
-            )
-        patch_id = patch_descriptor.get("id")
-        before_text = patch_descriptor.get("before")
-        after_text = patch_descriptor.get("after")
-        if not isinstance(patch_id, str) or not patch_id:
-            raise ValueError(
-                f"Claude prompt patch manifest is missing patch id in {template_path}"
-            )
-        if not isinstance(before_text, str) or not before_text:
-            raise ValueError(
-                f"Claude prompt patch manifest is missing before text for {patch_id}"
-            )
-        if not isinstance(after_text, str) or not after_text:
-            raise ValueError(
-                f"Claude prompt patch manifest is missing after text for {patch_id}"
-            )
-        normalized_patches.append(
-            {
-                "id": patch_id,
-                "before": before_text,
-                "after": after_text,
-            }
-        )
-
-    normalized_manifest = {
-        "source": manifest.get("source"),
-        "patches": normalized_patches,
-    }
-    _claude_prompt_patch_manifest_cache[template_path] = normalized_manifest
-    return normalized_manifest
+def _load_claude_prompt_patch_manifest(manifest_path: Path) -> dict[str, Any]:
+    return load_manifest_document(
+        manifest_path, legacy=True,
+        patterns={_CLAUDE_REPORT_FILE_PATCH_ID: _CLAUDE_REPORT_FILE_INSTRUCTION_PATTERN},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -249,13 +204,7 @@ def _load_claude_prompt_patch_manifest(template_path: Path) -> dict[str, Any]:
 
 
 def _extract_markdown_section(markdown_text: str, heading: str) -> str:
-    section_pattern = re.compile(
-        rf"(?ms)^## {re.escape(heading)}\n.*?(?=^## |\Z)"
-    )
-    match = section_pattern.search(markdown_text)
-    if match is None:
-        raise ValueError(f"Missing Claude auto-memory section: {heading}")
-    return match.group(0).rstrip()
+    return extract_markdown_section(markdown_text, heading)
 
 
 def _render_claude_auto_memory_replacement(
@@ -270,34 +219,16 @@ def _render_claude_auto_memory_replacement(
         )
 
     template_text = _load_claude_context_replacement_template(template_path)
-    rendered_text = template_text
-    if "{{TYPES_XML_BLOCK}}" in rendered_text:
-        types_match = _CLAUDE_TYPES_XML_BLOCK_PATTERN.search(memory_section)
-        if types_match is None:
-            raise ValueError("Missing Claude auto-memory <types> block")
-        rendered_text = rendered_text.replace(
-            "{{TYPES_XML_BLOCK}}", types_match.group(0).rstrip()
-        )
-
-    section_placeholders = {
-        "{{WHAT_NOT_TO_SAVE_SECTION}}": "What NOT to save in memory",
-        "{{BEFORE_RECOMMENDING_SECTION}}": "Before recommending from memory",
-        "{{MEMORY_AND_PERSISTENCE_SECTION}}": "Memory and other forms of persistence",
-    }
-    for placeholder, heading in section_placeholders.items():
-        if placeholder in rendered_text:
-            rendered_text = rendered_text.replace(
-                placeholder, _extract_markdown_section(memory_section, heading)
-            )
-
-    unresolved_placeholders = (
-        _CLAUDE_CONTEXT_REPLACEMENT_PLACEHOLDER_PATTERN.findall(rendered_text)
+    rendered_text = render_section_template(
+        memory_section, template_text,
+        blocks={"{{TYPES_XML_BLOCK}}": _CLAUDE_TYPES_XML_BLOCK_PATTERN},
+        sections={
+            "{{WHAT_NOT_TO_SAVE_SECTION}}": "What NOT to save in memory",
+            "{{BEFORE_RECOMMENDING_SECTION}}": "Before recommending from memory",
+            "{{MEMORY_AND_PERSISTENCE_SECTION}}": "Memory and other forms of persistence",
+        },
+        placeholder_pattern=_CLAUDE_CONTEXT_REPLACEMENT_PLACEHOLDER_PATTERN,
     )
-    if unresolved_placeholders:
-        raise ValueError(
-            "Unresolved Claude context replacement placeholders: "
-            + ", ".join(sorted(unresolved_placeholders))
-        )
 
     if section_heading != "# auto memory":
         rendered_text = rendered_text.replace("# auto memory", section_heading, 1)
@@ -308,19 +239,16 @@ def _render_claude_auto_memory_replacement(
 def _replace_claude_auto_memory_section_in_text(
     text: str, cc_version: str
 ) -> tuple[str, Optional[dict[str, Any]]]:
-    if "# auto memory" not in text and "# Persistent Agent Memory" not in text:
-        return text, None
-
-    section_match = _CLAUDE_MEMORY_SECTION_PATTERN.search(text)
-    if section_match is None:
-        return text, None
-
-    section_heading = section_match.group("section_heading")
-    replacement_text, logical_path = _render_claude_auto_memory_replacement(
-        section_match.group(0),
-        cc_version,
-        section_heading,
+    logical_path = _CLAUDE_AUTO_MEMORY_TEMPLATE_LOGICAL_PATH
+    updated_text, section_match, replacement_text = replace_template_section(
+        text, _CLAUDE_MEMORY_SECTION_PATTERN,
+        lambda match: _render_claude_auto_memory_replacement(
+            match.group(0), cc_version, match.group("section_heading"),
+        )[0],
     )
+    if section_match is None or replacement_text is None:
+        return text, None
+    section_heading = section_match.group("section_heading")
     replacement_event: dict[str, Any] = {
         "id": "auto-memory",
         "status": "resolved",
@@ -329,10 +257,7 @@ def _replace_claude_auto_memory_section_in_text(
         "section_heading": section_heading,
         "output_chars": len(replacement_text),
     }
-    return (
-        text[: section_match.start()] + replacement_text + text[section_match.end() :],
-        replacement_event,
-    )
+    return updated_text, replacement_event
 
 
 def _replace_claude_system_prompt_override_in_value(
@@ -523,8 +448,15 @@ def _replace_claude_system_prompt_in_anthropic_request_body(
 
 
 # ---------------------------------------------------------------------------
-# Prompt-patch replacement
+# Prompt-patch replacement  (CFG-073: routed through shared engine)
 # ---------------------------------------------------------------------------
+
+
+def _claude_manifest_to_rules(manifest: dict[str, Any]) -> list[Any]:
+    return rules_from_manifest(
+        manifest,
+        patterns={_CLAUDE_REPORT_FILE_PATCH_ID: _CLAUDE_REPORT_FILE_INSTRUCTION_PATTERN},
+    )
 
 
 def _apply_claude_prompt_patch_manifest_to_text(
@@ -533,43 +465,32 @@ def _apply_claude_prompt_patch_manifest_to_text(
     cc_version: str,
     manifest: dict[str, Any],
 ) -> tuple[str, list[dict[str, Any]]]:
-    updated_text = text
+    """Apply Claude prompt-patch rules via the shared CFG-073 engine.
+
+    Accepts the legacy ``manifest`` dict and converts internally.
+    """
+    rules = _claude_manifest_to_rules(manifest)
+    updated_text, result = apply_rules_to_text(
+        text,
+        rules,
+        cc_version=cc_version,
+    )
+
     patch_events: list[dict[str, Any]] = []
-
-    for patch_descriptor in manifest["patches"]:
-        patch_id = patch_descriptor["id"]
-        before_text = patch_descriptor["before"]
-        after_text = patch_descriptor["after"]
-        occurrences = updated_text.count(before_text)
-        match_types: list[str] = []
-        if occurrences:
-            updated_text = updated_text.replace(before_text, after_text)
-            match_types.append("exact")
-
-        if patch_id == _CLAUDE_REPORT_FILE_PATCH_ID:
-            updated_text, pattern_occurrences = (
-                _CLAUDE_REPORT_FILE_INSTRUCTION_PATTERN.subn(
-                    after_text,
-                    updated_text,
-                )
-            )
-            if pattern_occurrences:
-                occurrences += pattern_occurrences
-                match_types.append("pattern")
-
-        if not occurrences:
-            continue
-
+    for match in result.matched:
         event: dict[str, Any] = {
-            "id": patch_id,
+            "id": match.rule_id,
             "status": "resolved",
             "cc_version": cc_version,
             "manifest_path": _CLAUDE_PROMPT_PATCH_MANIFEST_LOGICAL_PATH,
-            "occurrences": occurrences,
+            "occurrences": match.occurrences,
         }
-        if match_types:
-            event["match_types"] = match_types
+        if match.match_types:
+            event["match_types"] = match.match_types
         patch_events.append(event)
+
+    for failure in result.failures:
+        patch_events.append(failure)
 
     return updated_text, patch_events
 
@@ -762,6 +683,11 @@ def _apply_claude_prompt_patches_to_anthropic_request_body(
                         datetime.now(timezone.utc)
                     )
     return updated_body, patch_events
+
+
+# ---------------------------------------------------------------------------
+# Build services
+# ---------------------------------------------------------------------------
 
 
 def build_claude_prompt_replacement_services() -> ClaudePromptReplacementServices:

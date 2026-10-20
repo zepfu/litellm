@@ -199,11 +199,36 @@ general_settings:
 - **LANGFUSE_PUBLIC_KEY/SECRET_KEY**: For Langfuse integration
 - **Custom headers**: Any additional key-value pairs
 
+When a target uses an unrecognized host, any provider-scoped request is
+rejected: expected-family labels, credential-family labels, and forwarded
+provider markers do not independently prove that the host belongs to that
+provider. Requests without those signals remain unscoped. OpenAI-bound requests
+retain their separate final-send binding.
+
+Credential headers, cookies, and LiteLLM proxy API keys are masked in
+observability copies handed to callbacks and diagnostics. The configured or
+forwarded transport headers retain the values required by the upstream API.
+The original request remains available only to internal pass-through
+operations; callback-visible request data is detached from that live object.
+
 ### Default Query Parameters
 - **Parameter precedence**: Client params > URL params > default params
+- **Final binding**: An omitted selected query mapping keeps the target query as already constructed. An explicitly empty mapping clears it, and a nonempty mapping replaces it. The final URL is validated before send.
 - **Use cases**: API versioning, authentication tokens, format control, feature flags
 - **Override capability**: Clients can override any default parameter
 - **Examples**: `version: "v1"`, `format: "json"`, `timeout: "30"`
+
+### Request Body Handling
+
+Streaming and non-streaming requests preserve the HTTP method and select the
+same body representation. GET requests have no body; raw requests retain their
+bytes and content type. Multipart requests retain their form fields and files,
+with a boundary generated for the outgoing body.
+
+An explicitly supplied JSON body, including `{}`, overrides multipart input.
+Pre-call hooks can replace that body, including with `{}`, or supply JSON for
+multipart input. In-place logging-only metadata changes retain the multipart body.
+LiteLLM parameters are removed before the JSON body is sent upstream.
 
 ### Sub-path Routing
 
@@ -227,6 +252,8 @@ general_settings:
 ### Default Query Parameters
 
 Pass-through endpoints support default query parameters that are automatically added to every request. This is useful for API versioning, format specifications, authentication tokens, or any default configuration.
+
+When a configured target is not an adapter, the URL factory preserves the guardrail and default-query settings captured at registration. A registry update with valid values overrides them; unavailable metadata values preserve the captured settings. An omitted request query remains omitted, while an explicit `{}` request query remains an empty replacement map.
 
 #### How It Works
 
@@ -267,6 +294,10 @@ general_settings:
 - **Format Control**: Default to `format=json` but allow client override
 - **Rate Limiting**: Set `rate_limit=standard` as default
 - **Feature Flags**: Enable `experimental=false` by default
+
+---
+
+Endpoint refresh and deletion reconcile registrations by exact registration key and preserve unaffected sibling registrations that share the endpoint ID or route path. Removing a registered URL route also removes that installed route so it cannot dispatch with the prior target or defaults.
 
 ---
 

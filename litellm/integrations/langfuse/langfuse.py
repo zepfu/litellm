@@ -2782,6 +2782,10 @@ class LangFuseLogger:
             ):
                 model_name = fallback_model_name
 
+            # Retain the proxy identity separately from Langfuse's generation ID
+            # so history recovery cannot duplicate a live call under a new ID.
+            if litellm_call_id:
+                clean_metadata["litellm_call_id"] = litellm_call_id
             generation_params = {
                 "name": generation_name,
                 "id": clean_metadata.pop("generation_id", generation_id),

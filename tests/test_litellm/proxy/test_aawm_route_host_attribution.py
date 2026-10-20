@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
+import pytest
 from fastapi import Request
 
 from litellm.proxy.aawm_route_logging import (
@@ -739,6 +740,69 @@ def test_build_aawm_route_rollup_context_maps_live_ohmypi_overlay_headers(
 
     assert context is not None
     assert context["group_header_label"] == "litellm#Ohmypi[17.4.2]@thoth"
+
+
+
+@pytest.mark.parametrize(
+    ("client", "header_repository", "body", "expected_repository"),
+    [
+        ("omp", "litellm", {"input": "<cwd>/home/user/projects/egressgateway</cwd>"}, "egressgateway"),
+        ("omp", None, {"input": "<cwd>/home/user/projects/egressgateway</cwd>"}, "egressgateway"),
+        ("Oh My Pi", "litellm", {
+            "instructions": "AGENTS.md instructions for /home/user/projects/egressgateway",
+            "input": [{"role": "assistant", "content": "<cwd>/home/user/projects/litellm</cwd>"}],
+        }, "egressgateway"),
+        ("omp", "litellm", {"messages": [
+            {"role": "user", "content": "<cwd>/home/user/projects/old</cwd>"},
+            {"role": "user", "content": "<environment_context><cwd>/home/user/projects/egressgateway</cwd></environment_context>"},
+            {"type": "function_call_output", "output": "<cwd>/home/user/projects/litellm</cwd>"},
+            {"role": "assistant", "content": "<cwd>/home/user/projects/litellm</cwd>"},
+        ]}, "egressgateway"),
+        ("omp", "litellm", {"input": [{"role": "user", "content": {"repoRoot": "/home/user/projects/egressgateway"}}]}, "egressgateway"),
+        ("omp", "litellm", {"working_directory": "/home/user/projects/egressgateway"}, "egressgateway"),
+        ("omp", "litellm", {"input": "<cwd>/tmp/omp-alpha-workspace</cwd>"}, "litellm"),
+        ("omp", "litellm", {"input": "<cwd>/home/user/projects/litellm</cwd>"}, "litellm"),
+        ("omp", "litellm", {"input": "no workspace context"}, "litellm"),
+        ("codex-cli", "canonical", {"input": "<cwd>/home/user/projects/egressgateway</cwd>"}, "canonical"),
+    ],
+)
+def test_should_share_current_ohmypi_workspace_between_rollup_and_alias(
+    monkeypatch, client, header_repository, body, expected_repository,
+):
+    from litellm.proxy import aawm_route_logging as route_logging
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_context import (
+        _extract_passthrough_repository as extract_alias_repository,
+    )
+
+    monkeypatch.setattr(
+        route_logging,
+        "resolve_aawm_route_host_attribution",
+        lambda request, **kwargs: {"host_name": "thoth"},
+    )
+    headers = {
+        "user-agent": "Bun/1.3.14",
+        "x-aawm-client": client,
+        "x-aawm-client-name": client,
+        "x-aawm-client-version": "17.4.2",
+        "langfuse_trace_name": "omp",
+    }
+    if header_repository is not None:
+        headers["x-aawm-repository"] = header_repository
+    request = Request({
+        "type": "http", "method": "POST",
+        "path": "/openai_passthrough/v1/responses", "query_string": b"",
+        "headers": [(key.encode(), value.encode()) for key, value in headers.items()],
+        "client": ("127.0.0.1", 12345),
+    })
+    context = build_aawm_route_rollup_context(
+        request=request, target="https://chatgpt.com/backend-api/codex/responses",
+        request_body={"model": "gpt-6-astra", **body},
+    )
+
+    assert extract_alias_repository(request, body) == expected_repository
+    assert context is not None
+    expected_client = "Codex" if client == "codex-cli" else "Ohmypi"
+    assert context["group_header_label"] == f"{expected_repository}#{expected_client}[17.4.2]@thoth"
 
 
 def test_is_tailscale_cgnat_client_ip_detects_100_64_range():

@@ -17,11 +17,13 @@ import re
 import secrets
 import shlex
 import ssl
+import sys
 import struct
 import time
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import FunctionType, MethodType
 from typing import (
     Any,
     AsyncIterator,
@@ -62,6 +64,15 @@ _CURSOR_CONNECT_MAX_ERROR_BODY_BYTES = 64 * 1024
 _CURSOR_PROTO_STRUCTURE_MAX_DEPTH = 3
 _CURSOR_PROTO_STRUCTURE_MAX_ITEMS = 64
 _CURSOR_PROTO_STRUCTURE_MAX_BYTES = 4096
+_CURSOR_OBSERVATION_MAX_ITEMS = 32
+_CURSOR_OBSERVATION_MAX_CONTENT_ITEMS = 8
+_CURSOR_OBSERVATION_TOKEN_MAX_CHARS = 64
+_CURSOR_OBSERVATION_MAX_TEXT_HASH_BYTES = 64 * 1024
+_CURSOR_OBSERVATION_H2_WRITER_BUFFER_PREFIX_DOMAIN = (
+    b"cursor-h2-writer-buffer-prefix:v1\0"
+)
+_CURSOR_OBSERVATION_CODE_HASH_ALGORITHM = "aawm-code-object-sha256-v1"
+_CURSOR_OBSERVATION_SAFE_TOKEN = re.compile(r"[A-Za-z0-9_.-]+")
 
 
 class CursorConnectError(Exception):
@@ -87,6 +98,256 @@ class CursorConnectError(Exception):
 
 class CursorConnectProtocolError(CursorConnectError):
     """Malformed or unsupported Connect framing."""
+
+
+def _cursor_observation_scope_enabled() -> bool:
+    try:
+        from litellm.proxy.aawm_route_logging import (
+            _get_aawm_route_rollup_observation_scope,
+        )
+    except Exception:
+        return False
+    try:
+        return bool(_get_aawm_route_rollup_observation_scope())
+    except Exception:
+        return False
+
+
+def _cursor_observation_capture_enabled(request_capture_enabled: bool) -> bool:
+    return bool(request_capture_enabled)
+
+
+def _cursor_observation_hash_prefix(
+    value: bytes,
+    digest: Any,
+    *,
+    max_bytes: int = _CURSOR_OBSERVATION_MAX_TEXT_HASH_BYTES,
+) -> tuple[int, bool]:
+    """Hash the bounded prefix of already-materialized transport bytes."""
+    if max_bytes <= 0:
+        return 0, len(value) > 0
+    bounded = bytes(memoryview(value)[:max_bytes])
+    digest.update(bounded)
+    return len(bounded), len(value) > len(bounded)
+
+
+def _cursor_observation_safe_token(value: Any) -> Optional[str]:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > _CURSOR_OBSERVATION_TOKEN_MAX_CHARS
+        or _CURSOR_OBSERVATION_SAFE_TOKEN.fullmatch(value) is None
+    ):
+        return None
+    return value
+
+
+def _cursor_observation_encode_evidence(
+    exec_request: Mapping[str, Any],
+    output: Any,
+    encoded_frames: List[bytes],
+) -> dict[str, Any]:
+    call_id = _cursor_observation_safe_token(exec_request.get("call_id"))
+    try:
+        output_bytes = json.dumps(
+            output,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    except Exception:
+        output_bytes = b"unserializable"
+    encoded_payload = b"".join(encoded_frames)
+    cursor_observation_encode_digest = hashlib.sha256(encoded_payload).hexdigest()
+    output_bytes_for_hash = output_bytes[
+        :_CURSOR_OBSERVATION_MAX_TEXT_HASH_BYTES
+    ]
+    return {
+        "call_id": call_id or "other",
+        "message_field": exec_request.get("message_field"),
+        "output_json_sha256": hashlib.sha256(output_bytes_for_hash).hexdigest(),
+        "output_json_length": len(output_bytes),
+        "output_json_sha256_truncated": len(output_bytes)
+        > _CURSOR_OBSERVATION_MAX_TEXT_HASH_BYTES,
+        "encoder_payload_sha256": f"cursor-connect-encoder:{cursor_observation_encode_digest}",
+        "encoded_payload_bytes": len(encoded_payload),
+    }
+
+
+def _cursor_observation_fresh_request_evidence(
+    request_payload: Mapping[str, Any],
+    request_body: bytes,
+) -> dict[str, Any]:
+    run_request = request_payload.get("runRequest")
+    run_request = run_request if isinstance(run_request, Mapping) else {}
+    action = run_request.get("action")
+    action = action if isinstance(action, Mapping) else {}
+    user_message_action = action.get("userMessageAction")
+    user_message_action = (
+        user_message_action if isinstance(user_message_action, Mapping) else {}
+    )
+    user_message = user_message_action.get("userMessage")
+    user_message = user_message if isinstance(user_message, Mapping) else {}
+    user_text = user_message.get("text")
+    user_text = user_text if isinstance(user_text, str) else ""
+    history = user_message_action.get("conversationHistory")
+    history = history if isinstance(history, Mapping) else {}
+    raw_history_items = history.get("messages")
+    history_items = raw_history_items if isinstance(raw_history_items, list) else []
+    roles: list[str] = []
+    call_ids: list[str] = []
+    content_omitted = False
+    for raw_item in history_items[:_CURSOR_OBSERVATION_MAX_ITEMS]:
+        item = raw_item if isinstance(raw_item, Mapping) else {}
+        user = item.get("user")
+        assistant = item.get("assistant")
+        tool = item.get("tool")
+        if isinstance(user, Mapping):
+            roles.append("user")
+            contents = user.get("content")
+            contents = contents if isinstance(contents, list) else []
+            content_omitted = content_omitted or len(contents) > (
+                _CURSOR_OBSERVATION_MAX_CONTENT_ITEMS
+            )
+            continue
+        if isinstance(assistant, Mapping):
+            roles.append("assistant")
+            contents = assistant.get("content")
+            contents = contents if isinstance(contents, list) else []
+            content_omitted = content_omitted or len(contents) > (
+                _CURSOR_OBSERVATION_MAX_CONTENT_ITEMS
+            )
+            for raw_content in contents[:_CURSOR_OBSERVATION_MAX_CONTENT_ITEMS]:
+                content = raw_content if isinstance(raw_content, Mapping) else {}
+                tool_call = content.get("toolCall")
+                tool_call = (
+                    tool_call
+                    if isinstance(tool_call, Mapping)
+                    else content.get("tool_call")
+                )
+                if not isinstance(tool_call, Mapping):
+                    continue
+                call_id = _proto_mapping_value(
+                    tool_call,
+                    "toolCallId",
+                    "tool_call_id",
+                )
+                call_ids.append(
+                    _cursor_observation_safe_token(call_id) or "other"
+                )
+            continue
+        if isinstance(tool, Mapping):
+            roles.append("tool")
+            call_id = _proto_mapping_value(
+                tool,
+                "toolCallId",
+                "tool_call_id",
+            )
+            call_ids.append(_cursor_observation_safe_token(call_id) or "other")
+            contents = tool.get("content")
+            contents = contents if isinstance(contents, list) else []
+            content_omitted = content_omitted or len(contents) > (
+                _CURSOR_OBSERVATION_MAX_CONTENT_ITEMS
+            )
+            continue
+        roles.append("other")
+    return {
+        "encoded_request_sha256": hashlib.sha256(request_body).hexdigest(),
+        "encoded_request_bytes": len(request_body),
+        "native_run_id": _cursor_observation_safe_token(run_request.get("runId")),
+        "native_conversation_id": _cursor_observation_safe_token(
+            run_request.get("conversationId")
+        ),
+        "native_message_id": _cursor_observation_safe_token(
+            user_message.get("messageId")
+        ),
+        "native_agent_session_id": _cursor_observation_safe_token(
+            run_request.get("agentSessionId")
+        ),
+        "user_message_text_sha256": hashlib.sha256(
+            user_text.encode("utf-8")
+        ).hexdigest(),
+        "conversation_history_roles": roles,
+        "conversation_history_call_ids": call_ids,
+        "identity_omitted_unbounded": len(history_items)
+        > _CURSOR_OBSERVATION_MAX_ITEMS,
+        "conversation_history_content_omitted_unbounded": content_omitted,
+    }
+
+
+def _cursor_observation_code_provenance() -> dict[str, Any]:
+    targets = (
+        "litellm.llms.cursor_agent.connect:_cursor_observation_scope_enabled",
+        "litellm.llms.cursor_agent.connect:_cursor_observation_capture_enabled",
+        "litellm.llms.cursor_agent.connect:_cursor_observation_encode_evidence",
+        (
+            "litellm.llms.cursor_agent.connect:"
+            "_cursor_observation_fresh_request_evidence"
+        ),
+        (
+            "litellm.llms.cursor_agent.connect:"
+            "CursorAgentRetainedSession.continue_with_tool_outputs"
+        ),
+        (
+            "litellm.llms.cursor_agent.connect:"
+            "CursorAgentRetainedSession._flush_pending"
+        ),
+        (
+            "litellm.llms.cursor_agent.common_utils:"
+            "_build_conversation_history"
+        ),
+        "litellm.llms.cursor_agent.common_utils:build_run_request",
+        (
+            "litellm.proxy.pass_through_endpoints.aawm_adapter_runtime"
+            ".codex_candidate_calls:"
+            "_cursor_observation_request_identity"
+        ),
+        (
+            "litellm.proxy.pass_through_endpoints.aawm_adapter_runtime"
+            ".codex_candidate_calls:"
+            "_perform_codex_auto_agent_cursor_agent_request"
+        ),
+    )
+    functions: list[dict[str, Any]] = []
+    try:
+        from litellm.proxy.aawm_route_logging import (
+            _hash_aawm_route_observation_code_object,
+        )
+    except Exception:
+        return {
+            "algorithm": _CURSOR_OBSERVATION_CODE_HASH_ALGORITHM,
+            "available": False,
+            "functions": [],
+            "reason": "shared_hash_helper_unavailable",
+        }
+    for symbol in targets:
+        prefix, local_name = symbol.split(":", 1)
+        owner: Any = sys.modules.get(prefix)
+        if owner is None:
+            functions.append({"symbol": symbol, "digest": None})
+            continue
+        for attribute_name in local_name.split("."):
+            owner = getattr(owner, attribute_name, None)
+            if owner is None:
+                break
+        if isinstance(owner, MethodType):
+            function = owner.__func__
+        elif isinstance(owner, FunctionType):
+            function = owner
+        else:
+            function = None
+        digest = None
+        try:
+            digest = _hash_aawm_route_observation_code_object(function)
+        except Exception:
+            digest = None
+        functions.append({"symbol": symbol, "digest": digest})
+    return {
+        "algorithm": _CURSOR_OBSERVATION_CODE_HASH_ALGORITHM,
+        "available": True,
+        "functions": functions,
+    }
 
 
 def ensure_cursor_http2_available() -> None:
@@ -1272,6 +1533,7 @@ _LOCAL_EXEC_TOOL_NAMES = (
     "bash",
     "run_shell_command",
 )
+_LOCAL_READ_TOOL_NAMES = ("read",)
 _SPAWN_AGENT_TOOL_NAME = "spawn_agent"
 _SUBAGENT_PROHIBITED_FIELD_NAMES = {
     6: "resume_agent_id",
@@ -1809,10 +2071,22 @@ def _encode_read_terminal_result(
     output: Any,
 ) -> List[bytes]:
     expected_path = str(exec_request["path"])
-    envelope = _decode_cursor_read_envelope(
-        output,
-        expected_path=expected_path,
-    )
+    if exec_request.get("native_read"):
+        content = output if isinstance(output, str) else str(output or "")
+        envelope = {
+            "status": "ok",
+            "path": expected_path,
+            "content": content,
+            "total_lines": 0,
+            "file_size": len(content.encode("utf-8")),
+            "truncated": False,
+            "range_applied": False,
+        }
+    else:
+        envelope = _decode_cursor_read_envelope(
+            output,
+            expected_path=expected_path,
+        )
     read_result = _encode_read_result(**envelope)
     exec_fields = cast(List[tuple[int, int, Any]], exec_request["exec_fields"])
     return [
@@ -2260,6 +2534,38 @@ def _advertised_local_exec_tool_name(
     return None
 
 
+def _advertised_read_tool_name(
+    request_payload: Mapping[str, Any],
+) -> Optional[str]:
+    run_request = _proto_mapping_value(
+        request_payload,
+        "runRequest",
+        "run_request",
+    )
+    if not isinstance(run_request, Mapping):
+        return None
+    mcp_tools = _proto_mapping_value(run_request, "mcpTools", "mcp_tools")
+    if not isinstance(mcp_tools, Mapping):
+        return None
+    definitions = _proto_mapping_value(mcp_tools, "mcpTools", "mcp_tools")
+    if not isinstance(definitions, list):
+        return None
+
+    for preferred_name in _LOCAL_READ_TOOL_NAMES:
+        for definition in definitions:
+            if not isinstance(definition, Mapping):
+                continue
+            name = _proto_mapping_value(
+                definition,
+                "name",
+                "toolName",
+                "tool_name",
+            )
+            if isinstance(name, str) and name.casefold() == preferred_name:
+                return name
+    return None
+
+
 def _advertised_spawn_agent_tool_definition(
     request_payload: Mapping[str, Any],
 ) -> Optional[Mapping[str, Any]]:
@@ -2663,27 +2969,42 @@ def _decode_read_tool_call(
     exec_fields: List[tuple[int, int, Any]],
     *,
     tool_name: str,
+    native_read: bool,
 ) -> Dict[str, Any]:
     read_args = _decode_read_args(exec_fields)
     request_id = int(read_args["request_id"])
     exec_id = str(read_args["exec_id"])
-    call_id = str(read_args["tool_call_id"] or exec_id or f"cursor-read-{request_id}")
+    tool_call_id = str(read_args["tool_call_id"])
+    if native_read:
+        call_id, item_id = _decode_mcp_tool_identity(tool_call_id)
+    else:
+        call_id, item_id = tool_call_id, ""
+    call_id = str(call_id or exec_id or f"cursor-read-{request_id}")
+    item_id = item_id or f"fc_{call_id}"
     if not call_id:
         raise CursorConnectProtocolError(
             "Cursor Agent read operation does not contain a replayable request identity."
         )
-    command = _read_command(str(read_args["path"]))
+    path = str(read_args["path"])
+    arguments: Dict[str, Any]
+    if native_read:
+        arguments = {
+            "i": "Read local file.",
+            "path": path,
+        }
+    else:
+        arguments = {"cmd": _read_command(path)}
     normalized = {
         "interactionUpdate": {
             "toolCallCompleted": {
                 "callId": call_id,
                 "toolName": tool_name,
                 "argsJson": json.dumps(
-                    {"cmd": command},
+                    arguments,
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ),
-                "itemId": f"fc_{call_id}",
+                "itemId": item_id,
             }
         }
     }
@@ -2693,7 +3014,8 @@ def _decode_read_tool_call(
             "call_id": call_id,
             "message_field": 7,
             "exec_fields": exec_fields,
-            "path": str(read_args["path"]),
+            "path": path,
+            "native_read": native_read,
         },
     }
 
@@ -2739,6 +3061,7 @@ def _process_agent_server_message(
     blobs: Dict[bytes, bytes],
     *,
     local_exec_tool_name: Optional[str] = None,
+    read_tool_name: Optional[str] = None,
     spawn_agent_tool_definition: Optional[Mapping[str, Any]] = None,
     external_exec_requests: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[Dict[str, Any], List[bytes]]:
@@ -2813,10 +3136,20 @@ def _process_agent_server_message(
                     local_exec_request["normalized"],
                     [],
                 )
+            if message_field == 7 and read_tool_name:
+                read_tool_call = _decode_read_tool_call(
+                    exec_fields,
+                    tool_name=read_tool_name,
+                    native_read=True,
+                )
+                if external_exec_requests is not None:
+                    external_exec_requests.append(read_tool_call["exec_request"])
+                return read_tool_call["normalized"], []
             if message_field == 7 and local_exec_tool_name:
                 read_tool_call = _decode_read_tool_call(
                     exec_fields,
                     tool_name=local_exec_tool_name,
+                    native_read=False,
                 )
                 if external_exec_requests is not None:
                     external_exec_requests.append(read_tool_call["exec_request"])
@@ -2874,6 +3207,7 @@ class CursorAgentRetainedSession:
         decoder: _ProtoConnectFrameDecoder,
         blobs: Dict[bytes, bytes],
         local_exec_tool_name: Optional[str],
+        read_tool_name: Optional[str],
         spawn_agent_tool_definition: Optional[Mapping[str, Any]],
         saw_response_headers: bool,
         retain_on_tool_call: bool = False,
@@ -2885,6 +3219,7 @@ class CursorAgentRetainedSession:
         self.decoder = decoder
         self.blobs = blobs
         self.local_exec_tool_name = local_exec_tool_name
+        self.read_tool_name = read_tool_name
         self.spawn_agent_tool_definition = spawn_agent_tool_definition
         self.saw_response_headers = saw_response_headers
         self.retain_on_tool_call = retain_on_tool_call
@@ -2897,7 +3232,14 @@ class CursorAgentRetainedSession:
         self._response_stream_ended = False
         self._result_bytes_written = False
         self._provider_progress_observed = False
+        self._continuation_encode_evidence: Optional[List[dict[str, Any]]] = None
+        self._h2_write_bytes_total: Optional[int] = None
+        self._h2_encoder_payload_bytes_total: Optional[int] = None
         self._pending_result_prefix: Optional[int] = None
+        self._h2_first_result_writer_handoff_attempt: Optional[
+            dict[str, Any]
+        ] = None
+        self._observation_enabled_for_request = False
         self._closed = False
         self._wait_closed_started = False
 
@@ -2959,6 +3301,17 @@ class CursorAgentRetainedSession:
     ) -> "CursorAgentRunResult":
         self._result_bytes_written = False
         self._provider_progress_observed = False
+        self._h2_first_result_writer_handoff_attempt = None
+        observation_enabled = self._observation_enabled_for_request
+        self._observation_enabled_for_request = False
+        if _cursor_observation_capture_enabled(observation_enabled):
+            self._continuation_encode_evidence = []
+            self._h2_write_bytes_total = 0
+            self._h2_encoder_payload_bytes_total = 0
+        else:
+            self._continuation_encode_evidence = None
+            self._h2_write_bytes_total = None
+            self._h2_encoder_payload_bytes_total = None
         self._pending_result_prefix = None
         if self._closed:
             raise CursorConnectError(
@@ -2993,11 +3346,25 @@ class CursorAgentRetainedSession:
             self._external_exec_requests.pop(str(call_id), None)
         self._pending_result_prefix = len(self.pending)
         for exec_request, output in requests:
+            encoded_frames: List[bytes] = []
             for client_message in _encode_external_exec_terminal_result(
                 exec_request,
                 output,
             ):
-                self.pending.extend(encode_connect_proto_frame(client_message))
+                encoded_frame = encode_connect_proto_frame(client_message)
+                encoded_frames.append(encoded_frame)
+                self.pending.extend(encoded_frame)
+            if self._continuation_encode_evidence is not None:
+                try:
+                    self._continuation_encode_evidence.append(
+                        _cursor_observation_encode_evidence(
+                            exec_request,
+                            output,
+                            encoded_frames,
+                        )
+                    )
+                except Exception:
+                    pass
         result = await self._read_until_boundary(
             stop_on_tool_call=False,
             timeout=timeout,
@@ -3052,6 +3419,7 @@ class CursorAgentRetainedSession:
             )
             if not outbound:
                 return
+            first_result_buffer = False
             if self._pending_result_prefix is not None:
                 consumed = pending_before - len(self.pending)
                 if consumed > self._pending_result_prefix:
@@ -3059,9 +3427,40 @@ class CursorAgentRetainedSession:
                     # it cannot establish that no result bytes escaped.
                     self._result_bytes_written = True
                     self._pending_result_prefix = None
+                    first_result_buffer = True
+                    if self._h2_write_bytes_total is not None:
+                        self._h2_write_bytes_total += int(consumed)
                 else:
                     self._pending_result_prefix -= consumed
-            self.writer.write(outbound)
+            if self._h2_encoder_payload_bytes_total is not None:
+                self._h2_encoder_payload_bytes_total += int(len(outbound))
+            write = self.writer.write
+            try:
+                write(outbound)
+            finally:
+                if (
+                    first_result_buffer
+                    and self._continuation_encode_evidence is not None
+                ):
+                    try:
+                        digest = hashlib.sha256(
+                            _CURSOR_OBSERVATION_H2_WRITER_BUFFER_PREFIX_DOMAIN
+                        )
+                        hashed_prefix_bytes, prefix_truncated = (
+                            _cursor_observation_hash_prefix(
+                                outbound,
+                                digest,
+                                max_bytes=_CURSOR_OBSERVATION_MAX_TEXT_HASH_BYTES,
+                            )
+                        )
+                        self._h2_first_result_writer_handoff_attempt = {
+                            "buffer_bytes": len(outbound),
+                            "hashed_prefix_bytes": hashed_prefix_bytes,
+                            "prefix_sha256": digest.hexdigest(),
+                            "prefix_truncated": prefix_truncated,
+                        }
+                    except Exception:
+                        pass
             await self.writer.drain()
 
     def _append_error_response_body(self, chunk: bytes) -> None:
@@ -3104,6 +3503,7 @@ class CursorAgentRetainedSession:
             frame.payload,
             self.blobs,
             local_exec_tool_name=self.local_exec_tool_name,
+            read_tool_name=self.read_tool_name,
             spawn_agent_tool_definition=self.spawn_agent_tool_definition,
             external_exec_requests=external_exec_requests,
         )
@@ -4110,6 +4510,7 @@ class CursorAgentConnectClient:
         self.http_client = http_client
         self.dashboard_base = dashboard_base
         self.client_factory = client_factory
+        self._observation_enabled_for_request = False
 
     @staticmethod
     def _ensure_http2_dependency() -> None:
@@ -4214,6 +4615,7 @@ class CursorAgentConnectClient:
         stop_on_tool_call: bool,
         timeout: Optional[float],
         local_exec_tool_name: Optional[str],
+        read_tool_name: Optional[str],
         spawn_agent_tool_definition: Optional[Mapping[str, Any]],
         retain_on_tool_call: bool,
     ) -> CursorAgentRunResult:
@@ -4304,6 +4706,7 @@ class CursorAgentConnectClient:
                 decoder=_ProtoConnectFrameDecoder(),
                 blobs={},
                 local_exec_tool_name=local_exec_tool_name,
+                read_tool_name=read_tool_name,
                 spawn_agent_tool_definition=spawn_agent_tool_definition,
                 saw_response_headers=False,
                 retain_on_tool_call=retain_on_tool_call,
@@ -4355,6 +4758,7 @@ class CursorAgentConnectClient:
         *,
         stop_on_tool_call: bool,
         local_exec_tool_name: Optional[str],
+        read_tool_name: Optional[str],
         spawn_agent_tool_definition: Optional[Mapping[str, Any]],
     ) -> CursorAgentRunResult:
         self._require_http2(response)
@@ -4388,6 +4792,7 @@ class CursorAgentConnectClient:
                 frame.payload,
                 blobs,
                 local_exec_tool_name=local_exec_tool_name,
+                read_tool_name=read_tool_name,
                 spawn_agent_tool_definition=spawn_agent_tool_definition,
             )
             if client_messages:
@@ -4410,6 +4815,7 @@ class CursorAgentConnectClient:
         stop_on_tool_call: bool,
         timeout: Optional[float],
         local_exec_tool_name: Optional[str],
+        read_tool_name: Optional[str],
         spawn_agent_tool_definition: Optional[Mapping[str, Any]],
         retain_on_tool_call: bool,
     ) -> CursorAgentRunResult:
@@ -4422,6 +4828,7 @@ class CursorAgentConnectClient:
                 stop_on_tool_call=stop_on_tool_call,
                 timeout=timeout,
                 local_exec_tool_name=local_exec_tool_name,
+                read_tool_name=read_tool_name,
                 spawn_agent_tool_definition=spawn_agent_tool_definition,
                 retain_on_tool_call=retain_on_tool_call,
             )
@@ -4463,6 +4870,7 @@ class CursorAgentConnectClient:
                             response,
                             stop_on_tool_call=stop_on_tool_call,
                             local_exec_tool_name=local_exec_tool_name,
+                            read_tool_name=read_tool_name,
                             spawn_agent_tool_definition=spawn_agent_tool_definition,
                         )
                 response = context
@@ -4471,6 +4879,7 @@ class CursorAgentConnectClient:
                         response,
                         stop_on_tool_call=stop_on_tool_call,
                         local_exec_tool_name=local_exec_tool_name,
+                        read_tool_name=read_tool_name,
                         spawn_agent_tool_definition=spawn_agent_tool_definition,
                     )
                 finally:
@@ -4482,6 +4891,7 @@ class CursorAgentConnectClient:
                 response,
                 stop_on_tool_call=stop_on_tool_call,
                 local_exec_tool_name=local_exec_tool_name,
+                read_tool_name=read_tool_name,
                 spawn_agent_tool_definition=spawn_agent_tool_definition,
             )
         except CursorConnectError:
@@ -4513,14 +4923,28 @@ class CursorAgentConnectClient:
         retain_on_tool_call: bool = False,
     ) -> CursorAgentRunResult:
         """Run one Connect request, retrying one 401 with refreshed auth."""
+        observation_enabled = self._observation_enabled_for_request
+        self._observation_enabled_for_request = False
         self._ensure_http2_dependency()
         target_url = (url or "").strip()
         if not target_url:
             target_url = f"{CURSOR_AGENT_TURN_HOST}{CURSOR_AGENT_RUN_PATH}"
         request_body = encode_cursor_run_request(request_payload)
+        self._fresh_run_evidence: Optional[dict[str, Any]] = None
+        if _cursor_observation_capture_enabled(observation_enabled):
+            try:
+                self._fresh_run_evidence = (
+                    _cursor_observation_fresh_request_evidence(
+                        request_payload,
+                        request_body,
+                    )
+                )
+            except Exception:
+                self._fresh_run_evidence = None
         run_request = request_payload.get("runRequest")
         run_id = str(run_request.get("runId") or "").strip() if isinstance(run_request, Mapping) else ""
         local_exec_tool_name = _advertised_local_exec_tool_name(request_payload)
+        read_tool_name = _advertised_read_tool_name(request_payload)
         spawn_agent_tool_definition = _advertised_spawn_agent_tool_definition(
             request_payload
         )
@@ -4549,6 +4973,7 @@ class CursorAgentConnectClient:
                 stop_on_tool_call=stop_on_tool_call,
                 timeout=timeout,
                 local_exec_tool_name=local_exec_tool_name,
+                read_tool_name=read_tool_name,
                 spawn_agent_tool_definition=spawn_agent_tool_definition,
                 retain_on_tool_call=retain_on_tool_call,
             )
@@ -4576,6 +5001,7 @@ class CursorAgentConnectClient:
                 stop_on_tool_call=stop_on_tool_call,
                 timeout=timeout,
                 local_exec_tool_name=local_exec_tool_name,
+                read_tool_name=read_tool_name,
                 spawn_agent_tool_definition=spawn_agent_tool_definition,
                 retain_on_tool_call=retain_on_tool_call,
             )

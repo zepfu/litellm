@@ -290,22 +290,49 @@ content, malformed parts, and unsupported fields fail closed before egress.
 Ordinary external-tool continuations retain the Cursor session assignment while
 the provider-owned session is live. Generic MCP/function calls (operation field
 11) return their actual output through Cursor's `McpResult` on the same open
-Run. Passive tool-progress notifications do not authorize another execution.
+Run. Native reads (field 7) bridge through an advertised `read` tool with `path`
+and `i`; field 2 and field 14 remain command-only shell bridges. Passive
+tool-progress notifications do not authorize another execution.
 Each bounded HTTP/2 read is fully consumed before pausing at a tool call, with
 later Connect frames retained in order and data acknowledged once. Received
 terminal or abort evidence prevents continuation result writes. Per-continuation
 transport evidence distinguishes result bytes handed to the writer from
 subsequent provider data; it contains no tool payloads or credentials.
+Tool continuations restore the original readable user assignment as encoded
+`userMessage.text`, retain the completed tool result in history, and fail
+closed before dispatch if no original user text is available.
 
 For stock full-history requests without `previous_response_id`, lookup requires
 the existing guarded owner identity, unchanged assignment and tools, and exact
 pending call IDs and qualified namespace/name identities. The trusted history
 prefix may contain earlier completed call/result pairs; only the newly
 completed pending outputs are sent back. Historical outputs are not executed
-again. A mismatched or ambiguous live session fails closed. Claimed and consumed
-generations remain non-replayable within the process-local registry's existing
-600-second/256-entry retention bounds. This is not durable deduplication across
-worker replacement or eviction.
+again. The derived Cursor history must preserve the original readable user
+assignment; a tool result cannot replace it. A mismatched or ambiguous live
+session fails closed. Claimed and consumed generations remain non-replayable
+within the process-local registry's existing 600-second/256-entry retention
+bounds. This is not durable deduplication across worker replacement or eviction.
+
+Alpha can emit scoped `cursor049_observation` records for the exact
+`sota-cursor` alias when the route-rollup provenance observation mapping contains
+a valid matching request selector. This fingerprint-only observation is off by
+default and does not require generic diagnostic or full-payload capture. It does
+not change continuation decisions.
+
+`h2_first_result_writer_handoff_attempt`, when present, describes the first
+writer invocation whose existing body-boundary calculation includes some
+tool-result bytes. It records the serialized buffer length, sampled prefix
+length, SHA-256 digest, and truncation flag. The digest covers at most 64 KiB
+from the beginning of that entire writer argument, with domain
+`cursor-h2-writer-buffer-prefix:v1\0`; the prefix may contain framing or
+preceding body bytes without any tool-result bytes. Encoder evidence has a
+separate domain.
+
+The record becomes available after the write invocation returns or raises and
+observation construction succeeds. It proves an attempted handoff, not complete
+tool-result delivery, socket transmission, provider receipt, or progress.
+Missing observation does not prove that no write occurred. Loaded-function
+fingerprints cover the listed code objects, not the complete deployment.
 
 Missing retained state and recoverable failure of one live transport do not
 enter shared cooldown evidence or publication. Socket EOF after complete frames
@@ -325,6 +352,17 @@ opaque Cursor state, unresolved tool calls, nested Cursor identifiers, and
 ownerless provider state fail closed before egress. A valid replay may then
 traverse native `xai` and managed `oa_xai` candidates without migrating the
 owned Cursor session.
+
+Oversized stored continuation state receives the distinct
+`cursor_replay_state_bound_exceeded` failure with `candidate_status: ineligible`,
+no cooldown publication, and no provider call. It terminates the alias with a
+fresh-owner redispatch signal rather than continuing to another candidate.
+
+During cooldown recovery, an in-flight non-replay Codex session cannot use a
+last-resort Cursor or xAI candidate with its existing identity. LiteLLM returns
+`aawm_session_owner_redispatch_required`; start a fresh subagent session before
+trying that route. Fresh eligible requests and server-validated replay keep
+their existing candidate selection.
 
 Replay validation preserves function namespaces even when the installed OpenAI
 SDK predates namespace tools. The compatibility path validates the namespace

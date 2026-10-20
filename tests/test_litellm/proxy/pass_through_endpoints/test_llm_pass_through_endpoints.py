@@ -3277,7 +3277,7 @@ class TestPassThroughRequestRetryableFailures:
                     total_stream_bytes=128,
                 )
             )
-            terminal_chunks = (
+            terminal_chunks, _terminal_payload = (
                 PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
                     endpoint_type=EndpointType.OPENAI,
                     url_route=target_url,
@@ -9813,15 +9813,17 @@ class TestClaudePersistedOutputExpansion:
             PassThroughStreamingHandler,
         )
 
-        terminal_chunks = PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
-            endpoint_type=EndpointType.OPENAI,
-            url_route="https://chatgpt.com/backend-api/codex/responses",
-            custom_llm_provider="openai",
-            failure_context={
-                "failure_kind": "streaming_upstream_read_timeout",
-                "model": "gpt-5.4",
-            },
-            exc=Exception("timeout"),
+        terminal_chunks, _terminal_payload = (
+            PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
+                endpoint_type=EndpointType.OPENAI,
+                url_route="https://chatgpt.com/backend-api/codex/responses",
+                custom_llm_provider="openai",
+                failure_context={
+                    "failure_kind": "streaming_upstream_read_timeout",
+                    "model": "gpt-5.4",
+                },
+                exc=Exception("timeout"),
+            )
         )
         streaming_chunks = [
             line.strip() for chunk in terminal_chunks for line in chunk.decode("utf-8").splitlines() if line.strip()

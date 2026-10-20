@@ -881,7 +881,14 @@ def _spool_session_history_records(
                 json.dumps(record_line, separators=(",", ":"), sort_keys=True)
             )
             spool_file.write("\n")
+        spool_file.flush()
+        os.fsync(spool_file.fileno())
     os.replace(tmp_path, final_path)
+    directory_fd = os.open(spool_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
     try:
         spool_bytes: Union[int, str] = os.path.getsize(final_path)
     except OSError:

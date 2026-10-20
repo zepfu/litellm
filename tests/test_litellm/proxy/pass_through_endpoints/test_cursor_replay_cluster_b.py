@@ -11,8 +11,14 @@ from litellm.llms.cursor_agent.connect import CursorConnectError
 from litellm.llms.custom_httpx.async_client_cleanup import (
     close_litellm_async_clients,
 )
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+    candidate_loop,
+)
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
     codex_candidate_calls,
+)
+from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+    HTTPException,
 )
 
 
@@ -275,6 +281,147 @@ def test_replay_registry_rejects_oversized_entry(
             tools=[],
         )
     assert "resp-too-large" not in codex_candidate_calls._CURSOR_REPLAY_REGISTRY
+
+
+def test_oversized_replay_state_redispatches_with_retired_cursor_identity() -> None:
+    closing_session = _AcloseCountingSession()
+    oversized_messages = [
+        {"role": "user", "content": "x" * (1024 * 1024 + 1)},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-oversized-replay",
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": '{"cmd":"pwd"}',
+                    },
+                }
+            ],
+        },
+    ]
+
+    with pytest.raises(CursorConnectError) as store_exc_info:
+        codex_candidate_calls._store_cursor_replay_state(
+            "resp-oversized-contract",
+            messages=oversized_messages,
+            tools=[],
+            retained_session=closing_session,
+        )
+
+    store_exc = store_exc_info.value
+    assert store_exc.status_code == 409
+    assert (
+        getattr(
+            store_exc,
+            codex_candidate_calls._CURSOR_REPLAY_STATE_BOUND_EXCEEDED_MARKER,
+        )
+        is True
+    )
+    assert getattr(store_exc, codex_candidate_calls._CURSOR_REPLAY_STATE_FIELD) == {
+        "messages": oversized_messages,
+        "tools": [],
+        "continuation_outcome": None,
+    }
+    assert (
+        "resp-oversized-contract"
+        not in codex_candidate_calls._CURSOR_REPLAY_REGISTRY
+    )
+    assert closing_session.close_calls == 1
+
+    with pytest.raises(HTTPException) as mapped_exc_info:
+        codex_candidate_calls._raise_cursor_agent_alias_error(
+            exc=store_exc,
+            candidate={"model": "cursor_agent/cursor-grok-4.6-high"},
+        )
+
+    mapped_exc = mapped_exc_info.value
+    assert mapped_exc.status_code == 409
+    assert mapped_exc.detail["error"]["code"] == (
+        "cursor_replay_state_bound_exceeded"
+    )
+    assert mapped_exc.detail["error"]["attempted_provider_call"] is False
+    assert mapped_exc.detail["failure_phase"] == "cursor_session_continuation"
+    assert mapped_exc.detail["redispatch_model"] == (
+        "cursor_agent/cursor-grok-4.6-high"
+    )
+    assert mapped_exc.detail["redispatch_reason"] == (
+        "cursor_replay_state_bound_exceeded"
+    )
+    assert mapped_exc.detail["redispatch_required"] is True
+    assert mapped_exc.attempted_provider_call is False
+    assert mapped_exc.failure_phase == "cursor_session_continuation"
+    assert mapped_exc.redispatch_model == "cursor_agent/cursor-grok-4.6-high"
+    assert mapped_exc.redispatch_reason == "cursor_replay_state_bound_exceeded"
+    assert mapped_exc.redispatch_required is True
+    assert getattr(
+        mapped_exc,
+        codex_candidate_calls._CURSOR_REPLAY_STATE_FIELD,
+    ) == getattr(store_exc, codex_candidate_calls._CURSOR_REPLAY_STATE_FIELD)
+    assert mapped_exc.__cause__ is store_exc
+
+    terminal_events: list[dict[str, Any]] = []
+    terminal_metadata = candidate_loop._validated_redispatch_terminal_metadata(
+        mapped_exc,
+        request=SimpleNamespace(state=SimpleNamespace()),
+    )
+    assert terminal_metadata is not None, mapped_exc.detail
+    emitted = candidate_loop._emit_validated_redispatch_terminal_event(
+        exc=mapped_exc,
+        request=SimpleNamespace(state=SimpleNamespace()),
+        alias_family="codex_auto_agent",
+        alias_model="test",
+        request_body={},
+        attempts=[],
+        emit_pre_attempt_terminal_event=(
+            lambda **kwargs: terminal_events.append(kwargs)
+        ),
+    )
+
+    assert emitted is True
+    assert len(terminal_events) == 1, (terminal_metadata, terminal_events)
+    event = terminal_events[0]
+    assert event["event_type"] == "redispatch_required"
+    assert event["candidate_status"] == "redispatch_required"
+    assert event["error_code"] == "cursor_replay_state_bound_exceeded"
+    assert event["error_status_code"] == 409
+    assert event["detail"]["error"]["attempted_provider_call"] is False
+    assert event["redispatch_required"] is True
+    assert event["failure_phase"] == "cursor_session_continuation"
+
+    request_body = {
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call-oversized-replay",
+                "output": "/workspace",
+            }
+        ]
+    }
+    rejection: dict[str, Any] = {}
+    fresh_body = codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+        request_body,
+        continuation_exc=store_exc,
+        rejection_diagnostic_out=rejection,
+    )
+    assert fresh_body is not None, rejection
+    assert "previous_response_id" not in fresh_body
+    assert fresh_body["input"] == [
+        {"role": "user", "content": "x" * (1024 * 1024 + 1)},
+        {
+            "type": "function_call",
+            "call_id": "call-oversized-replay",
+            "name": "exec_command",
+            "arguments": '{"cmd":"pwd"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-oversized-replay",
+            "output": "/workspace",
+        },
+    ]
 
 
 def test_replay_registry_evicts_to_stay_within_byte_budget(

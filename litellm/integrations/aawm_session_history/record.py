@@ -620,6 +620,8 @@ def _build_session_history_record_from_langfuse_trace_observation(  # noqa: PLR0
     if not isinstance(metadata, dict):
         metadata = {}
 
+    original_call_id = _clean_non_empty_string(metadata.get("litellm_call_id"))
+    call_id = original_call_id or observation.get("id")
     session_id, session_id_source = _extract_langfuse_session_id(trace, metadata)
     if not session_id:
         return None
@@ -903,6 +905,9 @@ def _build_session_history_record_from_langfuse_trace_observation(  # noqa: PLR0
             "backfill_run_id": backfill_run_id,
             "source_trace_id": trace_id,
             "source_observation_id": observation.get("id"),
+            "litellm_call_id_source": "observation.metadata.litellm_call_id"
+            if original_call_id
+            else "observation.id",
             "session_id_source": session_id_source,
             "trace_id_source": "trace.id" if trace_id else "missing",
             "source_trace_environment": trace.get("environment"),
@@ -921,13 +926,13 @@ def _build_session_history_record_from_langfuse_trace_observation(  # noqa: PLR0
         request_body=request_body,
         output_payload=output_payload,
         session_id=session_id,
-        litellm_call_id=observation.get("id"),
+        litellm_call_id=call_id,
         trace_id=trace_id,
     )
     tool_definition_snapshot = _tool_definition_snapshot_from_metadata(metadata)
 
     record = {
-        "litellm_call_id": observation.get("id"),
+        "litellm_call_id": call_id,
         "session_id": session_id,
         "trace_id": trace_id,
         "provider_response_id": _first_non_empty_string(
@@ -2591,6 +2596,9 @@ async def _persist_session_history_records(records: List[Dict[str, Any]]) -> Non
                     _build_session_history_db_payload(record)
                     for record in history_records
                 ]
+                # Preserve identity processing order, but take row locks in the
+                # same call-ID order as checkpoint batches and spool replay.
+                payloads.sort(key=lambda payload: payload[0])
                 tool_activity_payloads: List[Tuple[Any, ...]] = []
                 for record in history_records:
                     tool_activity_payloads.extend(

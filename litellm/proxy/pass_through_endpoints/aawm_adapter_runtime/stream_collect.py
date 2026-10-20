@@ -498,7 +498,10 @@ async def _collect_responses_response_from_stream(
                     continue
                 response_dict = _coerce_namespace_to_mapping(response_payload)
                 if isinstance(response_dict, dict):
-                    terminal_response_dict = response_dict
+                    # Finalization replaces top-level fields such as ``output``.
+                    # Keep that collector-owned projection from mutating the
+                    # effective event payload retained by the shared pipeline.
+                    terminal_response_dict = dict(response_dict)
     finally:
         await _close_stream_resource(
             event_iterator,

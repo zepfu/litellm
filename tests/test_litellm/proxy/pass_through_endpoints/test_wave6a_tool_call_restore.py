@@ -50,6 +50,7 @@ EXPECTED_SYMBOLS = (
     "_restore_adapted_custom_tool_stream_iterator",
     "_restore_adapted_custom_tool_calls_in_stream_event_payload",
     "_restore_adapted_custom_tool_calls_in_sse_event_block",
+    "_restore_adapted_tool_calls_in_associated_sse_block",
     "_restore_adapted_custom_tool_calls_in_streaming_response",
     "_restore_adapted_namespace_tool_calls_in_stream_event_payload",
     "_restore_adapted_namespace_tool_calls_in_sse_event_block",
@@ -58,6 +59,31 @@ EXPECTED_SYMBOLS = (
 )
 
 EXPECTED_SEAMS = {"_responses_repaired_output_item_id"}
+
+
+def _typed_sse_chunk(
+    payload: dict[str, Any],
+    *,
+    separator: bytes = b"\r\n\r\n",
+    event_field_prefix: bytes = b"event:",
+) -> tuple[bytes, Any]:
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+        ResponsesEventPipeline,
+        attach_responses_events,
+    )
+
+    event_type = payload["type"]
+    wire = (
+        event_field_prefix + b" " + event_type.encode() + b"\r\ndata: "
+        + json.dumps(payload, separators=(",", ":")).encode()
+        + separator
+    )
+    event = ResponsesEventPipeline().parse_event(wire)
+    return attach_responses_events(wire, [event]), event
+
+
+async def _collect_response_chunks(response: Any) -> list[Any]:
+    return [chunk async for chunk in response.body_iterator]
 
 
 # ---------------------------------------------------------------------------
@@ -1244,6 +1270,59 @@ class TestCustomStreamingResponse:
         assert result is not resp
         assert result.media_type == "text/event-stream"
 
+    @pytest.mark.parametrize("restoration", ["custom", "namespace"])
+    def test_associated_noop_preserves_crlf_carrier_without_json_decode(
+        self,
+        host_deps: None,
+        monkeypatch: pytest.MonkeyPatch,
+        restoration: str,
+    ) -> None:
+        from fastapi.responses import StreamingResponse
+
+        frames = [
+            _typed_sse_chunk({"type": "response.output_text.delta", "delta": delta})
+            for delta in ("unchanged", "adjacent")
+        ]
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+            responses_emissions_from_chunk,
+        )
+
+        original_emissions = [
+            responses_emissions_from_chunk(chunk)[0] for chunk, _ in frames
+        ]
+
+        async def gen():
+            for chunk, _ in frames:
+                yield chunk
+
+        response = StreamingResponse(gen(), media_type="text/event-stream")
+        if restoration == "custom":
+            result = mod._restore_adapted_custom_tool_calls_in_streaming_response(
+                response, request_body={"tools": []}, adapter_model="m",
+            )
+        else:
+            result = mod._restore_adapted_namespace_tool_calls_in_streaming_response(
+                response, request_body={"tools": []}, adapter_model="test-model",
+            )
+
+        def unexpected_json_decode(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("associated event was reparsed")
+
+        monkeypatch.setattr(mod.json, "loads", unexpected_json_decode)
+        chunks = []
+
+        async def send(message: dict[str, Any]) -> None:
+            if message["type"] == "http.response.body" and message.get("body"):
+                chunks.append(message["body"])
+
+        asyncio.run(result.stream_response(send))
+
+        assert b"".join(chunks) == b"".join(chunk for chunk, _ in frames)
+        assert len(chunks) == len(frames)
+        for actual, (_, event), emission in zip(chunks, frames, original_emissions):
+            assert sse_mod._sse_block_events(actual) == [event]
+            assert responses_emissions_from_chunk(actual)[0] is emission
+
     def test_end_to_end_stream_restore(self, host_deps: None) -> None:
         """Full SSE stream with added/delta/done produces restored output."""
         from fastapi.responses import StreamingResponse
@@ -1337,6 +1416,64 @@ class TestCustomStreamingResponse:
         # final unterminated block should not be double-terminated
         assert not combined.endswith("\n\n")
         assert ": keep-alive" in combined
+
+    def test_associated_custom_restore_preserves_effective_payload_and_event_envelope(
+        self,
+        host_deps: None,
+    ) -> None:
+        from fastapi.responses import StreamingResponse
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+            ResponsesEventPipeline,
+        )
+
+        added, added_event = _typed_sse_chunk(
+            {
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "name": "my_tool",
+                    "call_id": "call_1",
+                },
+            }
+        )
+        done, done_event = _typed_sse_chunk(
+            {
+                "type": "response.function_call_arguments.done",
+                "call_id": "call_1",
+                "arguments": '{"input":"hello"}',
+            },
+            event_field_prefix=b" \tevent:",
+        )
+
+        async def gen():
+            yield added
+            yield done
+
+        response = StreamingResponse(gen(), media_type="text/event-stream")
+        result = mod._restore_adapted_custom_tool_calls_in_streaming_response(
+            response, request_body={"tools": []}, adapter_model="m",
+        )
+        chunks = asyncio.run(_collect_response_chunks(result))
+
+        assert len(chunks) == 2
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+            responses_emissions_from_chunk,
+        )
+
+        added_emission = responses_emissions_from_chunk(chunks[0])[0]
+        done_emission = responses_emissions_from_chunk(chunks[1])[0]
+        assert added_emission.source_event is added_event
+        assert added_emission.effective_payload["item"]["type"] == "custom_tool_call"
+        assert done_emission.source_event is done_event
+        assert done_emission.effective_payload["type"] == "response.custom_tool_call_input.done"
+        done_wire = bytes(chunks[1])
+        assert b" \tevent: response.custom_tool_call_input.done\r\n" in done_wire
+        assert done_wire.endswith(b"\r\n\r\n")
+        data_line = next(line for line in done_wire.split(b"\r\n") if line.startswith(b"data:"))
+        assert json.loads(data_line.removeprefix(b"data: ")) == done_emission.effective_payload
+        reparsed = ResponsesEventPipeline().parse_event(done_wire)
+        assert reparsed.is_malformed is False
+        assert reparsed.event_type == done_emission.effective_payload["type"]
 
 
 # ===========================================================================
@@ -1477,3 +1614,111 @@ class TestNamespaceStreamingResponse:
         assert ": keep-alive" in combined
         assert "ns_adapter" in combined
         assert not combined.endswith("\n\n")
+
+    def test_namespace_restore_then_watermark_sanitize_reaches_collector(
+        self,
+        host_deps: None,
+    ) -> None:
+        from fastapi.responses import StreamingResponse
+
+        from litellm.proxy.pass_through_endpoints.aawm_text_watermark.config import (
+            load_text_watermark_config,
+        )
+        from litellm.proxy.pass_through_endpoints.aawm_text_watermark.response_hooks import (
+            maybe_wrap_passthrough_watermark_responses_stream,
+        )
+
+        watermark = "\u200b"
+        events = [
+            {
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "tool_a",
+                },
+                "output_index": 0,
+            },
+            {
+                "type": "response.function_call_arguments.done",
+                "item_id": "fc_1",
+                "output_index": 0,
+                "arguments": '{"query":"status"}',
+            },
+            {
+                "type": "response.output_text.done",
+                "text": f"visible{watermark}text",
+                "item_id": "msg_1",
+                "output_index": 1,
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_transformed",
+                    "status": "completed",
+                    "output": [],
+                },
+            },
+        ]
+
+        async def upstream_chunks():
+            for event in events:
+                event_type = event["type"]
+                wire = (
+                    f"event: {event_type}\ndata: "
+                    + json.dumps(event, separators=(",", ":"), ensure_ascii=False)
+                    + "\n\n"
+                )
+                yield wire.encode("utf-8")
+
+        upstream = StreamingResponse(
+            upstream_chunks(),
+            media_type="text/event-stream",
+        )
+        restored = mod._restore_adapted_namespace_tool_calls_in_streaming_response(
+            upstream,
+            request_body={"tools": []},
+            adapter_model="test-model",
+        )
+        config = load_text_watermark_config(
+            {
+                "mode": "sanitize",
+                "unicode": {"enabled": True, "policy": "conservative"},
+                "removal": {
+                    "enabled": True,
+                    "stream_policy": "buffer_response",
+                    "on_unremovable": "allow",
+                },
+            }
+        )
+        watermarked_chunks = maybe_wrap_passthrough_watermark_responses_stream(
+            restored.body_iterator,
+            config=config,
+            endpoint="responses",
+        )
+
+        wire_chunks: list[bytes] = []
+
+        async def capture_watermarked_chunks():
+            async for chunk in watermarked_chunks:
+                wire_chunks.append(bytes(chunk))
+                yield chunk
+
+        downstream = StreamingResponse(
+            capture_watermarked_chunks(),
+            media_type="text/event-stream",
+        )
+
+        result = asyncio.run(lpe._collect_responses_response_from_stream(downstream))
+
+        assert watermark.encode("utf-8") not in b"".join(wire_chunks)
+        function_calls = [
+            item for item in result["output"] if item.get("type") == "function_call"
+        ]
+        messages = [item for item in result["output"] if item.get("type") == "message"]
+        assert len(function_calls) == 1
+        assert function_calls[0]["namespace"] == "ns_adapter"
+        assert function_calls[0]["arguments"] == '{"query":"status"}'
+        assert len(messages) == 1
+        assert messages[0]["content"][0]["text"] == "visibletext"

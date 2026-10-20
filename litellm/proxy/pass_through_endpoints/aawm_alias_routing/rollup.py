@@ -153,6 +153,33 @@ def _auto_agent_alias_event_request_identity(event: dict[str, Any]) -> Optional[
     return None
 
 
+def _auto_agent_alias_route_rollup_observation_context(
+    event: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    from litellm.proxy.aawm_route_logging import (
+        _get_aawm_route_rollup_observation_scope,
+    )
+
+    if not _get_aawm_route_rollup_observation_scope():
+        return None
+    context: dict[str, Any] = {}
+    for key in (
+        "litellm_call_id",
+        "trace_id",
+        "session_id",
+        "canonical_session_identity",
+    ):
+        value = _clean_codex_auth_value(event.get(key))
+        if not value:
+            continue
+        context.setdefault(key, value)
+    for key in ("aawm_agent_name_source",):
+        value = _clean_codex_auth_value(event.get(key))
+        if value:
+            context.setdefault(key, value)
+    return context or None
+
+
 def _auto_agent_alias_request_outcome_is_recovered(event: dict[str, Any]) -> bool:
     request_outcome = str(event.get("request_outcome") or "")
     candidate_status = str(event.get("candidate_status") or "")
@@ -289,11 +316,12 @@ def _build_auto_agent_alias_rollup_group_header_label(
     host_name: Optional[str],
     agent_name: Optional[str] = None,
 ) -> Optional[str]:
+    agent_name_kwarg = {"agent_name": agent_name} if agent_name is not None else {}
     return build_aawm_route_rollup_group_header_label(
         repository=repository,
         client_product_label=client_product_label,
         host_name=host_name,
-        agent_name=agent_name,
+        **agent_name_kwarg,
     )
 
 
@@ -474,6 +502,9 @@ def _record_auto_agent_alias_route_status_rollup(  # noqa: PLR0915
             **request_status_kwargs,
             request_only=True,
             **request_origin_kwargs,
+            observation_context=(
+                _auto_agent_alias_route_rollup_observation_context(event)
+            ),
         )
         return
 
@@ -603,6 +634,9 @@ def _record_auto_agent_alias_route_status_rollup(  # noqa: PLR0915
             message=_clean_codex_auth_value(candidate_event.get("source_error")),
             **request_status_kwargs,
             **candidate_origin_kwargs,
+            observation_context=(
+                _auto_agent_alias_route_rollup_observation_context(event)
+            ),
         )
 
 
@@ -679,6 +713,10 @@ def install(host_globals: dict) -> None:
     host_globals.setdefault(
         "_resolve_aawm_route_rollup_reasoning_effort",
         _resolve_aawm_route_rollup_reasoning_effort,
+    )
+    host_globals.setdefault(
+        "_auto_agent_alias_route_rollup_observation_context",
+        _auto_agent_alias_route_rollup_observation_context,
     )
     host_globals.setdefault(
         "_safe_aawm_route_target_label",
