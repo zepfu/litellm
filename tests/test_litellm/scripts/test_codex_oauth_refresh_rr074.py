@@ -401,6 +401,7 @@ def test_eligibility_uses_persisted_timestamp_lifetime(
         ),
         encoding="utf-8",
     )
+    auth_path.chmod(0o600)
 
     result = codex.inspect_codex_oauth_refresh_eligibility(
         auth_path,
