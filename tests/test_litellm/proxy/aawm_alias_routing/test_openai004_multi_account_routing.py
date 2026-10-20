@@ -4865,12 +4865,27 @@ async def test_priority_stability_ignores_stale_balancing_cadence(
 
 
 @pytest.mark.asyncio
-async def test_openai_proxy_route_direct_uses_inventory_not_client_or_api_key(
+async def test_openai_proxy_route_direct_uses_inventory_without_diagnostic_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        config_startup,
+        durable as durable_mod,
+    )
+    from tests.test_litellm.proxy.pass_through_endpoints.test_d1_612_session_affinity import (
+        _FakeRedisCache,
+        _patch_dual,
+    )
+
     loaded = _patch_direct_inventory_auth(monkeypatch)
+    redis = _FakeRedisCache()
     request = _direct_request()
     body = {"model": "gpt-5.6-sol", "input": "hello"}
+    startup_inventory_reads: list[None] = []
+
+    def _read_startup_inventory():
+        startup_inventory_reads.append(None)
+        return _inventory()
 
     async def _fake_get_body(req):
         return dict(body)
@@ -4883,14 +4898,19 @@ async def test_openai_proxy_route_direct_uses_inventory_not_client_or_api_key(
 
     monkeypatch.setattr(lpe, "get_request_body", _fake_get_body)
     monkeypatch.setattr(
+        config_startup,
+        "load_codex_oauth_inventory",
+        _read_startup_inventory,
+    )
+    monkeypatch.setattr(
+        durable_mod,
+        "get_aawm_alias_routing_state_namespace",
+        lambda: "test",
+    )
+    monkeypatch.setattr(
         lpe.BaseOpenAIPassThroughHandler,
         "_base_openai_pass_through_handler",
         _fake_base_handler,
-    )
-    monkeypatch.setattr(
-        lpe,
-        "_resolve_codex_auto_agent_alias_model",
-        lambda *a, **k: None,
     )
     monkeypatch.setattr(lpe, "_is_oa_xai_request_body", lambda *_a, **_k: False)
     monkeypatch.setattr(
@@ -4904,12 +4924,13 @@ async def test_openai_proxy_route_direct_uses_inventory_not_client_or_api_key(
         ),
     )
 
-    response = await lpe.openai_proxy_route(
-        endpoint="v1/responses",
-        request=request,
-        fastapi_response=Response(),
-        user_api_key_dict=object(),  # type: ignore[arg-type]
-    )
+    with _patch_dual(redis):
+        response = await lpe.openai_proxy_route(
+            endpoint="v1/responses",
+            request=request,
+            fastapi_response=Response(),
+            user_api_key_dict=object(),  # type: ignore[arg-type]
+        )
     assert response.status_code == 200
     assert captured.get("api_key") is None
     assert captured.get("forward_headers") is False
@@ -4921,6 +4942,7 @@ async def test_openai_proxy_route_direct_uses_inventory_not_client_or_api_key(
     target = str(captured.get("base_target_url") or "")
     assert "api.openai.com" not in target
     assert "account1" in loaded
+    assert startup_inventory_reads == []
     assert lpe._should_preserve_openai_client_auth(request, "v1/responses") is False
 
 
