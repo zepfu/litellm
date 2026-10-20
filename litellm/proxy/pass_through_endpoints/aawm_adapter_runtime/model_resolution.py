@@ -555,10 +555,10 @@ def _resolve_codex_auto_agent_alias_model(
         configured_alias = False
         try:
             from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
-                get_startup_status,
+                get_startup_alias_diagnostic_status,
             )
 
-            startup_status = get_startup_status()
+            startup_status = get_startup_alias_diagnostic_status()
             startup_state = startup_status.get("state")
             alias_count = startup_status.get("alias_count")
             configured_alias = requested_model in set(

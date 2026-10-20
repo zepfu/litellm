@@ -31,6 +31,9 @@ import litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup as
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
     RoutingSnapshot,
 )
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+    model_resolution,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
     _lookup_active_snapshot_canonical_alias,
     _select_snapshot_candidates,
@@ -486,6 +489,28 @@ class TestStartupActivation:
         snap = get_active_routing_snapshot()
         assert snap is not None
         assert snap.config_hash == status["config_hash"]
+
+    def test_non_alias_responses_diagnostic_skips_inventory_read(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _write_alias_yaml(tmp_path, "basic.yaml", "basic")
+        activate_alias_config_directory(tmp_path)
+        monkeypatch.setattr(
+            _config_startup_module,
+            "load_codex_oauth_inventory",
+            lambda: pytest.fail("alias diagnostics must not read the OAuth inventory"),
+        )
+
+        assert (
+            model_resolution._resolve_codex_auto_agent_alias_model(
+                {"model": "gpt-5.4-mini"},
+                "/v1/responses",
+                request=object(),
+            )
+            is None
+        )
 
     def test_failed_activation_blocks_readiness(self, tmp_path: Path) -> None:
         (tmp_path / "bad.yaml").write_text(":::invalid:::", encoding="utf-8")

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 from types import SimpleNamespace
 from typing import Any
 
@@ -208,6 +210,26 @@ def _configure_readiness_dependencies(
     *,
     status: dict[str, Any],
 ) -> None:
+    async def run_in_thread(function: Any, *args: Any, **kwargs: Any) -> Any:
+        result: list[Any] = []
+        errors: list[BaseException] = []
+
+        def invoke() -> None:
+            try:
+                result.append(function(*args, **kwargs))
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=invoke)
+        worker.start()
+        while worker.is_alive():
+            await asyncio.sleep(0.001)
+        worker.join()
+        if errors:
+            raise errors[0]
+        return result[0]
+
+    monkeypatch.setattr(_health_endpoints.asyncio, "to_thread", run_in_thread)
     monkeypatch.setattr(config_startup, "is_startup_healthy", lambda: True)
     monkeypatch.setattr(
         config_startup,
@@ -257,6 +279,47 @@ async def test_readiness_reports_explicit_degraded_mode(
 
     assert response["status"] == "healthy"
     assert response["aawm_claude_control_plane"] == status
+
+
+@pytest.mark.asyncio
+async def test_readiness_resolves_alias_status_without_blocking_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status = {
+        "state": "degraded",
+        "mode": "optional",
+        "ready": True,
+        "reason": "optional_module_absent",
+        "error_type": None,
+    }
+    _configure_readiness_dependencies(monkeypatch, status=status)
+    loop_callback_ran = threading.Event()
+    status_lookup_ran = threading.Event()
+
+    def get_startup_status() -> dict[str, Any]:
+        status_lookup_ran.set()
+        if not loop_callback_ran.wait(timeout=1):
+            raise AssertionError(
+                "readiness blocked the event loop during status lookup"
+            )
+        return {"state": "active"}
+
+    async def get_inventory_status(**_kwargs: Any) -> dict[str, Any]:
+        return {"readiness_degraded": False}
+
+    asyncio.get_running_loop().call_soon(loop_callback_ran.set)
+    monkeypatch.setattr(config_startup, "get_startup_status", get_startup_status)
+    monkeypatch.setattr(
+        config_startup,
+        "get_codex_oauth_inventory_generation_status",
+        get_inventory_status,
+    )
+
+    response = await _health_endpoints.health_readiness()
+
+    assert response["status"] == "healthy"
+    assert loop_callback_ran.is_set()
+    assert status_lookup_ran.is_set()
 
 
 @pytest.mark.asyncio

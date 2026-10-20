@@ -1346,7 +1346,9 @@ async def health_readiness():
         is_startup_healthy as _aawm_alias_config_startup_healthy,
     )
 
-    aawm_alias_config_status = _get_aawm_alias_config_startup_status()
+    aawm_alias_config_status = await asyncio.to_thread(
+        _get_aawm_alias_config_startup_status
+    )
     if not _aawm_alias_config_startup_healthy():
         raise HTTPException(
             status_code=503,
