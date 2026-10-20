@@ -1208,6 +1208,119 @@ async def test_chunk_processor_orders_done_after_late_terminal():
 
 
 @pytest.mark.asyncio
+async def test_openai_responses_summary_overflow_delivers_failure_associations_once(
+    monkeypatch,
+):
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    monkeypatch.setenv("AAWM_RESPONSES_MAX_OUTPUT_ITEMS", "1")
+    created = _response_event(
+        "response.created",
+        1,
+        response_id="resp_summary_overflow",
+        status="in_progress",
+    )
+    accepted_item = _responses_event(
+        "response.output_item.added",
+        2,
+        output_index=0,
+        item={
+            "id": "msg_summary_0",
+            "type": "message",
+            "role": "assistant",
+            "status": "in_progress",
+            "content": [],
+        },
+    )
+    overflowing_item = _responses_event(
+        "response.output_item.added",
+        3,
+        output_index=1,
+        item={
+            "id": "msg_summary_1",
+            "type": "message",
+            "role": "assistant",
+            "status": "in_progress",
+            "content": [],
+        },
+    )
+    downstream_chunks = []
+    original_chunk_processor = PassThroughStreamingHandler.chunk_processor
+
+    async def observe_downstream_chunks(*args, **kwargs):
+        async for chunk in original_chunk_processor(*args, **kwargs):
+            downstream_chunks.append(chunk)
+            yield chunk
+
+    monkeypatch.setattr(
+        PassThroughStreamingHandler,
+        "chunk_processor",
+        staticmethod(observe_downstream_chunks),
+    )
+    result, client, sent_requests, upstream_streams = (
+        await _start_openai_responses_stream(
+            monkeypatch,
+            [_ClosableAsyncByteStream([created, accepted_item, overflowing_item])],
+        )
+    )
+    try:
+        assert not isinstance(result, Exception)
+        assert len(sent_requests) == 1
+        rendered = b"".join(
+            [bytes(chunk) async for chunk in result.body_iterator]
+        )
+    finally:
+        iterator = getattr(result, "body_iterator", None)
+        close_iterator = getattr(iterator, "aclose", None)
+        if callable(close_iterator):
+            await close_iterator()
+        for upstream_stream in upstream_streams:
+            await upstream_stream.aclose()
+        await client.aclose()
+
+    payloads = _responses_sse_payloads(rendered)
+    failed_payloads = [
+        payload for payload in payloads if payload.get("type") == "response.failed"
+    ]
+    assert len(failed_payloads) == 1
+    assert (
+        failed_payloads[0]["response"]["error"]["code"]
+        == "openai_responses_stream_retention_too_large"
+    )
+    assert rendered.count(b"data: [DONE]\n\n") == 1
+    assert rendered.count(b"event: response.failed\n") == 1
+
+    associated_events = [
+        event
+        for chunk in downstream_chunks
+        for event in (responses_events_from_chunk(chunk) or [])
+    ]
+    terminal_events = [
+        event for event in associated_events if event.event_type == "response.failed"
+    ]
+    assert len(terminal_events) == 1
+
+    associated_emissions = [
+        emission
+        for chunk in downstream_chunks
+        for emission in (responses_emissions_from_chunk(chunk) or [])
+    ]
+    terminal_emissions = [
+        emission
+        for emission in associated_emissions
+        if emission.source_event.event_type == "response.failed"
+    ]
+    assert len(terminal_emissions) == 1
+    assert terminal_emissions[0].source_event is terminal_events[0]
+    assert [payload.get("type") for payload in payloads] == [
+        "response.created",
+        "response.output_item.added",
+        "response.failed",
+    ]
+    assert payloads[0]["response"]["id"] == "resp_summary_overflow"
+    assert payloads[1]["item"]["id"] == "msg_summary_0"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("line_ending", [b"\n", b"\r"])
 async def test_chunk_processor_propagates_first_capacity_error_before_output(
     line_ending: bytes,
@@ -5823,7 +5936,15 @@ async def test_openai_responses_unsafe_admission_shapes_do_not_replay(
             assert failed_payloads[0]["response"]["output"] == expected_output
             assert failed_payloads[0]["response"]["error"]["code"] == "server_error"
         else:
-            assert _assert_provider_overload_terminal(body)
+            expected_code = (
+                "server_is_overloaded"
+                if scenario == "mismatched_output_index"
+                else "server_error"
+            )
+            assert _assert_provider_overload_terminal(
+                body,
+                expected_code=expected_code,
+            )
             if scenario == "unhashable_output_item_type":
                 payloads = _responses_sse_payloads(body)
                 event_types = [payload.get("type") for payload in payloads]
@@ -5966,7 +6087,10 @@ async def test_openai_responses_private_prefix_bound_preserves_admitted_events(
         failed_index = event_types.index("response.failed")
         assert created_index < progress_index < failed_index
         assert payloads[created_index]["response"]["id"] == response_id
-        assert _assert_provider_overload_terminal(body)
+        assert _assert_provider_overload_terminal(
+            body,
+            expected_code="server_is_overloaded",
+        )
     finally:
         iterator = getattr(result, "body_iterator", None)
         close_iterator = getattr(iterator, "aclose", None)
@@ -7087,7 +7211,11 @@ def _failed_snapshot_output_items(
     ]
 
 
-def _assert_provider_overload_terminal(body: bytes) -> bool:
+def _assert_provider_overload_terminal(
+    body: bytes,
+    *,
+    expected_code: str = "server_error",
+) -> bool:
     for payload in _responses_sse_payloads(body):
         if payload.get("type") != "response.failed":
             continue
@@ -7097,7 +7225,7 @@ def _assert_provider_overload_terminal(body: bytes) -> bool:
         error = response.get("error")
         if (
             isinstance(error, dict)
-            and error.get("code") == "server_error"
+            and error.get("code") == expected_code
             and "selected model is at capacity"
             in str(error.get("message", "")).lower()
         ):
