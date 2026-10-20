@@ -3199,6 +3199,7 @@ class PassThroughStreamingHandler:
             responses_terminal_seen = False
             responses_substantive_seen = False
             held_responses_done_suffix = b""
+            eof_responses_events: List[ParsedResponsesEvent] = []
             responses_sse_event_buffer = b""
             buffer_raw_bytes = True
             if (
@@ -3387,6 +3388,12 @@ class PassThroughStreamingHandler:
                 elif responses_event_pipeline.buffered_event_bytes:
                     for parsed_event in responses_event_pipeline.finish():
                         _consume_responses_event(parsed_event)
+                        if (
+                            parsed_event.forward_event is not None
+                            and parsed_event.separator
+                            and not parsed_event.is_malformed
+                        ):
+                            eof_responses_events.append(parsed_event)
 
                 if responses_sse_event_buffer:
                     # Native Responses partial frames are not client-deliverable
@@ -3959,6 +3966,21 @@ class PassThroughStreamingHandler:
             if responses_event_pipeline is not None:
                 synthetic_terminal = _finalize_responses_tracking()
                 terminal_chunks: List[bytes] = []
+                for parsed_event in eof_responses_events:
+                    if parsed_event.event_type in (
+                        PassThroughStreamingHandler._RESPONSES_TERMINAL_EVENTS
+                    ):
+                        _mark_responses_terminal_pending()
+                    event_chunk = attach_responses_emissions(
+                        b"",
+                        [parsed_event.emission()],
+                    )
+                    _record_responses_wire_chunk(event_chunk)
+                    await _publish_transfer_chunks(
+                        first_downstream=first_emitted_at is not None
+                        and downstream_chunk_count == 1
+                    )
+                    yield event_chunk
                 if synthetic_terminal is not None:
                     event_type = synthetic_terminal["type"]
                     terminal_chunks = [

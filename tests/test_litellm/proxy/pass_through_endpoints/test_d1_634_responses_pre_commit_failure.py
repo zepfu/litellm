@@ -943,6 +943,81 @@ async def test_peek_delivers_live_complete_cr_eof_with_shared_event():
     finalized.assert_called_once()
 
 
+@pytest.mark.asyncio
+async def test_chunk_processor_delivers_unpeeked_cr_terminal_at_eof():
+    accepted = _sse(
+        "response.created",
+        {
+            "type": "response.created",
+            "response": {
+                "id": "resp_cr_unpeeked",
+                "status": "in_progress",
+                "model": "gpt-5.4",
+                "output": [],
+            },
+        },
+    )
+    substantive = _sse(
+        "response.output_text.delta",
+        {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "delta": "visible",
+        },
+    )
+    completed = (
+        b"event: response.completed\r\n"
+        b'data: {"type":"response.completed","response":{"id":"resp_cr_unpeeked"}}\r\r'
+    )
+    pipeline = ResponsesEventPipeline(retain_events=True)
+    response = _FakeUpstreamStream([accepted, substantive, completed])
+    logging_obj = MagicMock()
+    logging_obj.model_call_details = {}
+    finalized = AsyncMock()
+
+    with patch.object(
+        PassThroughStreamingHandler,
+        "_route_streaming_logging_to_handler",
+        new=finalized,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.emit_aawm_route_status_event"
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.record_aawm_route_rollup"
+    ):
+        emitted = [
+            chunk
+            async for chunk in PassThroughStreamingHandler.chunk_processor(
+                response=response,
+                request_body={"model": "gpt-5.4", "stream": True},
+                litellm_logging_obj=logging_obj,
+                endpoint_type=EndpointType.OPENAI,
+                start_time=datetime.now(),
+                passthrough_success_handler_obj=MagicMock(
+                    spec=PassThroughEndpointLogging
+                ),
+                url_route="https://chatgpt.com/backend-api/codex/responses",
+                custom_llm_provider="openai",
+                success_handler_kwargs=_route_kwargs(),
+                responses_event_pipeline=pipeline,
+            )
+        ]
+
+    assert b"".join(bytes(chunk) for chunk in emitted) == (
+        accepted + substantive + completed
+    )
+    terminal_events = [
+        event
+        for chunk in emitted
+        for event in (responses_events_from_chunk(chunk) or [])
+        if event.event_type == "response.completed"
+    ]
+    assert len(terminal_events) == 1
+    assert terminal_events[0].separator == b"\r\r"
+    assert terminal_events[0].payload["response"]["id"] == "resp_cr_unpeeked"
+    assert pipeline.finish() == []
+    finalized.assert_called_once()
+
+
 def test_no_replay_after_substantive_output():
     chunks = [
         _sse(
