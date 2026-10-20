@@ -191,6 +191,8 @@ def _iter_exception_chain(exc: BaseException) -> Iterator[BaseException]:
 
 
 def _is_retryable_session_history_persistence_failure(exc: Exception) -> bool:
+    if _is_session_history_deadlock(exc):
+        return True
     for chained_exc in _iter_exception_chain(exc):
         exc_name = type(chained_exc).__name__
         if exc_name in _AAWM_SESSION_HISTORY_RETRYABLE_EXCEPTION_NAMES:
@@ -202,6 +204,14 @@ def _is_retryable_session_history_persistence_failure(exc: Exception) -> bool:
         ):
             return True
     return False
+
+
+def _is_session_history_deadlock(exc: Exception) -> bool:
+    return any(
+        getattr(chained_exc, "sqlstate", None) == "40P01"
+        or type(chained_exc).__name__ == "DeadlockDetectedError"
+        for chained_exc in _iter_exception_chain(exc)
+    )
 
 
 def _session_history_persistence_failure_fingerprint(exc: Exception) -> str:
@@ -357,7 +367,12 @@ def _prepare_session_history_retry_after_failure(
                     at_risk_of_loss=True,
                 ),
             )
-    db_pool_reset_count = _call("_reset_session_history_pool_after_retryable_failure", loop)
+    # A rolled-back deadlock transaction does not invalidate its connection.
+    db_pool_reset_count = (
+        0
+        if _is_session_history_deadlock(last_failure)
+        else _call("_reset_session_history_pool_after_retryable_failure", loop)
+    )
     return (
         True,
         retry_write_ahead_spool_path,
@@ -379,7 +394,7 @@ def _log_session_history_retry(
     degraded_telemetry: bool,
     failure_fingerprint: Optional[str],
 ) -> None:
-    at_risk = retryable_last_failure and not spooled
+    at_risk = not spooled
     verbose_logger.warning(
         "AawmAgentIdentity: retrying %s within the configured retry budget "
         "(batch_size=%d, retryable=%s, db_pool_reset=%d, "

@@ -71,6 +71,8 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_led
     ProviderCallReplayBlocked,
     bind_openai_candidate_context,
     get_request_provider_call_ledger,
+    get_request_openai_wire_commitment,
+    is_openai_wire_replay_prohibited,
 )
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.deferred_success import (
     finalize_deferred_success,
@@ -776,6 +778,7 @@ _TYPED_REDISPATCH_ERROR_CODES = frozenset(
         "aawm_codex_auto_agent_redispatch_required",
         "aawm_anthropic_auto_agent_redispatch_required",
         "aawm_session_owner_redispatch_required",
+        "cursor_replay_state_bound_exceeded",
     }
 )
 _SUPPORTED_REDISPATCH_ERROR_CODES = (
@@ -4508,6 +4511,15 @@ async def handle_alias_route(  # noqa: PLR0915
                         if probe_lock is not None and probe_lock.locked():
                             probe_lock.release()
 
+                    wire_commitment = (
+                        get_request_openai_wire_commitment(request)
+                        if probe_failure_exc is not None
+                        else None
+                    )
+                    wire_replay_prohibited = is_openai_wire_replay_prohibited(
+                        wire_commitment
+                    )
+
                     renewal_error_type = getattr(
                         sa,
                         "SessionOwnerLeaseRenewalError",
@@ -4654,6 +4666,7 @@ async def handle_alias_route(  # noqa: PLR0915
 
                     if (
                         probe_failure_exc is not None
+                        and not wire_replay_prohibited
                         and str(
                             candidate.get("xai_oauth_lane_key") or ""
                         )
@@ -4883,7 +4896,9 @@ async def handle_alias_route(  # noqa: PLR0915
                         early_pre_commit_error_class = fresh_codex_auth_error_class
                     early_account_slot = _codex_oauth_candidate_slot(candidate)
                     early_pre_commit_retry_plan = (
-                        _error_signals.plan_responses_pre_commit_retry(
+                        {"action": "wire_commitment_blocked", "wait_seconds": 0.0}
+                        if wire_replay_prohibited
+                        else _error_signals.plan_responses_pre_commit_retry(
                             error_class=early_pre_commit_error_class,
                             same_account_transient_attempts=(
                                 same_account_transient_attempts_by_slot.get(
@@ -4949,6 +4964,7 @@ async def handle_alias_route(  # noqa: PLR0915
                     )
                     skip_cooldown_for_account_failover = (
                         prefer_account_failover
+                        and not wire_replay_prohibited
                         and early_pre_commit_error_class
                         == "provider_terminal_error"
                         and _extract_adapter_exception_status_code(
@@ -4973,9 +4989,9 @@ async def handle_alias_route(  # noqa: PLR0915
                         if intent is not None:
                             intent.plan = probe_failure_plan
                     skip_cooldown_for_same_account_retry = (
-                        not prefer_account_failover
-                        and
-                        early_pre_commit_retry_plan["action"]
+                        not wire_replay_prohibited
+                        and not prefer_account_failover
+                        and early_pre_commit_retry_plan["action"]
                         in {"retry_same_account", "pre_stream_unavailable"}
                     )
                     publication_transaction_result: Optional[object] = None
@@ -5055,6 +5071,7 @@ async def handle_alias_route(  # noqa: PLR0915
                 token_invalidated_reload = None
                 if (
                     early_pre_commit_error_class == "token_invalidated"
+                    and not wire_replay_prohibited
                     and reload_label
                     and reload_account_hash is not None
                     and reload_lane_key is not None
@@ -5473,6 +5490,44 @@ async def handle_alias_route(  # noqa: PLR0915
                     error_class, _ = resolve_schema_rejection_failure_identity(
                         failure_class=error_class,
                         error_code=attempt_record.get("error_code"),
+                    )
+                if wire_replay_prohibited:
+                    terminal_error_class = (
+                        error_class
+                        or early_pre_commit_error_class
+                        or "provider_terminal_error"
+                    )
+                    _update_codex_auto_agent_retryable_attempt_record(
+                        attempt_record=attempt_record,
+                        exc=failure_exc,
+                        error_class=terminal_error_class,
+                        cooldown_seconds=0.0,
+                        cooldown_scope="none",
+                        alias_model=alias_model,
+                        candidate=candidate,
+                    )
+                    attempt_record["status"] = (
+                        "terminal_openai_wire_replay_blocked"
+                    )
+                    attempt_record["failure_phase"] = (
+                        "openai_wire_replay_blocked"
+                    )
+                    attempt_record["wire_commitment"] = wire_commitment
+                    _record_auto_agent_alias_attempt_failure(
+                        alias_family=alias_family,
+                        alias_model=alias_model,
+                        request=request,
+                        prepared_request_body=prepared_request_body,
+                        selection=selection,
+                        attempts=attempts,
+                        attempt_record=attempt_record,
+                        error_class=terminal_error_class,
+                        add_alias_metadata_fn=add_alias_metadata_fn,
+                    )
+                    _raise_terminal_alias_failure(
+                        failure_exc,
+                        preserve_upstream_failure=True,
+                        extra_fields={"wire_commitment": wire_commitment},
                     )
                 _remember_capacity_failure(
                     failure_exc=failure_exc,

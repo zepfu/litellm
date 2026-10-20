@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterator, Optional, TypeVar
 from urllib.parse import urlparse
@@ -72,8 +73,8 @@ def _safe_get_headers(request: Any) -> dict[str, str]:
     if getter is not None:
         return getter(request)
     headers = getattr(request, "headers", None)
-    if isinstance(headers, dict):
-        return headers
+    if isinstance(headers, Mapping):
+        return dict(headers)
     return {}
 
 
@@ -325,6 +326,7 @@ _PASSTHROUGH_REPOSITORY_BODY_KEYS: frozenset[str] = frozenset(
     {
         "repository",
         "repo",
+        "repoRoot",
         "workspace_root",
         "workspaceRoot",
         "project_root",
@@ -736,12 +738,33 @@ def _extract_passthrough_repository(
     request_body: Optional[dict[str, Any]] = None,
 ) -> Optional[str]:
     headers = _safe_get_headers(request)
+    # Ohmypi provider headers are static; current workspace context is per request.
+    is_ohmypi = any(
+        isinstance(value, str)
+        and value.strip().lower().split("/", 1)[0]
+        in {"omp", "ohmypi", "oh-my-pi", "oh my pi"}
+        for value in (
+            _get_passthrough_header_value(headers, "x-aawm-client"),
+            _get_passthrough_header_value(headers, "x-aawm-client-name"),
+        )
+    )
+    body_repository = (
+        _extract_passthrough_repository_from_body(request_body, current_turn_only=True)
+        if is_ohmypi
+        else None
+    )
     for header_name in _PASSTHROUGH_REPOSITORY_HEADER_NAMES:
         value = _get_passthrough_header_value(headers, header_name)
         if isinstance(value, str) and value.strip():
             repository = _normalize_passthrough_repository(value)
             if repository:
-                return repository
+                # HV2 intentionally labels its synthetic workspace as litellm.
+                if repository == "litellm" and body_repository == "omp-alpha-workspace":
+                    return repository
+                return body_repository or repository
+
+    if body_repository:
+        return body_repository
 
     current_project_path = _extract_passthrough_current_project_path(headers)
     if current_project_path:
@@ -749,10 +772,19 @@ def _extract_passthrough_repository(
         if repository:
             return repository
 
+    return _extract_passthrough_repository_from_body(request_body)
+
+
+def _extract_passthrough_repository_from_body(
+    request_body: Optional[dict[str, Any]],
+    *,
+    current_turn_only: bool = False,
+) -> Optional[str]:
     if isinstance(request_body, dict):
         for path in (
             ("repository",),
             ("repo",),
+            ("repoRoot",),
             ("workspace_root",),
             ("workspaceRoot",),
             ("project_root",),
@@ -791,7 +823,7 @@ def _extract_passthrough_repository(
             if value:
                 return _normalize_passthrough_repository(value)
 
-        if isinstance(request_body.get("input"), list):
+        if current_turn_only or isinstance(request_body.get("input"), list):
             instructions = request_body.get("instructions")
             if instructions is not None:
                 repository = _extract_passthrough_repository_from_body_text(
@@ -821,7 +853,7 @@ def _extract_passthrough_repository(
 
         repository = _extract_passthrough_repository_from_body_text(
             request_body,
-            skip_current_turn_nodes=False,
+            skip_current_turn_nodes=current_turn_only,
         )
         if repository:
             return repository

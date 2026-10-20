@@ -92,7 +92,10 @@ filesystem transaction. Changes that land **after** the final revalidation
 are not observed by this activation and load on the **next restart** (or the
 next successful refresh). The read-only container mount (below) is the
 primary guarantee against in-container mutation; the rescan is a bounded
-defense against host-side races on the bind-mounted source.
+defense against host-side races on the bind-mounted source. Startup and
+directory refresh share this check; request and failure behavior are
+documented in
+[refresh semantics](#restart-refresh-and-recovery-semantics).
 
 ## Readiness and failure behavior
 
@@ -132,6 +135,21 @@ Every alias compiled from YAML is an ordinary exact-name route and a valid
 visibility routing distinction in YAML or Python. Codex and Claude TUI
 selection catalogs are separate client model-definition lists; they are not
 generated from every snapshot alias and do not invent a denylist.
+
+Compilation checks `alias_reference` and dispatch targets as one graph using
+active/completed traversal, so a shared acyclic subgraph is validated once.
+The graph is bounded before publication: at most **64** alias hops in depth,
+**4,096** candidate occurrences in a branch's expanded output, and
+**32,768** expansion calls. Dispatch contributes one selected target to a
+request; compilation includes that dispatch hop and uses its largest supported
+target branch for the depth and output budgets and its expansion work total.
+Repeated occurrences remain distinct because references preserve branch
+ordering, weighting, and fallback semantics. Runtime selection independently
+bounds one top-level resolution to the same depth, output, and total traversal
+work, including filtered references and shared subgraphs. A graph beyond a
+budget raises an error; startup and refresh reject it without creating or
+replacing the oversized snapshot, and unsupported hand-built snapshots fail
+closed during selection.
 
 ## Provider-pinned aliases (CFG-029)
 
@@ -369,6 +387,12 @@ providers, accounts, and route families remain eligible. An unmarked local
 replay or tool-schema validation defect remains
 `candidate_deterministically_ineligible` with `cooldown_scope: none`.
 
+An explicit Cursor replay-state bound rejection is separately attributable as
+`cursor_replay_state_bound_exceeded`. It records `candidate_status: ineligible`
+and `attempted_provider_call: false`, marks the continuation phase, and does not
+publish cooldown. The candidate loop terminates the alias with the typed
+fresh-owner redispatch signal instead of continuing to another candidate.
+
 Upstream-origin evidence authorization is separate from provider-derived
 duration and monotonic TTL handling. Only evidence attributable to the upstream
 provider may advance provider evidence; client-origin, deterministic,
@@ -459,8 +483,29 @@ schedule:
   timezone: "America/Los_Angeles"
 ```
 
+Clock windows may add inclusive calendar-date bounds and weekday eligibility:
+
+```yaml
+schedule:
+  start_date: "2026/09/01"
+  end_date: "2026/10/20"
+  start_time: "22:00:00"
+  end_time: "09:00:00"
+  timezone: "UTC"
+  weekdays: ["tuesday"]
+```
+
+A date/weekday-only schedule is a whole-day calendar gate:
+
+```yaml
+schedule:
+  start_date: "2026/09/01"
+  end_date: "2026/10/20"
+  weekdays: ["tuesday"]
+```
+
 Absolute windows stay UTC-only and closed-closed (`start <= now <= end`).
-Daily windows require a local start time, local end time, and exactly one of
+Clock windows require a local start time, local end time, and exactly one of
 fixed `utc_offset` or an IANA `timezone`. They are half-open: the start is
 included and the end is excluded. When `start_time` is later than `end_time`,
 the window wraps midnight in the configured zone. Mixing the two forms,
@@ -471,6 +516,17 @@ An IANA `timezone` such as `America/Los_Angeles` applies its daylight-saving
 rules at selection time. For example, the Z.AI `03:00-23:00` eligibility
 window blocks `23:00-03:00` at `06:00-10:00 UTC` during PDT and
 `07:00-11:00 UTC` during PST.
+
+Dates use `YYYY/MM/DD`; both bounds are inclusive. A clock window is owned by
+the calendar day containing `start_time`, including the after-midnight portion
+of a wrapping window; a whole-day gate uses the schedule zone's local calendar
+day directly, or UTC when neither offset nor timezone is set. In the first
+bounded example above, September 1 owns the interval through September 2 at
+08:59:59 UTC, and October 20 owns its interval through October 21 at 08:59:59
+UTC. `weekdays` accepts unabbreviated English names or `0` through `6`, where
+Monday is `0` and Sunday is `6`; the schedule timezone's day that owns the
+occurrence must match. Existing schedules without
+`start_date`, `end_date`, or `weekdays` remain unrestricted by these gates.
 
 The schedule gate applies only to new affinity. Existing session owners are
 still found through `include_out_of_schedule` membership.
@@ -540,11 +596,24 @@ retries, cooldown recovery, probes, and acceptance harnesses.
 - **Routing snapshot lifetime**: once activated, the routing snapshot lasts
   until a **successful refresh** replaces it or the worker **restarts**. A
   failed refresh preserves the last-known-good snapshot.
+- **Refresh request**: an empty body or JSON object without `yaml` reloads
+  the canonical directory. An object with a string `yaml` field compiles that
+  inline configuration. Malformed nonempty JSON, non-object JSON, and a
+  present non-string `yaml` field return a sanitized 400 before source
+  loading or compilation.
+- **Directory refresh**: re-scans and compiles the complete canonical
+  directory, so host-side file additions, removals, and edits can take effect
+  without a restart. It uses the startup inventory revalidation check and
+  preserves the active snapshot and prior startup source-file metadata if
+  drift is detected. Synchronous loading and compilation run on a worker
+  thread. After work is scheduled, request cancellation is propagated only
+  after the worker finishes, while the per-process refresh lock remains held.
+  This prevents a later refresh from publishing ahead of an earlier worker.
+  Transactions are serialized within each process; there is no cross-worker
+  consensus (see
+  [Multi-worker refresh consensus](#multi-worker-refresh-consensus)).
 - **Restart**: the startup loader re-scans and compiles the complete canonical
-  directory. A successful empty-body/default refresh performs the same full
-  re-scan and compile, so host-side file additions, removals, and edits can
-  take effect without a restart. Recovery from a failed startup still requires
-  a worker restart.
+  directory. Recovery from a failed startup still requires a worker restart.
 - **Invalid hot refresh**: if a runtime refresh attempt encounters invalid
   config, the active last-known-good snapshot is preserved. No restart is
   needed; routing continues on the prior valid definition.
@@ -559,8 +628,7 @@ retries, cooldown recovery, probes, and acceptance harnesses.
 (`./litellm/proxy/aawm_alias_config:/app/litellm/proxy/aawm_alias_config:ro`).
 This blocks **container-side** writes to the config tree. It does **not**
 prevent host-side edits to the bind-mounted source. A successful
-empty-body/default refresh re-scans and compiles the complete canonical
-directory, including those host-side additions, removals, and edits; otherwise
+default refresh observes host-side additions, removals, and edits; otherwise
 they load on the next restart.
 
 ## CFG-017 source identity and parity contract

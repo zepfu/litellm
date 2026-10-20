@@ -17,6 +17,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import importlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -24,6 +25,10 @@ from typing import Any
 import pytest
 
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+    ResponsesEventPipeline,
+    attach_responses_events,
+)
 
 # ---------------------------------------------------------------------------
 # Module under test
@@ -718,6 +723,29 @@ class _FakeResponse:
         self.body_iterator = self._iterator
 
 
+def _real_pipeline_response_from_events(
+    events: list[dict[str, Any]],
+) -> SimpleNamespace:
+    pipeline = ResponsesEventPipeline(max_raw_events=0)
+    chunks: list[bytes] = []
+    for event in events:
+        event_type = event["type"]
+        wire = (
+            f"event: {event_type}\ndata: "
+            + json.dumps(event, separators=(",", ":"))
+            + "\n\n"
+        ).encode("utf-8")
+        parsed_events = pipeline.feed(wire)
+        assert len(parsed_events) == 1
+        chunks.append(attach_responses_events(wire, parsed_events))
+
+    async def body_iterator():
+        for chunk in chunks:
+            yield chunk
+
+    return SimpleNamespace(body_iterator=body_iterator(), retained_chunks=chunks)
+
+
 class FakeHTTPException(Exception):
     def __init__(self, status_code: int, detail: str) -> None:
         self.status_code = status_code
@@ -858,6 +886,121 @@ class TestCollectResponsesResponseFromStream:
         )
         text = result["output"][0]["content"][0]["text"]
         assert text == "Hello"
+
+    def test_real_pipeline_sse_iterator_deduplicates_text_done(self) -> None:
+        response = _real_pipeline_response_from_events(
+            [
+                {
+                    "type": "response.output_text.delta",
+                    "delta": "Hello",
+                    "item_id": "msg_1",
+                },
+                {
+                    "type": "response.output_text.done",
+                    "text": "Hello",
+                    "item_id": "msg_1",
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_real_delta_done",
+                        "status": "completed",
+                        "output": [],
+                    },
+                },
+            ]
+        )
+
+        result = asyncio.run(
+            sc._collect_responses_response_from_stream(response)  # type: ignore[arg-type]
+        )
+
+        assert len(result["output"]) == 1
+        assert result["output"][0]["content"][0]["text"] == "Hello"
+
+    def test_real_pipeline_collection_preserves_terminal_payload_and_wire(self) -> None:
+        response = _real_pipeline_response_from_events(
+            [
+                {
+                    "type": "response.output_text.delta",
+                    "delta": "Hello",
+                    "item_id": "msg_1",
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_real_source_unchanged",
+                        "status": "completed",
+                        "output": [],
+                    },
+                },
+            ]
+        )
+        terminal_chunk = response.retained_chunks[-1]
+        emission = terminal_chunk.responses_wire_emissions[0]
+        source_payload_before = json.loads(json.dumps(emission.source_event.payload))
+        effective_payload_before = json.loads(json.dumps(emission.effective_payload))
+        wire_before = bytes(terminal_chunk)
+
+        result = asyncio.run(
+            sc._collect_responses_response_from_stream(response)  # type: ignore[arg-type]
+        )
+
+        assert result["id"] == "resp_real_source_unchanged"
+        assert result["output"][0]["content"][0]["text"] == "Hello"
+        assert emission.source_event.payload == source_payload_before
+        assert emission.effective_payload == effective_payload_before
+        assert bytes(terminal_chunk) == wire_before
+
+    def test_real_pipeline_done_only_text_and_tool_are_reconstructed(self) -> None:
+        response = _real_pipeline_response_from_events(
+            [
+                {
+                    "type": "response.output_item.added",
+                    "item": {
+                        "type": "function_call",
+                        "id": "fc_1",
+                        "call_id": "call_1",
+                        "name": "lookup",
+                    },
+                    "output_index": 0,
+                },
+                {
+                    "type": "response.function_call_arguments.done",
+                    "item_id": "fc_1",
+                    "output_index": 0,
+                    "arguments": '{"query":"status"}',
+                },
+                {
+                    "type": "response.output_text.done",
+                    "text": "done-only text",
+                    "item_id": "msg_1",
+                    "output_index": 1,
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_real_done_only",
+                        "status": "completed",
+                        "output": [],
+                    },
+                },
+            ]
+        )
+
+        result = asyncio.run(
+            sc._collect_responses_response_from_stream(response)  # type: ignore[arg-type]
+        )
+
+        function_calls = [
+            item for item in result["output"] if item.get("type") == "function_call"
+        ]
+        messages = [item for item in result["output"] if item.get("type") == "message"]
+        assert len(function_calls) == 1
+        assert function_calls[0]["call_id"] == "call_1"
+        assert function_calls[0]["arguments"] == '{"query":"status"}'
+        assert len(messages) == 1
+        assert messages[0]["content"][0]["text"] == "done-only text"
 
 
 # ===========================================================================

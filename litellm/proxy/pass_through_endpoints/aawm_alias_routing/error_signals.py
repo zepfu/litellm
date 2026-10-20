@@ -2017,6 +2017,9 @@ _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER = (
 _CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_ERROR_CODE = (
     "aawm_codex_auto_agent_candidate_ineligible"
 )
+_CURSOR_REPLAY_STATE_BOUND_EXCEEDED_ERROR_CODE = (
+    "cursor_replay_state_bound_exceeded"
+)
 _CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_REASONS = frozenset(
     {
         "retired",
@@ -2031,6 +2034,11 @@ _CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_REASONS = frozenset(
 def _is_codex_auto_agent_candidate_deterministically_ineligible(exc: Any) -> bool:
     detail = getattr(exc, "detail", None)
     detail_error = detail.get("error") if isinstance(detail, dict) else None
+    detail_code = (
+        detail_error.get("code")
+        if isinstance(detail_error, dict)
+        else None
+    )
     return bool(
         getattr(exc, "candidate_status", None) == "ineligible"
         and getattr(exc, "ineligibility_reason", None)
@@ -2039,9 +2047,11 @@ def _is_codex_auto_agent_candidate_deterministically_ineligible(exc: Any) -> boo
             getattr(exc, "code", None)
             == _CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_ERROR_CODE
             or (
-                isinstance(detail_error, dict)
-                and detail_error.get("code")
-                == _CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_ERROR_CODE
+                detail_code
+                in (
+                    _CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_ERROR_CODE,
+                    _CURSOR_REPLAY_STATE_BOUND_EXCEEDED_ERROR_CODE,
+                )
             )
         )
     )

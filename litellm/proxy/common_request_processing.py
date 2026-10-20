@@ -66,6 +66,9 @@ if TYPE_CHECKING:
     ProxyConfig = _ProxyConfig
 else:
     ProxyConfig = Any
+from litellm.proxy.pass_through_endpoints.aawm_request_policy.prompt_replacement_hooks import (
+    apply_prompt_replacement_to_standard_request,
+)
 from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
 from litellm.types.utils import ModelResponse, ModelResponseStream, Usage
 
@@ -870,6 +873,12 @@ class ProxyBaseLLMRequestProcessing:
                 and "include_usage" not in self.data["stream_options"]
             ):
                 self.data["stream_options"]["include_usage"] = True
+        self.data = apply_prompt_replacement_to_standard_request(
+            self.data,
+            route_type=route_type,
+            request=request,
+        )
+
         ### CALL HOOKS ### - modify/reject incoming data before calling the model
 
         ## LOGGING OBJECT ## - initialize logging object for logging success/failure events for call

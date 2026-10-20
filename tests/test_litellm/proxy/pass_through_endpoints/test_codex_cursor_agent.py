@@ -1808,35 +1808,87 @@ def test_cursor_ohmypi_tool_output_without_previous_response_id_starts_fresh_run
     assert getattr(response, "status_code", 200) in {200, None}
 
 
-def test_cursor_fresh_full_history_tool_output_emits_continuation_cue() -> None:
-    messages = codex_candidate_calls._responses_input_to_cursor_messages(
-        {
-            "input": [
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": "run the requested read",
-                },
-                {
-                    "type": "function_call",
-                    "call_id": "read-call",
-                    "name": "exec_command",
-                    "arguments": '{"cmd":"read"}',
-                },
-                {
-                    "type": "function_call_output",
-                    "call_id": "read-call",
-                    "output": "read result",
-                },
-            ]
-        }
+def test_cursor_fresh_full_history_tool_output_emits_continuation_cue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_calls: list[dict[str, Any]] = []
+
+    class FakeCursorClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def run(
+            self,
+            payload: dict[str, Any],
+            **kwargs: Any,
+        ) -> CursorAgentRunResult:
+            run_calls.append({"payload": payload, "kwargs": kwargs})
+            return CursorAgentRunResult(text="fresh full-history run", turn_ended=True)
+
+    monkeypatch.setattr(
+        "litellm.llms.cursor_agent.connect.CursorAgentConnectClient",
+        FakeCursorClient,
     )
 
-    assert messages[-1] == {
-        "role": "user",
-        "content": codex_candidate_calls._CURSOR_TOOL_CONTINUATION_CUE,
-        codex_candidate_calls._CURSOR_TOOL_CONTINUATION_CUE_MARKER: True,
-    }
+    original_task = "Read the first heading in /workspace/README.md and report it."
+    tool_output = "Heading: Example"
+    response = asyncio.run(
+        llm_passthrough_endpoints._perform_codex_auto_agent_alias_candidate_request(
+            endpoint="/v1/responses",
+            request=_request(),
+            fastapi_response=Response(),
+            user_api_key_dict=None,
+            candidate=_candidate(provider="cursor_agent"),
+            candidate_body={
+                "model": "work",
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "exec_command"},
+                    }
+                ],
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": original_task,
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "read-call",
+                        "name": "exec_command",
+                        "arguments": '{"cmd":"head -n 1 /workspace/README.md"}',
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "read-call",
+                        "output": tool_output,
+                    },
+                ],
+            },
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key="access-token",
+            forward_headers=False,
+        )
+    )
+
+    assert json.loads(response.body)["output_text"] == "fresh full-history run"
+    assert len(run_calls) == 1
+
+    user_message_action = run_calls[0]["payload"]["runRequest"]["action"][
+        "userMessageAction"
+    ]
+    assert user_message_action["userMessage"]["text"] == original_task
+    history = user_message_action["conversationHistory"]["messages"]
+    assert len(history) == 3
+    assert history[0]["user"]["content"][0]["text"]["text"] == original_task
+    tool_call = history[1]["assistant"]["content"][0]["toolCall"]
+    assert tool_call["toolCallId"] == "read-call"
+    assert tool_call["toolName"] == "exec_command"
+    assert tool_call["argsJson"] == '{"cmd":"head -n 1 /workspace/README.md"}'
+    tool_result = history[2]["tool"]
+    assert tool_result["toolCallId"] == "read-call"
+    assert tool_result["content"][0]["text"]["text"] == tool_output
 
 
 def test_cursor_fresh_full_history_tool_output_starts_fresh_run_without_continuation_identity(

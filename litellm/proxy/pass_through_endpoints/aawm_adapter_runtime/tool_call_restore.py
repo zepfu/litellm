@@ -76,6 +76,7 @@ _HOST_FUNCTION_NAMES = (
     "_restore_adapted_custom_tool_stream_iterator",
     "_restore_adapted_custom_tool_calls_in_stream_event_payload",
     "_restore_adapted_custom_tool_calls_in_sse_event_block",
+    "_restore_adapted_tool_calls_in_associated_sse_block",
     "_restore_adapted_custom_tool_calls_in_streaming_response",
     "_restore_adapted_namespace_tool_calls_in_stream_event_payload",
     "_restore_adapted_namespace_tool_calls_in_sse_event_block",
@@ -816,6 +817,89 @@ def _restore_adapted_custom_tool_calls_in_sse_event_block(
     return "\n".join(restored_lines), restored_count
 
 
+def _restore_adapted_tool_calls_in_associated_sse_block(
+    event_block: Any,
+    *,
+    restore_event_payload: Callable[[dict[str, Any]], tuple[Optional[dict[str, Any]], int]],
+) -> tuple[Any, int]:
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+        attach_responses_emissions,
+        responses_emissions_from_chunk,
+        responses_events_from_chunk,
+    )
+
+    events = responses_events_from_chunk(event_block)
+    if events is None:
+        return event_block, 0
+
+    emissions = responses_emissions_from_chunk(event_block) or []
+    restored_emissions = []
+    restored_count = 0
+    changed = False
+    for event in events:
+        emission = next(
+            (
+                candidate
+                for candidate in emissions
+                if candidate.source_event is event
+            ),
+            None,
+        )
+        payload = (
+            emission.effective_payload
+            if emission is not None
+            else event.payload
+        )
+        if not isinstance(payload, dict):
+            restored_emissions.append(emission or event.emission())
+            continue
+
+        restored_payload, count = restore_event_payload(payload)
+        restored_count += count
+        if restored_payload is None:
+            changed = True
+            continue
+        if count:
+            changed = True
+            if emission is not None and emission.source_event is event:
+                transformed = emission.transformed(restored_payload)
+            else:
+                transformed = event.emission(payload=restored_payload)
+            restored_event_type = restored_payload.get("type")
+            if isinstance(restored_event_type, str) and event.event_type:
+                transformed_lines: list[bytes] = []
+                for line in transformed.wire_bytes.splitlines(keepends=True):
+                    if line.endswith(b"\r\n"):
+                        content, line_ending = line[:-2], b"\r\n"
+                    elif line.endswith((b"\r", b"\n")):
+                        content, line_ending = line[:-1], line[-1:]
+                    else:
+                        content, line_ending = line, b""
+                    event_field = content.lstrip()
+                    if event_field.startswith(b"event:"):
+                        whitespace = content[: len(content) - len(event_field)]
+                        line = (
+                            whitespace + b"event: "
+                            + restored_event_type.encode("utf-8")
+                            + line_ending
+                        )
+                    transformed_lines.append(line)
+                transformed_wire = b"".join(transformed_lines)
+                transformed = transformed.transformed(
+                    restored_payload,
+                    wire_bytes=transformed_wire,
+                )
+            restored_emissions.append(transformed)
+        else:
+            restored_emissions.append(emission or event.emission())
+
+    if not changed:
+        return event_block, 0
+    if not restored_emissions:
+        return None, restored_count
+    return attach_responses_emissions(b"", restored_emissions), restored_count
+
+
 async def _restore_adapted_custom_tool_stream_iterator(
     original_iterator: Any,
     *,
@@ -826,20 +910,42 @@ async def _restore_adapted_custom_tool_stream_iterator(
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
         sse as sse_runtime,
     )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+        attach_responses_events,
+        responses_emissions_from_chunk,
+    )
 
     state_by_key: dict[str, dict[str, Any]] = {}
     async for event_block, has_trailing_separator in sse_runtime._iter_sse_event_blocks_with_separator(
         original_iterator
     ):
-        restored_block, _ = _restore_adapted_custom_tool_calls_in_sse_event_block(
-            event_block,
-            request_body=request_body,
-            adapter_model=adapter_model,
-            adapted_names=adapted_names,
-            state_by_key=state_by_key,
-        )
+        if sse_runtime._sse_block_events(event_block) is not None:
+            restored_block, _ = _restore_adapted_tool_calls_in_associated_sse_block(
+                event_block,
+                restore_event_payload=lambda payload: _restore_adapted_custom_tool_calls_in_stream_event_payload(
+                    payload,
+                    request_body=request_body,
+                    adapter_model=adapter_model,
+                    adapted_names=adapted_names,
+                    state_by_key=state_by_key,
+                ),
+            )
+        else:
+            restored_block, _ = _restore_adapted_custom_tool_calls_in_sse_event_block(
+                event_block,
+                request_body=request_body,
+                adapter_model=adapter_model,
+                adapted_names=adapted_names,
+                state_by_key=state_by_key,
+            )
         if restored_block is not None:
-            if has_trailing_separator:
+            if sse_runtime._sse_block_events(restored_block) is not None:
+                yield attach_responses_events(
+                    sse_runtime._sse_block_wire_bytes(restored_block),
+                    emissions=responses_emissions_from_chunk(restored_block) or (),
+                    replace=True,
+                )
+            elif has_trailing_separator:
                 yield f"{restored_block}\n\n"
             else:
                 yield restored_block
@@ -1018,14 +1124,36 @@ def _restore_adapted_namespace_tool_calls_in_streaming_response(
         from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
             sse as sse_runtime,
         )
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+            attach_responses_events,
+            responses_emissions_from_chunk,
+        )
 
         async for event_block, has_trailing_separator in sse_runtime._iter_sse_event_blocks_with_separator(original_iterator):
-            restored_block, _ = _restore_adapted_namespace_tool_calls_in_sse_event_block(
-                event_block,
-                namespace_by_name=namespace_by_name,
-                schema_by_name=schema_by_name,
-            )
-            if has_trailing_separator:
+            if sse_runtime._sse_block_events(event_block) is not None:
+                restored_block, _ = _restore_adapted_tool_calls_in_associated_sse_block(
+                    event_block,
+                    restore_event_payload=lambda payload: _restore_adapted_namespace_tool_calls_in_stream_event_payload(
+                        payload,
+                        namespace_by_name=namespace_by_name,
+                        schema_by_name=schema_by_name,
+                    ),
+                )
+            else:
+                restored_block, _ = _restore_adapted_namespace_tool_calls_in_sse_event_block(
+                    event_block,
+                    namespace_by_name=namespace_by_name,
+                    schema_by_name=schema_by_name,
+                )
+            if restored_block is None:
+                continue
+            if sse_runtime._sse_block_events(restored_block) is not None:
+                yield attach_responses_events(
+                    sse_runtime._sse_block_wire_bytes(restored_block),
+                    emissions=responses_emissions_from_chunk(restored_block) or (),
+                    replace=True,
+                )
+            elif has_trailing_separator:
                 yield f"{restored_block}\n\n"
             else:
                 yield restored_block
