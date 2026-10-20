@@ -6059,7 +6059,13 @@ async def test_openai_responses_unsafe_admission_shapes_do_not_replay(
 @pytest.mark.parametrize("alpha_capacity_retry", [True, False])
 @pytest.mark.parametrize(
     "tool_shape",
-    ["provider_executable", "unknown_capability", "malformed_tool_entry"],
+    [
+        "provider_executable",
+        "unknown_capability",
+        "malformed_tool_entry",
+        "namespace_deferred_function",
+        "namespace_deferred_custom",
+    ],
 )
 async def test_openai_responses_provider_capability_blocks_raw_http_replay(
     monkeypatch,
@@ -6078,6 +6084,37 @@ async def test_openai_responses_provider_capability_blocks_raw_http_replay(
         ]
     elif tool_shape == "unknown_capability":
         tools = [{"type": "future_hosted_tool", "name": "weather"}]
+    elif tool_shape == "namespace_deferred_function":
+        tools = [
+            {
+                "type": "namespace",
+                "name": "multi_agent_v1",
+                "description": "Client-managed collaboration namespace.",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "spawn_agent",
+                        "parameters": {"type": "object", "properties": {}},
+                        "defer_loading": True,
+                    }
+                ],
+            }
+        ]
+    elif tool_shape == "namespace_deferred_custom":
+        tools = [
+            {
+                "type": "namespace",
+                "name": "multi_agent_v1",
+                "description": "Client-managed collaboration namespace.",
+                "tools": [
+                    {
+                        "type": "custom",
+                        "name": "run_custom",
+                        "defer_loading": True,
+                    }
+                ],
+            }
+        ]
     else:
         tools = ["opaque"]
     body = {

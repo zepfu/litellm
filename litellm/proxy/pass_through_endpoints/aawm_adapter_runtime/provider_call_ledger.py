@@ -1013,7 +1013,7 @@ def responses_effective_provider_tools_allowed(
                 if not isinstance(child, Mapping):
                     return True
                 child_type = child.get("type")
-                if child_type == "function":
+                if child_type in {"function", "custom"}:
                     child_name = child.get("name")
                     if not isinstance(child_name, str) or not child_name.strip():
                         return True
@@ -1021,49 +1021,38 @@ def responses_effective_provider_tools_allowed(
                         child.get("description"), str
                     ):
                         return True
-                    if "parameters" in child and not isinstance(
-                        child.get("parameters"), (Mapping, type(None))
+                    if child_type == "function":
+                        if "parameters" in child and not isinstance(
+                            child.get("parameters"), (Mapping, type(None))
+                        ):
+                            return True
+                        if "strict" in child and not isinstance(
+                            child.get("strict"), (bool, type(None))
+                        ):
+                            return True
+                    else:
+                        if "format" in child and not isinstance(
+                            child.get("format"), Mapping
+                        ):
+                            return True
+                    child_defer_loading = child.get("defer_loading")
+                    if child_defer_loading is True or (
+                        "defer_loading" in child
+                        and not isinstance(child_defer_loading, bool)
                     ):
                         return True
-                    if "strict" in child and not isinstance(
-                        child.get("strict"), (bool, type(None))
-                    ):
-                        return True
-                    if "defer_loading" in child and not isinstance(
-                        child.get("defer_loading"), bool
-                    ):
-                        return True
-                    if not set(child).issubset(
-                        {
-                            "type",
-                            "name",
-                            "parameters",
-                            "strict",
-                            "defer_loading",
-                            "description",
-                        }
-                    ):
-                        return True
-                    continue
-                if child_type == "custom":
-                    child_name = child.get("name")
-                    if not isinstance(child_name, str) or not child_name.strip():
-                        return True
-                    if "description" in child and not isinstance(
-                        child.get("description"), str
-                    ):
-                        return True
-                    if "format" in child and not isinstance(
-                        child.get("format"), Mapping
-                    ):
-                        return True
-                    if "defer_loading" in child and not isinstance(
-                        child.get("defer_loading"), bool
-                    ):
-                        return True
-                    if not set(child).issubset(
-                        {"type", "name", "description", "format", "defer_loading"}
-                    ):
+                    allowed_child_keys = {
+                        "type",
+                        "name",
+                        "description",
+                        "defer_loading",
+                    }
+                    allowed_child_keys.update(
+                        {"parameters", "strict"}
+                        if child_type == "function"
+                        else {"format"}
+                    )
+                    if not set(child).issubset(allowed_child_keys):
                         return True
                     continue
                 # Namespace children are stock function/custom tools. Any other
