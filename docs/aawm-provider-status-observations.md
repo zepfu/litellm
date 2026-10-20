@@ -321,12 +321,26 @@ sidecar's fresh per-account provider-exposed scheduled quota observations.
 The proxy selects only enabled, auth-healthy, model-eligible accounts;
 treats definitive account exhaustion (`usage_limit_reached`), account-scoped
 rate limits, and candidate-unavailable as eligible for traversal through every
-other eligible interchangeable account before terminal error; retries transient
-pre-commit `capacity_exhausted`/overload once on the same account, then returns
-the existing retryable pre-stream `503` without rotating accounts; keeps opaque
-continuation state pinned; returns a structured safe `429` when no account is
-admissible; and publishes only label/hash/lane/failover metadata without raw
-IDs or secrets. Managed Codex OAuth dispatch never falls back to
+other eligible interchangeable account before terminal error. Transient
+provider overload has a separate retry policy: the current OpenAI Responses
+capacity path uses bounded progressive same-account retries and a request-wide
+deadline, returning a retryable `503` when that deadline is exhausted; legacy
+transient paths retry once before a retryable pre-stream `503`. Nonportable
+opaque continuation state remains pinned. When no account is admissible,
+routing returns a structured safe `429`; metadata contains only
+label/hash/lane/failover details without raw IDs or secrets.
+
+The required continuation contract permits same-conversation migration in both
+directions when the owner exhausts quota **or available capacity**; capacity
+exhaustion does not also require quota exhaustion. Transient overload alone
+does not prove account exhaustion. A replacement send must bind matching
+credentials, account headers and ownership, preserve provider/model and
+supported history, avoid duplicate output/tools, and retain replacement-account
+affinity. `OPENAI-041` tracks the remaining implementation and stock-client
+acceptance; the current retry behavior is not proof of full migration
+acceptance.
+
+Managed Codex OAuth dispatch never falls back to
 `api.openai.com` API keys or unlisted credential files. Full operator contract:
 `docs/aawm-oauth-credential-maintenance.md` section `Codex multi-account
 request routing (OPENAI-004)`.

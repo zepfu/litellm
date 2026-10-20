@@ -535,15 +535,32 @@ Cooldown publication runs through the host-globals bindings installed by
 helper must be included in that binding set so an account-scoped failure can
 publish its cooldown before selecting an overflow account (OPENAI-073).
 
-Continuations are owner-first. Each continuation gets one owner-first attempt
-against the recorded upstream owner account and remains pinned unless the
-complete request is replay-safe, fully client-carried, still pre-commit, and
-that owner returns a real eligible account-scoped failure. At most one planned
-pre-commit move to an eligible overflow account is allowed. A transient
-pre-commit
-`capacity_exhausted`/overload retries once on the same account; if repeated,
-it returns the existing retryable pre-stream `503` without rotating accounts.
-After the first response byte, no account failover is planned.
+The required OpenAI continuation contract permits an established conversation
+to move between eligible managed accounts in either direction when its current
+account exhausts quota **or available capacity**. Capacity exhaustion alone is
+sufficient; quota exhaustion is not an additional gate. Each provider send
+must use the replacement account's matching token, account headers and
+ownership, preserve provider/model and supported conversation/tool history,
+avoid duplicate output or tool execution, and retain replacement-account
+affinity on later turns. The binding is fixed per send, not for the lifetime
+of the conversation.
+
+Current implementation and acceptance must be distinguished from that
+contract. `OPENAI-041` tracks the remaining binding and stock-client
+migration acceptance; documentation does not establish that all four
+direction/trigger combinations have passed. Current continuations are
+owner-first and require replay-safe, fully client-carried, pre-commit state
+and an eligible account-scoped failure before at most one planned overflow
+move. Nonportable upstream-owned state remains pinned as described below.
+
+Transient provider overload is distinct from an account exhausting available
+capacity. The current OpenAI Responses capacity-retry path uses bounded
+same-account retries with progressive waits and a request-wide deadline;
+deadline exhaustion returns a retryable `503`. Paths using the legacy
+transient policy retry once before returning a retryable pre-stream `503`.
+These retry policies do not establish a quota-only account-migration rule or
+prove that a transient overload is account exhaustion. Do not replay committed
+output or executed tools to recover availability.
 
 The configured `credential_affinity: interchangeable` pool keeps provider,
 model, route, endpoint, and encrypted-state-format session affinity while
