@@ -1243,7 +1243,11 @@ class ResponsesEventPipeline:
         # visibility. Reducers and other bounded observers still need to see
         # generated terminals exactly once.
         self._emit(event)
-        if self.summary_reducer is not None and self.summary_reducer.overflow:
+        if (
+            not control
+            and self.summary_reducer is not None
+            and self.summary_reducer.overflow
+        ):
             raise ResponsesEventRetentionTooLarge("Responses event summary retention exceeded configured bound")
         return event
 
