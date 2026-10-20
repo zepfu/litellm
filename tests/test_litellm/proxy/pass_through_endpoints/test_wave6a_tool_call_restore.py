@@ -65,6 +65,7 @@ def _typed_sse_chunk(
     payload: dict[str, Any],
     *,
     separator: bytes = b"\r\n\r\n",
+    event_field_prefix: bytes = b"event:",
 ) -> tuple[bytes, Any]:
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
         ResponsesEventPipeline,
@@ -73,8 +74,8 @@ def _typed_sse_chunk(
 
     event_type = payload["type"]
     wire = (
-        f"event: {event_type}\r\ndata: "
-        f"{json.dumps(payload, separators=(',', ':'))}".encode()
+        event_field_prefix + b" " + event_type.encode() + b"\r\ndata: "
+        + json.dumps(payload, separators=(",", ":")).encode()
         + separator
     )
     event = ResponsesEventPipeline().parse_event(wire)
@@ -1410,6 +1411,9 @@ class TestCustomStreamingResponse:
         host_deps: None,
     ) -> None:
         from fastapi.responses import StreamingResponse
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+            ResponsesEventPipeline,
+        )
 
         added, added_event = _typed_sse_chunk(
             {
@@ -1426,7 +1430,8 @@ class TestCustomStreamingResponse:
                 "type": "response.function_call_arguments.done",
                 "call_id": "call_1",
                 "arguments": '{"input":"hello"}',
-            }
+            },
+            event_field_prefix=b" \tevent:",
         )
 
         async def gen():
@@ -1451,10 +1456,13 @@ class TestCustomStreamingResponse:
         assert done_emission.source_event is done_event
         assert done_emission.effective_payload["type"] == "response.custom_tool_call_input.done"
         done_wire = bytes(chunks[1])
-        assert b"event: response.custom_tool_call_input.done\r\n" in done_wire
-        assert b"\r\n\r\n" in done_wire
+        assert b" \tevent: response.custom_tool_call_input.done\r\n" in done_wire
+        assert done_wire.endswith(b"\r\n\r\n")
         data_line = next(line for line in done_wire.split(b"\r\n") if line.startswith(b"data:"))
         assert json.loads(data_line.removeprefix(b"data: ")) == done_emission.effective_payload
+        reparsed = ResponsesEventPipeline().parse_event(done_wire)
+        assert reparsed.is_malformed is False
+        assert reparsed.event_type == done_emission.effective_payload["type"]
 
 
 # ===========================================================================

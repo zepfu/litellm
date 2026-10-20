@@ -836,16 +836,22 @@ def _restore_adapted_tool_calls_in_associated_sse_block(
     restored_emissions = []
     restored_count = 0
     changed = False
-    for index, event in enumerate(events):
-        emission = emissions[index] if index < len(emissions) else None
+    for event in events:
+        emission = next(
+            (
+                candidate
+                for candidate in emissions
+                if candidate.source_event is event
+            ),
+            None,
+        )
         payload = (
             emission.effective_payload
-            if emission is not None and emission.source_event is event
+            if emission is not None
             else event.payload
         )
         if not isinstance(payload, dict):
-            if emission is not None:
-                restored_emissions.append(emission)
+            restored_emissions.append(emission or event.emission())
             continue
 
         restored_payload, count = restore_event_payload(payload)
@@ -869,9 +875,11 @@ def _restore_adapted_tool_calls_in_associated_sse_block(
                         content, line_ending = line[:-1], line[-1:]
                     else:
                         content, line_ending = line, b""
-                    if content.startswith(b"event:"):
+                    event_field = content.lstrip()
+                    if event_field.startswith(b"event:"):
+                        whitespace = content[: len(content) - len(event_field)]
                         line = (
-                            b"event: "
+                            whitespace + b"event: "
                             + restored_event_type.encode("utf-8")
                             + line_ending
                         )
@@ -882,10 +890,8 @@ def _restore_adapted_tool_calls_in_associated_sse_block(
                     wire_bytes=transformed_wire,
                 )
             restored_emissions.append(transformed)
-        elif emission is not None:
-            restored_emissions.append(emission)
         else:
-            restored_emissions.append(event.emission())
+            restored_emissions.append(emission or event.emission())
 
     if not changed:
         return event_block, 0
