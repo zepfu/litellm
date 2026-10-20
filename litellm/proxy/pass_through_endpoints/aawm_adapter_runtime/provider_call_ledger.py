@@ -996,6 +996,58 @@ def responses_effective_provider_tools_allowed(
             ):
                 return True
             continue
+        if tool_type == "namespace":
+            namespace_name = tool.get("name")
+            if not isinstance(namespace_name, str) or not namespace_name.strip():
+                return True
+            if "description" in tool and not isinstance(
+                tool.get("description"), str
+            ):
+                return True
+            if "deferLoading" in tool and not isinstance(
+                tool.get("deferLoading"), bool
+            ):
+                return True
+            if tool.get("deferLoading") is True:
+                return True
+            children = tool.get("tools")
+            if not isinstance(children, list):
+                return True
+            for child in children:
+                if not isinstance(child, Mapping):
+                    return True
+                if child.get("type") != "namespace":
+                    return True
+                child_name = child.get("tool_name")
+                if not isinstance(child_name, str) or not child_name.strip():
+                    return True
+                if "description" in child and not isinstance(
+                    child.get("description"), str
+                ):
+                    return True
+                if "input_schema" in child and not isinstance(
+                    child.get("input_schema"), Mapping
+                ):
+                    return True
+                if "encrypted" in child and not isinstance(
+                    child.get("encrypted"), bool
+                ):
+                    return True
+                if not set(child).issubset(
+                    {
+                        "type",
+                        "tool_name",
+                        "description",
+                        "input_schema",
+                        "encrypted",
+                    }
+                ):
+                    return True
+            if not set(tool).issubset(
+                {"type", "name", "description", "tools", "deferLoading"}
+            ):
+                return True
+            continue
         # Any capability not explicitly known to be client-executed commits
         # before dispatch; this includes provider-executable and future tools.
         return True
