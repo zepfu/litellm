@@ -18,10 +18,13 @@ do not disable installed Kimi: consumers retain the last structurally valid
 descriptor, including after expiry, or use the conservative built-in identity
 when no usable descriptor is available.
 
-The authoritative native client for the managed contract is the WSL
-installation at `/home/zepfu/.kimi-code/bin/kimi`, version `0.29.1`. The
-separate Thoth updater tracked by `MS-032` is paused and is not a prerequisite
-for this contract.
+The authoritative native client for the managed contract is the Thoth
+installation at `/home/zepfu/.kimi-code/bin/kimi`. Capture its supported
+behavior locally rather than using a historical WSL installation. The
+`MS-032` updater service and timer were disabled and inactive on October 20,
+2026. CLI self-update is separate from OAuth refresh and is not a prerequisite
+for this contract. Recheck unit state before maintenance; updater activation
+and descriptor publication require separate rollout authorization.
 
 ## Overview
 
@@ -102,14 +105,14 @@ only for the recognized empty collaboration envelope before translating it to
 chat completions. Ordinary encrypted reasoning and continuation state is never
 treated as task text or sent to Kimi as plaintext.
 
-Kimi Code `0.29.1` cannot use a custom `KIMI_CODE_BASE_URL` while retaining
-the official default credential slot. It derives a separate environment-scoped
-OAuth slot for every custom base URL. Do not copy or symlink
-`~/.kimi-code/credentials/kimi-code.json`, and do not enroll a second grant to
-make the CLI use this gateway. Until the client supports an explicit
-same-credential custom-base contract, keep the direct `kimi` command on the
-official endpoint. The gateway remains available to trusted loopback clients
-that explicitly present the current managed bearer.
+Before using a custom `KIMI_CODE_BASE_URL`, verify that the installed
+Thoth client supports that endpoint with the official default credential file.
+A separate environment-scoped OAuth slot does not meet the shared-credential
+contract. Do not copy or symlink `~/.kimi-code/credentials/kimi-code.json`,
+and do not enroll a second grant to make the CLI use this gateway. Keep the
+direct `kimi` command on the official endpoint until a same-credential
+custom-base contract is verified. The gateway remains available to trusted
+loopback clients that explicitly present the current managed bearer.
 
 For the shared credential and native lock contract, see
 `docs/aawm-oauth-credential-maintenance.md` in the repository. Native quota

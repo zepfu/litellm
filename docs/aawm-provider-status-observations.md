@@ -2,10 +2,13 @@
 
 ## MS-031: shared Kimi native contract
 
-The authoritative capture source is the WSL
-`/home/zepfu/.kimi-code/bin/kimi` installation at version `0.29.1`. The paused
-Thoth updater in `MS-032` is not a prerequisite and must not be resumed or used
-to publish a descriptor without separate operator authorization.
+The authoritative capture source is the Thoth installation at
+`/home/zepfu/.kimi-code/bin/kimi`. Capture its current native contract locally;
+a historical WSL installation is not the client authority. The `MS-032`
+updater service and timer were disabled and inactive on October 20, 2026.
+CLI self-update is separate from OAuth refresh and is not a prerequisite for
+the managed contract. Recheck unit state before maintenance; updater
+activation and descriptor publication require separate rollout authorization.
 
 The Kimi usage poller is one consumer of the same sanitized native contract
 descriptor used by managed chat, the Codex adapter, the Claude adapter, and
