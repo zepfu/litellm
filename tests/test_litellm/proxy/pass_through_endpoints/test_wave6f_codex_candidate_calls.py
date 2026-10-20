@@ -2421,12 +2421,26 @@ class TestCFG030CodexNvidiaCompletionAdapter:
         from litellm.proxy.pass_through_endpoints.providers.nvidia import (
             runtime as nvidia_runtime,
         )
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.response_utils import (
+            _build_responses_response_from_adapter_response,
+        )
 
         transform = MagicMock()
         transform.transform_responses_api_request_to_chat_completion_request.return_value = {
             "model": "deepseek-ai/deepseek-v3.2",
             "messages": [{"role": "user", "content": "translated"}],
             "custom_llm_provider": "nvidia_nim",
+        }
+        transform.transform_chat_completion_response_to_responses_api_response.return_value = {
+            "id": "chatcmpl_nvidia_1",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "prepared"}],
+                }
+            ],
         }
         responses_transformation = __import__(
             "litellm.responses.litellm_completion_transformation.transformation",
@@ -2447,7 +2461,20 @@ class TestCFG030CodexNvidiaCompletionAdapter:
             "_get_anthropic_adapter_nvidia_target_base",
             lambda: "https://integrate.api.nvidia.com",
         )
-        completion = AsyncMock(return_value=SimpleNamespace(id="chatcmpl_nvidia_1"))
+        completion = AsyncMock(
+            return_value=codex_candidate_calls.litellm.ModelResponse(
+                id="chatcmpl_nvidia_1",
+                model="nvidia/test-model",
+                choices=[
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "prepared"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                usage=None,
+            )
+        )
         egress = MagicMock()
         host = {
             "__builtins__": __builtins__,
@@ -2472,12 +2499,19 @@ class TestCFG030CodexNvidiaCompletionAdapter:
             ),
             "_annotate_request_scope_for_adapted_access_log": MagicMock(),
             "_get_proxy_shared_aiohttp_session": MagicMock(return_value="shared-session"),
-            "_build_responses_response_from_adapter_response": MagicMock(),
+            "_build_responses_response_from_adapter_response": _build_responses_response_from_adapter_response,
             "apply_request_watermark_egress": MagicMock(
-                side_effect=lambda **kwargs: SimpleNamespace(body=kwargs["body"])
+                side_effect=lambda **kwargs: SimpleNamespace(
+                    body={**kwargs["body"], "prepared_marker": "adapted"}
+                )
             ),
             "_get_runtime_text_watermark_config": MagicMock(return_value=None),
             "_watermark_endpoint_from_path": MagicMock(return_value="chat_completions"),
+            "_serialize_responses_adapter_response": MagicMock(
+                side_effect=lambda response_obj: json.dumps(
+                    response_obj, separators=(",", ":")
+                )
+            ),
         }
         codex_candidate_calls.install(host)
         return SimpleNamespace(
@@ -2551,6 +2585,78 @@ class TestCFG030CodexNvidiaCompletionAdapter:
             )
         assert nvidia.completion.await_count == 0
         nvidia.egress.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_local_request_rejection_does_not_enter_nvidia_retry_owner(self, monkeypatch):
+        from fastapi import HTTPException
+
+        from litellm.proxy.pass_through_endpoints.providers.nvidia import (
+            runtime as nvidia_runtime,
+        )
+
+        nvidia = self._nvidia_host(monkeypatch)
+        operations = []
+
+        async def retry_owner(*, operation, **_kwargs):
+            operations.append(operation)
+            return await operation()
+
+        nvidia.host["apply_request_watermark_egress"] = MagicMock(
+            side_effect=HTTPException(status_code=403, detail="blocked")
+        )
+        monkeypatch.setattr(
+            nvidia_runtime,
+            "_perform_nvidia_completion_adapter_operation",
+            retry_owner,
+        )
+
+        with pytest.raises(HTTPException):
+            await nvidia.host["_perform_codex_nvidia_completion_adapter_call"](
+                config=nvidia.host["_aawm_adapter_config"].CODEX_NVIDIA_COMPLETION,
+                request=MagicMock(),
+                prepared_request_body={"model": "nvidia/test-model"},
+                adapter_model="nvidia/test-model",
+                target_url="https://integrate.api.nvidia.com/v1/chat/completions",
+                api_key="nvidia-test-key",
+                api_base="https://integrate.api.nvidia.com/v1",
+                client_requested_stream=False,
+                completion_kwargs={"model": "test-model"},
+                request_input="hello",
+                responses_api_request={},
+                litellm_metadata={},
+                upstream_model="test-model",
+            )
+
+        assert operations == []
+        assert nvidia.completion.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_prepared_watermark_body_is_sent_upstream(self, monkeypatch):
+        nvidia = self._nvidia_host(monkeypatch)
+        response = await nvidia.host["_perform_codex_nvidia_completion_adapter_call"](
+            config=nvidia.host["_aawm_adapter_config"].CODEX_NVIDIA_COMPLETION,
+            request=MagicMock(),
+            prepared_request_body={"model": "nvidia/test-model"},
+            adapter_model="nvidia/test-model",
+            target_url="https://integrate.api.nvidia.com/v1/chat/completions",
+            api_key="nvidia-test-key",
+            api_base="https://integrate.api.nvidia.com/v1",
+            client_requested_stream=False,
+            completion_kwargs={"model": "test-model", "source_marker": "original"},
+            request_input="hello",
+            responses_api_request={},
+            litellm_metadata={},
+            upstream_model="test-model",
+        )
+
+        call_kwargs = nvidia.completion.await_args.kwargs
+        assert b'"id": "chatcmpl_nvidia_1"' in response.body
+        assert b'"text": "prepared"' in response.body
+        assert response.media_type == "application/json"
+        assert call_kwargs["model"] == "test-model"
+        assert call_kwargs["source_marker"] == "original"
+        assert call_kwargs["prepared_marker"] == "adapted"
+        assert call_kwargs["caller_managed_hidden_retry"] is True
 
     @pytest.mark.asyncio
     async def test_missing_credentials_fail_closed_without_acompletion(self, monkeypatch):
