@@ -10412,10 +10412,12 @@ async def pass_through_request(  # noqa: PLR0915
                             failure_headers,
                         )
                     )
-                    stream_response = OpenAIResponsesBufferedResponse(
-                        content=failure_body,
+                    async def _failure_body_iterator():
+                        yield failure_body
+
+                    stream_response = OpenAIResponsesStreamingResponse(
+                        _failure_body_iterator(),
                         wire_trace=wire_trace,
-                        disposition=OpenAIResponsesWireDisposition.FAILED,
                         on_disposition=_on_native_wire_disposition,
                         status_code=failure_status_code,
                         headers=response_headers,
@@ -10974,6 +10976,13 @@ async def pass_through_request(  # noqa: PLR0915
                         _run_post_delivery_bookkeeping
                     )
                 if wrapper_setup_failure is not None:
+                    if isinstance(
+                        wrapper_setup_failure,
+                        ResponsesStreamPreCommitFailure,
+                    ):
+                        raise wrapper_setup_failure.as_http_exception() from (
+                            wrapper_setup_failure
+                        )
                     failure_body, failure_status_code, failure_headers = (
                         _build_native_responses_wrapper_failure_body(
                             wire_trace=wire_trace,
