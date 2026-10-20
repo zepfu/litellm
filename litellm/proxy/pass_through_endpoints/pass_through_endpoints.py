@@ -2498,11 +2498,21 @@ def _build_native_responses_wrapper_failure_body(
     *,
     wire_trace: OpenAIResponsesWireTrace,
     wrapper_setup_failure: BaseException,
-) -> Tuple[bytes, int]:
+) -> Tuple[bytes, int, Dict[str, str]]:
     """Build one failed terminal while retaining marked policy causes."""
 
     policy_failure_recorded = wire_trace.record_policy_failure_from_exception(
         wrapper_setup_failure
+    )
+    precommit_failure = (
+        wrapper_setup_failure
+        if isinstance(wrapper_setup_failure, ResponsesStreamPreCommitFailure)
+        else None
+    )
+    precommit_http_exception = (
+        precommit_failure.as_http_exception()
+        if precommit_failure is not None
+        else None
     )
     failure_metadata = {
         key: wire_trace.metadata.get(key)
@@ -2513,23 +2523,36 @@ def _build_native_responses_wrapper_failure_body(
         )
         if wire_trace.metadata.get(key) is not None
     }
-    failure_code = (
-        failure_metadata.get("policy_failure_code")
-        or "aawm_stream_wrapper_setup_failed"
-    )
-    failure_type = (
-        failure_metadata.get("policy_failure_class")
-        or failure_metadata.get("policy_failure_kind")
-        or type(wrapper_setup_failure).__name__
-    )
-    failure_message = (
-        (
+    if policy_failure_recorded:
+        failure_code = (
+            failure_metadata.get("policy_failure_code")
+            or "aawm_stream_wrapper_setup_failed"
+        )
+        failure_type = (
+            failure_metadata.get("policy_failure_class")
+            or failure_metadata.get("policy_failure_kind")
+            or type(wrapper_setup_failure).__name__
+        )
+        failure_message = (
             "OpenAI Responses output policy rejected the "
             f"delivered stream: {failure_code}"
         )
-        if policy_failure_recorded
-        else str(wrapper_setup_failure)
-    )
+    elif precommit_failure is not None:
+        failure_code = precommit_failure.error_code or precommit_failure.error_class
+        failure_type = precommit_failure.error_type or precommit_failure.error_class
+        failure_message = precommit_failure.message
+        failure_metadata = {
+            "error_class": precommit_failure.error_class,
+            "failure_kind": precommit_failure.classification,
+            "retryable": precommit_failure.retryable,
+            "stream_failure_stage": "stream_interrupted_before_emit",
+            "stream_hidden_retry_safe": False,
+        }
+    else:
+        failure_code = "aawm_stream_wrapper_setup_failed"
+        failure_type = type(wrapper_setup_failure).__name__
+        failure_message = str(wrapper_setup_failure)
+
     terminal_payload = {
         "type": "response.failed",
         "response": {
@@ -2549,11 +2572,27 @@ def _build_native_responses_wrapper_failure_body(
     wire_trace.disposition = OpenAIResponsesWireDisposition.FAILED
     wire_trace.state = OpenAIResponsesWireState.TERMINAL_SELECTED
     wire_trace._done_body = b"data: [DONE]\n\n"
-    wire_trace.metadata["aawm_stream_wrapper_setup_failed"] = type(
-        wrapper_setup_failure
-    ).__name__
+    if precommit_failure is not None:
+        wire_trace.metadata.update(
+            {
+                "aawm_responses_stream_failed": True,
+                "aawm_responses_stream_failure_class": precommit_failure.error_class,
+                "aawm_stream_failure_stage": "stream_interrupted_before_emit",
+                "aawm_route_rollup_turn_suppressed": True,
+            }
+        )
+    else:
+        wire_trace.metadata["aawm_stream_wrapper_setup_failed"] = type(
+            wrapper_setup_failure
+        ).__name__
+
     status_code = status.HTTP_502_BAD_GATEWAY
-    if policy_failure_recorded:
+    headers: Dict[str, str] = {}
+    if precommit_http_exception is not None:
+        status_code = precommit_http_exception.status_code
+        if precommit_http_exception.headers:
+            headers.update(precommit_http_exception.headers)
+    elif policy_failure_recorded:
         marked_status_code = getattr(wrapper_setup_failure, "status_code", None)
         if isinstance(marked_status_code, int) and 100 <= marked_status_code <= 599:
             status_code = marked_status_code
@@ -2562,6 +2601,7 @@ def _build_native_responses_wrapper_failure_body(
         + json.dumps(terminal_payload, separators=(",", ":")).encode("utf-8")
         + b"\n\ndata: [DONE]\n\n",
         status_code,
+        headers,
     )
 
 
@@ -10346,12 +10386,13 @@ async def pass_through_request(  # noqa: PLR0915
                         _run_post_delivery_bookkeeping
                     )
                 if wrapper_setup_failure is not None:
-                    failure_body, failure_status_code = (
+                    failure_body, failure_status_code, failure_headers = (
                         _build_native_responses_wrapper_failure_body(
                             wire_trace=wire_trace,
                             wrapper_setup_failure=wrapper_setup_failure,
                         )
                     )
+                    response_headers.update(failure_headers)
                     stream_response = OpenAIResponsesBufferedResponse(
                         content=failure_body,
                         wire_trace=wire_trace,
@@ -10914,12 +10955,13 @@ async def pass_through_request(  # noqa: PLR0915
                         _run_post_delivery_bookkeeping
                     )
                 if wrapper_setup_failure is not None:
-                    failure_body, failure_status_code = (
+                    failure_body, failure_status_code, failure_headers = (
                         _build_native_responses_wrapper_failure_body(
                             wire_trace=wire_trace,
                             wrapper_setup_failure=wrapper_setup_failure,
                         )
                     )
+                    response_headers.update(failure_headers)
                     stream_response = OpenAIResponsesBufferedResponse(
                         content=failure_body,
                         wire_trace=wire_trace,

@@ -25,6 +25,8 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _classify_codex_auto_agent_retryable_exhaustion,
 )
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+    OpenAIResponsesWireTrace,
+    _build_native_responses_wrapper_failure_body,
     _classify_passthrough_raw_http_error,
     _execute_passthrough_pre_first_byte_with_hidden_retries,
     _is_openai_alpha_capacity_retry_target,
@@ -1097,6 +1099,67 @@ async def test_chunk_processor_orders_done_after_late_terminal():
     assert rendered.count(b"data: [DONE]") == 1
     assert rendered.index(b"event: response.completed") < rendered.index(done)
     finalized.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("line_ending", [b"\n", b"\r"])
+async def test_chunk_processor_propagates_first_capacity_error_before_output(
+    line_ending: bytes,
+):
+    upstream_error = _sse(
+        "error",
+        {
+            "type": "error",
+            "error": {
+                "type": "server_error",
+                "code": "server_overloaded",
+                "message": "capacity exhausted",
+            },
+        },
+    ).replace(b"\n", line_ending)
+    response = _FakeUpstreamStream([upstream_error])
+    logging_obj = MagicMock()
+    logging_obj.model_call_details = {}
+    success_handler_kwargs = _route_kwargs()
+    wire_trace = OpenAIResponsesWireTrace()
+    emitted = []
+
+    with pytest.raises(ResponsesStreamPreCommitFailure) as failure:
+        async for chunk in PassThroughStreamingHandler.chunk_processor(
+            response=response,
+            request_body={"model": "gpt-5.4", "stream": True},
+            litellm_logging_obj=logging_obj,
+            endpoint_type=EndpointType.OPENAI,
+            start_time=datetime.now(),
+            passthrough_success_handler_obj=MagicMock(
+                spec=PassThroughEndpointLogging
+            ),
+            url_route="https://chatgpt.com/backend-api/codex/responses",
+            custom_llm_provider="openai",
+            success_handler_kwargs=success_handler_kwargs,
+            openai_wire_trace=wire_trace,
+        ):
+            emitted.append(chunk)
+
+    assert emitted == []
+    assert failure.value.error_class == "server_overloaded"
+    assert failure.value.classification == "transient_capacity"
+    assert failure.value.retryable is True
+
+    body, status_code, headers = _build_native_responses_wrapper_failure_body(
+        wire_trace=wire_trace,
+        wrapper_setup_failure=failure.value,
+    )
+    terminal = json.loads(body.split(b"data: ", 1)[1].split(b"\n\n", 1)[0])
+    assert status_code == 503
+    assert headers.get("Retry-After")
+    assert terminal["response"]["error"]["code"] == "server_overloaded"
+    assert terminal["response"]["metadata"]["stream_failure_stage"] == (
+        "stream_interrupted_before_emit"
+    )
+    assert wire_trace.metadata["aawm_stream_failure_stage"] == (
+        "stream_interrupted_before_emit"
+    )
 
 
 @pytest.mark.asyncio
