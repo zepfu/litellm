@@ -3443,6 +3443,19 @@ class PassThroughStreamingHandler:
                 )
                 return complete_chunk, delivered_events, recovery_failure
 
+            def _is_unemitted_capacity_failure(
+                failure: Optional[ResponsesStreamPreCommitFailure],
+                prepared_prefix: bytes,
+            ) -> bool:
+                return bool(
+                    failure is not None
+                    and failure.error_class in _RESPONSES_TRANSIENT_CAPACITY_CLASSES
+                    and not responses_substantive_seen
+                    and downstream_chunk_count == 0
+                    and not prepared_prefix
+                    and not _final_wire_committed()
+                )
+
             def _split_and_hold_responses_done(
                 chunk: bytes,
                 events: List[ParsedResponsesEvent],
@@ -3905,6 +3918,11 @@ class PassThroughStreamingHandler:
                             yield terminal_chunk
                         break
 
+                    if _is_unemitted_capacity_failure(
+                        recovery_failure, complete_chunk
+                    ):
+                        raise recovery_failure
+
                     if limit_exception is not None:
                         responses_sse_event_buffer = b""
                         held_responses_done_suffix = b""
@@ -4123,6 +4141,10 @@ class PassThroughStreamingHandler:
                             eof_recovery_failure
                         )
                     )
+                elif _is_unemitted_capacity_failure(
+                    eof_recovery_failure, eof_chunk
+                ):
+                    raise eof_recovery_failure
                 else:
                     eof_chunk = _split_and_hold_responses_done(
                         eof_chunk,
