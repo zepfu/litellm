@@ -459,6 +459,7 @@ class _PrefixedHttpxByteStream:
                 raise ResponsesBoundFailure(bound_failure.cause) from bound_failure
             async for chunk in self._iter_post_prefix_chunks():
                 yield chunk
+            await self.aclose()
         except BaseException:
             await self.aclose()
             raise
@@ -566,9 +567,6 @@ class _ResponsesPreCommitPrefixStore:
 
     def iter_chunks(self):
         if self._closed:
-            return
-        if self._byte_count:
-            yield self.read_range(0, self._byte_count)
             return
         self._data.seek(0)
         self._lengths.seek(0)
@@ -2368,6 +2366,9 @@ class PassThroughStreamingHandler:
                     continue
                 chunk = bytes(chunk)
                 event_type: Optional[str] = None
+                stream_bytes_before_feed = int(
+                    getattr(pipeline, "total_stream_bytes", 0)
+                )
                 try:
                     decision, error_payload, event_type = parser.feed(chunk)
                     prefix.append(chunk)
@@ -2377,7 +2378,11 @@ class PassThroughStreamingHandler:
                     ResponsesStreamTooLarge,
                 ) as exc:
                     bound_failure = ResponsesBoundFailure.from_exception(exc)
-                    accepted_bytes = max(0, bound_failure.accepted_bytes)
+                    accepted_bytes = max(
+                        0,
+                        int(getattr(pipeline, "total_stream_bytes", 0))
+                        - stream_bytes_before_feed,
+                    )
                     prior_safe = bool(
                         getattr(pipeline, "held_event_count", 0)
                         or bound_failure.accepted_events
@@ -2503,6 +2508,14 @@ class PassThroughStreamingHandler:
                             commitment_reason,
                             event_type,
                         )
+                        committed = _PrefixedHttpxByteStream(
+                            response,
+                            prefix,
+                            iterator,
+                            event_pipeline=pipeline,
+                        )
+                        pipeline.attach_to_response(committed)
+                        return committed, None
                     return (
                         prefixed,
                         PassThroughStreamingHandler._build_responses_pre_commit_failure(
