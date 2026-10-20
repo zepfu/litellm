@@ -743,7 +743,7 @@ def _real_pipeline_response_from_events(
         for chunk in chunks:
             yield chunk
 
-    return SimpleNamespace(body_iterator=body_iterator())
+    return SimpleNamespace(body_iterator=body_iterator(), retained_chunks=chunks)
 
 
 class FakeHTTPException(Exception):
@@ -917,6 +917,40 @@ class TestCollectResponsesResponseFromStream:
 
         assert len(result["output"]) == 1
         assert result["output"][0]["content"][0]["text"] == "Hello"
+
+    def test_real_pipeline_collection_preserves_terminal_payload_and_wire(self) -> None:
+        response = _real_pipeline_response_from_events(
+            [
+                {
+                    "type": "response.output_text.delta",
+                    "delta": "Hello",
+                    "item_id": "msg_1",
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_real_source_unchanged",
+                        "status": "completed",
+                        "output": [],
+                    },
+                },
+            ]
+        )
+        terminal_chunk = response.retained_chunks[-1]
+        emission = terminal_chunk.responses_wire_emissions[0]
+        source_payload_before = json.loads(json.dumps(emission.source_event.payload))
+        effective_payload_before = json.loads(json.dumps(emission.effective_payload))
+        wire_before = bytes(terminal_chunk)
+
+        result = asyncio.run(
+            sc._collect_responses_response_from_stream(response)  # type: ignore[arg-type]
+        )
+
+        assert result["id"] == "resp_real_source_unchanged"
+        assert result["output"][0]["content"][0]["text"] == "Hello"
+        assert emission.source_event.payload == source_payload_before
+        assert emission.effective_payload == effective_payload_before
+        assert bytes(terminal_chunk) == wire_before
 
     def test_real_pipeline_done_only_text_and_tool_are_reconstructed(self) -> None:
         response = _real_pipeline_response_from_events(
