@@ -356,6 +356,7 @@ class _PrefixedHttpxByteStream:
         self._response = response
         self._prefix = prefix
         self._remainder = remainder
+        self._post_prefix_iterator: Any = None
         self._aawm_responses_event_pipeline = event_pipeline
         self._bound_failure = bound_failure
         self._prefix_bound_failure = self._prepare_prefix_bound_failure(
@@ -457,7 +458,9 @@ class _PrefixedHttpxByteStream:
                 bound_failure = self._prefix_bound_failure
                 self._bound_failure = None
                 raise ResponsesBoundFailure(bound_failure.cause) from bound_failure
-            async for chunk in self._iter_post_prefix_chunks():
+            post_prefix_iterator = self._iter_post_prefix_chunks()
+            self._post_prefix_iterator = post_prefix_iterator
+            async for chunk in post_prefix_iterator:
                 yield chunk
             await self.aclose()
         except BaseException:
@@ -491,6 +494,13 @@ class _PrefixedHttpxByteStream:
 
     async def aclose(self) -> None:
         self._close_prefix()
+        post_prefix_iterator = self._post_prefix_iterator
+        if post_prefix_iterator is not None and not post_prefix_iterator.ag_running:
+            self._post_prefix_iterator = None
+            try:
+                await wait_for("resource_cleanup", post_prefix_iterator.aclose())
+            except Exception:
+                pass
         remainder = self._remainder
         self._remainder = None
         close_iterator = getattr(remainder, "aclose", None)
