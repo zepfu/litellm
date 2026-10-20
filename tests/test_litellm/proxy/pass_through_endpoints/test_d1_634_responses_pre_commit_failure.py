@@ -4508,9 +4508,16 @@ async def test_alpha_openai_sse_precommit_overload_closes_and_propagates(
 
 
 @pytest.mark.asyncio
-async def test_unpeeked_native_sse_handoff_becomes_live_only(monkeypatch):
+@pytest.mark.parametrize(
+    ("capacity_retry_enabled", "upstream_status"), [(False, 200), (True, 201)]
+)
+async def test_unpeeked_native_sse_handoff_becomes_live_only(
+    monkeypatch, capacity_retry_enabled, upstream_status,
+):
     monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
-    monkeypatch.setenv("AAWM_OPENAI_CAPACITY_RETRY_ENABLED", "0")
+    monkeypatch.setenv(
+        "AAWM_OPENAI_CAPACITY_RETRY_ENABLED", "1" if capacity_retry_enabled else "0"
+    )
     from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
         session_affinity as sa,
@@ -4570,7 +4577,7 @@ async def test_unpeeked_native_sse_handoff_becomes_live_only(monkeypatch):
     chunks.append(b"data: [DONE]\n\n")
     stream = _ClosableAsyncByteStream(chunks)
     upstream_response = httpx.Response(
-        status_code=200,
+        status_code=upstream_status,
         headers={"content-type": "text/event-stream"},
         stream=stream,
         request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
@@ -4598,7 +4605,15 @@ async def test_unpeeked_native_sse_handoff_becomes_live_only(monkeypatch):
     ), patch(
         "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
         new=AsyncMock(return_value=upstream_response),
-    ), patch(
+    ) as mock_upstream_request, patch.object(
+        pte,
+        "_execute_passthrough_pre_first_byte_with_hidden_retries",
+        wraps=pte._execute_passthrough_pre_first_byte_with_hidden_retries,
+    ) as mock_hidden_retry, patch.object(
+        PassThroughStreamingHandler,
+        "peek_responses_pre_commit_stream",
+        wraps=PassThroughStreamingHandler.peek_responses_pre_commit_stream,
+    ) as mock_peek, patch(
         "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
     ) as mock_get_client, patch(
         "litellm.proxy.proxy_server.proxy_logging_obj"
@@ -4625,6 +4640,11 @@ async def test_unpeeked_native_sse_handoff_becomes_live_only(monkeypatch):
         )
 
     assert isinstance(response, OpenAIResponsesStreamingResponse)
+    assert response.status_code == upstream_status
+    mock_upstream_request.assert_awaited_once()
+    mock_peek.assert_not_awaited()
+    coordinator = mock_hidden_retry.call_args.kwargs["openai_capacity_coordinator"]
+    assert (coordinator is not None) is capacity_retry_enabled
     wire = b"".join([chunk async for chunk in response.body_iterator])
     await response.body_iterator.aclose()
     assert response.wire_trace.finalized is True
@@ -4640,10 +4660,12 @@ async def test_unpeeked_native_sse_handoff_becomes_live_only(monkeypatch):
         response.wire_trace.metadata.get("body_iterator_close_error")
         is None
     )
-    assert wire.count(b'"delta-') == 300
-    for index in range(300):
-        assert f'"delta":"delta-{index}"'.encode("utf-8") in wire
-    assert b'"status":"completed"' in wire
+    payloads = _responses_sse_payloads(wire)
+    assert payloads[-1]["type"] == "response.completed", payloads[-1]
+    assert payloads[-1]["response"]["status"] == "completed"
+    expected_prefix = b"".join(chunks[:-2])
+    assert wire.startswith(expected_prefix)
+    assert len(_responses_sse_payloads(wire[len(expected_prefix):])) == 1
     assert wire.endswith(b"data: [DONE]\n\n")
 
 
