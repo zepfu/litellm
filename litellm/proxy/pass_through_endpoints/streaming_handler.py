@@ -2381,8 +2381,7 @@ class PassThroughStreamingHandler:
                     if bound_failure.accepted_bytes_known:
                         accepted_bytes = min(
                             len(chunk),
-                            max(0, bound_failure.accepted_bytes)
-                            - stream_bytes_before_feed,
+                            max(0, bound_failure.accepted_bytes),
                         )
                     else:
                         accepted_bytes = max(

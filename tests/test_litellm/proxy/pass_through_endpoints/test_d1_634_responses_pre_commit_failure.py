@@ -767,6 +767,77 @@ async def test_peek_replays_accepted_prefix_before_oversized_coalesced_suffix():
 
 
 @pytest.mark.asyncio
+async def test_peek_does_not_replay_rejected_bytes_after_prior_transport_chunk():
+    accepted_prior_chunk = b"".join(
+        _sse(
+            "response.in_progress",
+            {
+                "type": "response.in_progress",
+                "response": {
+                    "id": "resp_typed_hold",
+                    "object": "response",
+                    "status": "in_progress",
+                    "model": "gpt-5.4",
+                    "output": [],
+                },
+            },
+        )
+        for _ in range(3)
+    )
+    accepted_current_chunk = _sse(
+        "response.in_progress",
+        {
+            "type": "response.in_progress",
+            "response": {
+                "id": "resp_typed_hold",
+                "object": "response",
+                "status": "in_progress",
+                "model": "gpt-5.4",
+                "output": [],
+            },
+        },
+    )
+    rejected = _sse(
+        "response.completed",
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_typed_hold",
+                "status": "completed",
+                "output": [
+                    {"type": "opaque", "value": "rejected-suffix-" + ("x" * 4096)}
+                ],
+            },
+        },
+    )
+    pipeline = ResponsesEventPipeline(
+        max_event_bytes=6000,
+        max_stream_bytes=20000,
+        max_stream_events=10,
+        max_held_bytes=5000,
+        retain_events=True,
+    )
+    response = _FakeUpstreamStream(
+        [accepted_prior_chunk, accepted_current_chunk + rejected]
+    )
+
+    peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+        response,
+        event_pipeline=pipeline,
+    )
+
+    assert failure is None
+    emitted: list[bytes] = []
+    with pytest.raises(ResponsesBoundFailure):
+        async for chunk in peeked.aiter_bytes():
+            emitted.append(bytes(chunk))
+
+    rendered = b"".join(emitted)
+    assert rendered == accepted_prior_chunk + accepted_current_chunk
+    assert b"rejected-suffix-" not in rendered
+
+
+@pytest.mark.asyncio
 async def test_peek_preserves_storage_bound_failure_after_accepted_prefix_without_live_read():
     """A rejected coalesced suffix keeps its typed terminal after replay."""
     accepted = _sse(
