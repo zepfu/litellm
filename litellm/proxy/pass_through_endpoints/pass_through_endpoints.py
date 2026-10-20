@@ -2596,13 +2596,13 @@ def _build_native_responses_wrapper_failure_body(
         marked_status_code = getattr(wrapper_setup_failure, "status_code", None)
         if isinstance(marked_status_code, int) and 100 <= marked_status_code <= 599:
             status_code = marked_status_code
-    return (
+    failure_body = (
         b"event: response.failed\ndata: "
         + json.dumps(terminal_payload, separators=(",", ":")).encode("utf-8")
-        + b"\n\ndata: [DONE]\n\n",
-        status_code,
-        headers,
+        + b"\n\ndata: [DONE]\n\n"
     )
+    wire_trace._terminal_body = failure_body
+    return failure_body, status_code, headers
 
 
 def _is_passthrough_output_policy_exception(exc: BaseException) -> bool:
@@ -10414,6 +10414,9 @@ async def pass_through_request(  # noqa: PLR0915
                     )
                     async def _failure_body_iterator():
                         yield failure_body
+                        finalizer = wire_trace._finalize_transport
+                        if finalizer is not None:
+                            await finalizer(OpenAIResponsesWireDisposition.FAILED)
 
                     stream_response = OpenAIResponsesStreamingResponse(
                         _failure_body_iterator(),
