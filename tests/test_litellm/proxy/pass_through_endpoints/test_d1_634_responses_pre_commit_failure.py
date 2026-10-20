@@ -5639,6 +5639,77 @@ async def test_openai_responses_replays_safe_reasoning_prefix_once(
 
 
 @pytest.mark.asyncio
+async def test_openai_responses_replays_safe_stock_namespace_tools_once(
+    monkeypatch,
+):
+    """A client-executed namespace tool body is safe to retry before SSE."""
+    replacement_stream = _ClosableAsyncByteStream(
+        _replacement_success_stream_chunks()
+    )
+    namespace_tool = {
+        "type": "namespace",
+        "name": "multi_agent_v1",
+        "description": "Client-managed collaboration namespace.",
+        "tools": [
+            {
+                "type": "function",
+                "name": "spawn_agent",
+                "description": "Start a child agent.",
+                "parameters": {"type": "object", "properties": {}},
+                "strict": False,
+                "defer_loading": False,
+            }
+        ],
+    }
+    result, client, sent_requests, upstream_streams = await _start_openai_responses_stream(
+        monkeypatch,
+        [
+            _ClosableAsyncByteStream(
+                _reasoning_overload_stream_chunks(ensure_ascii=False)
+            ),
+            replacement_stream,
+        ],
+        custom_body={
+            "model": "gpt-5.4",
+            "input": "continue",
+            "tools": [namespace_tool],
+        },
+    )
+    try:
+        assert not isinstance(result, Exception)
+        assert len(sent_requests) == 2
+
+        sent_tools = json.loads(sent_requests[0].content)["tools"]
+        assert sent_tools == [namespace_tool]
+
+        body = b"".join([bytes(chunk) async for chunk in result.body_iterator])
+        payloads = _responses_sse_payloads(body)
+        assert not any(payload.get("type") == "response.failed" for payload in payloads)
+        assert not any(
+            payload.get("type") == "response.reasoning_text.delta"
+            and payload.get("item_id") == "rsn_1"
+            for payload in payloads
+        )
+        assert sum(
+            payload.get("type") == "response.output_text.delta"
+            and payload.get("delta") == "Recovered \u6771\u4eac"
+            for payload in payloads
+        ) == 1
+        assert any(
+            payload.get("type") == "response.completed"
+            and isinstance(payload.get("response"), dict)
+            and payload["response"].get("id") == "resp_replacement"
+            for payload in payloads
+        )
+    finally:
+        iterator = getattr(result, "body_iterator", None)
+        close_iterator = getattr(iterator, "aclose", None)
+        if callable(close_iterator):
+            await close_iterator()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("scenario", "provider_tools", "read_mode"),
     [
@@ -5988,7 +6059,14 @@ async def test_openai_responses_unsafe_admission_shapes_do_not_replay(
 @pytest.mark.parametrize("alpha_capacity_retry", [True, False])
 @pytest.mark.parametrize(
     "tool_shape",
-    ["provider_executable", "unknown_capability", "malformed_tool_entry"],
+    [
+        "provider_executable",
+        "unknown_capability",
+        "malformed_tool_entry",
+        "namespace_deferred_function",
+        "namespace_deferred_custom",
+        "namespace_unhashable_child_type",
+    ],
 )
 async def test_openai_responses_provider_capability_blocks_raw_http_replay(
     monkeypatch,
@@ -6007,6 +6085,46 @@ async def test_openai_responses_provider_capability_blocks_raw_http_replay(
         ]
     elif tool_shape == "unknown_capability":
         tools = [{"type": "future_hosted_tool", "name": "weather"}]
+    elif tool_shape == "namespace_deferred_function":
+        tools = [
+            {
+                "type": "namespace",
+                "name": "multi_agent_v1",
+                "description": "Client-managed collaboration namespace.",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "spawn_agent",
+                        "parameters": {"type": "object", "properties": {}},
+                        "defer_loading": True,
+                    }
+                ],
+            }
+        ]
+    elif tool_shape == "namespace_deferred_custom":
+        tools = [
+            {
+                "type": "namespace",
+                "name": "multi_agent_v1",
+                "description": "Client-managed collaboration namespace.",
+                "tools": [
+                    {
+                        "type": "custom",
+                        "name": "run_custom",
+                        "defer_loading": True,
+                    }
+                ],
+            }
+        ]
+    elif tool_shape == "namespace_unhashable_child_type":
+        tools = [
+            {
+                "type": "namespace",
+                "name": "multi_agent_v1",
+                "description": "Client-managed collaboration namespace.",
+                "tools": [{"type": []}],
+            }
+        ]
     else:
         tools = ["opaque"]
     body = {
@@ -7255,8 +7373,8 @@ def _assert_provider_overload_terminal(
     return False
 
 
-def _reasoning_overload_stream_bytes(*, ensure_ascii: bool) -> bytes:
-    return b"".join([
+def _reasoning_overload_stream_chunks(*, ensure_ascii: bool) -> list[bytes]:
+    return [
         _sse(
             "response.created",
             {"type": "response.created", "sequence_number": 1,
@@ -7347,7 +7465,11 @@ def _reasoning_overload_stream_bytes(*, ensure_ascii: bool) -> bytes:
                            "message": "The selected model is at capacity."}}},
             ensure_ascii=ensure_ascii,
         ),
-    ])
+    ]
+
+
+def _reasoning_overload_stream_bytes(*, ensure_ascii: bool) -> bytes:
+    return b"".join(_reasoning_overload_stream_chunks(ensure_ascii=ensure_ascii))
 
 
 def _reasoning_delta_utf8_split(buf: bytes) -> int:

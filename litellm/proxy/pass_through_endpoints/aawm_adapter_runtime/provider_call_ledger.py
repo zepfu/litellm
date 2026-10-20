@@ -996,6 +996,77 @@ def responses_effective_provider_tools_allowed(
             ):
                 return True
             continue
+        if tool_type == "namespace":
+            namespace_name = tool.get("name")
+            if not isinstance(namespace_name, str) or not namespace_name.strip():
+                return True
+            namespace_description = tool.get("description")
+            if (
+                not isinstance(namespace_description, str)
+                or not namespace_description.strip()
+            ):
+                return True
+            children = tool.get("tools")
+            if not isinstance(children, list):
+                return True
+            for child in children:
+                if not isinstance(child, Mapping):
+                    return True
+                child_type = child.get("type")
+                if (
+                    isinstance(child_type, str)
+                    and child_type in {"function", "custom"}
+                ):
+                    child_name = child.get("name")
+                    if not isinstance(child_name, str) or not child_name.strip():
+                        return True
+                    if "description" in child and not isinstance(
+                        child.get("description"), str
+                    ):
+                        return True
+                    if child_type == "function":
+                        if "parameters" in child and not isinstance(
+                            child.get("parameters"), (Mapping, type(None))
+                        ):
+                            return True
+                        if "strict" in child and not isinstance(
+                            child.get("strict"), (bool, type(None))
+                        ):
+                            return True
+                    else:
+                        if "format" in child and not isinstance(
+                            child.get("format"), Mapping
+                        ):
+                            return True
+                    child_defer_loading = child.get("defer_loading")
+                    if child_defer_loading is True or (
+                        "defer_loading" in child
+                        and not isinstance(child_defer_loading, bool)
+                    ):
+                        return True
+                    allowed_child_keys = {
+                        "type",
+                        "name",
+                        "description",
+                        "defer_loading",
+                    }
+                    allowed_child_keys.update(
+                        {"parameters", "strict"}
+                        if child_type == "function"
+                        else {"format"}
+                    )
+                    if not set(child).issubset(allowed_child_keys):
+                        return True
+                    continue
+                # Namespace children are stock function/custom tools. Any other,
+                # malformed, or unhashable child capability leaves replay safety
+                # unknown and commits.
+                return True
+            if not set(tool).issubset(
+                {"type", "name", "description", "tools"}
+            ):
+                return True
+            continue
         # Any capability not explicitly known to be client-executed commits
         # before dispatch; this includes provider-executable and future tools.
         return True
