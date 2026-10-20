@@ -831,3 +831,209 @@ def test_record_refresh_rejects_identity_change_without_publishing(
     assert str(auth_path) not in json.dumps(result)
     assert auth_path.read_bytes() == before
     assert Path(account["lock_path"]).exists()
+
+
+@pytest.mark.parametrize("kind", ["fifo", "directory", "oversized", "0400", "0700"])
+def test_readiness_rejects_unsafe_file_shapes(tmp_path: Path, kind: str) -> None:
+    import os
+    from litellm.secret_managers import codex_oauth_inventory as inventory
+
+    account = _account(tmp_path, label="account1", account_id="acct-one",
+                       priority=10, models=["*"])
+    record = load_codex_oauth_inventory(_inventory_json([account])).records[0]
+    path = record.auth_path
+    if kind == "fifo":
+        os.mkfifo(path, 0o600)
+    elif kind == "directory":
+        path.mkdir()
+    else:
+        _write_auth(path, account_id="acct-one", expires_at=int(time.time()) + 3600)
+        if kind == "oversized":
+            path.write_bytes(b"x" * (inventory.CODEX_OAUTH_AUTH_FILE_MAX_BYTES + 1))
+        else:
+            path.chmod(int(kind, 8))
+    with pytest.raises(CodexOAuthCredentialError):
+        inventory.read_codex_oauth_snapshot_sync(record)
+
+
+def test_readiness_replacement_preserves_held_snapshot(tmp_path: Path) -> None:
+    from litellm.secret_managers import codex_oauth_inventory as inventory
+
+    account = _account(tmp_path, label="account1", account_id="acct-one",
+                       priority=10, models=["*"])
+    record = load_codex_oauth_inventory(_inventory_json([account])).records[0]
+    _write_auth(record.auth_path, account_id="acct-one", expires_at=2000000000)
+    first = inventory.read_codex_oauth_snapshot_sync(record)
+    replacement = tmp_path / "replacement.json"
+    _write_auth(replacement, account_id="acct-one", expires_at=2000003600)
+    replacement.replace(record.auth_path)
+    second = inventory.read_codex_oauth_snapshot_sync(record)
+    assert first.expires_at == 2000000000
+    assert second.expires_at == 2000003600
+    assert first.account_hash == second.account_hash
+    with pytest.raises(TypeError):
+        first.raw_token_data["access_token"] = "changed"
+    _write_auth(replacement, account_id="another-account", expires_at=2000007200)
+    replacement.replace(record.auth_path)
+    with pytest.raises(CodexOAuthCredentialError):
+        inventory.read_codex_oauth_snapshot_sync(record)
+    assert first.account_id == second.account_id == "acct-one"
+
+
+@pytest.mark.asyncio
+async def test_request_inventory_failure_is_off_loop_and_reused(monkeypatch) -> None:
+    import threading
+
+    main_thread = threading.get_ident()
+    called_from = []
+
+    def fail():
+        called_from.append(threading.get_ident())
+        raise CodexOAuthInventoryError("synthetic inventory failure")
+
+    monkeypatch.setattr(codex_oauth, "load_codex_oauth_inventory", fail)
+    request = _request()
+    for _ in range(2):
+        with pytest.raises(CodexOAuthInventoryError, match="synthetic inventory failure"):
+            await codex_oauth._load_request_codex_oauth_inventory(request)
+    assert len(called_from) == 1
+    assert called_from[0] != main_thread
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expiry", [None, 1000, 1060, 1061])
+async def test_request_readiness_expiry_policy_and_snapshot_reuse(
+    tmp_path: Path, monkeypatch, expiry
+) -> None:
+    import threading
+    from litellm.secret_managers import codex_oauth_inventory as inventory
+
+    account = _account(tmp_path, label="account1", account_id="acct-one",
+                       priority=10, models=["*"])
+    record = load_codex_oauth_inventory(_inventory_json([account])).records[0]
+    token = {"access_token": "synthetic-access", "account_id": "acct-one"}
+    if expiry is not None:
+        token["expires_at"] = expiry
+    record.auth_path.write_text(json.dumps({"tokens": token}))
+    record.auth_path.chmod(0o600)
+    monkeypatch.setattr(codex_oauth.time, "time", lambda: 1000)
+    main_thread = threading.get_ident()
+    called_from = []
+    reader = inventory.read_codex_oauth_snapshot_sync
+
+    def read(selected):
+        called_from.append(threading.get_ident())
+        return reader(selected)
+
+    monkeypatch.setattr(inventory, "read_codex_oauth_snapshot_sync", read)
+    request = _request()
+    for _ in range(2):
+        if expiry in (1000, 1060):
+            with pytest.raises(HTTPException, match="expired or invalid"):
+                await codex_oauth._load_codex_oauth_headers_for_record(request, record)
+        else:
+            result = await codex_oauth._load_codex_oauth_headers_for_record(request, record)
+            assert result.headers["Authorization"] == "Bearer synthetic-access"
+    assert len(called_from) == 1
+    assert called_from[0] != main_thread
+
+
+def test_concurrent_replacement_cannot_mix_account_and_token(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from litellm.secret_managers import codex_oauth_inventory as inventory
+
+    account = _account(tmp_path, label="account1", account_id="acct-one",
+                       priority=10, models=["*"])
+    record = load_codex_oauth_inventory(_inventory_json([account])).records[0]
+    old_token = _write_auth(record.auth_path, account_id="acct-one", expires_at=2000000000)
+    replacement = tmp_path / "next.json"
+    new_token = _write_auth(replacement, account_id="acct-one", expires_at=2000003600)
+    opened = Event()
+    resume = Event()
+    read_bytes = inventory._read_bounded_bytes
+
+    def paused_read(descriptor, *, label):
+        opened.set()
+        assert resume.wait(5)
+        return read_bytes(descriptor, label=label)
+
+    monkeypatch.setattr(inventory, "_read_bounded_bytes", paused_read)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(inventory.read_codex_oauth_snapshot_sync, record)
+        try:
+            assert opened.wait(5)
+            replacement.replace(record.auth_path)
+        finally:
+            resume.set()
+        try:
+            held = pending.result(timeout=5)
+        except CodexOAuthCredentialError:
+            held = None  # A changed descriptor may fail closed.
+    current = inventory.read_codex_oauth_snapshot_sync(record)
+    assert current.access_token == new_token
+    assert current.account_id == "acct-one"
+    if held is not None:
+        assert held.access_token == old_token
+        assert held.expires_at == 2000000000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [{"tokens": {}}, {"tokens": []}])
+async def test_failed_credential_read_is_reused_within_request(
+    tmp_path: Path, monkeypatch, payload
+) -> None:
+    from litellm.secret_managers import codex_oauth_inventory as inventory
+
+    account = _account(tmp_path, label="account1", account_id="acct-one",
+                       priority=10, models=["*"])
+    record = load_codex_oauth_inventory(_inventory_json([account])).records[0]
+    record.auth_path.write_text(json.dumps(payload))
+    record.auth_path.chmod(0o600)
+    reads = []
+    reader = inventory.read_codex_oauth_snapshot_sync
+
+    def read(selected):
+        reads.append(selected.label)
+        return reader(selected)
+
+    monkeypatch.setattr(inventory, "read_codex_oauth_snapshot_sync", read)
+    request = _request()
+    for _ in range(2):
+        with pytest.raises(HTTPException):
+            await codex_oauth._load_codex_oauth_headers_for_record(request, record)
+    assert reads == ["account1"]
+    _write_auth(record.auth_path, account_id="acct-one", expires_at=2000000000)
+    result = await codex_oauth._load_codex_oauth_headers_for_record(_request(), record)
+    assert result.account_label == "account1"
+
+
+def test_snapshot_cache_evicts_old_entries_without_mutating_held_facts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from litellm.secret_managers import codex_oauth_inventory as inventory
+
+    monkeypatch.setattr(inventory, "CODEX_OAUTH_SNAPSHOT_CACHE_MAX_ENTRIES", 2)
+    accounts = [_account(tmp_path, label=f"account{i}", account_id=f"acct-{i}",
+                         priority=i, models=["*"]) for i in range(3)]
+    records = load_codex_oauth_inventory(_inventory_json(accounts)).records
+    for i, record in enumerate(records):
+        _write_auth(record.auth_path, account_id=f"acct-{i}", expires_at=2000000000)
+    reads = []
+    reader = inventory._read_bounded_bytes
+
+    def read(descriptor, *, label):
+        reads.append(label)
+        return reader(descriptor, label=label)
+
+    monkeypatch.setattr(inventory, "_read_bounded_bytes", read)
+    held = inventory.read_codex_oauth_snapshot_sync(records[0])
+    inventory.read_codex_oauth_snapshot_sync(records[0])
+    for record in records[1:]:
+        inventory.read_codex_oauth_snapshot_sync(record)
+    reread = inventory.read_codex_oauth_snapshot_sync(records[0])
+    assert reads == ["account0", "account1", "account2", "account0"]
+    assert held.account_id == reread.account_id == "acct-0"
+    assert held.access_token == reread.access_token

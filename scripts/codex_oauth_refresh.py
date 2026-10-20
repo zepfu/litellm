@@ -174,7 +174,11 @@ def _token_refresh_metadata(
         obtained_at=token_data.get("obtained_at"),
         refreshed_at=token_data.get("refreshed_at"),
     )
-    threshold, threshold_source, degraded = _threshold_from_lifetime(lifetime, source, min_seconds)
+    threshold, threshold_source, degraded = _threshold_from_lifetime(
+        lifetime,
+        source,
+        min_seconds,
+    )
     return lifetime, threshold, threshold_source or source, degraded
 
 

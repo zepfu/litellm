@@ -21,6 +21,8 @@ import time
 from datetime import datetime, timezone
 from typing import AbstractSet, Any, Awaitable, Callable, Mapping, Optional, Sequence
 
+from collections.abc import Mapping  # host binding for installed selection helpers
+
 from fastapi import HTTPException, Request
 
 from litellm._logging import verbose_proxy_logger
@@ -281,6 +283,7 @@ def configure_selection_runtime(
     _get_codex_quota_observation_pool = get_codex_quota_observation_pool
     global _get_codex_quota_observation_environment
     _get_codex_quota_observation_environment = get_codex_quota_observation_environment
+
 
 
 # ---------------------------------------------------------------------------

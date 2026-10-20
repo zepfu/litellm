@@ -4610,14 +4610,16 @@ class TestCodexAccountBound:
     ) -> None:
         from types import SimpleNamespace
 
+        inventory = SimpleNamespace(
+            routing=SimpleNamespace(accounts_are_interchangeable=True)
+        )
         monkeypatch.setattr(
             "litellm.secret_managers.codex_oauth_inventory.load_codex_oauth_inventory",
-            lambda: SimpleNamespace(
-                routing=SimpleNamespace(accounts_are_interchangeable=True)
-            ),
+            lambda: inventory,
         )
         adjusted = selection._apply_codex_oauth_inventory_affinity_policy(
-            _oauth_account_candidate()
+            _oauth_account_candidate(),
+            inventory=inventory,
         )
         assert adjusted is not None
         assert adjusted["codex_oauth_credential_affinity"] == "interchangeable"
@@ -4631,16 +4633,18 @@ class TestCodexAccountBound:
     ) -> None:
         from types import SimpleNamespace
 
+        inventory = SimpleNamespace(
+            routing=SimpleNamespace(accounts_are_interchangeable=True)
+        )
         monkeypatch.setattr(
             "litellm.secret_managers.codex_oauth_inventory.load_codex_oauth_inventory",
-            lambda: SimpleNamespace(
-                routing=SimpleNamespace(accounts_are_interchangeable=True)
-            ),
+            lambda: inventory,
         )
         affinity = _oauth_account_candidate()
         adjusted = selection._apply_codex_oauth_inventory_affinity_policy(
             affinity,
             account_bound=True,
+            inventory=inventory,
         )
         assert adjusted is not None
         assert adjusted["codex_oauth_credential_affinity"] == "interchangeable"
@@ -4789,7 +4793,7 @@ class TestCodexAccountBound:
             )
         _set_selection_runtime_value(
             "_apply_codex_oauth_inventory_affinity_policy",
-            lambda affinity, *, account_bound=False: affinity,
+            lambda affinity, inventory=None, *, account_bound=False: affinity,
             monkeypatch,
         )
         _set_selection_runtime_value(

@@ -18567,6 +18567,7 @@ def _sanitize_chatgpt_native_history_probe_observation(
     return {key: value[key] for key in _CHATGPT_NATIVE_HISTORY_PROBE_OBSERVATION_KEYS if key in value}
 
 
+
 def _chatgpt_native_history_probe_exit_status(
     event: Mapping[str, Any],
 ) -> int:

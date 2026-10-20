@@ -507,6 +507,16 @@ def build_codex_oauth_credential_snapshot(
         obtained_at=token_data.get("obtained_at"),
         refreshed_at=token_data.get("refreshed_at"),
     )
+    issued_at = get_codex_oauth_token_issued_at(token_data)
+    expires_at = get_codex_oauth_token_expiry(token_data)
+    issued_lifetime, issued_lifetime_source = get_codex_oauth_token_issued_lifetime(
+        expires_in=token_data.get("expires_in"),
+        access_token=access_token,
+        expires_at=expires_at,
+        issued_at=token_data.get("issued_at"),
+        obtained_at=token_data.get("obtained_at"),
+        refreshed_at=token_data.get("refreshed_at"),
+    )
     return CodexOAuthCredentialSnapshot(
         record=record,
         account_hash=account_hash,
