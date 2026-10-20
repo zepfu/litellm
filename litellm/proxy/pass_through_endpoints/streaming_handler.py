@@ -357,6 +357,7 @@ class _PrefixedHttpxByteStream:
         self._prefix = prefix
         self._remainder = remainder
         self._post_prefix_iterator: Any = None
+        self._live_chunk_iterator: Any = None
         self._aawm_responses_event_pipeline = event_pipeline
         self._bound_failure = bound_failure
         self._prefix_bound_failure = self._prepare_prefix_bound_failure(
@@ -445,8 +446,11 @@ class _PrefixedHttpxByteStream:
                     yield attach_responses_events(replayed, events)
                 live_suffix = chunk[replay_length:]
                 if live_suffix:
-                    async for live_chunk in self._iter_live_chunk(live_suffix):
+                    live_chunk_iterator = self._iter_live_chunk(live_suffix)
+                    self._live_chunk_iterator = live_chunk_iterator
+                    async for live_chunk in live_chunk_iterator:
                         yield live_chunk
+                    self._live_chunk_iterator = None
 
         try:
             async for chunk in _iter_prefix_chunks():
@@ -478,8 +482,11 @@ class _PrefixedHttpxByteStream:
         async for chunk in self._remainder:
             if not chunk:
                 continue
-            async for live_chunk in self._iter_live_chunk(bytes(chunk)):
+            live_chunk_iterator = self._iter_live_chunk(bytes(chunk))
+            self._live_chunk_iterator = live_chunk_iterator
+            async for live_chunk in live_chunk_iterator:
                 yield live_chunk
+            self._live_chunk_iterator = None
         if pipeline is not None:
             for event in pipeline.finish():
                 if (
@@ -494,6 +501,13 @@ class _PrefixedHttpxByteStream:
 
     async def aclose(self) -> None:
         self._close_prefix()
+        live_chunk_iterator = self._live_chunk_iterator
+        if live_chunk_iterator is not None and not live_chunk_iterator.ag_running:
+            self._live_chunk_iterator = None
+            try:
+                await wait_for("resource_cleanup", live_chunk_iterator.aclose())
+            except Exception:
+                pass
         post_prefix_iterator = self._post_prefix_iterator
         if post_prefix_iterator is not None and not post_prefix_iterator.ag_running:
             self._post_prefix_iterator = None
@@ -2542,6 +2556,9 @@ class PassThroughStreamingHandler:
                             ),
                         ),
                     )
+                _maybe_set_replay_latch(
+                    request, parser.commitment_reason, event_type
+                )
                 return prefixed, None
             try:
                 (

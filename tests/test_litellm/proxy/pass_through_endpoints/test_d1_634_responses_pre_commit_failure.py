@@ -883,6 +883,15 @@ async def test_peek_preserves_storage_bound_failure_after_accepted_prefix_withou
 @pytest.mark.asyncio
 async def test_peek_replays_complete_cr_eof_without_partial_substitution():
     """A CR-only event completed at EOF uses the normal replay association."""
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        ProviderCallReplayBlocked,
+        ensure_openai_wire_replay_allowed,
+    )
+
+    request = Request(
+        {"type": "http", "method": "POST", "path": "/v1/responses", "headers": []}
+    )
+    ensure_openai_wire_replay_allowed(request)
     accepted = _sse(
         "response.created",
         {
@@ -905,9 +914,13 @@ async def test_peek_replays_complete_cr_eof_without_partial_substitution():
     peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
         response,
         event_pipeline=pipeline,
+        request=request,
+        provider_bound_body={"model": "gpt-5.4", "tools": []},
     )
 
     assert failure is None
+    with pytest.raises(ProviderCallReplayBlocked):
+        ensure_openai_wire_replay_allowed(request)
     replayed = [chunk async for chunk in peeked.aiter_bytes()]
     assert b"".join(replayed) == accepted + completed
 
@@ -3193,6 +3206,7 @@ async def test_central_coordinator_replaces_legacy_precommit_cap():
         ("http_status_error", 529, "type", "server_is_overloaded"),
         ("http_status_error", 504, "code", "capacity_exhausted"),
         ("http_exception", 500, "type", "capacity_exhausted"),
+        ("http_exception", 500, "code", "internal_error"),
     ],
 )
 async def test_central_coordinator_retries_raw_http_overload_then_succeeds(
@@ -3514,10 +3528,6 @@ def test_terminal_wire_headers_read_preserved_upstream_headers(
             "http_status_error", 504,
             {"error": {"code": "upstream_timeout", "message": "Gateway timeout."}},
         ),
-        (
-            "http_exception", 500,
-            {"error": {"code": "internal_error", "message": "Internal error."}},
-        ),
     ],
 )
 async def test_central_coordinator_exits_raw_http_quota_or_auth_immediately(
@@ -3619,7 +3629,7 @@ async def test_central_coordinator_uses_remaining_deadline_once_per_attempt():
         ),
         patch(
             "litellm.proxy.pass_through_endpoints.pass_through_endpoints.time.monotonic",
-            side_effect=[0.0, 15.0, 15.0],
+            return_value=0.0,
         ),
         patch.object(
             type(coordinator),
@@ -3627,7 +3637,7 @@ async def test_central_coordinator_uses_remaining_deadline_once_per_attempt():
             new_callable=PropertyMock,
         ) as remaining_seconds,
     ):
-        remaining_seconds.side_effect = [7200.0, 7185.0]
+        remaining_seconds.side_effect = [7200.0, 7200.0, 7185.0]
         result = await _execute_passthrough_pre_first_byte_with_hidden_retries(
             kwargs={},
             operation_name="stream_pre_first_byte",
@@ -4975,11 +4985,19 @@ async def test_stream_capacity_failure_retry_after_reaches_proxy_wire_headers(
         coordinator = MagicMock()
         coordinator.deadline_seconds = 7200.0
         coordinator.remaining_seconds = 1.0
-        coordinator.elapsed_seconds = 7200.0
-        coordinator.within_deadline.return_value = False
+        coordinator.elapsed_seconds = 7199.0
+        coordinator.sleep_with_wakeup = AsyncMock(
+            side_effect=AssertionError("an expired capacity attempt must not sleep")
+        )
+
+        async def fail_at_deadline():
+            coordinator.remaining_seconds = 0.0
+            coordinator.elapsed_seconds = 7200.0
+            raise terminal_failure
+
         return await _execute_passthrough_pre_first_byte_with_hidden_retries(
             kwargs={},
-            operation=AsyncMock(side_effect=terminal_failure),
+            operation=fail_at_deadline,
             operation_name="stream_pre_first_byte",
             caller_managed_hidden_retry=False,
             openai_capacity_coordinator=coordinator,
