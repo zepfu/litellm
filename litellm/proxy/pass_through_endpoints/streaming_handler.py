@@ -2378,11 +2378,18 @@ class PassThroughStreamingHandler:
                     ResponsesStreamTooLarge,
                 ) as exc:
                     bound_failure = ResponsesBoundFailure.from_exception(exc)
-                    accepted_bytes = max(
-                        0,
-                        int(getattr(pipeline, "total_stream_bytes", 0))
-                        - stream_bytes_before_feed,
-                    )
+                    if bound_failure.accepted_bytes_known:
+                        accepted_bytes = min(
+                            len(chunk),
+                            max(0, bound_failure.accepted_bytes)
+                            - stream_bytes_before_feed,
+                        )
+                    else:
+                        accepted_bytes = max(
+                            0,
+                            int(getattr(pipeline, "total_stream_bytes", 0))
+                            - stream_bytes_before_feed,
+                        )
                     prior_safe = bool(
                         getattr(pipeline, "held_event_count", 0)
                         or bound_failure.accepted_events
