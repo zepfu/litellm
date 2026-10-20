@@ -2432,6 +2432,7 @@ if TYPE_CHECKING:
         request_body: Any = None,
     ) -> Any: ...
     def _serialize_responses_adapter_response(response_obj: Any) -> str: ...
+    def _responses_body_for_fake_stream(responses_api_response: Any) -> dict[str, Any]: ...
     async def _validate_codex_auto_agent_responses_payload(response: Any, **kwargs: Any) -> Any: ...
     def _xai_oauth_candidate_unavailable_detail(exc: Exception) -> Optional[str]: ...
     def _build_opencode_go_provider_rejection_evidence(**kwargs: Any) -> dict[str, Any]: ...
@@ -2518,6 +2519,8 @@ _NVIDIA_FUNCTION_NAMES = (
     "_prepare_codex_nvidia_completion_adapter_route",
     "_perform_codex_nvidia_completion_adapter_call",
     "_handle_codex_nvidia_completion_adapter_route",
+    "_codex_nvidia_completion_adapter_response",
+    "_responses_body_for_fake_stream",
 )
 
 
@@ -2647,10 +2650,6 @@ def install(
             shield_cohere_responses_function_parameters,
         ),
         ("apply_request_watermark_egress", apply_request_watermark_egress),
-        (
-            "_codex_nvidia_completion_adapter_response",
-            _codex_nvidia_completion_adapter_response,
-        ),
         ("load_text_watermark_config", load_text_watermark_config),
         ("_get_runtime_text_watermark_config", _get_runtime_text_watermark_config),
         ("_watermark_endpoint_from_path", _watermark_endpoint_from_path),
