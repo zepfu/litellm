@@ -6065,6 +6065,7 @@ async def test_openai_responses_unsafe_admission_shapes_do_not_replay(
         "malformed_tool_entry",
         "namespace_deferred_function",
         "namespace_deferred_custom",
+        "namespace_unhashable_child_type",
     ],
 )
 async def test_openai_responses_provider_capability_blocks_raw_http_replay(
@@ -6113,6 +6114,15 @@ async def test_openai_responses_provider_capability_blocks_raw_http_replay(
                         "defer_loading": True,
                     }
                 ],
+            }
+        ]
+    elif tool_shape == "namespace_unhashable_child_type":
+        tools = [
+            {
+                "type": "namespace",
+                "name": "multi_agent_v1",
+                "description": "Client-managed collaboration namespace.",
+                "tools": [{"type": []}],
             }
         ]
     else:

@@ -1013,7 +1013,10 @@ def responses_effective_provider_tools_allowed(
                 if not isinstance(child, Mapping):
                     return True
                 child_type = child.get("type")
-                if child_type in {"function", "custom"}:
+                if (
+                    isinstance(child_type, str)
+                    and child_type in {"function", "custom"}
+                ):
                     child_name = child.get("name")
                     if not isinstance(child_name, str) or not child_name.strip():
                         return True
@@ -1055,8 +1058,9 @@ def responses_effective_provider_tools_allowed(
                     if not set(child).issubset(allowed_child_keys):
                         return True
                     continue
-                # Namespace children are stock function/custom tools. Any other
-                # child capability leaves replay safety unknown and commits.
+                # Namespace children are stock function/custom tools. Any other,
+                # malformed, or unhashable child capability leaves replay safety
+                # unknown and commits.
                 return True
             if not set(tool).issubset(
                 {"type", "name", "description", "tools"}
