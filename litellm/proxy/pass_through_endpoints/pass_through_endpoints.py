@@ -10610,6 +10610,7 @@ async def pass_through_request(  # noqa: PLR0915
                         )
                         _authorize_openai_capacity_retry(provider_exception, e.response)
                         raise provider_exception from e
+                    pre_commit_peeked = False
                     if (
                         response.status_code == status.HTTP_200_OK
                         and capacity_retry_coordinator is not None
@@ -10629,6 +10630,7 @@ async def pass_through_request(  # noqa: PLR0915
                             request=request,
                             provider_bound_body=provider_bound_body,
                         )
+                        pre_commit_peeked = True
                         if pre_commit_failure is not None:
                             retired_response = raw_response
                             await response.aclose()
@@ -10645,7 +10647,7 @@ async def pass_through_request(  # noqa: PLR0915
                     if (
                         is_native_openai_responses_route
                         and responses_event_pipeline is not None
-                        and capacity_retry_coordinator is None
+                        and not pre_commit_peeked
                     ):
                         # This is an unpeeked same-owner handoff: release the
                         # live-only hold without discarding associations from a
