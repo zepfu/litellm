@@ -2472,7 +2472,11 @@ class _PrefixedNativeResponsesAsyncIterator:
             chunk = self._consumed_chunks[self._consumed_index]
             self._consumed_index += 1
             return chunk
-        return await self._source.__anext__()
+        try:
+            return await self._source.__anext__()
+        except StopAsyncIteration:
+            await self.aclose()
+            raise
 
     async def aclose(self) -> None:
         if self._closed:
@@ -10576,7 +10580,11 @@ async def pass_through_request(  # noqa: PLR0915
                     if (
                         is_native_openai_responses_route
                         and responses_event_pipeline is not None
+                        and capacity_retry_coordinator is None
                     ):
+                        # This is an unpeeked same-owner handoff: release the
+                        # live-only hold without discarding associations from a
+                        # successful precommit peek.
                         responses_event_pipeline.drain_held_events()
                     ensure_precommit_send_active()
                     return response
