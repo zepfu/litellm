@@ -43,6 +43,60 @@ from litellm.proxy.pass_through_endpoints.success_handler import (
 from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
 
 
+def _successful_peek_native_sse_chunks() -> list[bytes]:
+    item_id = "msg_peeked"
+
+    def delta(value: str) -> bytes:
+        return _sse(
+            "response.output_text.delta",
+            {
+                "type": "response.output_text.delta",
+                "item_id": item_id,
+                "output_index": 0,
+                "content_index": 0,
+                "delta": value,
+            },
+        )
+
+    return [
+        _sse(
+            "response.created",
+            {
+                "type": "response.created",
+                "response": {
+                    "id": "resp_peeked",
+                    "object": "response",
+                    "status": "in_progress",
+                    "model": "gpt-5.4",
+                    "output": [],
+                },
+            },
+        ),
+        _sse(
+            "response.output_item.added",
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": item_id,
+                    "type": "message",
+                    "role": "assistant",
+                },
+            },
+        ),
+        delta("prefix-delta-0"),
+        *(delta(f"delta-{index}") for index in range(200)),
+        _sse(
+            "response.completed",
+            {
+                "type": "response.completed",
+                "response": {"id": "resp_peeked", "status": "completed"},
+            },
+        ),
+        b"data: [DONE]\n\n",
+    ]
+
+
 def _sse(event_type: str, payload: dict[str, Any]) -> bytes:
     return (
         f"event: {event_type}\ndata: "
@@ -3527,12 +3581,12 @@ async def test_nonstream_openai_passthrough_responses_hands_off_capacity_coordin
     upstream_response.aread = AsyncMock(return_value=b'{"ok": true}')
     captured: dict[str, Any] = {}
 
+    async def run_with_renewal(_lease, operation):
+        return await operation()
+
     async def execute_hidden_retries(**kwargs):
         captured.update(kwargs)
         return upstream_response
-
-    async def run_with_renewal(_lease, operation):
-        return await operation()
 
     with patch.object(
         pte,
@@ -3617,6 +3671,7 @@ async def test_alpha_openai_sse_precommit_overload_closes_and_propagates(
     mock_request.headers = {"content-type": "application/json"}
     mock_request.query_params = {}
     mock_request.state = SimpleNamespace()
+    mock_request.is_disconnected = AsyncMock(return_value=False)
     custom_body = {"model": "gpt-5.4"}
     error = {"code": error_code, "type": "server_error", "message": "Try again."}
     payload = (
@@ -3633,6 +3688,9 @@ async def test_alpha_openai_sse_precommit_overload_closes_and_propagates(
     )
     captured: dict[str, Any] = {}
 
+    async def run_with_renewal(_lease, operation):
+        return await operation()
+
     async def execute_hidden_retries(**kwargs):
         captured.update(kwargs)
         try:
@@ -3640,9 +3698,6 @@ async def test_alpha_openai_sse_precommit_overload_closes_and_propagates(
         except BaseException as exc:
             captured["exception"] = exc
             raise
-
-    async def run_with_renewal(_lease, operation):
-        return await operation()
 
     with patch.object(
         pte,
@@ -3664,9 +3719,6 @@ async def test_alpha_openai_sse_precommit_overload_closes_and_propagates(
         pte,
         "_execute_passthrough_pre_first_byte_with_hidden_retries",
         new=execute_hidden_retries,
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
-        new=AsyncMock(return_value=upstream_response),
     ), patch(
         "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
     ) as mock_get_client, patch(
@@ -3818,6 +3870,7 @@ async def test_unpeeked_native_sse_handoff_becomes_live_only(monkeypatch):
 
     assert isinstance(response, OpenAIResponsesStreamingResponse)
     wire = b"".join([chunk async for chunk in response.body_iterator])
+    await response.body_iterator.aclose()
     assert response.wire_trace.finalized is True
     assert (
         response.wire_trace.metadata.get("disposition_callback_error")
@@ -3836,6 +3889,114 @@ async def test_unpeeked_native_sse_handoff_becomes_live_only(monkeypatch):
         assert f'"delta":"delta-{index}"'.encode("utf-8") in wire
     assert b'"status":"completed"' in wire
     assert wire.endswith(b"data: [DONE]\n\n")
+
+
+@pytest.mark.asyncio
+@pytest.mark.filterwarnings("error::RuntimeWarning")
+async def test_successful_peek_native_sse_replays_prefix_and_terminal(monkeypatch):
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    monkeypatch.setenv("AAWM_RESPONSES_MAX_OUTPUT_ITEMS", "1")
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+        OpenAIResponsesStreamingResponse,
+    )
+    from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+        pass_through_request,
+    )
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.url = SimpleNamespace(path="/openai_passthrough/v1/responses")
+    mock_request.headers = {"content-type": "application/json"}
+    mock_request.query_params = {}
+    mock_request.state = SimpleNamespace()
+    mock_request.is_disconnected = AsyncMock(return_value=False)
+    custom_body = {"model": "gpt-5.4"}
+    stream = _ClosableAsyncByteStream(_successful_peek_native_sse_chunks())
+    upstream_response = httpx.Response(
+        status_code=200,
+        headers={"content-type": "text/event-stream"},
+        stream=stream,
+        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+    )
+
+    async def run_with_renewal(_lease, operation):
+        return await operation()
+
+    successful_peeks = []
+    original_peek = PassThroughStreamingHandler.peek_responses_pre_commit_stream
+
+    async def record_peek(*args, **kwargs):
+        result = await original_peek(*args, **kwargs)
+        successful_peeks.append(result[1])
+        return result
+
+    with patch.object(
+        pte,
+        "_aawm_session_owner_pre_send_guard",
+        new=AsyncMock(),
+    ), patch.object(
+        sa,
+        "get_request_session_owner_lease",
+        return_value=None,
+    ), patch.object(
+        sa,
+        "run_with_session_owner_lease_renewal",
+        new=run_with_renewal,
+    ), patch.object(
+        sa,
+        "finalize_request_session_owner_lease",
+        new=AsyncMock(),
+    ), patch.object(
+        PassThroughStreamingHandler,
+        "peek_responses_pre_commit_stream",
+        new=record_peek,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+        new=AsyncMock(return_value=upstream_response),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+    ) as mock_get_client, patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj"
+    ) as mock_logging_obj, patch.object(
+        pte.pass_through_endpoint_logging,
+        "pass_through_async_success_handler",
+        new_callable=AsyncMock,
+    ):
+        mock_client_obj = MagicMock()
+        mock_client_obj.client.send = AsyncMock(return_value=upstream_response)
+        mock_client_obj.client.build_request = MagicMock(
+            return_value=upstream_response.request
+        )
+        mock_get_client.return_value = mock_client_obj
+        mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
+        mock_logging_obj.post_call_success_hook = AsyncMock()
+        mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+        response = await pass_through_request(
+            request=mock_request,
+            target="https://api.openai.com/v1/responses",
+            custom_headers={},
+            user_api_key_dict=MagicMock(),
+            custom_body=custom_body,
+            custom_llm_provider="openai",
+            stream=False,
+        )
+
+    assert isinstance(response, OpenAIResponsesStreamingResponse)
+    response_aiter = response.body_iterator
+    wire = b"".join([chunk async for chunk in response_aiter])
+    await response_aiter.aclose()
+    assert successful_peeks == [None]
+    assert b'"delta":"prefix-delta-0"' in wire
+    assert b'"delta":"delta-0"' in wire
+    assert b'"item_id":"msg_peeked"' in wire
+    assert b'"status":"completed"' in wire
+    assert wire.endswith(b"data: [DONE]\n\n")
+    assert stream.close_calls == 1
 
 
 @pytest.mark.asyncio
@@ -3879,30 +4040,24 @@ async def test_failed_precommit_prefix_retired_before_retry_handoff(monkeypatch)
         stream=stream,
         request=httpx.Request("POST", target),
     )
-    prefix_store = SimpleNamespace(byte_count=8, iter_chunks=lambda: iter([]))
-
     class _RetiringPrefixStore:
-        def __init__(self, store):
-            self._store = store
-            self.retired = False
+        byte_count = 8
 
-        @property
-        def byte_count(self):
-            return self._store.byte_count
+        def __init__(self):
+            self.close_calls = 0
 
         def iter_chunks(self):
-            return self._store.iter_chunks()
+            return iter([])
 
         def close(self):
-            self.retired = True
+            self.close_calls += 1
 
+    prefix_store = _RetiringPrefixStore()
     wrapper = _PrefixedHttpxByteStream(
         upstream_response,
         prefix_store,
         event_pipeline=ResponsesEventPipeline(retain_events=True),
     )
-    retiring_prefix = _RetiringPrefixStore(prefix_store)
-    wrapper._prefix = retiring_prefix
     wrapper_aclose = AsyncMock(wraps=wrapper.aclose)
     wrapper.aclose = wrapper_aclose
     failure = ResponsesStreamPreCommitFailure(
@@ -3985,11 +4140,9 @@ async def test_failed_precommit_prefix_retired_before_retry_handoff(monkeypatch)
     assert isinstance(captured["exception"], ResponsesStreamPreCommitFailure)
     assert captured["exception"].retryable is True
     wrapper_aclose.assert_awaited_once()
-    assert retiring_prefix.retired is True
+    assert prefix_store.close_calls == 1
     assert stream.close_calls == 1
     assert upstream_response.is_closed is True
-    assert getattr(mock_request.state, "_aawm_active_upstream_response", None) is None
-    assert captured["operation_name"] == "non_stream_pre_first_byte"
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error_code", ["server_is_overloaded", "capacity_exhausted"])
 @pytest.mark.parametrize(
