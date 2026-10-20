@@ -4314,6 +4314,10 @@ async def test_alpha_openai_sse_precommit_overload_closes_and_propagates(
         new=AsyncMock(),
     ), patch.object(
         pte,
+        "_finalize_native_openai_responses_owner_wire_disposition",
+        new_callable=AsyncMock,
+    ) as mock_wire_disposition, patch.object(
+        pte,
         "_execute_passthrough_pre_first_byte_with_hidden_retries",
         new=execute_hidden_retries,
     ), patch(
@@ -4324,7 +4328,11 @@ async def test_alpha_openai_sse_precommit_overload_closes_and_propagates(
         mock_client_obj = MagicMock()
         mock_client_obj.client = MagicMock()
         mock_client_obj.client.send = AsyncMock(return_value=upstream_response)
-        mock_client_obj.client.build_request.return_value = upstream_response.request
+        if stream_request:
+            # Retain the committed live handoff used to exercise wrapper failure.
+            mock_client_obj.client.build_request.return_value = upstream_response.request
+        else:
+            mock_client_obj.client.build_request.side_effect = httpx.Request
         mock_get_client.return_value = mock_client_obj
         mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
         mock_logging_obj.post_call_failure_hook = AsyncMock(return_value=None)
@@ -4339,13 +4347,32 @@ async def test_alpha_openai_sse_precommit_overload_closes_and_propagates(
                 custom_llm_provider="openai",
                 stream=True,
             )
+            delivered = AsyncMock()
+            passthrough_response.wire_trace.register_post_finalization_callback(delivered)
+            send = AsyncMock()
+            await passthrough_response(
+                {"type": "http", "asgi": {"spec_version": "2.4"}},
+                asyncio.Event().wait,
+                send,
+            )
             forwarded_body = b"".join(
-                [
-                    bytes(chunk)
-                    async for chunk in passthrough_response.body_iterator
-                ]
+                call.args[0].get("body", b"")
+                for call in send.await_args_list
+                if call.args[0]["type"] == "http.response.body"
             )
             assert error_code.encode() in forwarded_body
+            assert forwarded_body.endswith(b"data: [DONE]\n\n")
+            assert passthrough_response.wire_trace.terminal_wire_committed is True
+            assert passthrough_response.wire_trace.done_wire_committed is True
+            assert passthrough_response.wire_trace.finalized is True
+            assert passthrough_response.wire_trace.disposition.value == "failed"
+            mock_wire_disposition.assert_awaited_once()
+            assert mock_wire_disposition.call_args.kwargs["disposition"].value == "failed"
+            delivered.assert_awaited_once()
+            delivered_snapshot = delivered.call_args.args[0]
+            assert delivered_snapshot["disposition"] == "failed"
+            assert delivered_snapshot["terminal_wire_committed"] is True
+            assert delivered_snapshot["asgi_delivery_complete"] is True
             assert "exception" not in captured
         else:
             with pytest.raises(ProxyException):
