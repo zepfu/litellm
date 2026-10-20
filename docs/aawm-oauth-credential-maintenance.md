@@ -880,9 +880,17 @@ The shared Codex OAuth reader rejects final symlinks, nonregular files
 payloads, and changes during a descriptor-backed read. Managed snapshots also
 validate identity coherence and the configured account pin. Legacy file-only
 health and refresh use the same file and parsing policy without an inventory
-pin. The legacy writer retains its locked metadata-repair step before reading:
-it can correct group/world-readable regular files to `0600`. Read-only
-inspection and managed snapshot loading never repair permissions.
+pin. The path-only legacy writer repairs metadata under its lock before
+reading and can correct group/world-readable regular files to `0600`.
+Inventory-managed refresh validates the strict snapshot before metadata
+repair, so unsafe permissions fail that read. Read-only inspection and
+managed snapshot loading never repair permissions.
+
+The shared reader reports file and JSON validation failures as
+`CodexOAuthCredentialError`. Refresh and passive-health summaries preserve
+that typed name in `error_class`, including for missing or malformed files.
+Managed identity-pin mismatches use `CodexOAuthIdentityMismatchError`.
+Errors caught earlier by path, lock, or refresh checks retain their own types.
 
 Snapshots hide secrets from `repr()` and recursively freeze token and auth
 payloads. Refresh works on a mutable copy under the writer lock, validates the
