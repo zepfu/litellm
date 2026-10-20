@@ -6442,6 +6442,20 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         return return_headers
 
     @staticmethod
+    def merge_response_headers(
+        response_headers: dict,
+        overrides: Mapping[str, str],
+    ) -> dict:
+        merged_headers = dict(response_headers)
+        for name, value in overrides.items():
+            normalized_name = name.casefold()
+            for existing_name in list(merged_headers):
+                if existing_name.casefold() == normalized_name:
+                    del merged_headers[existing_name]
+            merged_headers[name] = value
+        return merged_headers
+
+    @staticmethod
     def get_endpoint_type(url: str) -> EndpointType:
         parsed_url = urlparse(url)
         hostname = parsed_url.hostname or ""
@@ -10392,7 +10406,12 @@ async def pass_through_request(  # noqa: PLR0915
                             wrapper_setup_failure=wrapper_setup_failure,
                         )
                     )
-                    response_headers.update(failure_headers)
+                    response_headers = (
+                        HttpPassThroughEndpointHelpers.merge_response_headers(
+                            response_headers,
+                            failure_headers,
+                        )
+                    )
                     stream_response = OpenAIResponsesBufferedResponse(
                         content=failure_body,
                         wire_trace=wire_trace,
@@ -10961,7 +10980,12 @@ async def pass_through_request(  # noqa: PLR0915
                             wrapper_setup_failure=wrapper_setup_failure,
                         )
                     )
-                    response_headers.update(failure_headers)
+                    response_headers = (
+                        HttpPassThroughEndpointHelpers.merge_response_headers(
+                            response_headers,
+                            failure_headers,
+                        )
+                    )
                     stream_response = OpenAIResponsesBufferedResponse(
                         content=failure_body,
                         wire_trace=wire_trace,
