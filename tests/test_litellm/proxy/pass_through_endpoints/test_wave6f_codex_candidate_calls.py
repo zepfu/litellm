@@ -2553,6 +2553,50 @@ class TestCFG030CodexNvidiaCompletionAdapter:
         nvidia.egress.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_local_request_rejection_does_not_enter_nvidia_retry_owner(self, monkeypatch):
+        from fastapi import HTTPException
+
+        from litellm.proxy.pass_through_endpoints.providers.nvidia import (
+            runtime as nvidia_runtime,
+        )
+
+        nvidia = self._nvidia_host(monkeypatch)
+        operations = []
+
+        async def retry_owner(*, operation, **_kwargs):
+            operations.append(operation)
+            return await operation()
+
+        nvidia.host["apply_request_watermark_egress"] = MagicMock(
+            side_effect=HTTPException(status_code=403, detail="blocked")
+        )
+        monkeypatch.setattr(
+            nvidia_runtime,
+            "_perform_nvidia_completion_adapter_operation",
+            retry_owner,
+        )
+
+        with pytest.raises(HTTPException):
+            await nvidia.host["_perform_codex_nvidia_completion_adapter_call"](
+                config=nvidia.host["_aawm_adapter_config"].CODEX_NVIDIA_COMPLETION,
+                request=MagicMock(),
+                prepared_request_body={"model": "nvidia/test-model"},
+                adapter_model="nvidia/test-model",
+                target_url="https://integrate.api.nvidia.com/v1/chat/completions",
+                api_key="nvidia-test-key",
+                api_base="https://integrate.api.nvidia.com/v1",
+                client_requested_stream=False,
+                completion_kwargs={"model": "test-model"},
+                request_input="hello",
+                responses_api_request={},
+                litellm_metadata={},
+                upstream_model="test-model",
+            )
+
+        assert operations == []
+        assert nvidia.completion.await_count == 0
+
+    @pytest.mark.asyncio
     async def test_missing_credentials_fail_closed_without_acompletion(self, monkeypatch):
         from litellm.proxy._types import ProxyException
 

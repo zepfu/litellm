@@ -8641,44 +8641,37 @@ async def _perform_codex_nvidia_completion_adapter_call(
     from litellm.proxy.pass_through_endpoints.providers.nvidia import (
         runtime as _nvidia_runtime,
     )
-    def _prepare_adapted_request() -> tuple[
-        Payload,
-        dict[str, Any] | None,
-        Any | None,
-    ]:
-        _ = adapter_model
-        _annotate_request_scope_for_adapted_access_log(
-            request,
-            httpx.URL(str(target_url)),
+    _annotate_request_scope_for_adapted_access_log(
+        request,
+        httpx.URL(str(target_url)),
+    )
+    watermark_intake = None
+    try:
+        watermark_intake = getattr(
+            getattr(request, "state", None), "watermark_intake", None
         )
+    except Exception:
         watermark_intake = None
-        try:
-            watermark_intake = getattr(
-                getattr(request, "state", None), "watermark_intake", None
-            )
-        except Exception:
-            watermark_intake = None
-        watermark_metadata = (
-            litellm_metadata if isinstance(litellm_metadata, dict) else {}
-        )
-        watermark_egress = apply_request_watermark_egress(
-            body=completion_kwargs,
-            intake=watermark_intake,
-            config=_get_runtime_text_watermark_config(),
-            endpoint=_watermark_endpoint_from_path("chat/completions", target_url),
-            direction="request",
-            metadata=watermark_metadata,
-            litellm_metadata=watermark_metadata,
-        )
-        adapted_body = watermark_egress.body
-        adapted_completion_kwargs: Any = completion_kwargs
-        if isinstance(adapted_body, dict):
-            adapted_completion_kwargs = adapted_body
-        if isinstance(adapted_completion_kwargs, dict):
-            adapted_completion_kwargs["caller_managed_hidden_retry"] = True
-        if isinstance(litellm_metadata, dict):
-            litellm_metadata["caller_managed_hidden_retry"] = True
-        return prepared_request_body, litellm_metadata, adapted_completion_kwargs
+    watermark_metadata = (
+        litellm_metadata if isinstance(litellm_metadata, dict) else {}
+    )
+    watermark_egress = apply_request_watermark_egress(
+        body=completion_kwargs,
+        intake=watermark_intake,
+        config=_get_runtime_text_watermark_config(),
+        endpoint=_watermark_endpoint_from_path("chat/completions", target_url),
+        direction="request",
+        metadata=watermark_metadata,
+        litellm_metadata=watermark_metadata,
+    )
+    adapted_body = watermark_egress.body
+    adapted_completion_kwargs: Any = completion_kwargs
+    if isinstance(adapted_body, dict):
+        adapted_completion_kwargs = adapted_body
+    if isinstance(adapted_completion_kwargs, dict):
+        adapted_completion_kwargs["caller_managed_hidden_retry"] = True
+    if isinstance(litellm_metadata, dict):
+        litellm_metadata["caller_managed_hidden_retry"] = True
 
     def _stamp_nvidia_attempt_accounting(target: Any) -> None:
         _nvidia_runtime._stamp_nvidia_attempt_accounting(
@@ -8699,10 +8692,6 @@ async def _perform_codex_nvidia_completion_adapter_call(
     custom_llm_provider = config.custom_llm_provider
 
     async def _operation() -> Any:
-        prepared_request_body, litellm_metadata, completion_kwargs = (
-            _prepare_adapted_request()
-        )
-
         def _copy_nvidia_lower_level_http_attempts(target: Any) -> None:
             _nvidia_runtime._copy_nvidia_lower_level_http_attempts(
                 litellm_metadata=target,
