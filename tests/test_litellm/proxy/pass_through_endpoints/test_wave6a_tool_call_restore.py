@@ -50,6 +50,7 @@ EXPECTED_SYMBOLS = (
     "_restore_adapted_custom_tool_stream_iterator",
     "_restore_adapted_custom_tool_calls_in_stream_event_payload",
     "_restore_adapted_custom_tool_calls_in_sse_event_block",
+    "_restore_adapted_tool_calls_in_associated_sse_block",
     "_restore_adapted_custom_tool_calls_in_streaming_response",
     "_restore_adapted_namespace_tool_calls_in_stream_event_payload",
     "_restore_adapted_namespace_tool_calls_in_sse_event_block",
@@ -58,6 +59,30 @@ EXPECTED_SYMBOLS = (
 )
 
 EXPECTED_SEAMS = {"_responses_repaired_output_item_id"}
+
+
+def _typed_sse_chunk(
+    payload: dict[str, Any],
+    *,
+    separator: bytes = b"\r\n\r\n",
+) -> tuple[bytes, Any]:
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+        ResponsesEventPipeline,
+        attach_responses_events,
+    )
+
+    event_type = payload["type"]
+    wire = (
+        f"event: {event_type}\r\ndata: "
+        f"{json.dumps(payload, separators=(',', ':'))}".encode()
+        + separator
+    )
+    event = ResponsesEventPipeline().parse_event(wire)
+    return attach_responses_events(wire, [event]), event
+
+
+async def _collect_response_chunks(response: Any) -> list[Any]:
+    return [chunk async for chunk in response.body_iterator]
 
 
 # ---------------------------------------------------------------------------
@@ -1244,6 +1269,48 @@ class TestCustomStreamingResponse:
         assert result is not resp
         assert result.media_type == "text/event-stream"
 
+    @pytest.mark.parametrize("restoration", ["custom", "namespace"])
+    def test_associated_noop_preserves_crlf_carrier_without_json_decode(
+        self,
+        host_deps: None,
+        monkeypatch: pytest.MonkeyPatch,
+        restoration: str,
+    ) -> None:
+        from fastapi.responses import StreamingResponse
+
+        chunk, event = _typed_sse_chunk(
+            {"type": "response.output_text.delta", "delta": "unchanged"}
+        )
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+            responses_emissions_from_chunk,
+        )
+
+        original_emission = responses_emissions_from_chunk(chunk)[0]
+
+        async def gen():
+            yield chunk
+
+        response = StreamingResponse(gen(), media_type="text/event-stream")
+        if restoration == "custom":
+            result = mod._restore_adapted_custom_tool_calls_in_streaming_response(
+                response, request_body={"tools": []}, adapter_model="m",
+            )
+        else:
+            result = mod._restore_adapted_namespace_tool_calls_in_streaming_response(
+                response, request_body={"tools": []}, adapter_model="test-model",
+            )
+
+        def unexpected_json_decode(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("associated event was reparsed")
+
+        monkeypatch.setattr(mod.json, "loads", unexpected_json_decode)
+        chunks = asyncio.run(_collect_response_chunks(result))
+
+        assert len(chunks) == 1
+        assert sse_mod._sse_block_wire_bytes(chunks[0]) == chunk
+        assert sse_mod._sse_block_events(chunks[0]) == [event]
+        assert responses_emissions_from_chunk(chunks[0])[0] is original_emission
+
     def test_end_to_end_stream_restore(self, host_deps: None) -> None:
         """Full SSE stream with added/delta/done produces restored output."""
         from fastapi.responses import StreamingResponse
@@ -1337,6 +1404,57 @@ class TestCustomStreamingResponse:
         # final unterminated block should not be double-terminated
         assert not combined.endswith("\n\n")
         assert ": keep-alive" in combined
+
+    def test_associated_custom_restore_preserves_effective_payload_and_event_envelope(
+        self,
+        host_deps: None,
+    ) -> None:
+        from fastapi.responses import StreamingResponse
+
+        added, added_event = _typed_sse_chunk(
+            {
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "name": "my_tool",
+                    "call_id": "call_1",
+                },
+            }
+        )
+        done, done_event = _typed_sse_chunk(
+            {
+                "type": "response.function_call_arguments.done",
+                "call_id": "call_1",
+                "arguments": '{"input":"hello"}',
+            }
+        )
+
+        async def gen():
+            yield added
+            yield done
+
+        response = StreamingResponse(gen(), media_type="text/event-stream")
+        result = mod._restore_adapted_custom_tool_calls_in_streaming_response(
+            response, request_body={"tools": []}, adapter_model="m",
+        )
+        chunks = asyncio.run(_collect_response_chunks(result))
+
+        assert len(chunks) == 2
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+            responses_emissions_from_chunk,
+        )
+
+        added_emission = responses_emissions_from_chunk(chunks[0])[0]
+        done_emission = responses_emissions_from_chunk(chunks[1])[0]
+        assert added_emission.source_event is added_event
+        assert added_emission.effective_payload["item"]["type"] == "custom_tool_call"
+        assert done_emission.source_event is done_event
+        assert done_emission.effective_payload["type"] == "response.custom_tool_call_input.done"
+        done_wire = bytes(chunks[1])
+        assert b"event: response.custom_tool_call_input.done\r\n" in done_wire
+        assert b"\r\n\r\n" in done_wire
+        data_line = next(line for line in done_wire.split(b"\r\n") if line.startswith(b"data:"))
+        assert json.loads(data_line.removeprefix(b"data: ")) == done_emission.effective_payload
 
 
 # ===========================================================================
