@@ -5652,11 +5652,12 @@ async def test_openai_responses_replays_safe_stock_namespace_tools_once(
         "description": "Client-managed collaboration namespace.",
         "tools": [
             {
-                "type": "namespace",
-                "tool_name": "spawn_agent",
+                "type": "function",
+                "name": "spawn_agent",
                 "description": "Start a child agent.",
-                "input_schema": {"type": "object", "properties": {}},
-                "encrypted": False,
+                "parameters": {"type": "object", "properties": {}},
+                "strict": False,
+                "defer_loading": False,
             }
         ],
     }

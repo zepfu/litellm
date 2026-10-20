@@ -1000,15 +1000,11 @@ def responses_effective_provider_tools_allowed(
             namespace_name = tool.get("name")
             if not isinstance(namespace_name, str) or not namespace_name.strip():
                 return True
-            if "description" in tool and not isinstance(
-                tool.get("description"), str
+            namespace_description = tool.get("description")
+            if (
+                not isinstance(namespace_description, str)
+                or not namespace_description.strip()
             ):
-                return True
-            if "deferLoading" in tool and not isinstance(
-                tool.get("deferLoading"), bool
-            ):
-                return True
-            if tool.get("deferLoading") is True:
                 return True
             children = tool.get("tools")
             if not isinstance(children, list):
@@ -1016,35 +1012,65 @@ def responses_effective_provider_tools_allowed(
             for child in children:
                 if not isinstance(child, Mapping):
                     return True
-                if child.get("type") != "namespace":
-                    return True
-                child_name = child.get("tool_name")
-                if not isinstance(child_name, str) or not child_name.strip():
-                    return True
-                if "description" in child and not isinstance(
-                    child.get("description"), str
-                ):
-                    return True
-                if "input_schema" in child and not isinstance(
-                    child.get("input_schema"), Mapping
-                ):
-                    return True
-                if "encrypted" in child and not isinstance(
-                    child.get("encrypted"), bool
-                ):
-                    return True
-                if not set(child).issubset(
-                    {
-                        "type",
-                        "tool_name",
-                        "description",
-                        "input_schema",
-                        "encrypted",
-                    }
-                ):
-                    return True
+                child_type = child.get("type")
+                if child_type == "function":
+                    child_name = child.get("name")
+                    if not isinstance(child_name, str) or not child_name.strip():
+                        return True
+                    if "description" in child and not isinstance(
+                        child.get("description"), str
+                    ):
+                        return True
+                    if "parameters" in child and not isinstance(
+                        child.get("parameters"), (Mapping, type(None))
+                    ):
+                        return True
+                    if "strict" in child and not isinstance(
+                        child.get("strict"), (bool, type(None))
+                    ):
+                        return True
+                    if "defer_loading" in child and not isinstance(
+                        child.get("defer_loading"), bool
+                    ):
+                        return True
+                    if not set(child).issubset(
+                        {
+                            "type",
+                            "name",
+                            "parameters",
+                            "strict",
+                            "defer_loading",
+                            "description",
+                        }
+                    ):
+                        return True
+                    continue
+                if child_type == "custom":
+                    child_name = child.get("name")
+                    if not isinstance(child_name, str) or not child_name.strip():
+                        return True
+                    if "description" in child and not isinstance(
+                        child.get("description"), str
+                    ):
+                        return True
+                    if "format" in child and not isinstance(
+                        child.get("format"), Mapping
+                    ):
+                        return True
+                    if "defer_loading" in child and not isinstance(
+                        child.get("defer_loading"), bool
+                    ):
+                        return True
+                    if not set(child).issubset(
+                        {"type", "name", "description", "format", "defer_loading"}
+                    ):
+                        return True
+                    continue
+                # Namespace children are stock function/custom tools. Any other
+                # child capability leaves replay safety unknown and commits.
+                return True
             if not set(tool).issubset(
-                {"type", "name", "description", "tools", "deferLoading"}
+                {"type", "name", "description", "tools"}
             ):
                 return True
             continue
