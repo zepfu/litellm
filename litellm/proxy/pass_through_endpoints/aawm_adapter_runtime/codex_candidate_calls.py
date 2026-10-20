@@ -2362,6 +2362,7 @@ if TYPE_CHECKING:
         *,
         request_body: Any = None,
     ) -> Response: ...
+    def _codex_nvidia_completion_adapter_response(**kwargs: Any) -> Response: ...
     def _codex_native_openai_candidate_unavailable_detail(
         exc: Any,
         **kwargs: Any,
@@ -2646,6 +2647,10 @@ def install(
             shield_cohere_responses_function_parameters,
         ),
         ("apply_request_watermark_egress", apply_request_watermark_egress),
+        (
+            "_codex_nvidia_completion_adapter_response",
+            _codex_nvidia_completion_adapter_response,
+        ),
         ("load_text_watermark_config", load_text_watermark_config),
         ("_get_runtime_text_watermark_config", _get_runtime_text_watermark_config),
         ("_watermark_endpoint_from_path", _watermark_endpoint_from_path),
@@ -8700,7 +8705,7 @@ async def _perform_codex_nvidia_completion_adapter_call(
 
         try:
             result = await litellm.acompletion(
-                **completion_kwargs,
+                **adapted_completion_kwargs,
                 api_key=api_key,
                 api_base=api_base,
                 litellm_metadata=litellm_metadata,

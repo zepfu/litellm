@@ -2474,7 +2474,9 @@ class TestCFG030CodexNvidiaCompletionAdapter:
             "_get_proxy_shared_aiohttp_session": MagicMock(return_value="shared-session"),
             "_build_responses_response_from_adapter_response": MagicMock(),
             "apply_request_watermark_egress": MagicMock(
-                side_effect=lambda **kwargs: SimpleNamespace(body=kwargs["body"])
+                side_effect=lambda **kwargs: SimpleNamespace(
+                    body={**kwargs["body"], "prepared_marker": "adapted"}
+                )
             ),
             "_get_runtime_text_watermark_config": MagicMock(return_value=None),
             "_watermark_endpoint_from_path": MagicMock(return_value="chat_completions"),
@@ -2595,6 +2597,37 @@ class TestCFG030CodexNvidiaCompletionAdapter:
 
         assert operations == []
         assert nvidia.completion.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_prepared_watermark_body_is_sent_upstream(self):
+        nvidia = self._nvidia_host(MagicMock())
+        completion_response = object()
+        nvidia.host["_codex_nvidia_completion_adapter_response"] = MagicMock(
+            return_value=completion_response
+        )
+
+        response = await nvidia.host["_perform_codex_nvidia_completion_adapter_call"](
+            config=nvidia.host["_aawm_adapter_config"].CODEX_NVIDIA_COMPLETION,
+            request=MagicMock(),
+            prepared_request_body={"model": "nvidia/test-model"},
+            adapter_model="nvidia/test-model",
+            target_url="https://integrate.api.nvidia.com/v1/chat/completions",
+            api_key="nvidia-test-key",
+            api_base="https://integrate.api.nvidia.com/v1",
+            client_requested_stream=False,
+            completion_kwargs={"model": "test-model", "source_marker": "original"},
+            request_input="hello",
+            responses_api_request={},
+            litellm_metadata={},
+            upstream_model="test-model",
+        )
+
+        call_kwargs = nvidia.completion.await_args.kwargs
+        assert response is completion_response
+        assert call_kwargs["model"] == "test-model"
+        assert call_kwargs["source_marker"] == "original"
+        assert call_kwargs["prepared_marker"] == "adapted"
+        assert call_kwargs["caller_managed_hidden_retry"] is True
 
     @pytest.mark.asyncio
     async def test_missing_credentials_fail_closed_without_acompletion(self, monkeypatch):
