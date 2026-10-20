@@ -401,6 +401,7 @@ def test_eligibility_uses_persisted_timestamp_lifetime(
         ),
         encoding="utf-8",
     )
+    auth_path.chmod(0o600)
 
     result = codex.inspect_codex_oauth_refresh_eligibility(
         auth_path,
@@ -409,10 +410,10 @@ def test_eligibility_uses_persisted_timestamp_lifetime(
     )
 
     assert result["issued_lifetime_seconds"] == 900.0
-    assert result["refresh_threshold_seconds"] == 450.0
+    assert result["refresh_threshold_seconds"] == 300.0
     assert result["refresh_threshold_source"] == "persisted_timestamp"
     assert result["refresh_threshold_degraded"] is False
-    assert result["refresh_due_at"] == "1970-01-01T00:24:10Z"
+    assert result["refresh_due_at"] == "1970-01-01T00:26:40Z"
     assert result["eligible"] is False
 
 
@@ -690,3 +691,42 @@ def test_sanitize_redacts_even_backslash_quoted_suffix_leaks(codex) -> None:
     sanitized_escaped = codex._sanitize_error_message(raw_escaped)
     assert "ret-value" not in sanitized_escaped
     assert "access_token=[REDACTED]" in sanitized_escaped
+
+
+@pytest.mark.parametrize("lifetime", [None, 120, 900, 7200])
+@pytest.mark.parametrize("buffer", [0, 60, 300, 900, 10000])
+def test_configured_buffer_agrees_across_refresh_consumers(
+    codex, tmp_path: Path, monkeypatch, lifetime, buffer: int
+) -> None:
+    now = 1000000
+    expiry = now + (lifetime or 20000)
+    token_data = {
+        "access_token": "synthetic-access",
+        "refresh_token": "synthetic-refresh",
+        "expires_at": expiry,
+    }
+    if lifetime is not None:
+        token_data["expires_in"] = lifetime
+    path = tmp_path / "auth.json"
+    path.write_text(json.dumps({"tokens": token_data}))
+    path.chmod(0o600)
+    monkeypatch.setattr(codex.time, "time", lambda: now)
+    expected = buffer if lifetime is None else min(buffer, lifetime / 2)
+    health = codex.inspect_codex_oauth_credential_health(path, buffer_seconds=buffer)
+    eligibility = codex.inspect_codex_oauth_refresh_eligibility(
+        path, buffer_seconds=buffer, now=lambda: now, poll_interval_seconds=30
+    )
+    summary = codex.refresh_codex_oauth_auth_file(
+        path, buffer_seconds=buffer, lock_file=tmp_path / "auth.lock"
+    )
+    for result in (health, eligibility, summary):
+        assert result["refresh_threshold_seconds"] == expected
+        assert result["refresh_threshold_degraded"] is (lifetime is None)
+    assert eligibility["eligible"] is False
+    assert summary["skipped"] is True
+
+    due = expiry - expected
+    monkeypatch.setattr(codex.time, "time", lambda: due - 1)
+    assert codex._token_needs_refresh(token_data, buffer_seconds=buffer) is False
+    monkeypatch.setattr(codex.time, "time", lambda: due)
+    assert codex._token_needs_refresh(token_data, buffer_seconds=buffer) is True
