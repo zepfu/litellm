@@ -1674,7 +1674,7 @@ class PassThroughStreamingHandler:
     def _is_openai_response_protection_unavailable_payload(
         error_payload: Optional[Dict[str, Any]],
     ) -> bool:
-        """Match the observed OpenAI protection-unavailable provider shape."""
+        """Match OpenAI protection errors with their optional provider code."""
         if not isinstance(error_payload, dict):
             return False
         direct_error = error_payload.get("error")
@@ -1693,7 +1693,7 @@ class PassThroughStreamingHandler:
                 and message.strip().lower()
                 == _OPENAI_RESPONSE_PROTECTION_UNAVAILABLE_ERROR
                 and candidate.get("type") == "internal_error"
-                and candidate.get("code") == "error"
+                and candidate.get("code") in (None, "error")
             ):
                 return True
         return False

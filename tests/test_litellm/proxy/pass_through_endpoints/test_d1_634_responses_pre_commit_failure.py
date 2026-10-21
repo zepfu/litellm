@@ -1650,6 +1650,87 @@ async def test_hidden_retry_retries_same_account_then_returns_503():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("provider_code", [None, "error"])
+async def test_response_protection_sse_uses_only_ordinary_retries(
+    provider_code: Optional[str],
+) -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        get_or_create_openai_provider_call_ledger,
+    )
+
+    request = MagicMock(spec=Request)
+    request.state = SimpleNamespace()
+    request.is_disconnected = AsyncMock(return_value=False)
+    target = "https://chatgpt.com/backend-api/codex/responses"
+    ledger = get_or_create_openai_provider_call_ledger(
+        request, custom_llm_provider="openai", target=target
+    )
+    assert ledger is not None
+    # The native provider returns HTTP 200 with this error event and a null code.
+    chunk = _sse(
+        "error",
+        {
+            "type": "error",
+            "error": {
+                "message": "response protection is unavailable",
+                "type": "internal_error",
+                "param": None,
+                "code": provider_code,
+            },
+        },
+    )
+    coordinator = MagicMock()
+    coordinator.deadline_seconds = 7200.0
+    coordinator.remaining_seconds = 7200.0
+    coordinator.within_deadline.return_value = True
+    coordinator.sleep_with_wakeup = AsyncMock()
+    sends = 0
+
+    async def operation():
+        nonlocal sends
+        sends += 1
+        assert sends <= 2, "protection failure received extended capacity retries"
+        ledger.reserve(
+            target=target,
+            candidate_context={"provider": "openai", "model": "gpt-6-luna"},
+            prior_response_closed=True,
+        )
+        response, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+            _FakeUpstreamStream([chunk]),
+            openai_alpha_capacity_retry_enabled=True,
+        )
+        await response.aclose()
+        assert failure is not None
+        raise failure
+
+    sleep = AsyncMock()
+    with patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+        sleep,
+    ):
+        with pytest.raises(ResponsesStreamPreCommitFailure) as raised:
+            await _execute_passthrough_pre_first_byte_with_hidden_retries(
+                kwargs={},
+                operation_name="stream_pre_first_byte",
+                operation=operation,
+                caller_managed_hidden_retry=False,
+                openai_capacity_coordinator=coordinator,
+                request=request,
+            )
+
+    assert sends == 2
+    sleep.assert_awaited_once_with(10.0)
+    coordinator.sleep_with_wakeup.assert_not_awaited()
+    coordinator.record_retry.assert_not_called()
+    assert raised.value.error_class == "openai_response_protection_unavailable"
+    normalized = raised.value.as_http_exception()
+    assert normalized.status_code == 503
+    assert normalized.detail["error"]["message"] == "response protection is unavailable"
+    assert normalized.detail["error"]["type"] == "internal_error"
+    assert getattr(normalized, "_aawm_provider_returned") is True
+
+
+@pytest.mark.asyncio
 async def test_hidden_retry_does_not_retry_usage_limit():
     async def operation():
         raise ResponsesStreamPreCommitFailure(
