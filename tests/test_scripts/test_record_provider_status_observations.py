@@ -7710,6 +7710,7 @@ def test_codex_oauth_refresh_reinspects_replaced_account_identity(
         ),
         encoding="utf-8",
     )
+    record.auth_path.chmod(0o600)
     config = _codex_oauth_auth_persist_config(
         apply=False,
         codex_oauth_inventory=inventory,
@@ -7767,6 +7768,7 @@ def test_codex_oauth_refresh_reinspects_replaced_account_identity(
         ),
         encoding="utf-8",
     )
+    replacement_path.chmod(0o600)
     os.replace(replacement_path, record.auth_path)
 
     second_events = loop._run_codex_oauth_refresh_task(
@@ -7827,6 +7829,7 @@ def test_codex_actual_attempt_throttle_retains_failed_degraded_aggregate(
         ),
         encoding="utf-8",
     )
+    record.auth_path.chmod(0o600)
     config = _codex_oauth_auth_persist_config(
         apply=False,
         codex_oauth_inventory=inventory,
