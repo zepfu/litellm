@@ -3516,6 +3516,20 @@ def _affinity_pins_account_identity(
     )
 
 
+def _owned_session_owner_record_pins_account_identity(
+    session_owner_record: Any,
+    affinity: Optional[Mapping[str, Any]],
+) -> bool:
+    sa = _session_affinity_mod()
+    return bool(
+        isinstance(session_owner_record, Mapping)
+        and sa._record_state(session_owner_record) == "owned"
+        and isinstance(affinity, Mapping)
+        and affinity.get("affinity_state_source") == "session_owner"
+        and _affinity_pins_account_identity(affinity)
+    )
+
+
 def _affinity_pins_xai_oauth_account_identity(
     affinity: Optional[Mapping[str, Any]],
 ) -> bool:
@@ -7093,27 +7107,35 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             "with durable session affinity."
         ),
     )
-
     authenticated_token_affinity = token_affinity is not None
-    account_identity_pinned = has_account_bound_state
-    effective_account_bound_state = has_account_bound_state
+
     account_failover_context = _get_codex_oauth_request_local_failover_context(
         request,
         candidate=affinity,
     )
-    if (
+    portable_account_failover = bool(
         account_failover_context is not None
         and account_failover_context.get("portable_replay")
-    ):
-        account_identity_pinned = False
-        if affinity is not None:
-            affinity = dict(affinity)
-            for field in (
-                "codex_oauth_account_label",
-                "codex_oauth_account_hash",
-                "codex_oauth_lane_key",
-            ):
-                affinity.pop(field, None)
+    )
+    owned_account_pin = _owned_session_owner_record_pins_account_identity(
+        session_owner_record,
+        affinity,
+    )
+    account_identity_pinned = (
+        (has_account_bound_state or owned_account_pin)
+        and not portable_account_failover
+    )
+    effective_account_bound_state = (
+        has_account_bound_state or account_identity_pinned
+    )
+    if affinity is not None and not account_identity_pinned:
+        affinity = dict(affinity)
+        for field in (
+            "codex_oauth_account_label",
+            "codex_oauth_account_hash",
+            "codex_oauth_lane_key",
+        ):
+            affinity.pop(field, None)
 
     affinity = _apply_codex_oauth_inventory_affinity_policy(
         affinity,
@@ -7876,7 +7898,10 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
                 ),
                 request=request,
             )
-        affinity = sa.owner_record_as_affinity_hint(session_owner_record)
+        affinity = sa.owner_record_as_strict_affinity_hint(
+            session_owner_record,
+            preserve_account_identity=True,
+        )
         session_owner_guard_meta.update(
             {
                 "decision": "compatible_owner",
@@ -7942,8 +7967,37 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
         if existing_affinity is not None:
             affinity_bypassed = True
 
+    account_failover_context = _get_codex_oauth_request_local_failover_context(
+        request,
+        candidate=affinity,
+    )
+    portable_account_failover = bool(
+        account_failover_context is not None
+        and account_failover_context.get("portable_replay")
+    )
+    owned_account_pin = _owned_session_owner_record_pins_account_identity(
+        session_owner_record,
+        affinity,
+    )
+    account_identity_pinned = (
+        (has_account_bound_state or owned_account_pin)
+        and not portable_account_failover
+    )
+    if affinity is not None and not account_identity_pinned:
+        affinity = dict(affinity)
+        for field in (
+            "codex_oauth_account_label",
+            "codex_oauth_account_hash",
+            "codex_oauth_lane_key",
+        ):
+            affinity.pop(field, None)
+
+    affinity = _apply_codex_oauth_inventory_affinity_policy(
+        affinity,
+        account_bound=account_identity_pinned,
+    )
     effective_account_bound_state = bool(
-        has_account_bound_state
+        has_account_bound_state or account_identity_pinned
         or _affinity_pins_xai_oauth_account_identity(affinity)
     )
     if affinity is not None:
@@ -7996,25 +8050,28 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
             )
             and _is_auto_agent_candidate_state_available(affinity_state)
         ):
-            return _attach_session_owner_selection_fields(
-                _attach_aawm_alias_routing_state_sources(
-                    {
-                        **affinity_state,
-                        "alias_model": alias_model,
-                        "session_key": session_key,
-                        "selection_reason": "session_affinity",
-                        "skipped": [],
-                        "in_flight_session": True,
-                        "has_account_bound_state": effective_account_bound_state,
-                        "request_mode": request_mode,
-                        "redispatch_ordinal": redispatch_ordinal,
-                        "affinity_bypassed": affinity_bypassed,
-                    },
-                    affinity=affinity,
-                    selected_state=affinity_state,
+            return _attach_account_bound_selection_metadata(
+                _attach_session_owner_selection_fields(
+                    _attach_aawm_alias_routing_state_sources(
+                        {
+                            **affinity_state,
+                            "alias_model": alias_model,
+                            "session_key": session_key,
+                            "selection_reason": "session_affinity",
+                            "skipped": [],
+                            "in_flight_session": True,
+                            "request_mode": request_mode,
+                            "redispatch_ordinal": redispatch_ordinal,
+                            "affinity_bypassed": affinity_bypassed,
+                        },
+                        affinity=affinity,
+                        selected_state=affinity_state,
+                    ),
+                    canonical_session_identity=canonical_session_identity,
+                    session_owner_guard=type("G", (), session_owner_guard_meta)(),
                 ),
-                canonical_session_identity=canonical_session_identity,
-                session_owner_guard=type("G", (), session_owner_guard_meta)(),
+                has_account_bound_state=effective_account_bound_state,
+                affinity=affinity,
             )
         if affinity_state["cooldown_seconds"] > 0:
             if session_owner_record is not None and sa._record_state(session_owner_record) == "owned":
@@ -8267,6 +8324,7 @@ _HOST_FUNCTION_NAMES = (
     "_is_codex_oauth_account_candidate",
     "_is_xai_oauth_account_candidate",
     "_affinity_pins_account_identity",
+    "_owned_session_owner_record_pins_account_identity",
     "_affinity_pins_xai_oauth_account_identity",
     "_affinity_account_lane",
     "_attach_account_bound_selection_metadata",
@@ -8382,6 +8440,9 @@ def install(host_globals: dict) -> None:
         "alias_routing_state": alias_routing_state,
         "_codex_quota_balance": _codex_quota_balance,
         "_admission": _admission,
+        "_owned_session_owner_record_pins_account_identity": (
+            _owned_session_owner_record_pins_account_identity
+        ),
         "Mapping": Mapping,
         "Sequence": Sequence,
         "inspect": inspect,
