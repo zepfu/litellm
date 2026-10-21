@@ -10379,6 +10379,11 @@ async def pass_through_request(  # noqa: PLR0915
                     ),
                     event_pipeline=responses_event_pipeline,
                 )
+                if is_xai_responses_wire_owned_route:
+                    processed_chunks = _CleanupBoundAsyncIterator(
+                        processed_chunks,
+                        upstream_chunk_iterator.aclose,
+                    )
             response_headers = HttpPassThroughEndpointHelpers.get_response_headers(
                 headers=response.headers,
                 litellm_call_id=litellm_call_id,
@@ -10965,6 +10970,11 @@ async def pass_through_request(  # noqa: PLR0915
                     ),
                     event_pipeline=responses_event_pipeline,
                 )
+                if is_xai_responses_wire_owned_route:
+                    processed_chunks = _CleanupBoundAsyncIterator(
+                        processed_chunks,
+                        upstream_chunk_iterator.aclose,
+                    )
             response_headers = HttpPassThroughEndpointHelpers.get_response_headers(
                 headers=response.headers,
                 litellm_call_id=litellm_call_id,
