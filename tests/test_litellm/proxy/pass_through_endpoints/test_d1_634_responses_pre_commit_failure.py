@@ -4339,6 +4339,147 @@ async def test_nonstream_openai_passthrough_responses_hands_off_capacity_coordin
     )
 
 
+def _stub_session_owner_lease(monkeypatch, session_affinity):
+    async def run_without_lease(_lease, operation):
+        return await operation()
+
+    monkeypatch.setattr(
+        session_affinity, "get_request_session_owner_lease", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        session_affinity, "run_with_session_owner_lease_renewal", run_without_lease
+    )
+    monkeypatch.setattr(
+        session_affinity, "finalize_request_session_owner_lease", AsyncMock()
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exit_reason", "status_code", "expected_exception"),
+    [
+        ("redirect", 302, ProxyException),
+        ("cancelled", 200, asyncio.CancelledError),
+    ],
+)
+@pytest.mark.parametrize("stream_request", [False, True])
+async def test_openai_post_send_close_failure_preserves_primary_exit(
+    monkeypatch,
+    exit_reason,
+    status_code,
+    expected_exception,
+    stream_request,
+):
+    from litellm.proxy import proxy_server
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+    from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+        pass_through_request,
+    )
+
+    class CloseFailingStream(httpx.AsyncByteStream):
+        def __init__(self):
+            self.close_calls = 0
+
+        async def __aiter__(self):
+            if False:
+                yield b""
+
+        async def aclose(self):
+            self.close_calls += 1
+            raise RuntimeError("upstream response close failed")
+
+    custom_body = {"model": "gpt-5.4", "input": "test"}
+    request = _responses_request(custom_body)
+    request.is_disconnected = AsyncMock(return_value=False)
+    upstream_stream = CloseFailingStream()
+    response_returned = False
+    responses = []
+
+    async def dispatch(outgoing_request):
+        nonlocal response_returned
+        upstream_response = httpx.Response(
+            status_code=status_code,
+            headers={
+                "content-type": "application/json",
+                **(
+                    {"location": "https://redirect.example/v1/responses"}
+                    if exit_reason == "redirect"
+                    else {}
+                ),
+            },
+            stream=upstream_stream,
+            request=outgoing_request,
+        )
+        responses.append(upstream_response)
+        response_returned = True
+        return upstream_response
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(dispatch), timeout=2)
+    monkeypatch.setattr(
+        pte,
+        "get_async_httpx_client",
+        lambda *_args, **_kwargs: SimpleNamespace(client=client),
+    )
+    monkeypatch.setattr(
+        pte,
+        "_read_request_body",
+        AsyncMock(return_value=custom_body),
+    )
+    monkeypatch.setattr(pte, "_aawm_session_owner_pre_send_guard", AsyncMock())
+
+    async def execute_operation(**kwargs):
+        return await kwargs["operation"]()
+
+    monkeypatch.setattr(
+        pte,
+        "_execute_passthrough_pre_first_byte_with_hidden_retries",
+        execute_operation,
+    )
+
+    _stub_session_owner_lease(monkeypatch, sa)
+    logging_obj = MagicMock()
+    logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
+    logging_obj.post_call_failure_hook = AsyncMock(return_value=None)
+    monkeypatch.setattr(proxy_server, "proxy_logging_obj", logging_obj)
+
+    primary_cancellation = asyncio.CancelledError("client request cancelled")
+    if exit_reason == "cancelled":
+        ensure_precommit_send_active = pte.ensure_precommit_send_active
+
+        def cancel_after_send():
+            if response_returned:
+                raise primary_cancellation
+            ensure_precommit_send_active()
+
+        monkeypatch.setattr(pte, "ensure_precommit_send_active", cancel_after_send)
+
+    try:
+        with pytest.raises(expected_exception) as raised:
+            await pass_through_request(
+                request=request,
+                target="https://api.openai.com/v1/responses",
+                custom_headers={},
+                user_api_key_dict=MagicMock(),
+                custom_body=custom_body,
+                custom_llm_provider="openai",
+                stream=stream_request,
+            )
+    finally:
+        await client.aclose()
+
+    if exit_reason == "redirect":
+        assert "Blocked OpenAI redirect response" in str(raised.value.detail)
+    else:
+        assert raised.value is primary_cancellation
+    assert len(responses) == 1
+    assert upstream_stream.close_calls == 1
+    assert request.state.aawm_openai_precommit_retirement_state == "failed"
+    assert request.state.aawm_openai_precommit_retirement_failed is True
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream_request", [False, True])
 @pytest.mark.parametrize("error_code", ["server_overloaded", "server_is_overloaded", "capacity_exhausted"])
@@ -4792,13 +4933,10 @@ async def test_failed_precommit_prefix_retired_before_retry_handoff(monkeypatch)
     )
 
     target = "https://api.openai.com/v1/responses"
-    mock_request = MagicMock(spec=Request)
-    mock_request.method = "POST"
-    mock_request.url = SimpleNamespace(path="/openai_passthrough/v1/responses")
-    mock_request.headers = {"content-type": "application/json"}
-    mock_request.query_params = {}
-    mock_request.state = SimpleNamespace()
     custom_body = {"model": "gpt-5.4"}
+    mock_request = _responses_request(custom_body)
+    mock_request.scope["state"] = {}
+    mock_request.is_disconnected = AsyncMock(return_value=False)
     stream = _ClosableAsyncByteStream([
         _sse(
             "error",

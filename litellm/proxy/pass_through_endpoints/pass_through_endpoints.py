@@ -6564,13 +6564,6 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         ):
             if not is_openai_redirect:
                 return
-            try:
-                await wait_for("resource_cleanup", response.aclose())
-            except Exception:  # noqa: BLE001
-                verbose_proxy_logger.debug(
-                    "Failed to close rejected OpenAI redirect response",
-                    exc_info=True,
-                )
             HttpPassThroughEndpointHelpers._raise_egress_guard_block(
                 detail=(
                     "Blocked OpenAI redirect response before any follow-up "
@@ -9575,6 +9568,15 @@ async def pass_through_request(  # noqa: PLR0915
             """Close and positively record raw-response retirement."""
 
             if response is None:
+                if (
+                    getattr(
+                        request.state,
+                        "aawm_openai_precommit_retirement_state",
+                        None,
+                    )
+                    == "failed"
+                ):
+                    return False
                 request.state.aawm_openai_precommit_retirement_failed = False
                 request.state.aawm_openai_precommit_retirement_state = (
                     "not_applicable"
@@ -10580,33 +10582,26 @@ async def pass_through_request(  # noqa: PLR0915
                         ),
                     )
                     try:
-                        ensure_precommit_send_active()
-                    except asyncio.CancelledError:
-                        await wait_for("resource_cleanup", response.aclose())
+                        register_active_upstream_response(request, response)
+                        _record_openai_final_send_binding_observation(
+                            request=request,
+                            metadata=passthrough_metadata,
+                            correlation_id=litellm_call_id,
+                            outcome="transport_returned",
+                            owner_comparison_mode=owner_comparison_mode,
+                            owner_comparison_result=owner_comparison_result,
+                            selected_account_context=selected_openai_account_context,
+                            current_account_context=current_selected_account_context,
+                            expected_model=expected_model,
+                            serialized_model=serialized_model,
+                            protected_headers_match=protected_headers_match,
+                            ledger_calls_before=ledger_calls_before,
+                            reservation_ordinal=reservation.ordinal,
+                            transport_outcome="response_returned",
+                        )
+                    except BaseException:
+                        await _retire_openai_precommit_response(response)
                         raise
-                    _record_openai_final_send_binding_observation(
-                        request=request,
-                        metadata=passthrough_metadata,
-                        correlation_id=litellm_call_id,
-                        outcome="transport_returned",
-                        owner_comparison_mode=owner_comparison_mode,
-                        owner_comparison_result=owner_comparison_result,
-                        selected_account_context=selected_openai_account_context,
-                        current_account_context=current_selected_account_context,
-                        expected_model=expected_model,
-                        serialized_model=serialized_model,
-                        protected_headers_match=protected_headers_match,
-                        ledger_calls_before=ledger_calls_before,
-                        reservation_ordinal=reservation.ordinal,
-                        transport_outcome="response_returned",
-                    )
-                    await HttpPassThroughEndpointHelpers.reject_managed_xai_redirect_response(
-                        response=response,
-                        url=url,
-                        credential_family=egress_credential_family,
-                        expected_target_family=expected_target_family,
-                        custom_llm_provider=custom_llm_provider,
-                    )
                 except (httpx.ConnectError, httpx.ConnectTimeout):
                     _record_openai_final_send_binding_observation(
                         request=request,
@@ -10625,8 +10620,8 @@ async def pass_through_request(  # noqa: PLR0915
                         transport_outcome="connection_error",
                     )
                     record_transport_connection_attempt(request)
+                    await _retire_openai_precommit_response(None)
                     raise
-                register_active_upstream_response(request, response)
                 return response
 
             openai_send_request_fn = _send_prepared_openai_request
@@ -10845,6 +10840,7 @@ async def pass_through_request(  # noqa: PLR0915
                             "upstream_response", async_client.send(req, **send_kwargs)
                         )
                     raw_response = response
+                    ensure_precommit_send_active()
                     await HttpPassThroughEndpointHelpers.reject_managed_xai_redirect_response(
                         response=response,
                         url=url,
@@ -10897,8 +10893,6 @@ async def pass_through_request(  # noqa: PLR0915
                 except BaseException:
                     if raw_response is not None:
                         await _retire_openai_precommit_response(raw_response)
-                    else:
-                        await _record_retired_openai_precommit_response()
                     raise
 
             try:
@@ -11338,6 +11332,7 @@ async def pass_through_request(  # noqa: PLR0915
                     )
                 )
                 raw_response = response
+                ensure_precommit_send_active()
                 await HttpPassThroughEndpointHelpers.reject_managed_xai_redirect_response(
                     response=response,
                     url=url,
@@ -11497,8 +11492,6 @@ async def pass_through_request(  # noqa: PLR0915
             except BaseException:
                 if raw_response is not None:
                     await _retire_openai_precommit_response(raw_response)
-                else:
-                    await _record_retired_openai_precommit_response()
                 raise
 
         try:
