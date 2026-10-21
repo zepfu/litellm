@@ -1001,10 +1001,9 @@ def responses_effective_provider_tools_allowed(
             if not isinstance(namespace_name, str) or not namespace_name.strip():
                 return True
             namespace_description = tool.get("description")
-            if (
-                not isinstance(namespace_description, str)
-                or not namespace_description.strip()
-            ):
+            # Stock Codex uses an empty namespace description for its ordinary
+            # client-executed function/custom tool namespace.
+            if not isinstance(namespace_description, str):
                 return True
             children = tool.get("tools")
             if not isinstance(children, list):
