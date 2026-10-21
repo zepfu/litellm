@@ -833,6 +833,7 @@ def _copy_translated_anthropic_adapter_response_headers(
         if header_name.lower() in {
             "content-length",
             "content-encoding",
+            "content-type",
             "transfer-encoding",
         }:
             continue
