@@ -7128,7 +7128,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
     effective_account_bound_state = (
         has_account_bound_state or account_identity_pinned
     )
-    if affinity is not None and not account_identity_pinned:
+    if affinity is not None and portable_account_failover:
         affinity = dict(affinity)
         for field in (
             "codex_oauth_account_label",
@@ -7983,7 +7983,7 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
         (has_account_bound_state or owned_account_pin)
         and not portable_account_failover
     )
-    if affinity is not None and not account_identity_pinned:
+    if affinity is not None and portable_account_failover:
         affinity = dict(affinity)
         for field in (
             "codex_oauth_account_label",
