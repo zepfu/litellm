@@ -454,6 +454,7 @@ async def test_rr054_issue9_responses_stream_vs_nonstream_finalization(
         assert isinstance(collapsed, Response)
         assert not isinstance(collapsed, StreamingResponse)
         assert collapsed.status_code == 201
+        assert collapsed.media_type == "application/json"
 
 
 @pytest.mark.parametrize("adapter_name,config", COMPLETION_ADAPTERS, ids=[n for n, _ in COMPLETION_ADAPTERS])

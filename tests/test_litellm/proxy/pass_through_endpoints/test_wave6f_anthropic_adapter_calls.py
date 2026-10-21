@@ -585,12 +585,16 @@ class TestCopyResponseHeaders:
         upstream = Response(content="ok")
         upstream.headers["x-custom"] = "val"
         upstream.headers["content-length"] = "2"
-        translated = Response(content="translated")
+        upstream.headers["CONTENT-TYPE"] = "text/event-stream"
+        translated = Response(
+            content="translated", media_type="text/plain; charset=utf-8"
+        )
         mod._copy_translated_anthropic_adapter_response_headers(
             translated_response=translated, upstream_response=upstream
         )
         assert translated.headers["x-custom"] == "val"
         assert translated.headers.get("content-length") != "2"
+        assert translated.headers["content-type"] == "text/plain; charset=utf-8"
 
 
 class TestAccessLogTargetLabel:
