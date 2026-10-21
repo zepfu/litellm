@@ -4070,7 +4070,11 @@ def test_interchangeable_policy_removes_legacy_account_affinity(
         "codex_oauth_lane_key": "codex-oauth:account1:hash-account-1",
     }
 
-    adjusted = selection._apply_codex_oauth_inventory_affinity_policy(legacy)
+    inventory = codex_oauth_inventory.load_codex_oauth_inventory()
+    adjusted = selection._apply_codex_oauth_inventory_affinity_policy(
+        legacy,
+        inventory=inventory,
+    )
     assert adjusted is not None
     assert adjusted["codex_oauth_credential_affinity"] == "interchangeable"
     assert "codex_oauth_account_label" not in adjusted
@@ -4097,6 +4101,7 @@ def test_account_bound_policy_preserves_creating_account_lane(
     adjusted = selection._apply_codex_oauth_inventory_affinity_policy(
         affinity,
         account_bound=True,
+        inventory=codex_oauth_inventory.load_codex_oauth_inventory(),
     )
     assert adjusted is not None
     assert adjusted["codex_oauth_credential_affinity"] == "interchangeable"

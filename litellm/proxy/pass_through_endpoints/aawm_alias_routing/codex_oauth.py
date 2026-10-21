@@ -1099,7 +1099,9 @@ def _direct_codex_oauth_affinity_from_session_owner(
         "codex_oauth_account_label": label,
         "codex_oauth_account_hash": account_hash,
         "codex_oauth_lane_key": lane_key,
-        "affinity_state_source": owner_affinity.get("affinity_state_source") or "session_owner",
+        "affinity_state_source": owner_affinity.get(
+            "affinity_state_source"
+        ) or "session_owner",
     }
 
 
