@@ -153,6 +153,62 @@ async def test_stream_wrapper_emits_mcp_tool_use_and_result_blocks():
 
 
 @pytest.mark.asyncio
+async def test_stream_wrapper_reads_dict_completed_tool_output_and_nested_usage():
+    response_obj = {
+        "status": "completed",
+        "usage": {
+            "input_tokens": 13,
+            "output_tokens": 6,
+            "cache_creation_input_tokens": 2,
+            "cache_read_input_tokens": 3,
+            "input_tokens_details": {"cached_tokens": 2},
+            "output_tokens_details": {"reasoning_tokens": 4},
+        },
+        "output": [{"type": "function_call", "id": "fc_terminal"}],
+    }
+    wrapper = AnthropicResponsesStreamWrapper(
+        responses_stream=_make_stream(
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(type="response.completed", response=response_obj),
+        ),
+        model="gpt-5.4",
+    )
+
+    chunks = [chunk async for chunk in wrapper]
+
+    message_delta = next(chunk for chunk in chunks if chunk["type"] == "message_delta")
+    assert message_delta["delta"]["stop_reason"] == "tool_use"
+    assert message_delta["usage"] == {
+        "input_tokens": 13,
+        "output_tokens": 6,
+        "cache_creation_input_tokens": 2,
+        "cache_read_input_tokens": 3,
+    }
+
+
+@pytest.mark.asyncio
+async def test_stream_wrapper_reads_dict_incomplete_status_and_usage():
+    response_obj = {
+        "status": "incomplete",
+        "usage": {"input_tokens": 7, "output_tokens": 2},
+        "output": [],
+    }
+    wrapper = AnthropicResponsesStreamWrapper(
+        responses_stream=_make_stream(
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(type="response.incomplete", response=response_obj),
+        ),
+        model="gpt-5.4",
+    )
+
+    chunks = [chunk async for chunk in wrapper]
+
+    message_delta = next(chunk for chunk in chunks if chunk["type"] == "message_delta")
+    assert message_delta["delta"]["stop_reason"] == "max_tokens"
+    assert message_delta["usage"] == {"input_tokens": 7, "output_tokens": 2}
+
+
+@pytest.mark.asyncio
 async def test_stream_wrapper_failed_response_raises_provider_error():
     response_obj = SimpleNamespace(
         status="failed",
