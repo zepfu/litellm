@@ -7035,8 +7035,10 @@ def test_passive_oauth_health_inspection_classifies_expired_and_malformed(
         ),
         encoding="utf-8",
     )
+    expired_path.chmod(0o600)
     malformed_path = tmp_path / "malformed-codex.json"
     malformed_path.write_text("{not-json", encoding="utf-8")
+    malformed_path.chmod(0o600)
 
     expired = codex_oauth_refresh.inspect_codex_oauth_credential_health(
         expired_path
@@ -7048,7 +7050,7 @@ def test_passive_oauth_health_inspection_classifies_expired_and_malformed(
     assert expired["health_status"] == "expired"
     assert expired["error_class"] == "CredentialExpiredError"
     assert malformed["health_status"] == "malformed"
-    assert malformed["error_class"] == "ValueError"
+    assert malformed["error_class"] == "CodexOAuthCredentialError"
 
 
 def _grok_oidc_auth_persist_config(**overrides):
