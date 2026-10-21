@@ -18778,6 +18778,9 @@ async def test_codex_auto_agent_native_openai_owns_hidden_retry_only_for_alpha(
         headers=managed_codex_headers,
         json=request_body,
     )
+    async def run_owner_renewal_inline(_lease, operation):
+        return await operation()
+
     transient_failure = httpx.ReadTimeout(
         "transient upstream failure",
         request=upstream_request,
@@ -18822,6 +18825,10 @@ async def test_codex_auto_agent_native_openai_owns_hidden_retry_only_for_alpha(
     ), patch(
         "litellm.proxy.pass_through_endpoints.pass_through_endpoints._aawm_session_owner_on_upstream_result",
         new=AsyncMock(),
+    ), patch.object(
+        sa,
+        "run_with_session_owner_lease_renewal",
+        new=run_owner_renewal_inline,
     ), patch(
         "litellm.proxy.proxy_server.proxy_logging_obj"
     ) as mock_logging_obj:

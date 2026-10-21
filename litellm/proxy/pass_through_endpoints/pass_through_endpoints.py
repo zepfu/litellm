@@ -10918,6 +10918,16 @@ async def pass_through_request(  # noqa: PLR0915
                 except BaseException:
                     if raw_response is not None:
                         await _retire_openai_precommit_response(raw_response)
+                        raw_response = None
+                    elif (
+                        getattr(
+                            request.state,
+                            "aawm_openai_precommit_retirement_state",
+                            None,
+                        )
+                        is None
+                    ):
+                        await _retire_openai_precommit_response(None)
                     raise
 
             try:
