@@ -8045,6 +8045,8 @@ async def test_p11r1_staged_portable_transition_uses_cas_before_ordinary_refresh
         rebind_calls.append(dict(kwargs))
         result = MagicMock()
         result.outcome = sa.SessionOwnerMutationOutcome.PROMOTED
+        result.session_identity = kwargs.get("session_identity")
+        result.cache_key = "ck-p11r1"
         return result
 
     async def _record_ordinary(request=None, **kwargs: Any) -> MagicMock:
@@ -8088,8 +8090,12 @@ async def test_p11r1_staged_portable_transition_uses_cas_before_ordinary_refresh
     )
 
     mock_lease = MagicMock()
+    mock_lease.released = False
+    mock_lease.promoted = False
     mock_lease.wire_disposition = None
     mock_lease.wire_terminal_pending = True
+
+    mock_receipt = MagicMock()
 
     with patch.object(
         sa,
@@ -8107,6 +8113,14 @@ async def test_p11r1_staged_portable_transition_uses_cas_before_ordinary_refresh
         sa,
         "session_owner_lease_is_release_only",
         return_value=False,
+    ), patch.object(
+        sa,
+        "_session_owner_lease_release_invariant",
+        return_value=None,
+    ), patch.object(
+        sa,
+        "record_session_owner_continuity_receipt",
+        new=mock_receipt,
     ), patch.object(
         pte,
         "_finalize_native_openai_responses_legacy_affinity",
@@ -8126,6 +8140,10 @@ async def test_p11r1_staged_portable_transition_uses_cas_before_ordinary_refresh
     assert not ordinary_calls, (
         "ordinary finalize_session_owner_lease_on_wire_disposition was called"
     )
+    mock_receipt.assert_called_once()
+    assert mock_receipt.call_args.kwargs["phase"] == "owner_finalize"
+    assert mock_receipt.call_args.kwargs["source"] == "wire_terminal"
+    assert mock_receipt.call_args.kwargs["outcome"] == "promoted"
 
 
 @pytest.mark.asyncio
@@ -8151,6 +8169,8 @@ async def test_p11r1_no_staged_transition_uses_ordinary_refresh() -> None:
     mock_request.state = SimpleNamespace()
 
     mock_lease = MagicMock()
+    mock_lease.released = False
+    mock_lease.promoted = False
     mock_lease.wire_disposition = None
     mock_lease.wire_terminal_pending = True
 
@@ -8166,6 +8186,10 @@ async def test_p11r1_no_staged_transition_uses_ordinary_refresh() -> None:
         sa,
         "session_owner_lease_is_release_only",
         return_value=False,
+    ), patch.object(
+        sa,
+        "_session_owner_lease_release_invariant",
+        return_value=None,
     ), patch.object(
         pte,
         "_finalize_native_openai_responses_legacy_affinity",

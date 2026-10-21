@@ -8223,37 +8223,60 @@ async def _finalize_native_openai_responses_owner_wire_disposition(  # noqa: PLR
                 else None
             )
             if isinstance(_staged, dict) and _staged:
-                _rebind = getattr(
-                    sa, "rebind_session_owner_for_portable_failover", None
-                )
-                if callable(_rebind):
-                    result = await _rebind(
-                        session_identity=_staged.get("session_identity"),
-                        source_owner_id=_staged.get("source_owner_id"),
-                        source_attributes=(
-                            _staged.get("source_attributes") or {}
-                        ),
-                        destination_attributes=(
-                            _staged.get("destination_attributes") or {}
-                        ),
-                        authorization=_staged.get("authorization"),
-                        failover_ordinal=_staged.get("failover_ordinal"),
+                # Apply the same lease-state guards as
+                # finalize_session_owner_lease_on_wire_disposition before
+                # attempting the portable CAS rebind.
+                if lease is not None and (
+                    lease.released
+                    or lease.promoted
+                    or lease.wire_disposition is not None
+                    or sa._session_owner_lease_release_invariant(lease) is not None
+                ):
+                    pass  # skip portable CAS; fall through to ordinary path
+                else:
+                    _rebind = getattr(
+                        sa, "rebind_session_owner_for_portable_failover", None
                     )
-                    outcome = getattr(
-                        getattr(result, "outcome", None), "value", None
-                    )
-                    if outcome in {"promoted", "already_owned"}:
-                        if lease is not None:
-                            lease.wire_disposition = disposition.value
-                            lease.wire_terminal_pending = False
-                            lease.promoted = True
-                            _stop = getattr(
-                                sa, "_stop_session_owner_lease_renewal", None
+                    if callable(_rebind):
+                        result = await _rebind(
+                            session_identity=_staged.get("session_identity"),
+                            source_owner_id=_staged.get("source_owner_id"),
+                            source_attributes=(
+                                _staged.get("source_attributes") or {}
+                            ),
+                            destination_attributes=(
+                                _staged.get("destination_attributes") or {}
+                            ),
+                            authorization=_staged.get("authorization"),
+                            failover_ordinal=_staged.get("failover_ordinal"),
+                        )
+                        outcome = getattr(
+                            getattr(result, "outcome", None), "value", None
+                        )
+                        if outcome in {"promoted", "already_owned"}:
+                            if lease is not None:
+                                lease.wire_disposition = disposition.value
+                                lease.wire_terminal_pending = False
+                                lease.promoted = True
+                                _stop = getattr(
+                                    sa, "_stop_session_owner_lease_renewal", None
+                                )
+                                if callable(_stop):
+                                    _stop(lease)
+                                lease.last_finalization_outcome = outcome
+                            sa.record_session_owner_continuity_receipt(
+                                request,
+                                phase="owner_finalize",
+                                source="wire_terminal",
+                                session_identity=getattr(
+                                    result, "session_identity", None
+                                ),
+                                cache_key=getattr(
+                                    result, "cache_key", None
+                                ),
+                                outcome=outcome,
                             )
-                            if callable(_stop):
-                                _stop(lease)
-                            lease.last_finalization_outcome = outcome
-                        portable_cas_applied = True
+                            portable_cas_applied = True
         if not portable_cas_applied:
             lease = sa.get_request_session_owner_lease(request)
             result = await sa.finalize_session_owner_lease_on_wire_disposition(request, disposition=disposition.value)
