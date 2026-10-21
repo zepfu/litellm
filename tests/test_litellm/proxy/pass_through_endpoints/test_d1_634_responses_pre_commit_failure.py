@@ -6172,7 +6172,7 @@ async def test_openai_responses_replays_safe_stock_namespace_tools_once(
     namespace_tool = {
         "type": "namespace",
         "name": "multi_agent_v1",
-        "description": "Client-managed collaboration namespace.",
+        "description": "",
         "tools": [
             {
                 "type": "function",
@@ -7108,6 +7108,7 @@ async def _start_openai_responses_stream(
     request.method = "POST"
     request.url = SimpleNamespace(path="/openai_passthrough/v1/responses")
     request.headers = {"content-type": "application/json"}
+    request.scope = {"headers": []}
     request.query_params = {}
     request.state = SimpleNamespace()
     request.is_disconnected = AsyncMock(return_value=False)
