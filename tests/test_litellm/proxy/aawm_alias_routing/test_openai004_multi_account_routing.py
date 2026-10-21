@@ -4221,6 +4221,260 @@ def test_owner_hint_preserves_account_identity_only_when_requested() -> None:
     )
 
 
+def _patch_owned_canonical_affinity_selector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncMock:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+
+    async def _owned(**_kwargs):
+        return (
+            _owned_interchangeable_record("account2"),
+            "cache-key",
+            None,
+        )
+
+    monkeypatch.setattr(sa, "get_session_owner_record", _owned)
+    monkeypatch.setattr(
+        sa,
+        "resolve_canonical_session_identity",
+        lambda *_args, **_kwargs: "sess-openai-019",
+    )
+    monkeypatch.setattr(
+        codex_oauth_inventory,
+        "load_codex_oauth_inventory",
+        _interchangeable_inventory,
+    )
+    monkeypatch.setattr(
+        codex_oauth,
+        "_load_codex_oauth_headers_for_record",
+        _healthy_auth,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_has_account_bound_state",
+        lambda _body: False,
+    )
+    _patch_selector_runtime(monkeypatch)
+
+    async def _alternate(**_kwargs):
+        raise AssertionError("ordinary owned affinity must not fall back")
+
+    monkeypatch.setattr(
+        lpe,
+        "_build_codex_auto_agent_candidate_states",
+        _alternate,
+    )
+    return AsyncMock()
+
+
+def _anthropic_owned_record(label: str) -> dict[str, Any]:
+    account_hash = "hash-account-1" if label == "account1" else "hash-account-2"
+    return {
+        "state": "owned",
+        "owner": "owner-1",
+        "attributes": {
+            "provider": "openai",
+            "model": "gpt-5.3-codex",
+            "route_family": "anthropic_openai_responses_adapter",
+            "endpoint_contract": "anthropic_openai_responses_adapter",
+            "state_format": "anthropic_openai_responses_adapter",
+            "account_label": label,
+            "account_hash": account_hash,
+            "account_lane": f"codex-oauth:{label}:{account_hash}",
+            "credential_affinity": "interchangeable",
+        },
+    }
+
+
+def _patch_owned_anthropic_affinity_selector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncMock:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+
+    async def _owned(**_kwargs):
+        return (
+            _anthropic_owned_record("account2"),
+            "cache-key",
+            None,
+        )
+
+    monkeypatch.setattr(sa, "get_session_owner_record", _owned)
+    monkeypatch.setattr(
+        sa,
+        "resolve_canonical_session_identity",
+        lambda *_args, **_kwargs: "sess-anthropic-019",
+    )
+    monkeypatch.setattr(
+        codex_oauth_inventory,
+        "load_codex_oauth_inventory",
+        _interchangeable_inventory,
+    )
+    monkeypatch.setattr(
+        codex_oauth,
+        "_load_codex_oauth_headers_for_record",
+        _healthy_auth,
+    )
+    _patch_selector_runtime(monkeypatch)
+    anthropic_enumeration = SelectionEnumeration(
+        candidates=(
+            _candidate(),
+            {
+                **_candidate(),
+                "route_family": "anthropic_openai_responses_adapter",
+            },
+        ),
+        commit_token=None,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_resolve_aawm_alias_selection_enumeration",
+        lambda request, alias, *, ingress, client_product_label=None: (
+            anthropic_enumeration
+        ),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_select_snapshot_candidates",
+        lambda alias, *, ingress, client_product_label, request,
+        include_out_of_schedule: list(anthropic_enumeration.candidates),
+    )
+
+    async def _alternate(**_kwargs):
+        raise AssertionError("ordinary owned affinity must not fall back")
+
+    monkeypatch.setattr(
+        lpe,
+        "_build_anthropic_auto_agent_candidate_states",
+        _alternate,
+    )
+    return AsyncMock()
+
+
+@pytest.mark.asyncio
+async def test_owned_text_only_continuation_selects_canonical_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _patch_owned_canonical_affinity_selector(monkeypatch)
+
+    selected = await lpe._select_codex_auto_agent_candidate(
+        request=_request(),
+        request_body={"model": "basic"},
+    )
+
+    builder.assert_not_awaited()
+    assert selected["selection_reason"] == "session_owner_pin"
+    assert selected["candidate"]["codex_oauth_account_label"] == "account2"
+    assert selected["candidate"]["codex_oauth_account_hash"] == "hash-account-2"
+    assert selected["candidate"]["codex_oauth_lane_key"] == (
+        "codex-oauth:account2:hash-account-2"
+    )
+    assert selected["has_account_bound_state"] is True
+    assert selected["account_bound_owner_lane"] == (
+        "codex-oauth:account2:hash-account-2"
+    )
+
+
+@pytest.mark.asyncio
+async def test_authorized_portable_context_releases_owned_account_pin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _patch_owned_canonical_affinity_selector(monkeypatch)
+    request = _request()
+    request.state.aawm_codex_oauth_request_local_failover_context = {
+        "base_slot": "openai:gpt-5.3-codex:codex_responses:",
+        "candidate_identity": {
+            "provider": CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+            "model": "gpt-5.3-codex",
+            "route_family": "codex_responses",
+        },
+        "attempted_account_hashes": ["hash-account-1"],
+        "portable_replay": True,
+    }
+
+    selected = await lpe._select_codex_auto_agent_candidate(
+        request=request,
+        request_body={
+            "model": "basic",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "done",
+                }
+            ],
+        },
+    )
+
+    builder.assert_not_awaited()
+    assert selected["selection_reason"] == "session_owner_pin"
+    assert selected["candidate"]["codex_oauth_account_label"] == "account1"
+    assert selected["candidate"]["codex_oauth_account_hash"] == "hash-account-1"
+    assert selected["has_account_bound_state"] is False
+    assert "account_bound_owner_lane" not in selected
+
+
+@pytest.mark.asyncio
+async def test_owned_anthropic_continuation_selects_canonical_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _patch_owned_anthropic_affinity_selector(monkeypatch)
+
+    selected = await lpe._select_anthropic_auto_agent_candidate(
+        request=_request(),
+        request_body={"model": "basic"},
+    )
+
+    builder.assert_not_awaited()
+    assert selected["selection_reason"] == "session_affinity"
+    assert selected["candidate"]["codex_oauth_account_label"] == "account2"
+    assert selected["candidate"]["codex_oauth_account_hash"] == (
+        "hash-account-2"
+    )
+    assert selected["candidate"]["codex_oauth_lane_key"] == (
+        "codex-oauth:account2:hash-account-2"
+    )
+    assert selected["has_account_bound_state"] is True
+    assert selected["account_bound_owner_lane"] == (
+        "codex-oauth:account2:hash-account-2"
+    )
+
+
+@pytest.mark.asyncio
+async def test_authorized_portable_anthropic_context_releases_pin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _patch_owned_anthropic_affinity_selector(monkeypatch)
+    request = _request()
+    request.state.aawm_codex_oauth_request_local_failover_context = {
+        "base_slot": "openai:gpt-5.3-codex:anthropic_openai_responses_adapter:",
+        "candidate_identity": {
+            "provider": CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+            "model": "gpt-5.3-codex",
+            "route_family": "anthropic_openai_responses_adapter",
+        },
+        "attempted_account_hashes": ["hash-account-1"],
+        "portable_replay": True,
+    }
+
+    selected = await lpe._select_anthropic_auto_agent_candidate(
+        request=request,
+        request_body={"model": "basic"},
+    )
+
+    builder.assert_not_awaited()
+    assert selected["selection_reason"] == "session_affinity"
+    assert selected["candidate"]["codex_oauth_account_label"] == "account1"
+    assert selected["candidate"]["codex_oauth_account_hash"] == (
+        "hash-account-1"
+    )
+    assert selected["has_account_bound_state"] is False
+    assert "account_bound_owner_lane" not in selected
+
+
 def test_account_bound_state_blocks_interchangeable_failover() -> None:
     request = _request()
     candidate = {
