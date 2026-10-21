@@ -1490,6 +1490,7 @@ def _codex_oauth_account_exhaustion_is_confirmed(  # noqa: PLR0915
         "usage_limit_reached",
         "candidate_unavailable",
         "capacity_exhausted",
+        "server_overloaded",
     }:
         return False
     account_hash = str(candidate.get("codex_oauth_account_hash") or "").strip()
@@ -1510,7 +1511,7 @@ def _codex_oauth_account_exhaustion_is_confirmed(  # noqa: PLR0915
     )
     provider_returned = attempt_record.get("provider_returned") is True
     if (
-        error_class == "capacity_exhausted"
+        error_class in {"capacity_exhausted", "server_overloaded"}
         and attempted_provider_call
         and provider_returned
     ):
