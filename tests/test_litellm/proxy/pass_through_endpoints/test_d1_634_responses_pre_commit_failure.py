@@ -47,6 +47,31 @@ from litellm.proxy.pass_through_endpoints.success_handler import (
 from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
 
 
+def _configure_precommit_overload_client(
+    mock_client_obj,
+    upstream_response,
+    mock_logging_obj,
+    custom_body,
+    stream_request,
+):
+    mock_client_obj.client = MagicMock()
+    mock_client_obj.client.send = AsyncMock(return_value=upstream_response)
+    if stream_request:
+        # Retain the committed live handoff used to exercise wrapper failure.
+        mock_client_obj.client.build_request.side_effect = (
+            lambda **kwargs: httpx.Request(
+                kwargs.get("method", "POST"),
+                kwargs["url"],
+                headers=kwargs["headers"],
+                json=kwargs.get("json"),
+            )
+        )
+    else:
+        mock_client_obj.client.build_request.side_effect = httpx.Request
+    mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
+    mock_logging_obj.post_call_failure_hook = AsyncMock(return_value=None)
+
+
 def _successful_peek_native_sse_chunks() -> list[bytes]:
     item_id = "msg_peeked"
 
@@ -4363,6 +4388,7 @@ async def test_alpha_openai_sse_precommit_overload_closes_and_propagates(
     mock_request.method = "POST"
     mock_request.url = SimpleNamespace(path="/openai_passthrough/v1/responses")
     mock_request.headers = {"content-type": "application/json"}
+    mock_request.scope = {"headers": []}
     mock_request.query_params = {}
     mock_request.state = SimpleNamespace()
     mock_request.is_disconnected = AsyncMock(return_value=False)
@@ -4429,7 +4455,7 @@ async def test_alpha_openai_sse_precommit_overload_closes_and_propagates(
         pte,
         "_finalize_native_openai_responses_owner_wire_disposition",
         new_callable=AsyncMock,
-    ) as mock_wire_disposition, patch.object(
+    ), patch.object(
         pte,
         "_execute_passthrough_pre_first_byte_with_hidden_retries",
         new=execute_hidden_retries,
@@ -4439,54 +4465,43 @@ async def test_alpha_openai_sse_precommit_overload_closes_and_propagates(
         "litellm.proxy.proxy_server.proxy_logging_obj"
     ) as mock_logging_obj:
         mock_client_obj = MagicMock()
-        mock_client_obj.client = MagicMock()
-        mock_client_obj.client.send = AsyncMock(return_value=upstream_response)
-        if stream_request:
-            # Retain the committed live handoff used to exercise wrapper failure.
-            mock_client_obj.client.build_request.return_value = upstream_response.request
-        else:
-            mock_client_obj.client.build_request.side_effect = httpx.Request
+        _configure_precommit_overload_client(
+            mock_client_obj,
+            upstream_response,
+            mock_logging_obj,
+            custom_body,
+            stream_request,
+        )
         mock_get_client.return_value = mock_client_obj
-        mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
-        mock_logging_obj.post_call_failure_hook = AsyncMock(return_value=None)
 
         if stream_request:
-            passthrough_response = await pass_through_request(
-                request=mock_request,
-                target=target,
-                custom_headers={},
-                user_api_key_dict=MagicMock(),
-                custom_body=custom_body,
-                custom_llm_provider="openai",
-                stream=True,
-            )
-            delivered = AsyncMock()
-            passthrough_response.wire_trace.register_post_finalization_callback(delivered)
-            send = AsyncMock()
-            await passthrough_response(
-                {"type": "http", "asgi": {"spec_version": "2.4"}},
-                asyncio.Event().wait,
-                send,
-            )
-            forwarded_body = b"".join(
-                call.args[0].get("body", b"")
-                for call in send.await_args_list
-                if call.args[0]["type"] == "http.response.body"
-            )
-            assert error_code.encode() in forwarded_body
-            assert forwarded_body.endswith(b"data: [DONE]\n\n")
-            assert passthrough_response.wire_trace.terminal_wire_committed is True
-            assert passthrough_response.wire_trace.done_wire_committed is True
-            assert passthrough_response.wire_trace.finalized is True
-            assert passthrough_response.wire_trace.disposition.value == "failed"
-            mock_wire_disposition.assert_awaited_once()
-            assert mock_wire_disposition.call_args.kwargs["disposition"].value == "failed"
-            delivered.assert_awaited_once()
-            delivered_snapshot = delivered.call_args.args[0]
-            assert delivered_snapshot["disposition"] == "failed"
-            assert delivered_snapshot["terminal_wire_committed"] is True
-            assert delivered_snapshot["asgi_delivery_complete"] is True
-            assert "exception" not in captured
+            with pytest.raises(ProxyException):
+                await pass_through_request(
+                    request=mock_request,
+                    target=target,
+                    custom_headers={},
+                    user_api_key_dict=MagicMock(),
+                    custom_body=custom_body,
+                    custom_llm_provider="openai",
+                    expected_target_family=(
+                        "codex_oauth" if "chatgpt.com" in target else "openai"
+                    ),
+                    egress_selected_openai_headers=(
+                        {
+                            "Authorization": "Bearer test-token",
+                            "chatgpt-account-id": "hash-account",
+                            "session_id": "session-overloaded",
+                        }
+                        if "chatgpt.com" in target
+                        else None
+                    ),
+                    stream=True,
+                    caller_managed_hidden_retry=True,
+                )
+            assert isinstance(captured["exception"], ResponsesStreamPreCommitFailure)
+            assert captured["exception"].error_class == "server_overloaded"
+            assert captured["exception"].retryable is True
+            assert captured["exception"].error_code == error_code
         else:
             with pytest.raises(ProxyException):
                 await pass_through_request(
@@ -4496,6 +4511,18 @@ async def test_alpha_openai_sse_precommit_overload_closes_and_propagates(
                     user_api_key_dict=MagicMock(),
                     custom_body=custom_body,
                     custom_llm_provider="openai",
+                    expected_target_family=(
+                        "codex_oauth" if "chatgpt.com" in target else "openai"
+                    ),
+                    egress_selected_openai_headers=(
+                        {
+                            "Authorization": "Bearer test-token",
+                            "chatgpt-account-id": "hash-account",
+                            "session_id": "session-overloaded",
+                        }
+                        if "chatgpt.com" in target
+                        else None
+                    ),
                     stream=False,
                 )
             assert isinstance(captured["exception"], ResponsesStreamPreCommitFailure)
@@ -4912,6 +4939,9 @@ async def test_failed_precommit_prefix_retired_before_retry_handoff(monkeypatch)
                 user_api_key_dict=MagicMock(),
                 custom_body=custom_body,
                 custom_llm_provider="openai",
+                expected_target_family=(
+                    "codex_oauth" if "chatgpt.com" in target else "openai"
+                ),
                 stream=False,
             )
 

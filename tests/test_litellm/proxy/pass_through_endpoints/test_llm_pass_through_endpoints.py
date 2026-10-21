@@ -14534,6 +14534,7 @@ def _build_codex_auto_agent_request(session_id: str = "codex-session"):
         "user-agent": "codex-cli/1.0",
         "originator": "codex_cli_rs",
     }
+    mock_request.is_disconnected = AsyncMock(return_value=False)
     mock_request.query_params = {}
     mock_request.url = httpx.URL("http://127.0.0.1:4001/openai_passthrough/v1/responses")
     mock_request.scope = {
@@ -18741,10 +18742,17 @@ async def test_codex_auto_agent_native_openai_owns_hidden_retry_only_for_alpha(
     alpha_enabled,
     expected_send_count,
 ):
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry import (
         OpenAIAlphaCapacityRetryCoordinator,
     )
 
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+
+    monkeypatch.setenv("AAWM_PASSTHROUGH_HIDDEN_RETRY_BUDGET_SECONDS", "0")
     request = _build_codex_auto_agent_request()
     request_body = {
         "model": "gpt-5.3-codex-spark",
@@ -18752,7 +18760,24 @@ async def test_codex_auto_agent_native_openai_owns_hidden_retry_only_for_alpha(
         "litellm_metadata": {"requested_model_alias": "work"},
     }
     target_url = "https://chatgpt.com/backend-api/codex/responses"
-    upstream_request = httpx.Request("POST", target_url)
+    request.state.aawm_codex_oauth_selected_account = {
+        "account_label": "account1",
+        "account_hash": "hash-account-1",
+        "lane_key": "codex-oauth:account1:hash-account-1",
+        "model": request_body["model"],
+    }
+    managed_codex_headers = {
+        "Authorization": "Bearer test-token-account1",
+        "chatgpt-account-id": "hash-account-1",
+        "session_id": "codex-session",
+    }
+    request.headers.update(managed_codex_headers)
+    upstream_request = httpx.Request(
+        "POST",
+        target_url,
+        headers=managed_codex_headers,
+        json=request_body,
+    )
     transient_failure = httpx.ReadTimeout(
         "transient upstream failure",
         request=upstream_request,
@@ -18784,6 +18809,10 @@ async def test_codex_auto_agent_native_openai_owns_hidden_retry_only_for_alpha(
     with patch(
         "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client",
         return_value=mock_client_obj,
+    ), patch.object(
+        sa,
+        "ensure_session_owner_guard_for_request",
+        new=AsyncMock(return_value=_NO_OP_SESSION_OWNER_GUARD),
     ), patch(
         "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
         new=AsyncMock(),
@@ -18812,19 +18841,25 @@ async def test_codex_auto_agent_native_openai_owns_hidden_retry_only_for_alpha(
                     api_key=None,
                     forward_headers=True,
                     request_body=request_body,
+                    custom_headers=managed_codex_headers,
                 )
         else:
-            response = await _perform_codex_auto_agent_native_openai_request(
-                request=request,
-                fastapi_response=MagicMock(spec=Response),
-                user_api_key_dict=MagicMock(),
-                target_url=target_url,
-                api_key=None,
-                forward_headers=True,
-                request_body=request_body,
-            )
-            assert isinstance(response, StreamingResponse)
-
+            with patch.object(
+                pte,
+                "get_or_create_openai_alpha_capacity_retry_coordinator",
+                return_value=None,
+            ):
+                response = await _perform_codex_auto_agent_native_openai_request(
+                    request=request,
+                    fastapi_response=MagicMock(spec=Response),
+                    user_api_key_dict=MagicMock(),
+                    target_url=target_url,
+                    api_key=None,
+                    forward_headers=True,
+                    request_body=request_body,
+                    custom_headers=managed_codex_headers,
+                )
+                assert isinstance(response, StreamingResponse)
     assert mock_client.send.await_count == expected_send_count
     if alpha_enabled:
         mock_hidden_retry_sleep.assert_not_awaited()
