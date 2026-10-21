@@ -4594,6 +4594,70 @@ async def test_replayable_bound_owner_capacity_failure_selects_alternate_account
     assert selected["failover_ordinal"] == 1
 
 
+def test_provider_returned_server_overload_is_account_attributed() -> None:
+    request = _request()
+    candidate = {
+        **_candidate(),
+        "codex_oauth_account_label": "account1",
+        "codex_oauth_account_hash": "hash-account-1",
+        "codex_oauth_lane_key": "codex-oauth:account1:hash-account-1",
+    }
+    selection_state = {
+        "candidate": candidate,
+        "failover_ordinal": 0,
+        "lane_key": candidate["codex_oauth_lane_key"],
+    }
+    provider_returned_attempt = {
+        "failure_phase": "direct_openai_provider_response",
+        "attempted_provider_call": True,
+        "provider_returned": True,
+        "send_ledger_snapshot": {
+            "reservations": [
+                {"account_fingerprint": "d9e0aacda9d3cfc5"},
+            ]
+        },
+    }
+    unattributed_attempt = {
+        **provider_returned_attempt,
+        "send_ledger_snapshot": {
+            "reservations": [
+                {"account_fingerprint": "not-this-account"},
+            ]
+        },
+    }
+    local_failure_attempt = {
+        **provider_returned_attempt,
+        "provider_returned": False,
+    }
+
+    assert selection._plan_codex_oauth_account_failover(
+        request,
+        candidate=candidate,
+        selection=selection_state,
+        attempt_record=dict(provider_returned_attempt),
+        error_class="server_overloaded",
+        has_continuation_state=False,
+    )
+    context = request.state.aawm_codex_oauth_request_local_failover_context
+    assert context["prior_account_outcome"]["outcome"] == "server_overloaded"
+    assert not selection._plan_codex_oauth_account_failover(
+        request,
+        candidate=candidate,
+        selection=selection_state,
+        attempt_record=dict(unattributed_attempt),
+        error_class="server_overloaded",
+        has_continuation_state=False,
+    )
+    assert not selection._plan_codex_oauth_account_failover(
+        request,
+        candidate=candidate,
+        selection=selection_state,
+        attempt_record=dict(local_failure_attempt),
+        error_class="server_overloaded",
+        has_continuation_state=False,
+    )
+
+
 @pytest.mark.asyncio
 async def test_resp_previous_response_id_pins_creating_lane(
     monkeypatch: pytest.MonkeyPatch,
