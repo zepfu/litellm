@@ -39,6 +39,15 @@ affinity remain request-scoped while the stream is active. A completed terminal
 can promote the owner and commit affinity. Failed, incomplete, cancelled, or
 disconnected streams release the reservation and do not write new affinity.
 
+Native stream cleanup explicitly retires the original chunk processor after
+response wrappers close, keeping its finalization out of garbage collection.
+
+For Codex OAuth, a text-only request with `tools: []` and retained
+`web_search_call` history declares `web_search` with `tool_choice: "none"`.
+The provider needs that declaration to read search history. Existing history
+is preserved and new searches remain disabled. Nonempty tool lists, forced
+tool choices and other provider routes retain their existing behavior.
+
 ### Responses stream limits
 
 Native Responses streams share one attempt-scoped event pipeline across
@@ -175,9 +184,10 @@ sent for non-streaming Responses.
 
 Exit telemetry retains logical provider-call counts, transport connection
 failure counts, and hidden retry counts alongside the wire-enriched send-ledger
-snapshot. The exact OpenAI provider signature `internal_error` / `error` /
-`response protection is unavailable` follows the ordinary retry budget and
-cannot receive the additional OpenAI capacity-retry authorization.
+snapshot. The OpenAI provider message `response protection is unavailable`,
+with type `internal_error` and code `error`, null, or absent, follows the
+ordinary retry budget and cannot receive additional capacity-retry
+authorization.
 
 The internal callback contract is
 `on_disposition(disposition, trace)`. Consumers should read a copy from

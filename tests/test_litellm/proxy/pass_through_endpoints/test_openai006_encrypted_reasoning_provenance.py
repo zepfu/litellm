@@ -30,6 +30,70 @@ CIPHERTEXT = "gAAAAABpnW_yEYmSNEyOG_ORIGINAL_BYTES_do_not_mutate=="
 XAI_CIPHERTEXT = "gAAAAABpnW_xai_FOREIGN_REASONING_BYTES_xxxx=="
 
 
+@pytest.mark.parametrize("tool_choice", ["auto", "none"])
+@pytest.mark.parametrize(
+    ("family", "url"),
+    [("codex_oauth", None), ("openai", "https://chatgpt.com/backend-api/codex/responses")],
+)
+def test_text_only_codex_history_can_replay_web_search_without_enabling_tools(
+    tool_choice, family, url,
+):
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_body import (
+        compile_openai_responses_wire_body,
+    )
+
+    history = [
+        {
+            "type": "web_search_call",
+            "id": "ws_retained",
+            "status": "completed",
+            "action": {"type": "search", "query": "retained query"},
+        }
+    ]
+    body = {
+        "model": "gpt-6-luna",
+        "input": history,
+        "tools": [],
+        "tool_choice": tool_choice,
+    }
+    wire = compile_openai_responses_wire_body(
+        body, egress_credential_family=family, url=url
+    )
+
+    assert wire.body["tools"] == [{"type": "web_search"}]
+    assert wire.body["tool_choice"] == "none"
+    assert wire.body["input"] == history
+    assert body["tools"] == []
+    assert body["tool_choice"] == tool_choice
+
+
+@pytest.mark.parametrize(
+    ("family", "tools", "tool_choice"),
+    [
+        ("openai", [], "auto"),
+        ("codex_oauth", [{"type": "function", "name": "probe"}], "auto"),
+        ("codex_oauth", [], {"type": "function", "name": "probe"}),
+    ],
+)
+def test_retained_web_search_preserves_other_dispatch_contracts(
+    family, tools, tool_choice
+):
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_body import (
+        compile_openai_responses_wire_body,
+    )
+
+    body = {
+        "model": "gpt-6-luna",
+        "input": [{"type": "web_search_call"}],
+        "tools": tools,
+        "tool_choice": tool_choice,
+    }
+    wire = compile_openai_responses_wire_body(body, egress_credential_family=family)
+
+    assert wire.body["tools"] == tools
+    assert wire.body["tool_choice"] == tool_choice
+
+
 def _reasoning_item(
     *,
     item_id: str = "rs_1e1f2dad-631d-9e15-b4f3-0c8f60403798",

@@ -26,6 +26,7 @@ from litellm.integrations.aawm_agent_quality_rules import (
 )
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 
+
 MALFORMED_ERROR_JSONL_FILENAME = "malformed-error.jsonl"
 MALFORMED_TOOL_CALL_SCHEMA_VERSION = 1
 MALFORMED_TOOL_CALL_ERROR_CODE = "aawm_auto_agent_malformed_tool_call_text"
