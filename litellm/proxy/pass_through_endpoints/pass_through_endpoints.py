@@ -232,6 +232,7 @@ def _get_explicit_operational_passthrough_request(
 
 
 from .aawm_adapter_runtime.repetitive_output import (
+    _CleanupBoundAsyncIterator,
     bind_output_guard_to_streaming_response,
     maybe_reject_passthrough_responses_body,
     maybe_wrap_passthrough_responses_stream,
@@ -8200,12 +8201,86 @@ async def _finalize_native_openai_responses_owner_wire_disposition(  # noqa: PLR
             except Exception:
                 pass
     try:
+        # For COMPLETED with a staged portable canonical-owner transition,
+        # run the strict source→destination CAS as the accepted-completion
+        # owner mutation *before* any ordinary mutable refresh.  Ordinary
+        # refresh can add ``requested_model`` to the captured source
+        # attributes, causing the subsequent CAS in
+        # ``_finalize_native_openai_responses_legacy_affinity`` to reject
+        # its own intended account transition.
+        portable_cas_applied = False
         lease = sa.get_request_session_owner_lease(request)
-        result = await sa.finalize_session_owner_lease_on_wire_disposition(
-            request,
-            disposition=disposition.value,
-        )
-        outcome = getattr(getattr(result, "outcome", None), "value", None)
+        if disposition is OpenAIResponsesWireDisposition.COMPLETED:
+            _owner_state = getattr(request, "state", None)
+            _pending = getattr(
+                _owner_state,
+                "_aawm_native_openai_responses_affinity_commitment",
+                None,
+            )
+            _staged = (
+                _pending.get("canonical_owner_transition")
+                if isinstance(_pending, dict)
+                else None
+            )
+            if isinstance(_staged, dict) and _staged:
+                # Apply the same lease-state guards as
+                # finalize_session_owner_lease_on_wire_disposition before
+                # attempting the portable CAS rebind.
+                if lease is not None and (
+                    lease.released
+                    or lease.promoted
+                    or lease.wire_disposition is not None
+                    or sa._session_owner_lease_release_invariant(lease) is not None
+                ):
+                    pass  # skip portable CAS; fall through to ordinary path
+                else:
+                    _rebind = getattr(
+                        sa, "rebind_session_owner_for_portable_failover", None
+                    )
+                    if callable(_rebind):
+                        result = await _rebind(
+                            session_identity=_staged.get("session_identity"),
+                            source_owner_id=_staged.get("source_owner_id"),
+                            source_attributes=(
+                                _staged.get("source_attributes") or {}
+                            ),
+                            destination_attributes=(
+                                _staged.get("destination_attributes") or {}
+                            ),
+                            authorization=_staged.get("authorization"),
+                            failover_ordinal=_staged.get("failover_ordinal"),
+                        )
+                        outcome = getattr(
+                            getattr(result, "outcome", None), "value", None
+                        )
+                        if outcome in {"promoted", "already_owned"}:
+                            if lease is not None:
+                                lease.wire_disposition = disposition.value
+                                lease.wire_terminal_pending = False
+                                lease.promoted = True
+                                _stop = getattr(
+                                    sa, "_stop_session_owner_lease_renewal", None
+                                )
+                                if callable(_stop):
+                                    _stop(lease)
+                                lease.last_finalization_outcome = outcome
+                            sa.record_session_owner_continuity_receipt(
+                                request,
+                                phase="owner_finalize",
+                                source="wire_terminal",
+                                session_identity=getattr(
+                                    result, "session_identity", None
+                                ),
+                                cache_key=getattr(
+                                    result, "cache_key", None
+                                ),
+                                outcome=outcome,
+                            )
+                            portable_cas_applied = True
+        if not portable_cas_applied:
+            lease = sa.get_request_session_owner_lease(request)
+            result = await sa.finalize_session_owner_lease_on_wire_disposition(request, disposition=disposition.value)
+            outcome = getattr(getattr(result, "outcome", None), "value", None)
         if trace is not None:
             trace.metadata["session_owner_wire_disposition"] = disposition.value
             if outcome is not None:
@@ -10918,6 +10993,16 @@ async def pass_through_request(  # noqa: PLR0915
                 except BaseException:
                     if raw_response is not None:
                         await _retire_openai_precommit_response(raw_response)
+                        raw_response = None
+                    elif (
+                        getattr(
+                            request.state,
+                            "aawm_openai_precommit_retirement_state",
+                            None,
+                        )
+                        is None
+                    ):
+                        await _retire_openai_precommit_response(None)
                     raise
 
             try:
@@ -11007,6 +11092,7 @@ async def pass_through_request(  # noqa: PLR0915
                 responses_event_pipeline=responses_event_pipeline,
                 operational_request=request,
             )
+            upstream_chunk_iterator = processed_chunks
             cfg072_output_gate = (
                 _build_cfg072_send_message_output_gate(
                     request,
@@ -11082,6 +11168,13 @@ async def pass_through_request(  # noqa: PLR0915
                             getattr(getattr(request, "url", None), "path", None),
                         ),
                         event_pipeline=responses_event_pipeline,
+                    )
+                    # Transform generators need not propagate close to their
+                    # source. Retain and retire the processor before GC can
+                    # schedule competing finalizers for the wrapper chain.
+                    processed_chunks = _CleanupBoundAsyncIterator(
+                        processed_chunks,
+                        upstream_chunk_iterator.aclose,
                     )
                     wrapper_cleanup_source = processed_chunks
                     prefixed_source = _PrefixedNativeResponsesAsyncIterator(
@@ -11161,6 +11254,11 @@ async def pass_through_request(  # noqa: PLR0915
                     ),
                     event_pipeline=responses_event_pipeline,
                 )
+                if is_xai_responses_wire_owned_route:
+                    processed_chunks = _CleanupBoundAsyncIterator(
+                        processed_chunks,
+                        upstream_chunk_iterator.aclose,
+                    )
             response_headers = HttpPassThroughEndpointHelpers.get_response_headers(
                 headers=response.headers,
                 litellm_call_id=litellm_call_id,
@@ -11601,6 +11699,7 @@ async def pass_through_request(  # noqa: PLR0915
                 responses_event_pipeline=responses_event_pipeline,
                 operational_request=request,
             )
+            upstream_chunk_iterator = processed_chunks
             cfg072_output_gate = (
                 _build_cfg072_send_message_output_gate(
                     request,
@@ -11676,6 +11775,10 @@ async def pass_through_request(  # noqa: PLR0915
                             getattr(getattr(request, "url", None), "path", None),
                         ),
                         event_pipeline=responses_event_pipeline,
+                    )
+                    processed_chunks = _CleanupBoundAsyncIterator(
+                        processed_chunks,
+                        upstream_chunk_iterator.aclose,
                     )
                     wrapper_cleanup_source = processed_chunks
                     prefixed_source = _PrefixedNativeResponsesAsyncIterator(
@@ -11755,6 +11858,11 @@ async def pass_through_request(  # noqa: PLR0915
                     ),
                     event_pipeline=responses_event_pipeline,
                 )
+                if is_xai_responses_wire_owned_route:
+                    processed_chunks = _CleanupBoundAsyncIterator(
+                        processed_chunks,
+                        upstream_chunk_iterator.aclose,
+                    )
             response_headers = HttpPassThroughEndpointHelpers.get_response_headers(
                 headers=response.headers,
                 litellm_call_id=litellm_call_id,

@@ -925,8 +925,11 @@ async def get_codex_oauth_inventory_generation_status(  # noqa: PLR0915 - bounde
     return result
 
 
-def get_startup_status() -> dict[str, Any]:
-    """Return sanitized activation metadata for health/readiness responses.
+def _get_startup_status(
+    *,
+    include_codex_oauth_inventory_generation: bool,
+) -> dict[str, Any]:
+    """Build sanitized activation metadata, optionally including inventory state.
 
     Exposes only: state, config_hash, config_version, config_epoch, relative
     file names, alias names, alias_count, activation result.
@@ -958,14 +961,7 @@ def get_startup_status() -> dict[str, Any]:
     identity_snapshot = (
         active_snapshot if active_snapshot is not None else startup_snapshot
     )
-    try:
-        inventory_generation = codex_oauth_inventory_generation_digest(
-            load_codex_oauth_inventory()
-        )
-    except CodexOAuthInventoryError:
-        inventory_generation = None
-
-    return {
+    result: dict[str, Any] = {
         "state": "active",
         "config_hash": identity_snapshot.config_hash,
         "config_version": identity_snapshot.config_version,
@@ -973,9 +969,27 @@ def get_startup_status() -> dict[str, Any]:
         "files": list(files_loaded),
         "aliases": sorted(identity_snapshot.aliases.keys()),
         "alias_count": len(identity_snapshot.aliases),
-        "codex_oauth_inventory_generation": inventory_generation,
-        "activation_result": "success",
     }
+    if include_codex_oauth_inventory_generation:
+        try:
+            inventory_generation = codex_oauth_inventory_generation_digest(
+                load_codex_oauth_inventory()
+            )
+        except CodexOAuthInventoryError:
+            inventory_generation = None
+        result["codex_oauth_inventory_generation"] = inventory_generation
+    result["activation_result"] = "success"
+    return result
+
+
+def get_startup_status() -> dict[str, Any]:
+    """Return sanitized activation metadata for health/readiness responses."""
+    return _get_startup_status(include_codex_oauth_inventory_generation=True)
+
+
+def get_startup_alias_diagnostic_status() -> dict[str, Any]:
+    """Return startup alias metadata without reading the OAuth inventory."""
+    return _get_startup_status(include_codex_oauth_inventory_generation=False)
 
 
 def reset_startup_state() -> None:

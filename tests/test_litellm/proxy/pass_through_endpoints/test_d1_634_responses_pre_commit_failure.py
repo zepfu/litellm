@@ -1675,6 +1675,87 @@ async def test_hidden_retry_retries_same_account_then_returns_503():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("provider_code", [None, "error"])
+async def test_response_protection_sse_uses_only_ordinary_retries(
+    provider_code: Optional[str],
+) -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        get_or_create_openai_provider_call_ledger,
+    )
+
+    request = MagicMock(spec=Request)
+    request.state = SimpleNamespace()
+    request.is_disconnected = AsyncMock(return_value=False)
+    target = "https://chatgpt.com/backend-api/codex/responses"
+    ledger = get_or_create_openai_provider_call_ledger(
+        request, custom_llm_provider="openai", target=target
+    )
+    assert ledger is not None
+    # The native provider returns HTTP 200 with this error event and a null code.
+    chunk = _sse(
+        "error",
+        {
+            "type": "error",
+            "error": {
+                "message": "response protection is unavailable",
+                "type": "internal_error",
+                "param": None,
+                "code": provider_code,
+            },
+        },
+    )
+    coordinator = MagicMock()
+    coordinator.deadline_seconds = 7200.0
+    coordinator.remaining_seconds = 7200.0
+    coordinator.within_deadline.return_value = True
+    coordinator.sleep_with_wakeup = AsyncMock()
+    sends = 0
+
+    async def operation():
+        nonlocal sends
+        sends += 1
+        assert sends <= 2, "protection failure received extended capacity retries"
+        ledger.reserve(
+            target=target,
+            candidate_context={"provider": "openai", "model": "gpt-6-luna"},
+            prior_response_closed=True,
+        )
+        response, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+            _FakeUpstreamStream([chunk]),
+            openai_alpha_capacity_retry_enabled=True,
+        )
+        await response.aclose()
+        assert failure is not None
+        raise failure
+
+    sleep = AsyncMock()
+    with patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+        sleep,
+    ):
+        with pytest.raises(ResponsesStreamPreCommitFailure) as raised:
+            await _execute_passthrough_pre_first_byte_with_hidden_retries(
+                kwargs={},
+                operation_name="stream_pre_first_byte",
+                operation=operation,
+                caller_managed_hidden_retry=False,
+                openai_capacity_coordinator=coordinator,
+                request=request,
+            )
+
+    assert sends == 2
+    sleep.assert_awaited_once_with(10.0)
+    coordinator.sleep_with_wakeup.assert_not_awaited()
+    coordinator.record_retry.assert_not_called()
+    assert raised.value.error_class == "openai_response_protection_unavailable"
+    normalized = raised.value.as_http_exception()
+    assert normalized.status_code == 503
+    assert normalized.detail["error"]["message"] == "response protection is unavailable"
+    assert normalized.detail["error"]["type"] == "internal_error"
+    assert getattr(normalized, "_aawm_provider_returned") is True
+
+
+@pytest.mark.asyncio
 async def test_hidden_retry_does_not_retry_usage_limit():
     async def operation():
         raise ResponsesStreamPreCommitFailure(
@@ -4899,10 +4980,16 @@ async def test_alpha_openai_sse_precommit_overload_closes_and_propagates(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("capacity_retry_enabled", "upstream_status"), [(False, 200), (True, 201)]
+    ("provider", "stream_request", "capacity_retry_enabled", "upstream_status"),
+    [
+        ("openai", False, False, 200),
+        ("openai", False, True, 201),
+        ("xai", False, False, 200),
+        ("xai", True, False, 200),
+    ],
 )
-async def test_unpeeked_native_sse_handoff_becomes_live_only(
-    monkeypatch, capacity_retry_enabled, upstream_status,
+async def test_responses_sse_handoff_retires_upstream(
+    monkeypatch, provider, stream_request, capacity_retry_enabled, upstream_status,
 ):
     monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
     monkeypatch.setenv(
@@ -4918,15 +5005,37 @@ async def test_unpeeked_native_sse_handoff_becomes_live_only(
     from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
         pass_through_request,
     )
+    if provider == "xai":
+        from litellm.proxy.pass_through_endpoints.aawm_text_watermark.config import (
+            load_text_watermark_config,
+        )
 
-    mock_request = MagicMock(spec=Request)
-    mock_request.method = "POST"
-    mock_request.url = SimpleNamespace(path="/openai_passthrough/v1/responses")
-    mock_request.headers = {"content-type": "application/json"}
-    mock_request.query_params = {}
-    mock_request.state = SimpleNamespace()
-    mock_request.is_disconnected = AsyncMock(return_value=False)
-    custom_body = {"model": "gpt-5.4"}
+        monkeypatch.setattr(
+            pte,
+            "_get_runtime_text_watermark_config",
+            lambda: load_text_watermark_config({"mode": "detect"}),
+        )
+
+    mock_request = MagicMock(
+        spec=Request,
+        method="POST",
+        url=SimpleNamespace(path="/openai_passthrough/v1/responses"),
+        headers={"content-type": "application/json"},
+        query_params={},
+        state=SimpleNamespace(),
+        is_disconnected=AsyncMock(return_value=False),
+    )
+    custom_body = {
+        "model": "gpt-5.4",
+        "tools": [
+            {
+                "type": "function",
+                "name": "alpha_probe" * 8,
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+    }
+    target = f"https://api.{'openai.com' if provider == 'openai' else 'x.ai'}/v1/responses"
     chunks = [
         _sse(
             "response.created",
@@ -4965,12 +5074,22 @@ async def test_unpeeked_native_sse_handoff_becomes_live_only(
         )
     )
     chunks.append(b"data: [DONE]\n\n")
+    iterator_retired = asyncio.Event()
+
+    class RetiringResponse(httpx.Response):
+        async def aiter_bytes(self, *args, **kwargs):
+            try:
+                async for chunk in super().aiter_bytes(*args, **kwargs):
+                    yield chunk
+            finally:
+                iterator_retired.set()
+
     stream = _ClosableAsyncByteStream(chunks)
-    upstream_response = httpx.Response(
+    upstream_response = RetiringResponse(
         status_code=upstream_status,
         headers={"content-type": "text/event-stream"},
         stream=stream,
-        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+        request=httpx.Request("POST", target),
     )
 
     async def run_with_renewal(_lease, operation):
@@ -5012,44 +5131,57 @@ async def test_unpeeked_native_sse_handoff_becomes_live_only(
         "pass_through_async_success_handler",
         new_callable=AsyncMock,
     ):
-        mock_client_obj = MagicMock()
-        mock_client_obj.client = MagicMock()
+        mock_client_obj = SimpleNamespace(
+            client=MagicMock(
+                send=AsyncMock(return_value=upstream_response),
+                build_request=MagicMock(side_effect=httpx.Request),
+            )
+        )
         mock_get_client.return_value = mock_client_obj
-        mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
-        mock_logging_obj.post_call_success_hook = AsyncMock()
-        mock_logging_obj.post_call_failure_hook = AsyncMock()
+        mock_logging_obj.configure_mock(
+            pre_call_hook=AsyncMock(return_value=custom_body),
+            post_call_success_hook=AsyncMock(),
+            post_call_failure_hook=AsyncMock(),
+        )
 
         response = await pass_through_request(
             request=mock_request,
-            target="https://api.openai.com/v1/responses",
+            target=target,
             custom_headers={},
             user_api_key_dict=MagicMock(),
             custom_body=custom_body,
-            custom_llm_provider="openai",
-            stream=False,
+            custom_llm_provider=provider,
+            stream=stream_request,
+            responses_wire_owned=provider == "xai",
         )
 
+    if provider == "xai":
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
+            _bind_responses_wire_stream,
+        )
+
+        response = _bind_responses_wire_stream(
+            response, request=mock_request, adapter_model="gpt-5.4"
+        )
     assert isinstance(response, OpenAIResponsesStreamingResponse)
     assert response.status_code == upstream_status
-    mock_upstream_request.assert_awaited_once()
+    if stream_request:
+        mock_client_obj.client.send.assert_awaited_once()
+    else:
+        mock_upstream_request.assert_awaited_once()
     mock_peek.assert_not_awaited()
     coordinator = mock_hidden_retry.call_args.kwargs["openai_capacity_coordinator"]
-    assert (coordinator is not None) is capacity_retry_enabled
+    assert (coordinator is not None) is (capacity_retry_enabled and provider == "openai")
     wire = b"".join([chunk async for chunk in response.body_iterator])
-    await response.body_iterator.aclose()
     assert response.wire_trace.finalized is True
-    assert (
-        response.wire_trace.metadata.get("disposition_callback_error")
-        is None
-    )
-    assert (
-        response.wire_trace.metadata.get("background_callback_error")
-        is None
-    )
-    assert (
-        response.wire_trace.metadata.get("body_iterator_close_error")
-        is None
-    )
+    assert all(
+        response.wire_trace.metadata.get(key) is None
+        for key in (
+            "disposition_callback_error",
+            "background_callback_error",
+            "body_iterator_close_error",
+        )
+    ), response.wire_trace.metadata
     payloads = _responses_sse_payloads(wire)
     assert payloads[-1]["type"] == "response.completed", payloads[-1]
     assert payloads[-1]["response"]["status"] == "completed"
@@ -5057,6 +5189,7 @@ async def test_unpeeked_native_sse_handoff_becomes_live_only(
     assert wire.startswith(expected_prefix)
     assert len(_responses_sse_payloads(wire[len(expected_prefix):])) == 1
     assert wire.endswith(b"data: [DONE]\n\n")
+    assert (iterator_retired.is_set(), stream.close_calls) == (True, 1)
 
 
 @pytest.mark.asyncio
@@ -7760,6 +7893,8 @@ def _assert_provider_overload_terminal(
             in str(error.get("message", "")).lower()
         ):
             return True
+
+
     return False
 
 
@@ -7886,3 +8021,267 @@ def _chunks_for_read_mode(
         second_nl = buf.find(b"\n\n", buf.find(b"\n\n") + 2)
         return [buf[: second_nl + 1], buf[second_nl + 1 :]]
     raise ValueError(f"unknown read_mode: {read_mode}")
+
+@pytest.mark.asyncio
+async def test_p11r1_staged_portable_transition_uses_cas_before_ordinary_refresh() -> None:
+    """P11-R1: staged portable transition runs rebind (CAS) instead of ordinary refresh.
+
+    When disposition is COMPLETED and a staged canonical_owner_transition is
+    present, the portable CAS must be the accepted-completion owner mutation
+    and the ordinary mutable refresh must NOT be called.
+    """
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+        OpenAIResponsesWireDisposition,
+    )
+
+    rebind_calls: list[dict[str, Any]] = []
+    ordinary_calls: list[dict[str, Any]] = []
+
+    async def _record_rebind(**kwargs: Any) -> MagicMock:
+        rebind_calls.append(dict(kwargs))
+        result = MagicMock()
+        result.outcome = sa.SessionOwnerMutationOutcome.PROMOTED
+        result.session_identity = kwargs.get("session_identity")
+        result.cache_key = "ck-p11r1"
+        return result
+
+    async def _record_ordinary(request=None, **kwargs: Any) -> MagicMock:
+        ordinary_calls.append({"disposition": kwargs.get("disposition")})
+        result = MagicMock()
+        result.outcome = sa.SessionOwnerMutationOutcome.RELEASED
+        return result
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.state = SimpleNamespace()
+    staged_transition: dict[str, Any] = {
+        "session_identity": "sess-p11r1",
+        "source_owner_id": "owner-src",
+        "source_attributes": {
+            "provider": "openai",
+            "model": "gpt-5.6-sol",
+            "route_family": "codex_oauth",
+            "endpoint_contract": "openai_responses",
+            "state_format": "openai_responses",
+            "account_hash": "acct-src",
+            "account_label": "source",
+            "account_lane": "lane-a",
+        },
+        "destination_attributes": {
+            "provider": "openai",
+            "model": "gpt-5.6-sol",
+            "route_family": "codex_oauth",
+            "endpoint_contract": "openai_responses",
+            "state_format": "openai_responses",
+            "account_hash": "acct-dst",
+            "account_label": "destination",
+            "account_lane": "lane-a",
+        },
+        "authorization": "codex_oauth_portable_account_failover",
+        "failover_ordinal": 1,
+    }
+    setattr(
+        mock_request.state,
+        "_aawm_native_openai_responses_affinity_commitment",
+        {"canonical_owner_transition": staged_transition},
+    )
+
+    mock_lease = MagicMock()
+    mock_lease.released = False
+    mock_lease.promoted = False
+    mock_lease.wire_disposition = None
+    mock_lease.wire_terminal_pending = True
+
+    mock_receipt = MagicMock()
+
+    with patch.object(
+        sa,
+        "get_request_session_owner_lease",
+        return_value=mock_lease,
+    ), patch.object(
+        sa,
+        "rebind_session_owner_for_portable_failover",
+        side_effect=_record_rebind,
+    ), patch.object(
+        sa,
+        "finalize_session_owner_lease_on_wire_disposition",
+        side_effect=_record_ordinary,
+    ), patch.object(
+        sa,
+        "session_owner_lease_is_release_only",
+        return_value=False,
+    ), patch.object(
+        sa,
+        "_session_owner_lease_release_invariant",
+        return_value=None,
+    ), patch.object(
+        sa,
+        "record_session_owner_continuity_receipt",
+        new=mock_receipt,
+    ), patch.object(
+        pte,
+        "_finalize_native_openai_responses_legacy_affinity",
+        new_callable=AsyncMock,
+    ):
+        await pte._finalize_native_openai_responses_owner_wire_disposition(
+            request=mock_request,
+            disposition=OpenAIResponsesWireDisposition.COMPLETED,
+            trace=None,
+        )
+
+    assert len(rebind_calls) == 1, f"rebind not called once: {rebind_calls}"
+    assert rebind_calls[0]["session_identity"] == "sess-p11r1"
+    assert rebind_calls[0]["source_owner_id"] == "owner-src"
+    assert rebind_calls[0]["authorization"] == "codex_oauth_portable_account_failover"
+    assert rebind_calls[0]["failover_ordinal"] == 1
+    assert not ordinary_calls, (
+        "ordinary finalize_session_owner_lease_on_wire_disposition was called"
+    )
+    mock_receipt.assert_called_once()
+    assert mock_receipt.call_args.kwargs["phase"] == "owner_finalize"
+    assert mock_receipt.call_args.kwargs["source"] == "wire_terminal"
+    assert mock_receipt.call_args.kwargs["outcome"] == "promoted"
+
+
+@pytest.mark.asyncio
+async def test_p11r1_no_staged_transition_uses_ordinary_refresh() -> None:
+    """P11-R1: without a staged transition, ordinary refresh still runs normally."""
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+        OpenAIResponsesWireDisposition,
+    )
+
+    ordinary_calls: list[dict[str, Any]] = []
+
+    async def _record_ordinary(request=None, **kwargs: Any) -> MagicMock:
+        ordinary_calls.append({"disposition": kwargs.get("disposition")})
+        result = MagicMock()
+        result.outcome = sa.SessionOwnerMutationOutcome.RELEASED
+        return result
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.state = SimpleNamespace()
+
+    mock_lease = MagicMock()
+    mock_lease.released = False
+    mock_lease.promoted = False
+    mock_lease.wire_disposition = None
+    mock_lease.wire_terminal_pending = True
+
+    with patch.object(
+        sa,
+        "get_request_session_owner_lease",
+        return_value=mock_lease,
+    ), patch.object(
+        sa,
+        "finalize_session_owner_lease_on_wire_disposition",
+        side_effect=_record_ordinary,
+    ), patch.object(
+        sa,
+        "session_owner_lease_is_release_only",
+        return_value=False,
+    ), patch.object(
+        sa,
+        "_session_owner_lease_release_invariant",
+        return_value=None,
+    ), patch.object(
+        pte,
+        "_finalize_native_openai_responses_legacy_affinity",
+        new_callable=AsyncMock,
+    ):
+        await pte._finalize_native_openai_responses_owner_wire_disposition(
+            request=mock_request,
+            disposition=OpenAIResponsesWireDisposition.COMPLETED,
+            trace=None,
+        )
+
+    assert len(ordinary_calls) == 1, f"ordinary not called exactly once: {ordinary_calls}"
+
+
+@pytest.mark.asyncio
+async def test_p11r1_non_completed_disposition_always_uses_ordinary_refresh() -> None:
+    """P11-R1: FAILED disposition always uses ordinary refresh, even with staged transition."""
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+        OpenAIResponsesWireDisposition,
+    )
+
+    ordinary_calls: list[dict[str, Any]] = []
+
+    async def _record_ordinary(request=None, **kwargs: Any) -> MagicMock:
+        ordinary_calls.append({"disposition": kwargs.get("disposition")})
+        result = MagicMock()
+        result.outcome = sa.SessionOwnerMutationOutcome.RELEASED
+        return result
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.state = SimpleNamespace()
+    staged_transition: dict[str, Any] = {
+        "session_identity": "sess-p11r1",
+        "source_owner_id": "owner-src",
+        "source_attributes": {
+            "provider": "openai",
+            "model": "gpt-5.6-sol",
+            "route_family": "codex_oauth",
+            "endpoint_contract": "openai_responses",
+            "state_format": "openai_responses",
+            "account_hash": "acct-src",
+            "account_label": "source",
+            "account_lane": "lane-a",
+        },
+        "destination_attributes": {
+            "provider": "openai",
+            "model": "gpt-5.6-sol",
+            "route_family": "codex_oauth",
+            "endpoint_contract": "openai_responses",
+            "state_format": "openai_responses",
+            "account_hash": "acct-dst",
+            "account_label": "destination",
+            "account_lane": "lane-a",
+        },
+        "authorization": "codex_oauth_portable_account_failover",
+        "failover_ordinal": 1,
+    }
+    setattr(
+        mock_request.state,
+        "_aawm_native_openai_responses_affinity_commitment",
+        {"canonical_owner_transition": staged_transition},
+    )
+
+    mock_lease = MagicMock()
+
+    with patch.object(
+        sa,
+        "get_request_session_owner_lease",
+        return_value=mock_lease,
+    ), patch.object(
+        sa,
+        "finalize_session_owner_lease_on_wire_disposition",
+        side_effect=_record_ordinary,
+    ), patch.object(
+        sa,
+        "session_owner_lease_is_release_only",
+        return_value=False,
+    ), patch.object(
+        pte,
+        "_finalize_native_openai_responses_legacy_affinity",
+        new_callable=AsyncMock,
+    ):
+        await pte._finalize_native_openai_responses_owner_wire_disposition(
+            request=mock_request,
+            disposition=OpenAIResponsesWireDisposition.FAILED,
+            trace=None,
+        )
+
+    assert len(ordinary_calls) == 1, (
+        f"ordinary not called exactly once for FAILED: {ordinary_calls}"
+    )

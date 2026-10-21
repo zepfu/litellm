@@ -18,6 +18,7 @@ import importlib.util
 import json
 import os
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,12 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _SCRIPT = _REPO_ROOT / "scripts" / "codex_oauth_refresh.py"
+sys.path.insert(0, str(_REPO_ROOT))
+
+from litellm.secret_managers.codex_oauth_inventory import (
+    CodexOAuthCredentialRecord,
+    codex_oauth_account_identity_hash,
+)
 
 
 def _load_module():
@@ -401,6 +408,7 @@ def test_eligibility_uses_persisted_timestamp_lifetime(
         ),
         encoding="utf-8",
     )
+    auth_path.chmod(0o600)
 
     result = codex.inspect_codex_oauth_refresh_eligibility(
         auth_path,
@@ -409,10 +417,10 @@ def test_eligibility_uses_persisted_timestamp_lifetime(
     )
 
     assert result["issued_lifetime_seconds"] == 900.0
-    assert result["refresh_threshold_seconds"] == 450.0
+    assert result["refresh_threshold_seconds"] == 300.0
     assert result["refresh_threshold_source"] == "persisted_timestamp"
     assert result["refresh_threshold_degraded"] is False
-    assert result["refresh_due_at"] == "1970-01-01T00:24:10Z"
+    assert result["refresh_due_at"] == "1970-01-01T00:26:40Z"
     assert result["eligible"] is False
 
 
@@ -512,6 +520,112 @@ def test_refresh_writes_new_tokens_under_lock(codex, tmp_path: Path) -> None:
     data = json.loads(auth_path.read_text(encoding="utf-8"))
     assert data["tokens"]["access_token"] == "new-access"
     assert data["tokens"]["refresh_token"] == "new-refresh"
+    assert auth_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_competing_public_refreshes_rotate_one_credential_generation_once(
+    codex,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real competing public lock holder cannot rotate the same generation."""
+    inventory_record = CodexOAuthCredentialRecord(
+        label="contention-account",
+        auth_path=tmp_path / "auth.json",
+        lock_path=tmp_path / "auth.json.lock",
+        priority=10,
+        weight=1.0,
+        enabled=True,
+        models=("*",),
+        expected_account_hash=codex_oauth_account_identity_hash("acct-contention"),
+        declaration_order=0,
+    )
+    auth_path = inventory_record.auth_path
+    auth_path.write_text(
+        json.dumps(
+            {
+                "tokens": {
+                    "access_token": "old-access",
+                    "refresh_token": "old-refresh",
+                    "account_id": "acct-contention",
+                    "expires_at": 1050,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(auth_path, 0o600)
+
+    first_acquired = threading.Event()
+    release_response = threading.Event()
+    endpoint_attempts: list[str] = []
+    results: list[dict[str, Any]] = []
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def read(self) -> bytes:
+            assert release_response.wait(timeout=5)
+            return json.dumps(
+                {
+                    "access_token": "new-access",
+                    "refresh_token": "new-refresh",
+                    "expires_in": 3600,
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(*_args: Any, **_kwargs: Any) -> _Response:
+        return _Response()
+
+    class _FrozenClock:
+        @staticmethod
+        def time() -> float:
+            return 1000.0
+
+    def on_token_endpoint_attempt() -> None:
+        endpoint_attempts.append(inventory_record.label)
+        first_acquired.set()
+
+    def run_refresh() -> dict[str, Any]:
+        result = codex.refresh_codex_oauth_inventory_record(
+            inventory_record,
+            buffer_seconds=300,
+            on_token_endpoint_attempt=on_token_endpoint_attempt,
+        )
+        results.append(result)
+        return result
+
+    monkeypatch.setattr(codex.urllib_request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(codex, "time", _FrozenClock)
+    first = threading.Thread(target=run_refresh)
+    second = threading.Thread(target=run_refresh)
+    first.start()
+    assert first_acquired.wait(timeout=5)
+    second.start()
+    second.join(timeout=5)
+    assert not second.is_alive()
+    assert len(results) == 1
+    assert results[0]["refreshed"] is False
+    assert results[0]["error_class"] == "CredentialFileLockError"
+    release_response.set()
+    first.join(timeout=5)
+    assert not first.is_alive()
+
+    assert endpoint_attempts == [inventory_record.label]
+    successful_result = results[1]
+    assert successful_result["refreshed"] is True
+    assert successful_result["expires_at"] == "1970-01-01T01:16:40Z"
+    assert successful_result["refresh_threshold_seconds"] == 300
+    assert successful_result["refresh_threshold_degraded"] is False
+    persisted = json.loads(auth_path.read_text(encoding="utf-8"))
+    assert persisted["tokens"]["access_token"] == "new-access"
+    assert persisted["tokens"]["refresh_token"] == "new-refresh"
+    assert persisted["tokens"]["account_id"] == "acct-contention"
+    assert persisted["tokens"]["expires_at"] == 4600
     assert auth_path.stat().st_mode & 0o777 == 0o600
 
 
@@ -690,3 +804,42 @@ def test_sanitize_redacts_even_backslash_quoted_suffix_leaks(codex) -> None:
     sanitized_escaped = codex._sanitize_error_message(raw_escaped)
     assert "ret-value" not in sanitized_escaped
     assert "access_token=[REDACTED]" in sanitized_escaped
+
+
+@pytest.mark.parametrize("lifetime", [None, 120, 900, 7200])
+@pytest.mark.parametrize("buffer", [0, 60, 300, 900, 10000])
+def test_configured_buffer_agrees_across_refresh_consumers(
+    codex, tmp_path: Path, monkeypatch, lifetime, buffer: int
+) -> None:
+    now = 1000000
+    expiry = now + (lifetime or 20000)
+    token_data = {
+        "access_token": "synthetic-access",
+        "refresh_token": "synthetic-refresh",
+        "expires_at": expiry,
+    }
+    if lifetime is not None:
+        token_data["expires_in"] = lifetime
+    path = tmp_path / "auth.json"
+    path.write_text(json.dumps({"tokens": token_data}))
+    path.chmod(0o600)
+    monkeypatch.setattr(codex.time, "time", lambda: now)
+    expected = buffer if lifetime is None else min(buffer, lifetime / 2)
+    health = codex.inspect_codex_oauth_credential_health(path, buffer_seconds=buffer)
+    eligibility = codex.inspect_codex_oauth_refresh_eligibility(
+        path, buffer_seconds=buffer, now=lambda: now, poll_interval_seconds=30
+    )
+    summary = codex.refresh_codex_oauth_auth_file(
+        path, buffer_seconds=buffer, lock_file=tmp_path / "auth.lock"
+    )
+    for result in (health, eligibility, summary):
+        assert result["refresh_threshold_seconds"] == expected
+        assert result["refresh_threshold_degraded"] is (lifetime is None)
+    assert eligibility["eligible"] is False
+    assert summary["skipped"] is True
+
+    due = expiry - expected
+    monkeypatch.setattr(codex.time, "time", lambda: due - 1)
+    assert codex._token_needs_refresh(token_data, buffer_seconds=buffer) is False
+    monkeypatch.setattr(codex.time, "time", lambda: due)
+    assert codex._token_needs_refresh(token_data, buffer_seconds=buffer) is True

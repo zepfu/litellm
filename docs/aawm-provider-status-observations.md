@@ -172,13 +172,15 @@ have two separate timing controls:
   (`AAWM_PROVIDER_STATUS_INTERVAL_SECONDS`). On each eligible outer cycle, the
   sidecar performs a read-only credential inspection and derives
   `refresh_due_at` from the credential expiry and the provider refresh buffer.
-  With valid issued lifetime metadata, every managed credential uses
-  `max(300, issued_lifetime_seconds * 0.5)` and reports that effective value as
-  `refresh_threshold_seconds`. The `300` value is the eligibility/retry
-  cadence and minimum threshold input, not a fixed normal authority. When
-  lifetime metadata is missing or malformed, the threshold falls back to
-  `300` and is marked degraded. A `refresh_not_due` inspection does not consume
-  the endpoint-attempt throttle. A local or pre-network helper failure also
+  With valid issued lifetime metadata, Codex uses
+  `min(configured buffer, issued_lifetime_seconds * 0.5)`; when lifetime is
+  unavailable, it uses the configured buffer as a degraded fallback. Other
+  managed credentials retain `max(300, issued_lifetime_seconds * 0.5)` and
+  the degraded `300`-second fallback when lifetime metadata is unavailable.
+  Each provider reports its effective value as `refresh_threshold_seconds`.
+  Eligibility cadence and refresh threshold are separate controls. A
+  `refresh_not_due` inspection does not consume the endpoint-attempt throttle.
+  A local or pre-network helper failure also
   leaves that throttle untouched and may retry on the next outer cycle. Every
   outer cycle reinspects the current credential pathname, including an inode
   replaced by an external credential writer.
@@ -212,8 +214,8 @@ error fields. The result classes are:
 
 Missing or malformed expiry or lifetime data never makes a credential
 permanently fresh. An otherwise usable credential with missing or unparseable
-`expires_at` is eligible for the safe refresh path, uses the `300`-second
-degraded fallback threshold, and is reported as degraded. A malformed or
+`expires_at` is eligible for the safe refresh path and is reported as degraded.
+Threshold selection follows the provider-specific rules above. A malformed or
 unreadable credential is reported as malformed and unusable until recovery.
 Inspection and operation errors are bounded and redacted before they enter
 events or persisted auth observations.

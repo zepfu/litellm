@@ -4141,7 +4141,11 @@ def test_interchangeable_policy_removes_legacy_account_affinity(
         "codex_oauth_lane_key": "codex-oauth:account1:hash-account-1",
     }
 
-    adjusted = selection._apply_codex_oauth_inventory_affinity_policy(legacy)
+    inventory = codex_oauth_inventory.load_codex_oauth_inventory()
+    adjusted = selection._apply_codex_oauth_inventory_affinity_policy(
+        legacy,
+        inventory=inventory,
+    )
     assert adjusted is not None
     assert adjusted["codex_oauth_credential_affinity"] == "interchangeable"
     assert "codex_oauth_account_label" not in adjusted
@@ -4168,6 +4172,7 @@ def test_account_bound_policy_preserves_creating_account_lane(
     adjusted = selection._apply_codex_oauth_inventory_affinity_policy(
         affinity,
         account_bound=True,
+        inventory=codex_oauth_inventory.load_codex_oauth_inventory(),
     )
     assert adjusted is not None
     assert adjusted["codex_oauth_credential_affinity"] == "interchangeable"
@@ -4594,6 +4599,70 @@ async def test_replayable_bound_owner_capacity_failure_selects_alternate_account
     assert selected["failover_ordinal"] == 1
 
 
+def test_provider_returned_server_overload_is_account_attributed() -> None:
+    request = _request()
+    candidate = {
+        **_candidate(),
+        "codex_oauth_account_label": "account1",
+        "codex_oauth_account_hash": "hash-account-1",
+        "codex_oauth_lane_key": "codex-oauth:account1:hash-account-1",
+    }
+    selection_state = {
+        "candidate": candidate,
+        "failover_ordinal": 0,
+        "lane_key": candidate["codex_oauth_lane_key"],
+    }
+    provider_returned_attempt = {
+        "failure_phase": "direct_openai_provider_response",
+        "attempted_provider_call": True,
+        "provider_returned": True,
+        "send_ledger_snapshot": {
+            "reservations": [
+                {"account_fingerprint": "d9e0aacda9d3cfc5"},
+            ]
+        },
+    }
+    unattributed_attempt = {
+        **provider_returned_attempt,
+        "send_ledger_snapshot": {
+            "reservations": [
+                {"account_fingerprint": "not-this-account"},
+            ]
+        },
+    }
+    local_failure_attempt = {
+        **provider_returned_attempt,
+        "provider_returned": False,
+    }
+
+    assert selection._plan_codex_oauth_account_failover(
+        request,
+        candidate=candidate,
+        selection=selection_state,
+        attempt_record=dict(provider_returned_attempt),
+        error_class="server_overloaded",
+        has_continuation_state=False,
+    )
+    context = request.state.aawm_codex_oauth_request_local_failover_context
+    assert context["prior_account_outcome"]["outcome"] == "server_overloaded"
+    assert not selection._plan_codex_oauth_account_failover(
+        request,
+        candidate=candidate,
+        selection=selection_state,
+        attempt_record=dict(unattributed_attempt),
+        error_class="server_overloaded",
+        has_continuation_state=False,
+    )
+    assert not selection._plan_codex_oauth_account_failover(
+        request,
+        candidate=candidate,
+        selection=selection_state,
+        attempt_record=dict(local_failure_attempt),
+        error_class="server_overloaded",
+        has_continuation_state=False,
+    )
+
+
 @pytest.mark.asyncio
 async def test_resp_previous_response_id_pins_creating_lane(
     monkeypatch: pytest.MonkeyPatch,
@@ -4936,12 +5005,42 @@ async def test_priority_stability_ignores_stale_balancing_cadence(
 
 
 @pytest.mark.asyncio
-async def test_openai_proxy_route_direct_uses_inventory_not_client_or_api_key(
+async def test_openai_proxy_route_direct_uses_inventory_without_diagnostic_read(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        config_startup,
+        durable as durable_mod,
+    )
+    from tests.test_litellm.proxy.pass_through_endpoints.test_d1_612_session_affinity import (
+        _FakeRedisCache,
+        _patch_dual,
+    )
+
     loaded = _patch_direct_inventory_auth(monkeypatch)
+    redis = _FakeRedisCache()
     request = _direct_request()
     body = {"model": "gpt-5.6-sol", "input": "hello"}
+    startup_inventory_reads: list[None] = []
+    config_dir = tmp_path / "alias_config"
+    config_dir.mkdir()
+    (config_dir / "unrelated.yaml").write_text(
+        """
+aliases:
+  - name: unrelated-alias
+    candidates:
+      - provider: openai
+        model: gpt-5.3-codex
+        route_family: codex_responses
+        priority: 10
+""",
+        encoding="utf-8",
+    )
+
+    def _read_startup_inventory():
+        startup_inventory_reads.append(None)
+        return _inventory()
 
     async def _fake_get_body(req):
         return dict(body)
@@ -4954,14 +5053,19 @@ async def test_openai_proxy_route_direct_uses_inventory_not_client_or_api_key(
 
     monkeypatch.setattr(lpe, "get_request_body", _fake_get_body)
     monkeypatch.setattr(
+        config_startup,
+        "load_codex_oauth_inventory",
+        _read_startup_inventory,
+    )
+    monkeypatch.setattr(
+        durable_mod,
+        "get_aawm_alias_routing_state_namespace",
+        lambda: "test",
+    )
+    monkeypatch.setattr(
         lpe.BaseOpenAIPassThroughHandler,
         "_base_openai_pass_through_handler",
         _fake_base_handler,
-    )
-    monkeypatch.setattr(
-        lpe,
-        "_resolve_codex_auto_agent_alias_model",
-        lambda *a, **k: None,
     )
     monkeypatch.setattr(lpe, "_is_oa_xai_request_body", lambda *_a, **_k: False)
     monkeypatch.setattr(
@@ -4975,12 +5079,28 @@ async def test_openai_proxy_route_direct_uses_inventory_not_client_or_api_key(
         ),
     )
 
-    response = await lpe.openai_proxy_route(
-        endpoint="v1/responses",
-        request=request,
-        fastapi_response=Response(),
-        user_api_key_dict=object(),  # type: ignore[arg-type]
+    previous_snapshot = snapshot_select.get_active_routing_snapshot()
+    monkeypatch.setattr(
+        config_startup,
+        "_startup_state",
+        replace(config_startup._startup_state),
     )
+    try:
+        config_startup.activate_alias_config_directory(config_dir)
+        assert config_startup.is_startup_healthy()
+        active_snapshot = snapshot_select.get_active_routing_snapshot()
+        assert active_snapshot is not None
+        assert set(active_snapshot.aliases) == {"unrelated-alias"}
+        assert body["model"] not in active_snapshot.aliases
+        with _patch_dual(redis):
+            response = await lpe.openai_proxy_route(
+                endpoint="v1/responses",
+                request=request,
+                fastapi_response=Response(),
+                user_api_key_dict=object(),  # type: ignore[arg-type]
+            )
+    finally:
+        snapshot_select.set_active_routing_snapshot(previous_snapshot)
     assert response.status_code == 200
     assert captured.get("api_key") is None
     assert captured.get("forward_headers") is False
@@ -4992,6 +5112,7 @@ async def test_openai_proxy_route_direct_uses_inventory_not_client_or_api_key(
     target = str(captured.get("base_target_url") or "")
     assert "api.openai.com" not in target
     assert "account1" in loaded
+    assert startup_inventory_reads == []
     assert lpe._should_preserve_openai_client_auth(request, "v1/responses") is False
 
 

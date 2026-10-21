@@ -27,6 +27,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping, NoReturn, Optional
+from urllib.parse import urlsplit
 
 from litellm.types.utils import all_litellm_params
 
@@ -487,6 +488,30 @@ def compile_openai_responses_wire_body(
     )
     if name_rewrite.changed and isinstance(name_rewrite.body, dict):
         body = name_rewrite.body
+
+    # Codex needs its search handler registered to read retained search calls,
+    # even for a text-only turn. Keep the effective empty-tool contract: the
+    # declaration permits history replay while "none" prevents new searches.
+    target_url = urlsplit(str(url or ""))
+    if (
+        (
+            egress_credential_family == "codex_oauth"
+            or (
+                target_url.hostname == "chatgpt.com"
+                and target_url.path.rstrip("/") == "/backend-api/codex/responses"
+            )
+        )
+        and body.get("tools") == []
+        and body.get("tool_choice") in (None, "auto", "none")
+        and isinstance(body.get("input"), list)
+        and any(
+            isinstance(item, dict) and item.get("type") == "web_search_call"
+            for item in body["input"]
+        )
+    ):
+        body["tools"] = [{"type": "web_search"}]
+        body["tool_choice"] = "none"
+
     # 4. Watermark egress.
     body, watermark_audit = _apply_watermark_egress(
         body=body,

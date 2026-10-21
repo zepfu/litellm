@@ -1674,7 +1674,7 @@ class PassThroughStreamingHandler:
     def _is_openai_response_protection_unavailable_payload(
         error_payload: Optional[Dict[str, Any]],
     ) -> bool:
-        """Match the observed OpenAI protection-unavailable provider shape."""
+        """Match OpenAI protection errors with their optional provider code."""
         if not isinstance(error_payload, dict):
             return False
         direct_error = error_payload.get("error")
@@ -1693,7 +1693,7 @@ class PassThroughStreamingHandler:
                 and message.strip().lower()
                 == _OPENAI_RESPONSE_PROTECTION_UNAVAILABLE_ERROR
                 and candidate.get("type") == "internal_error"
-                and candidate.get("code") == "error"
+                and candidate.get("code") in (None, "error")
             ):
                 return True
         return False
@@ -4504,7 +4504,9 @@ class PassThroughStreamingHandler:
         success_handler_kwargs: Optional[Dict[str, Any]] = None,
         local_prepare_ms: Optional[float] = None,
         error_log_context: Optional[Dict[str, Any]] = None,
-        upstream_prefix_bytes: Optional[List[bytes]] = None,
+        upstream_prefix_bytes: Optional[
+            Union[List[bytes], _ResponsesPreCommitPrefixStore]
+        ] = None,
         responses_event_pipeline: Optional[ResponsesEventPipeline] = None,
         operational_request: Optional[Any] = None,
     ) -> None:
@@ -4583,7 +4585,7 @@ class PassThroughStreamingHandler:
             request_body=request_body or {},
             endpoint_type=endpoint_type,
             start_time=start_time,
-            raw_bytes=upstream_prefix_bytes or [],
+            raw_bytes=prefix_chunks,
             precomputed_lines=None,
             end_time=datetime.now(),
             passthrough_logging_payload=passthrough_logging_payload,

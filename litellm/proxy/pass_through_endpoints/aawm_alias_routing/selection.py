@@ -20,17 +20,21 @@ import random
 import sys
 import time
 from datetime import datetime, timezone
-from typing import AbstractSet, Any, Awaitable, Callable, Mapping, Optional, Sequence
+from typing import AbstractSet, Any, Awaitable, Callable, Optional, Sequence
+
+from collections.abc import Mapping  # host binding for installed selection helpers
 
 from fastapi import HTTPException, Request
 
 from litellm._logging import verbose_proxy_logger
 from litellm.llms.alibaba_token_plan.chat.transformation import (
-    ALIBABA_TOKEN_PLAN_SUBSCRIPTION_IDENTITY_SOURCE as _ALIBABA_TOKEN_PLAN_SUBSCRIPTION_IDENTITY_SOURCE,
+    ALIBABA_TOKEN_PLAN_SUBSCRIPTION_IDENTITY_SOURCE
+    as _ALIBABA_TOKEN_PLAN_SUBSCRIPTION_IDENTITY_SOURCE,
     alibaba_token_plan_account_quota_cooldown_key,
     resolve_alibaba_token_plan_subscription_identity,
     subscription_identity_for_candidate,
 )
+from litellm.secret_managers.codex_oauth_inventory import CodexOAuthInventory
 from litellm.utils import get_model_info
 
 from . import admission as _admission
@@ -94,47 +98,25 @@ _aawm_selection = sys.modules[__name__]
 # ---------------------------------------------------------------------------
 # Injected runtime seams (god-module / cooldown_state.py dependencies)
 # ---------------------------------------------------------------------------
-_get_codex_active_cooldown_state: Optional[
-    Callable[[str], Awaitable[tuple[float, str]]]
-] = None
-_get_anthropic_active_cooldown_state: Optional[
-    Callable[[str], Awaitable[tuple[float, str]]]
-] = None
-_get_anthropic_merged_codex_openai_cooldown_state: Optional[
-    Callable[[str], Awaitable[tuple[float, str]]]
-] = None
+_get_codex_active_cooldown_state: Optional[Callable[[str], Awaitable[tuple[float, str]]]] = None
+_get_anthropic_active_cooldown_state: Optional[Callable[[str], Awaitable[tuple[float, str]]]] = None
+_get_anthropic_merged_codex_openai_cooldown_state: Optional[Callable[[str], Awaitable[tuple[float, str]]]] = None
 _set_codex_cooldown: Optional[Callable[[str, float], Awaitable[object]]] = None
 _set_anthropic_cooldown: Optional[Callable[[str, float], Awaitable[object]]] = None
-_get_codex_session_affinity: Optional[
-    Callable[[Optional[str]], Awaitable[Optional[dict[str, Any]]]]
-] = None
-_get_anthropic_session_affinity: Optional[
-    Callable[[Optional[str]], Awaitable[Optional[dict[str, Any]]]]
-] = None
-_get_openrouter_adapter_active_cooldown_seconds: Optional[
-    Callable[[Optional[str]], Awaitable[float]]
-] = None
-_extract_client_product_label: Optional[
-    Callable[[Request, dict[str, Any]], Optional[str]]
-] = None
+_get_codex_session_affinity: Optional[Callable[[Optional[str]], Awaitable[Optional[dict[str, Any]]]]] = None
+_get_anthropic_session_affinity: Optional[Callable[[Optional[str]], Awaitable[Optional[dict[str, Any]]]]] = None
+_get_openrouter_adapter_active_cooldown_seconds: Optional[Callable[[Optional[str]], Awaitable[float]]] = None
+_extract_client_product_label: Optional[Callable[[Request, dict[str, Any]], Optional[str]]] = None
 _resolve_codex_session_key: Optional[Callable[..., Optional[str]]] = None
 _resolve_anthropic_session_key: Optional[Callable[..., Optional[str]]] = None
 _has_continuation_state: Optional[Callable[[Any], bool]] = None
 _has_account_bound_state: Optional[Callable[[Any], bool]] = None
-_is_grok_account_quota_candidate: Optional[
-    Callable[[Optional[dict[str, Any]]], bool]
-] = None
-_get_grok_account_quota_lane_cooldown_key: Optional[
-    Callable[[Any, Optional[str]], Optional[str]]
-] = None
+_is_grok_account_quota_candidate: Optional[Callable[[Optional[dict[str, Any]]], bool]] = None
+_get_grok_account_quota_lane_cooldown_key: Optional[Callable[[Any, Optional[str]], Optional[str]]] = None
 _is_kimi_code_candidate: Optional[Callable[[Optional[dict[str, Any]]], bool]] = None
 _get_kimi_managed_account_cooldown_key: Optional[Callable[[], str]] = None
-_get_codex_quota_observation_pool: Optional[
-    Callable[[], Awaitable[Any]]
-] = None
-_get_codex_quota_observation_environment: Optional[
-    Callable[[], Optional[str]]
-] = None
+_get_codex_quota_observation_pool: Optional[Callable[[], Awaitable[Any]]] = None
+_get_codex_quota_observation_environment: Optional[Callable[[], Optional[str]]] = None
 
 _CODEX_OAUTH_QUOTA_CACHE_TTL_SECONDS = 30.0
 _CODEX_OAUTH_QUOTA_FAILURE_RETRY_SECONDS = 5.0
@@ -142,9 +124,7 @@ _CODEX_OAUTH_QUOTA_LOOKUP_TIMEOUT_SECONDS = 0.5
 _CODEX_OAUTH_QUOTA_VALIDITY_DEFAULT_SECONDS = 600.0
 _CODEX_OAUTH_QUOTA_VALIDITY_ENV = "AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS"
 _CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_DEFAULT_PCT = 10.0
-_CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_ENV = (
-    "AAWM_CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_PCT"
-)
+_CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_ENV = "AAWM_CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_PCT"
 _CODEX_OAUTH_QUOTA_CLIENT = "codex"
 _CODEX_OAUTH_QUOTA_SOURCE = "codex_quota_poll"
 _CODEX_OAUTH_QUOTA_SHARED_SCOPE = "shared"
@@ -160,12 +140,8 @@ _ALIBABA_TOKEN_PLAN_QUOTA_WINDOWS = frozenset({"5h", "7d", "monthly"})
 _ALIBABA_TOKEN_PLAN_QUOTA_TYPE = "credits"
 _ALIBABA_TOKEN_PLAN_QUOTA_UNIT = "credits"
 _ALIBABA_TOKEN_PLAN_QUOTA_CACHE_TTL_SECONDS = _SHARED_ACCOUNT_QUOTA_CACHE_TTL_SECONDS
-_ALIBABA_TOKEN_PLAN_QUOTA_FAILURE_RETRY_SECONDS = (
-    _SHARED_ACCOUNT_QUOTA_FAILURE_RETRY_SECONDS
-)
-_ALIBABA_TOKEN_PLAN_QUOTA_LOOKUP_TIMEOUT_SECONDS = (
-    _SHARED_ACCOUNT_QUOTA_LOOKUP_TIMEOUT_SECONDS
-)
+_ALIBABA_TOKEN_PLAN_QUOTA_FAILURE_RETRY_SECONDS = _SHARED_ACCOUNT_QUOTA_FAILURE_RETRY_SECONDS
+_ALIBABA_TOKEN_PLAN_QUOTA_LOOKUP_TIMEOUT_SECONDS = _SHARED_ACCOUNT_QUOTA_LOOKUP_TIMEOUT_SECONDS
 _ZAI_CODING_PLAN_QUOTA_CLIENT = "zai-coding-plan"
 _ZAI_CODING_PLAN_QUOTA_SOURCE = "zai_coding_plan_quota_poll"
 _ZAI_CODING_PLAN_QUOTA_TYPES = frozenset({"credits", "percent", "count"})
@@ -265,12 +241,8 @@ def configure_selection_runtime(
     get_grok_account_quota_lane_cooldown_key: Callable[[Any, Optional[str]], Optional[str]],
     is_kimi_code_candidate: Callable[[Optional[dict[str, Any]]], bool],
     get_kimi_managed_account_cooldown_key: Callable[[], str],
-    get_codex_quota_observation_pool: Optional[
-        Callable[[], Awaitable[Any]]
-    ] = None,
-    get_codex_quota_observation_environment: Optional[
-        Callable[[], Optional[str]]
-    ] = None,
+    get_codex_quota_observation_pool: Optional[Callable[[], Awaitable[Any]]] = None,
+    get_codex_quota_observation_environment: Optional[Callable[[], Optional[str]]] = None,
 ) -> None:
     """Bind god-module / cooldown_state.py owned dependencies."""
     global _get_codex_active_cooldown_state
@@ -310,9 +282,9 @@ def configure_selection_runtime(
     global _get_codex_quota_observation_pool
     _get_codex_quota_observation_pool = get_codex_quota_observation_pool
     global _get_codex_quota_observation_environment
-    _get_codex_quota_observation_environment = (
-        get_codex_quota_observation_environment
-    )
+    _get_codex_quota_observation_environment = get_codex_quota_observation_environment
+
+
 
 # ---------------------------------------------------------------------------
 # Utility
@@ -435,10 +407,7 @@ def _codex_auto_agent_candidate_public_shape(
         }:
             continue
         value = candidate.get(source_field)
-        if value is not None or (
-            source_field == "codex_oauth_inventory_generation"
-            and source_field in candidate
-        ):
+        if value is not None or (source_field == "codex_oauth_inventory_generation" and source_field in candidate):
             shaped[public_field] = value
     if lane_key is not None and include_account_identity:
         shaped["lane_key"] = lane_key
@@ -459,10 +428,7 @@ def _attempt_has_provider_call(attempt: Mapping[str, Any]) -> bool:
 
 
 def _provider_attempt_count(attempts: Sequence[Any]) -> int:
-    return sum(
-        isinstance(attempt, Mapping) and _attempt_has_provider_call(attempt)
-        for attempt in attempts
-    )
+    return sum(isinstance(attempt, Mapping) and _attempt_has_provider_call(attempt) for attempt in attempts)
 
 
 def _provider_attempt_record_index(
@@ -479,9 +445,7 @@ def _provider_attempt_record_index(
         return None
     provider_attempt_number = 0
     for raw_index, attempt in enumerate(attempts):
-        if not isinstance(attempt, Mapping) or not _attempt_has_provider_call(
-            attempt
-        ):
+        if not isinstance(attempt, Mapping) or not _attempt_has_provider_call(attempt):
             continue
         provider_attempt_number += 1
         if provider_attempt_number == target:
@@ -587,9 +551,7 @@ def _cohere_observation_exhausted(
         (
             float(value)
             for name in used_names
-            if (value := observation.get(name)) is not None
-            and not isinstance(value, bool)
-            and _is_finite_number(value)
+            if (value := observation.get(name)) is not None and not isinstance(value, bool) and _is_finite_number(value)
         ),
         None,
     )
@@ -621,9 +583,7 @@ def _cohere_local_quota_exhausted(
     ):
         return False, None, None
     model = str(candidate.get("model") or "").strip()
-    monthly = state_manager.resolve_cohere_monthly_observation(
-        now_epoch=now_epoch
-    )
+    monthly = state_manager.resolve_cohere_monthly_observation(now_epoch=now_epoch)
     if _cohere_observation_exhausted(monthly or {}, period="monthly"):
         return True, monthly, None
     try:
@@ -722,9 +682,7 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
 ) -> list[dict[str, Any]]:
     """Account for every compiled candidate in one terminal inventory."""
 
-    normalized_attempts = [
-        attempt for attempt in attempts or [] if isinstance(attempt, dict)
-    ]
+    normalized_attempts = [attempt for attempt in attempts or [] if isinstance(attempt, dict)]
     stored_skipped = getattr(
         request.state,
         "aawm_alias_terminal_skipped_candidates",
@@ -739,9 +697,7 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
         if not isinstance(candidate_rows, list):
             return []
         if not isinstance(stored_skipped, list):
-            return [
-                candidate for candidate in candidate_rows if isinstance(candidate, dict)
-            ]
+            return [candidate for candidate in candidate_rows if isinstance(candidate, dict)]
         stored_projection = _redact_auto_agent_account_identity(
             stored_skipped,
             redact_cooldown_keys=True,
@@ -755,8 +711,7 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
                 (
                     index
                     for index, projected in enumerate(stored_projection)
-                    if index not in consumed_projection_indexes
-                    and projected == candidate
+                    if index not in consumed_projection_indexes and projected == candidate
                 ),
                 None,
             )
@@ -844,8 +799,7 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
     def _skip_identity(candidate: Mapping[str, Any]) -> tuple[Any, ...]:
         return (
             *_capture_identity(candidate),
-            _first_identity_value(candidate, "skip_reason", "reason")
-            or "unavailable",
+            _first_identity_value(candidate, "skip_reason", "reason") or "unavailable",
             _first_identity_value(
                 candidate,
                 "candidate_semantic_ineligibility_reason",
@@ -885,9 +839,7 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
     # attempts by exact account/lane/cooldown identity so failover records do
     # not overwrite one another, while preserving the provider-attempt count
     # within each captured occurrence.
-    provider_attempt_groups: dict[
-        tuple[Any, ...], dict[str, Any]
-    ] = {}
+    provider_attempt_groups: dict[tuple[Any, ...], dict[str, Any]] = {}
     terminal_skip_groups: dict[tuple[Any, ...], dict[str, Any]] = {}
     for attempt_index, attempt in enumerate(normalized_attempts):
         if attempt.get("terminal_disposition") == "skipped":
@@ -973,11 +925,7 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
                 shaped[field] = skipped[field]
         shaped["terminal_disposition"] = "skipped"
         shaped["attempted_provider_call"] = False
-        shaped["reason"] = (
-            skipped.get("skip_reason")
-            or skipped.get("reason")
-            or "unavailable"
-        )
+        shaped["reason"] = skipped.get("skip_reason") or skipped.get("reason") or "unavailable"
         return shaped
 
     def _shape_captured_attempt(
@@ -1005,11 +953,7 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
             {
                 "terminal_disposition": "attempted",
                 "attempt_count": _provider_attempt_count(records),
-                "outcome": (
-                    last_attempt.get("status")
-                    or last_attempt.get("error_class")
-                    or "attempted"
-                ),
+                "outcome": (last_attempt.get("status") or last_attempt.get("error_class") or "attempted"),
             }
         )
         continue_reason = last_attempt.get("error_class")
@@ -1045,13 +989,9 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
     for group in terminal_skip_groups.values():
         group["kind"] = "terminal_skip"
     captured_groups.sort(key=lambda group: int(group["first_index"]))
-    captured_groups_by_occurrence: dict[
-        tuple[Any, ...], list[dict[str, Any]]
-    ] = {}
+    captured_groups_by_occurrence: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
     for group in captured_groups:
-        captured_groups_by_occurrence.setdefault(
-            group["occurrence"], []
-        ).append(group)
+        captured_groups_by_occurrence.setdefault(group["occurrence"], []).append(group)
 
     consumed_group_ids: set[int] = set()
     inventory: list[dict[str, Any]] = []
@@ -1081,11 +1021,7 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
             shaped["reasoning_effort"] = candidate["reasoning_effort"]
         shaped["terminal_disposition"] = "skipped"
         shaped["attempted_provider_call"] = False
-        shaped["reason"] = (
-            "traversal_budget_exhausted"
-            if traversal_budget_exhausted
-            else "not_reached_before_terminal"
-        )
+        shaped["reason"] = "traversal_budget_exhausted" if traversal_budget_exhausted else "not_reached_before_terminal"
         inventory.append(shaped)
 
     for group in captured_groups:
@@ -1202,10 +1138,7 @@ def _peek_codex_auto_agent_request_local_excluded_keys(
 def _codex_oauth_candidate_slot(
     candidate: dict[str, Any],
 ) -> Optional[str]:
-    account_hash = (
-        candidate.get("codex_oauth_account_hash")
-        or candidate.get("xai_oauth_account_hash")
-    )
+    account_hash = candidate.get("codex_oauth_account_hash") or candidate.get("xai_oauth_account_hash")
     if not account_hash:
         return None
     base_slot = _codex_oauth_candidate_base_slot(candidate)
@@ -1217,10 +1150,7 @@ def _codex_oauth_candidate_slot(
 def _codex_oauth_candidate_base_slot(
     candidate: dict[str, Any],
 ) -> Optional[str]:
-    if not (
-        candidate.get("codex_oauth_account_hash")
-        or candidate.get("xai_oauth_account_hash")
-    ):
+    if not (candidate.get("codex_oauth_account_hash") or candidate.get("xai_oauth_account_hash")):
         return None
     return "{}:{}:{}:{}".format(
         candidate.get("provider") or "",
@@ -1309,18 +1239,12 @@ def _apply_codex_oauth_failover_context_to_state(
         request,
         candidate=candidate,
     )
-    if (
-        context is None
-        or candidate.get("codex_oauth_account_hash")
-        in set(context.get("attempted_account_hashes") or ())
+    if context is None or candidate.get("codex_oauth_account_hash") in set(
+        context.get("attempted_account_hashes") or ()
     ):
         return state
-    state["failover_ordinal"] = len(
-        context.get("attempted_account_hashes") or ()
-    )
-    state["prior_account_outcome"] = dict(
-        context.get("prior_account_outcome") or {}
-    )
+    state["failover_ordinal"] = len(context.get("attempted_account_hashes") or ())
+    state["prior_account_outcome"] = dict(context.get("prior_account_outcome") or {})
     return state
 
 
@@ -1344,9 +1268,7 @@ def _get_xai_oauth_request_local_failover_context(
             if not isinstance(identity, dict):
                 return None
             for field in ("provider", "model", "route_family"):
-                if str(identity.get(field) or "") != str(
-                    candidate.get(field) or ""
-                ):
+                if str(identity.get(field) or "") != str(candidate.get(field) or ""):
                     return None
     return context
 
@@ -1364,17 +1286,10 @@ def _apply_xai_oauth_failover_context_to_state(
         candidate=candidate,
     )
     account_hash = candidate.get("xai_oauth_account_hash")
-    if (
-        context is None
-        or account_hash in set(context.get("attempted_account_hashes") or ())
-    ):
+    if context is None or account_hash in set(context.get("attempted_account_hashes") or ()):
         return state
-    state["failover_ordinal"] = len(
-        context.get("attempted_account_hashes") or ()
-    )
-    state["prior_account_outcome"] = dict(
-        context.get("prior_account_outcome") or {}
-    )
+    state["failover_ordinal"] = len(context.get("attempted_account_hashes") or ())
+    state["prior_account_outcome"] = dict(context.get("prior_account_outcome") or {})
     return state
 
 
@@ -1404,10 +1319,7 @@ def _plan_xai_oauth_account_failover(
         or attempt_record.get("provider_returned") is not True
     ):
         return False
-    if (
-        provider_status_code not in {401, 429}
-        and error_class != "usage_limit_reached"
-    ):
+    if provider_status_code not in {401, 429} and error_class != "usage_limit_reached":
         return False
 
     account_hash = candidate.get("xai_oauth_account_hash")
@@ -1417,9 +1329,7 @@ def _plan_xai_oauth_account_failover(
         request,
         candidate=candidate,
     )
-    attempted_account_hashes = list(
-        (existing or {}).get("attempted_account_hashes") or ()
-    )
+    attempted_account_hashes = list((existing or {}).get("attempted_account_hashes") or ())
     if account_hash in attempted_account_hashes:
         attempt_record["account_failover_limit_reached"] = True
         return False
@@ -1442,25 +1352,16 @@ def _plan_xai_oauth_account_failover(
         value = attempt_record.get(field)
         if value is not None:
             prior_account_outcome[field] = value
-    prior_account_outcome = {
-        key: value
-        for key, value in prior_account_outcome.items()
-        if value is not None
-    }
+    prior_account_outcome = {key: value for key, value in prior_account_outcome.items() if value is not None}
     attempted_account_hashes.append(account_hash)
-    prior_account_outcomes = list(
-        (existing or {}).get("prior_account_outcomes") or ()
-    )
+    prior_account_outcomes = list((existing or {}).get("prior_account_outcomes") or ())
     prior_account_outcomes.append(prior_account_outcome)
     setattr(
         request.state,
         "aawm_xai_oauth_request_local_failover_context",
         {
             "slot": _codex_oauth_candidate_slot(candidate),
-            "candidate_identity": {
-                field: candidate.get(field)
-                for field in ("provider", "model", "route_family")
-            },
+            "candidate_identity": {field: candidate.get(field) for field in ("provider", "model", "route_family")},
             "attempted_account_hashes": attempted_account_hashes,
             "prior_account_hash": account_hash,
             "prior_account_outcomes": prior_account_outcomes,
@@ -1490,27 +1391,21 @@ def _codex_oauth_account_exhaustion_is_confirmed(  # noqa: PLR0915
         "usage_limit_reached",
         "candidate_unavailable",
         "capacity_exhausted",
+        "server_overloaded",
     }:
         return False
     account_hash = str(candidate.get("codex_oauth_account_hash") or "").strip()
     if not account_hash:
         return False
 
-    admission_decision = str(
-        attempt_record.get("admission_decision") or ""
-    ).strip()
+    admission_decision = str(attempt_record.get("admission_decision") or "").strip()
     if admission_decision == "confirmed_exhausted":
-        return (
-            str(attempt_record.get("admission_account_hash") or "").strip()
-            == account_hash
-        )
+        return str(attempt_record.get("admission_account_hash") or "").strip() == account_hash
 
-    attempted_provider_call = (
-        attempt_record.get("attempted_provider_call") is True
-    )
+    attempted_provider_call = attempt_record.get("attempted_provider_call") is True
     provider_returned = attempt_record.get("provider_returned") is True
     if (
-        error_class == "capacity_exhausted"
+        error_class in {"capacity_exhausted", "server_overloaded"}
         and attempted_provider_call
         and provider_returned
     ):
@@ -1548,9 +1443,7 @@ def _codex_oauth_account_exhaustion_is_confirmed(  # noqa: PLR0915
         attempted_provider_call and provider_returned
     ):
         raw_status_code = (
-            provider_status_code
-            if provider_status_code is not None
-            else attempt_record.get("error_status_code")
+            provider_status_code if provider_status_code is not None else attempt_record.get("error_status_code")
         )
         try:
             status_code = int(raw_status_code)
@@ -1558,17 +1451,9 @@ def _codex_oauth_account_exhaustion_is_confirmed(  # noqa: PLR0915
             status_code = None
         error_code = str(attempt_record.get("error_code") or "").strip().lower()
         error_tokens = {
-            str(token).strip().lower()
-            for token in (attempt_record.get("error_tokens") or ())
-            if str(token).strip()
+            str(token).strip().lower() for token in (attempt_record.get("error_tokens") or ()) if str(token).strip()
         }
-        if (
-            status_code == 429
-            and (
-                error_code == "usage_limit_reached"
-                or "usage_limit_reached" in error_tokens
-            )
-        ):
+        if status_code == 429 and (error_code == "usage_limit_reached" or "usage_limit_reached" in error_tokens):
             return True
     elif attempted_provider_call or provider_returned:
         if error_class != "usage_limit_reached":
@@ -1581,25 +1466,15 @@ def _codex_oauth_account_exhaustion_is_confirmed(  # noqa: PLR0915
             observations.append(value)
             nested_windows = value.get("windows")
             if isinstance(nested_windows, list):
-                observations.extend(
-                    window
-                    for window in nested_windows
-                    if isinstance(window, Mapping)
-                )
+                observations.extend(window for window in nested_windows if isinstance(window, Mapping))
             for nested_key in ("valid_windows", "weekly"):
                 nested_value = value.get(nested_key)
                 if isinstance(nested_value, Mapping):
                     observations.append(nested_value)
                 elif isinstance(nested_value, list):
-                    observations.extend(
-                        window
-                        for window in nested_value
-                        if isinstance(window, Mapping)
-                    )
+                    observations.extend(window for window in nested_value if isinstance(window, Mapping))
         elif isinstance(value, list):
-            observations.extend(
-                window for window in value if isinstance(window, Mapping)
-            )
+            observations.extend(window for window in value if isinstance(window, Mapping))
         return observations
 
     quota_sources = (
@@ -1611,9 +1486,7 @@ def _codex_oauth_account_exhaustion_is_confirmed(  # noqa: PLR0915
     for source in quota_sources:
         for window in _iter_observations(source):
             observed_account_hash = str(
-                window.get("account_hash")
-                or window.get("codex_oauth_account_hash")
-                or ""
+                window.get("account_hash") or window.get("codex_oauth_account_hash") or ""
             ).strip()
             if observed_account_hash and observed_account_hash != account_hash:
                 continue
@@ -1630,13 +1503,9 @@ def _codex_oauth_account_exhaustion_is_confirmed(  # noqa: PLR0915
                 "observation_age_seconds",
                 normalized.get("snapshot_age_seconds"),
             )
-            if not _codex_oauth_quota_window_is_confirmed_exhausted(
-                normalized
-            ):
+            if not _codex_oauth_quota_window_is_confirmed_exhausted(normalized):
                 continue
-            if not _admission.is_confirmed_account_usage_exhaustion(
-                normalized
-            ):
+            if not _admission.is_confirmed_account_usage_exhaustion(normalized):
                 continue
             return True
     return False
@@ -1676,15 +1545,11 @@ def _plan_codex_oauth_account_failover(
         )
     if not _is_codex_oauth_account_candidate(candidate):
         return reject("candidate_not_codex_oauth")
-    if (
-        has_account_bound_state or selection.get("has_account_bound_state")
-    ) and not account_failover_replay_safe:
+    if (has_account_bound_state or selection.get("has_account_bound_state")) and not account_failover_replay_safe:
         return reject("account_bound_state_nonportable")
     if has_previous_response_id and not account_failover_replay_safe:
         return reject("previous_response_id_nonportable")
-    interchangeable = (
-        candidate.get("codex_oauth_credential_affinity") == "interchangeable"
-    )
+    interchangeable = candidate.get("codex_oauth_credential_affinity") == "interchangeable"
     if has_continuation_state and not interchangeable:
         return reject("account_not_interchangeable_for_continuation")
 
@@ -1693,9 +1558,7 @@ def _plan_codex_oauth_account_failover(
         candidate=candidate,
     )
     account_hash = candidate.get("codex_oauth_account_hash")
-    attempted_account_hashes = list(
-        (existing or {}).get("attempted_account_hashes") or ()
-    )
+    attempted_account_hashes = list((existing or {}).get("attempted_account_hashes") or ())
     if account_hash in attempted_account_hashes:
         attempt_record["account_failover_limit_reached"] = True
         return reject("account_failover_limit_reached")
@@ -1715,9 +1578,7 @@ def _plan_codex_oauth_account_failover(
         "account_lane": candidate.get("codex_oauth_lane_key"),
         "outcome": error_class,
         "failure_phase": attempt_record.get("failure_phase"),
-        "attempted_provider_call": attempt_record.get(
-            "attempted_provider_call"
-        ),
+        "attempted_provider_call": attempt_record.get("attempted_provider_call"),
     }
     for field in (
         "quota_snapshot_age_seconds",
@@ -1731,15 +1592,9 @@ def _plan_codex_oauth_account_failover(
         value = attempt_record.get(field)
         if value is not None:
             prior_account_outcome[field] = value
-    prior_account_outcome = {
-        key: value
-        for key, value in prior_account_outcome.items()
-        if value is not None
-    }
+    prior_account_outcome = {key: value for key, value in prior_account_outcome.items() if value is not None}
     attempted_account_hashes.append(account_hash)
-    prior_account_outcomes = list(
-        (existing or {}).get("prior_account_outcomes") or ()
-    )
+    prior_account_outcomes = list((existing or {}).get("prior_account_outcomes") or ())
     prior_account_outcomes.append(prior_account_outcome)
     setattr(
         request.state,
@@ -1747,10 +1602,7 @@ def _plan_codex_oauth_account_failover(
         {
             "slot": _codex_oauth_candidate_slot(candidate),
             "base_slot": _codex_oauth_candidate_base_slot(candidate),
-            "candidate_identity": {
-                field: candidate.get(field)
-                for field in ("provider", "model", "route_family")
-            },
+            "candidate_identity": {field: candidate.get(field) for field in ("provider", "model", "route_family")},
             "attempted_account_hashes": attempted_account_hashes,
             "prior_account_hash": account_hash,
             "prior_account_outcomes": prior_account_outcomes,
@@ -1833,19 +1685,13 @@ def _apply_codex_auto_agent_request_local_candidate_state(
     if request_local_cooldown_seconds > cooldown_seconds:
         cooldown_seconds = request_local_cooldown_seconds
         cooldown_state_source = "request_local"
-    if request_local_cooldown_key in _peek_codex_auto_agent_request_local_excluded_keys(
-        request
-    ):
+    if request_local_cooldown_key in _peek_codex_auto_agent_request_local_excluded_keys(request):
         if request_local_cooldown_seconds <= 0:
             cooldown_seconds = max(cooldown_seconds, 0.001)
         cooldown_state_source = "request_local"
         skip_reason = "request_local_transient_failure"
     account_slot = _codex_oauth_candidate_slot(candidate)
-    if (
-        account_slot is not None
-        and account_slot
-        in _peek_codex_oauth_request_local_blocked_slots(request)
-    ):
+    if account_slot is not None and account_slot in _peek_codex_oauth_request_local_blocked_slots(request):
         cooldown_state_source = "request_local"
         skip_reason = "account_failover_limit"
     return cooldown_seconds, cooldown_state_source, skip_reason
@@ -1910,12 +1756,8 @@ async def _get_openrouter_account_lane_cooldown_state(
     """
     assert _get_codex_active_cooldown_state is not None
     assert _get_anthropic_active_cooldown_state is not None
-    anthropic_seconds, anthropic_source = await _get_anthropic_active_cooldown_state(
-        cooldown_key
-    )
-    codex_seconds, codex_source = await _get_codex_active_cooldown_state(
-        cooldown_key
-    )
+    anthropic_seconds, anthropic_source = await _get_anthropic_active_cooldown_state(cooldown_key)
+    codex_seconds, codex_source = await _get_codex_active_cooldown_state(cooldown_key)
     return _cooldown_state._format_merged_alias_family_cooldown_state_source(
         anthropic_seconds=anthropic_seconds,
         anthropic_source=anthropic_source,
@@ -2042,8 +1884,12 @@ async def _apply_kimi_code_managed_account_lane_cooldown(
 
 
 async def _apply_openrouter_credit_lane_cooldown(
-    *, candidate: dict[str, Any], lane_key: Optional[str], cooldown_seconds: float,
-    cooldown_state_source: Optional[str], skip_reason: Optional[str],
+    *,
+    candidate: dict[str, Any],
+    lane_key: Optional[str],
+    cooldown_seconds: float,
+    cooldown_state_source: Optional[str],
+    skip_reason: Optional[str],
     get_active_cooldown_state: Callable[[str], Awaitable[tuple[float, str]]],
 ) -> tuple[float, Optional[str], Optional[str]]:
     key = openrouter_credit_lane_cooldown_key(candidate, lane_key)
@@ -2093,14 +1939,10 @@ async def _apply_codex_auto_agent_alibaba_token_plan_account_cooldown(
     """Suppress every Alibaba Token Plan candidate during shared account cooling."""
     if candidate.get("provider") != _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER:
         return cooldown_seconds, cooldown_state_source, skip_reason
-    cooldown_key = alibaba_token_plan_account_quota_cooldown_key(
-        subscription_identity_for_candidate(candidate)
-    )
+    cooldown_key = alibaba_token_plan_account_quota_cooldown_key(subscription_identity_for_candidate(candidate))
     if cooldown_key is None:
         return cooldown_seconds, cooldown_state_source, skip_reason
-    account_seconds, account_source = await get_active_cooldown_state(
-        cooldown_key
-    )
+    account_seconds, account_source = await get_active_cooldown_state(cooldown_key)
     if account_seconds > cooldown_seconds:
         cooldown_seconds = account_seconds
         cooldown_state_source = f"alibaba_token_plan_account:{account_source}"
@@ -2198,12 +2040,10 @@ def _alibaba_token_plan_quota_observation_from_row(
     except Exception:
         return None
     if (
-        values.get("provider")
-        != _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
+        values.get("provider") != _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
         or values.get("client") != _ALIBABA_TOKEN_PLAN_QUOTA_CLIENT
         or values.get("source") != _ALIBABA_TOKEN_PLAN_QUOTA_SOURCE
-        or evidence.get("parser_version")
-        != _ALIBABA_TOKEN_PLAN_QUOTA_PARSER_VERSION
+        or evidence.get("parser_version") != _ALIBABA_TOKEN_PLAN_QUOTA_PARSER_VERSION
         or evidence.get("telemetry_status") != "valid"
     ):
         return None
@@ -2332,15 +2172,10 @@ async def _hydrate_shared_account_quota_observations(
     snapshot in place.
     """
     state_manager = state_manager or alias_routing_state
-    if (
-        _get_codex_quota_observation_pool is None
-        or _get_codex_quota_observation_environment is None
-    ):
+    if _get_codex_quota_observation_pool is None or _get_codex_quota_observation_environment is None:
         return
     try:
-        environment = str(
-            _get_codex_quota_observation_environment() or ""
-        ).strip()
+        environment = str(_get_codex_quota_observation_environment() or "").strip()
     except Exception as exc:
         verbose_proxy_logger.debug(
             "%s quota environment resolution failed closed (error_class=%s)",
@@ -2483,9 +2318,7 @@ def _alibaba_token_plan_quota_evidence(
         return None, []
     state_manager = state_manager or alias_routing_state
     try:
-        configured_environment = str(
-            _get_codex_quota_observation_environment() or ""
-        ).strip()
+        configured_environment = str(_get_codex_quota_observation_environment() or "").strip()
     except Exception:
         return None, []
     now = time.time() if now_epoch is None else float(now_epoch)
@@ -2493,26 +2326,16 @@ def _alibaba_token_plan_quota_evidence(
     with state_manager._normalized_quota_observations_lock:
         observations = [
             dict(observation)
-            for key, observation in (
-                state_manager._normalized_quota_observations.items()
-            )
-            if (
-                key[0] == _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
-                and key[4] == configured_environment
-            )
+            for key, observation in (state_manager._normalized_quota_observations.items())
+            if (key[0] == _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER and key[4] == configured_environment)
         ]
     fresh = [
         observation
         for observation in observations
         if (
             0 <= now - observation["observed_at"] <= 900.0
-            and str(observation.get("quota_period") or "")
-            in _ALIBABA_TOKEN_PLAN_QUOTA_WINDOWS
-            and observation.get("quota_key")
-            == (
-                "alibaba_token_plan_"
-                f"{observation.get('quota_period')}:credits"
-            )
+            and str(observation.get("quota_period") or "") in _ALIBABA_TOKEN_PLAN_QUOTA_WINDOWS
+            and observation.get("quota_key") == ("alibaba_token_plan_" f"{observation.get('quota_period')}:credits")
             and isinstance(observation.get("exhausted"), bool)
             and _alibaba_observation_matches_subscription(
                 observation,
@@ -2525,9 +2348,7 @@ def _alibaba_token_plan_quota_evidence(
     confirmed_exhausted_windows = {
         str(observation.get("quota_period") or "")
         for observation in fresh
-        if observation.get("exhausted") is True
-        and observation.get("quota_period")
-        in _ALIBABA_TOKEN_PLAN_QUOTA_WINDOWS
+        if observation.get("exhausted") is True and observation.get("quota_period") in _ALIBABA_TOKEN_PLAN_QUOTA_WINDOWS
     }
     if confirmed_exhausted_windows:
         return None, sorted(
@@ -2535,8 +2356,7 @@ def _alibaba_token_plan_quota_evidence(
                 observation
                 for observation in fresh
                 if observation.get("exhausted") is True
-                and observation.get("quota_period")
-                in confirmed_exhausted_windows
+                and observation.get("quota_period") in confirmed_exhausted_windows
             ),
             key=lambda observation: str(observation.get("quota_period") or ""),
         )
@@ -2728,8 +2548,7 @@ def _attach_alibaba_token_plan_quota_state(
     if not isinstance(candidate, dict):
         return state
     if (
-        candidate.get("provider")
-        != _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
+        candidate.get("provider") != _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
         or state.get("skip_reason") is not None
     ):
         return state
@@ -2826,11 +2645,7 @@ async def _clear_alibaba_token_plan_account_quota_cooldown(
     ):
         return False
     cooldown_key = alibaba_token_plan_account_quota_cooldown_key(
-        str(
-            evidence.get("subscription_identity")
-            or evidence.get("account_hash")
-            or ""
-        )
+        str(evidence.get("subscription_identity") or evidence.get("account_hash") or "")
     )
     if cooldown_key is None:
         return False
@@ -2913,8 +2728,7 @@ def _zai_coding_plan_quota_observation_from_row(
         or values.get("source") != _ZAI_CODING_PLAN_QUOTA_SOURCE
         or evidence.get("account_hash") != account_hash
         or evidence.get("customerId_sha256") != account_hash
-        or evidence.get("account_identity_source")
-        != _ZAI_CODING_PLAN_QUOTA_ACCOUNT_IDENTITY_SOURCE
+        or evidence.get("account_identity_source") != _ZAI_CODING_PLAN_QUOTA_ACCOUNT_IDENTITY_SOURCE
         or evidence.get("telemetry_status") != "valid"
         or evidence.get("fresh") is not True
         or evidence.get("complete") is not True
@@ -2935,23 +2749,16 @@ def _zai_coding_plan_quota_observation_from_row(
     quota_type = str(values.get("quota_type") or "").strip().lower()
     if (
         quota_type not in _ZAI_CODING_PLAN_QUOTA_TYPES
-        or values.get("quota_key")
-        != f"zai_coding_plan_{row_window}:{quota_type}"
+        or values.get("quota_key") != f"zai_coding_plan_{row_window}:{quota_type}"
     ):
         return None
-    observed_at = alias_routing_state._quota_observation_timestamp(
-        values.get("observed_at")
-    )
-    expected_reset_at = alias_routing_state._quota_observation_timestamp(
-        values.get("expected_reset_at")
-    )
+    observed_at = alias_routing_state._quota_observation_timestamp(values.get("observed_at"))
+    expected_reset_at = alias_routing_state._quota_observation_timestamp(values.get("expected_reset_at"))
     remaining_pct = _zai_coding_plan_control_remaining_pct(
         remaining_pct=_zai_coding_plan_quota_number(values.get("remaining_pct")),
         quota_type=quota_type,
         quota_limit=_zai_coding_plan_quota_number(values.get("quota_limit")),
-        quota_remaining=_zai_coding_plan_quota_number(
-            values.get("quota_remaining")
-        ),
+        quota_remaining=_zai_coding_plan_quota_number(values.get("quota_remaining")),
     )
     if observed_at is None or remaining_pct is None:
         return None
@@ -3005,9 +2812,7 @@ def _zai_coding_plan_quota_evidence(
     if _get_codex_quota_observation_environment is None:
         return None, []
     try:
-        configured_environment = str(
-            _get_codex_quota_observation_environment() or ""
-        ).strip()
+        configured_environment = str(_get_codex_quota_observation_environment() or "").strip()
     except Exception:
         return None, []
     if not configured_environment:
@@ -3025,20 +2830,14 @@ def _zai_coding_plan_quota_evidence(
         ]
     usable: list[dict[str, Any]] = []
     for observation in cached:
-        observed_at = state_manager._quota_observation_timestamp(
-            observation.get("observed_at")
-        )
+        observed_at = state_manager._quota_observation_timestamp(observation.get("observed_at"))
         period = str(observation.get("quota_period") or "").strip()
         quota_type = str(observation.get("quota_type") or "").strip().lower()
         account_hash = str(observation.get("account_hash") or "").strip()
         quota_key = str(observation.get("quota_key") or "").strip()
         remaining_pct = observation.get("remaining_pct")
-        evidence = _codex_oauth_quota_json_mapping(
-            observation.get("evidence")
-        )
-        evidence_environment = str(
-            evidence.get("environment") or ""
-        ).strip()
+        evidence = _codex_oauth_quota_json_mapping(observation.get("evidence"))
+        evidence_environment = str(evidence.get("environment") or "").strip()
         if (
             observed_at is None
             or now < observed_at
@@ -3048,13 +2847,11 @@ def _zai_coding_plan_quota_evidence(
             or quota_key != f"zai_coding_plan_{period}:{quota_type}"
             or not account_hash
             or observation.get("client") != _ZAI_CODING_PLAN_QUOTA_CLIENT
-            or str(observation.get("environment") or "").strip()
-            != configured_environment
+            or str(observation.get("environment") or "").strip() != configured_environment
             or evidence_environment != configured_environment
             or evidence.get("account_hash") != account_hash
             or evidence.get("customerId_sha256") != account_hash
-            or evidence.get("account_identity_source")
-            != _ZAI_CODING_PLAN_QUOTA_ACCOUNT_IDENTITY_SOURCE
+            or evidence.get("account_identity_source") != _ZAI_CODING_PLAN_QUOTA_ACCOUNT_IDENTITY_SOURCE
             or evidence.get("telemetry_status") != "valid"
             or evidence.get("fresh") is not True
             or evidence.get("complete") is not True
@@ -3068,9 +2865,7 @@ def _zai_coding_plan_quota_evidence(
             or observation.get("exhausted") is not (float(remaining_pct) <= 0.0)
         ):
             continue
-        reset_at = state_manager._quota_observation_timestamp(
-            observation.get("expected_reset_at")
-        )
+        reset_at = state_manager._quota_observation_timestamp(observation.get("expected_reset_at"))
         if reset_at is not None and reset_at <= now:
             continue
         usable.append(
@@ -3088,23 +2883,18 @@ def _zai_coding_plan_quota_evidence(
                 "source": _ZAI_CODING_PLAN_QUOTA_SOURCE,
             }
         )
-    account_hashes = {
-        str(observation["account_hash"]).strip() for observation in usable
-    }
+    account_hashes = {str(observation["account_hash"]).strip() for observation in usable}
     if not usable or len(account_hashes) != 1:
         return None, []
     by_window: dict[str, list[dict[str, Any]]] = {}
     for observation in usable:
         by_window.setdefault(observation["quota_period"], []).append(observation)
     if set(by_window) != set(_ZAI_CODING_PLAN_QUOTA_WINDOWS) or any(
-        len(window_observations) != 1
-        for window_observations in by_window.values()
+        len(window_observations) != 1 for window_observations in by_window.values()
     ):
         return None, []
     windows = [by_window[period][0] for period in sorted(by_window)]
-    exhausted = [
-        window for window in windows if window.get("exhausted") is True
-    ]
+    exhausted = [window for window in windows if window.get("exhausted") is True]
     if exhausted:
         return None, exhausted
     evidence = {
@@ -3113,9 +2903,7 @@ def _zai_coding_plan_quota_evidence(
         "source": _ZAI_CODING_PLAN_QUOTA_SOURCE,
         "account_hash": next(iter(account_hashes)),
         "customerId_sha256": next(iter(account_hashes)),
-        "account_identity_source": (
-            _ZAI_CODING_PLAN_QUOTA_ACCOUNT_IDENTITY_SOURCE
-        ),
+        "account_identity_source": (_ZAI_CODING_PLAN_QUOTA_ACCOUNT_IDENTITY_SOURCE),
         "environment": configured_environment,
         "telemetry_status": "valid",
         "fresh": True,
@@ -3139,10 +2927,7 @@ def _attach_zai_coding_plan_quota_state(
     candidate = state.get("candidate")
     if not isinstance(candidate, dict):
         return state
-    if (
-        candidate.get("provider") != _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER
-        or state.get("skip_reason") is not None
-    ):
+    if candidate.get("provider") != _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER or state.get("skip_reason") is not None:
         return state
     observation, windows = _zai_coding_plan_quota_evidence(
         state_manager=state_manager,
@@ -3161,9 +2946,7 @@ def _attach_zai_coding_plan_quota_state(
         float(observation["observation_age_seconds"]),
         3,
     )
-    state["quota_remaining_pct"] = min(
-        float(window["remaining_pct"]) for window in windows
-    )
+    state["quota_remaining_pct"] = min(float(window["remaining_pct"]) for window in windows)
     return state
 
 
@@ -3177,8 +2960,7 @@ async def _clear_zai_coding_plan_account_quota_cooldown(
         or evidence.get("client") != _ZAI_CODING_PLAN_QUOTA_CLIENT
         or evidence.get("source") != _ZAI_CODING_PLAN_QUOTA_SOURCE
         or evidence.get("customerId_sha256") != evidence.get("account_hash")
-        or evidence.get("account_identity_source")
-        != _ZAI_CODING_PLAN_QUOTA_ACCOUNT_IDENTITY_SOURCE
+        or evidence.get("account_identity_source") != _ZAI_CODING_PLAN_QUOTA_ACCOUNT_IDENTITY_SOURCE
         or evidence.get("telemetry_status") != "valid"
         or evidence.get("fresh") is not True
         or evidence.get("complete") is not True
@@ -3197,9 +2979,7 @@ async def _clear_zai_coding_plan_account_quota_cooldown(
     ):
         return False
     try:
-        configured_environment = str(
-            _get_codex_quota_observation_environment() or ""
-        ).strip()
+        configured_environment = str(_get_codex_quota_observation_environment() or "").strip()
     except Exception:
         return False
     if not configured_environment or environment != configured_environment:
@@ -3209,33 +2989,25 @@ async def _clear_zai_coding_plan_account_quota_cooldown(
     for window in windows:
         if not isinstance(window, Mapping):
             return False
-        window_evidence = _codex_oauth_quota_json_mapping(
-            window.get("evidence")
-        )
+        window_evidence = _codex_oauth_quota_json_mapping(window.get("evidence"))
         period = str(window.get("quota_period") or "").strip()
         quota_type = str(window.get("quota_type") or "").strip().lower()
         remaining_pct = window.get("remaining_pct")
         reset_at = window.get("expected_reset_at")
-        observed_at = alias_routing_state._quota_observation_timestamp(
-            window.get("observed_at")
-        )
+        observed_at = alias_routing_state._quota_observation_timestamp(window.get("observed_at"))
         if (
             period not in _ZAI_CODING_PLAN_QUOTA_WINDOWS
             or period in seen_windows
             or quota_type not in _ZAI_CODING_PLAN_QUOTA_TYPES
-            or window.get("quota_key")
-            != f"zai_coding_plan_{period}:{quota_type}"
+            or window.get("quota_key") != f"zai_coding_plan_{period}:{quota_type}"
             or str(window.get("account_hash") or "").strip() != account_hash
-            or str(window.get("environment") or "").strip()
-            != configured_environment
-            or window.get("client", _ZAI_CODING_PLAN_QUOTA_CLIENT)
-            != _ZAI_CODING_PLAN_QUOTA_CLIENT
+            or str(window.get("environment") or "").strip() != configured_environment
+            or window.get("client", _ZAI_CODING_PLAN_QUOTA_CLIENT) != _ZAI_CODING_PLAN_QUOTA_CLIENT
             or window.get("source") != _ZAI_CODING_PLAN_QUOTA_SOURCE
             or window_evidence.get("environment") != configured_environment
             or window_evidence.get("account_hash") != account_hash
             or window_evidence.get("customerId_sha256") != account_hash
-            or window_evidence.get("account_identity_source")
-            != _ZAI_CODING_PLAN_QUOTA_ACCOUNT_IDENTITY_SOURCE
+            or window_evidence.get("account_identity_source") != _ZAI_CODING_PLAN_QUOTA_ACCOUNT_IDENTITY_SOURCE
             or window_evidence.get("telemetry_status") != "valid"
             or window_evidence.get("fresh") is not True
             or window_evidence.get("complete") is not True
@@ -3271,9 +3043,7 @@ async def _clear_zai_coding_plan_account_quota_cooldown(
     result = await clear_alias_family_cooldown_state(
         alias_family="codex",
         canonical_aliases=[_CODEX_AUTO_AGENT_ZAI_CODING_PLAN_LANE_KEY],
-        cooldown_keys=[
-            _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
-        ],
+        cooldown_keys=[_CODEX_AUTO_AGENT_ZAI_CODING_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY],
         delete_durable=delete_durable,
     )
     return bool(result)
@@ -3435,8 +3205,7 @@ def _find_anthropic_auto_agent_affinity_candidate(
         if (
             candidate["provider"] == affinity.get("provider")
             and candidate["model"] == affinity.get("model")
-            and candidate.get("route_family")
-            == affinity.get("route_family")
+            and candidate.get("route_family") == affinity.get("route_family")
         ):
             return dict(candidate)
     return None
@@ -3550,9 +3319,7 @@ def _attach_account_bound_selection_metadata(
     affinity: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     selection["has_account_bound_state"] = bool(has_account_bound_state)
-    selection["account_bound_classification"] = (
-        "account_bound" if has_account_bound_state else "unbound"
-    )
+    selection["account_bound_classification"] = "account_bound" if has_account_bound_state else "unbound"
     if not has_account_bound_state:
         return selection
     candidate = selection.get("candidate")
@@ -3560,10 +3327,7 @@ def _attach_account_bound_selection_metadata(
     if isinstance(affinity, Mapping):
         lane = _affinity_account_lane(affinity)
     if not lane and isinstance(candidate, Mapping):
-        lane = (
-            candidate.get("xai_oauth_lane_key")
-            or candidate.get("codex_oauth_lane_key")
-        )
+        lane = candidate.get("xai_oauth_lane_key") or candidate.get("codex_oauth_lane_key")
     if lane:
         selection["account_bound_owner_lane"] = lane
     return selection
@@ -3610,16 +3374,14 @@ def _candidate_matches_affinity(
 def _codex_oauth_affinity_is_authenticated_token(
     affinity: Mapping[str, Any],
 ) -> bool:
-    return (
-        affinity.get("affinity_state_source")
-        == "authenticated_continuation_token"
-    )
+    return affinity.get("affinity_state_source") == "authenticated_continuation_token"
 
 
 def _apply_codex_oauth_inventory_affinity_policy(
     affinity: Optional[dict[str, Any]],
     *,
     account_bound: bool = False,
+    inventory: Optional[CodexOAuthInventory] = None,
 ) -> Optional[dict[str, Any]]:
     if not isinstance(affinity, dict):
         return affinity
@@ -3630,14 +3392,9 @@ def _apply_codex_oauth_inventory_affinity_policy(
         "anthropic_openai_responses_adapter",
     }:
         return affinity
-    try:
-        from litellm.secret_managers.codex_oauth_inventory import (
-            load_codex_oauth_inventory,
-        )
-
-        routing = load_codex_oauth_inventory().routing
-    except Exception:  # noqa: BLE001
+    if inventory is None:
         return affinity
+    routing = inventory.routing
     if not routing.accounts_are_interchangeable:
         return affinity
     adjusted = dict(affinity)
@@ -3682,15 +3439,9 @@ def _codex_oauth_quota_observation_from_row(
     except Exception:
         return {}
     environment = str(values.get("environment") or "").strip()
-    raw_provider_fields = _codex_oauth_quota_json_mapping(
-        values.get("raw_provider_fields")
-    )
+    raw_provider_fields = _codex_oauth_quota_json_mapping(values.get("raw_provider_fields"))
     evidence = _codex_oauth_quota_json_mapping(values.get("evidence"))
-    freshness = str(
-        raw_provider_fields.get("freshness_state")
-        or evidence.get("freshness_state")
-        or ""
-    ).strip().lower()
+    freshness = str(raw_provider_fields.get("freshness_state") or evidence.get("freshness_state") or "").strip().lower()
     remaining_pct = values.get("remaining_pct")
     try:
         exhausted = freshness == "fresh" and float(remaining_pct) <= 0
@@ -3704,10 +3455,7 @@ def _codex_oauth_quota_observation_from_row(
         "quota_key": values.get("quota_key"),
         "quota_period": values.get("quota_period"),
         "quota_type": values.get("quota_type"),
-        "limit_scope": (
-            evidence.get("upstream_limit_scope")
-            or raw_provider_fields.get("limit_scope")
-        ),
+        "limit_scope": (evidence.get("upstream_limit_scope") or raw_provider_fields.get("limit_scope")),
         # Preserve malformed duration evidence instead of treating it as absent.
         "window_minutes": raw_provider_fields.get("window_minutes"),
         "remaining_pct": remaining_pct,
@@ -3733,40 +3481,26 @@ def _capture_codex_oauth_quota_evidence(
     environment = _codex_oauth_expected_quota_environment()
     try:
         runtime_environment = (
-            _get_codex_quota_observation_environment()
-            if _get_codex_quota_observation_environment is not None
-            else None
+            _get_codex_quota_observation_environment() if _get_codex_quota_observation_environment is not None else None
         )
     except Exception:
         runtime_environment = None
-    account_hashes = {
-        context["candidate"].get("codex_oauth_account_hash")
-        for context in contexts
-    }
+    account_hashes = {context["candidate"].get("codex_oauth_account_hash") for context in contexts}
     with alias_routing_state._normalized_quota_observations_lock:
         observations = [
             {
                 **observation,
                 "quota_family": _codex_oauth_quota_observation_family(observation),
             }
-            for key, observation in (
-                alias_routing_state._normalized_quota_observations.items()
-            )
-            if key[0] == _CODEX_AUTO_AGENT_NATIVE_PROVIDER
-            and key[2] in account_hashes
+            for key, observation in (alias_routing_state._normalized_quota_observations.items())
+            if key[0] == _CODEX_AUTO_AGENT_NATIVE_PROVIDER and key[2] in account_hashes
         ]
     horizon = _codex_oauth_quota_validity_horizon_seconds()
     for context in contexts:
         candidate = context["candidate"]
         context["quota_evidence"] = _codex_quota_balance.account_evidence(
-            [
-                row for row in observations
-                if row.get("account_hash") == candidate.get("codex_oauth_account_hash")
-            ],
-            family=(
-                _codex_oauth_quota_family_for_model(candidate["model"])
-                if candidate.get("model") else None
-            ),
+            [row for row in observations if row.get("account_hash") == candidate.get("codex_oauth_account_hash")],
+            family=(_codex_oauth_quota_family_for_model(candidate["model"]) if candidate.get("model") else None),
             environment=environment,
             runtime_environment=runtime_environment,
             now=now,
@@ -3782,30 +3516,22 @@ async def _refresh_codex_oauth_quota_observations(
     environment = _CODEX_OAUTH_QUOTA_SHARED_SCOPE
     account_hashes = tuple(
         dict.fromkeys(
-            str(context.get("candidate", {}).get("codex_oauth_account_hash") or "")
-            .strip()
+            str(context.get("candidate", {}).get("codex_oauth_account_hash") or "").strip()
             for context in contexts
-            if str(
-                context.get("candidate", {}).get("codex_oauth_account_hash")
-                or ""
-            ).strip()
+            if str(context.get("candidate", {}).get("codex_oauth_account_hash") or "").strip()
         )
     )
-    due_account_hashes = (
-        alias_routing_state.codex_quota_hydration_due_account_hashes(
-            account_hashes,
-            environment=environment,
-        )
+    due_account_hashes = alias_routing_state.codex_quota_hydration_due_account_hashes(
+        account_hashes,
+        environment=environment,
     )
     if not due_account_hashes:
         return
 
     async with alias_routing_state.codex_quota_hydration_lock:
-        due_account_hashes = (
-            alias_routing_state.codex_quota_hydration_due_account_hashes(
-                account_hashes,
-                environment=environment,
-            )
+        due_account_hashes = alias_routing_state.codex_quota_hydration_due_account_hashes(
+            account_hashes,
+            environment=environment,
         )
         if not due_account_hashes:
             return
@@ -3832,8 +3558,7 @@ async def _refresh_codex_oauth_quota_observations(
                 ttl_seconds=_CODEX_OAUTH_QUOTA_FAILURE_RETRY_SECONDS,
             )
             verbose_proxy_logger.debug(
-                "Codex OAuth durable quota hydration failed open "
-                "(error_class=%s)",
+                "Codex OAuth durable quota hydration failed open " "(error_class=%s)",
                 exc.__class__.__name__,
             )
             return
@@ -3866,8 +3591,12 @@ async def _resolve_codex_oauth_account_candidate_contexts(
     *,
     candidate_template: dict[str, Any],
     affinity: Optional[dict[str, Any]] = None,
+    inventory: Optional[CodexOAuthInventory] = None,
 ) -> list[dict[str, Any]]:
     """Resolve ordered, auth-checked account contexts without carrying secrets."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        codex_oauth as _codex_oauth_mod,
+    )
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
         _remove_proxy_owned_account_display_fields,
         _validated_codex_account_display,
@@ -3877,7 +3606,6 @@ async def _resolve_codex_oauth_account_candidate_contexts(
     from litellm.secret_managers.codex_oauth_inventory import (
         CodexOAuthInventoryError,
         codex_oauth_inventory_generation_digest,
-        load_codex_oauth_inventory,
     )
 
     _remove_proxy_owned_account_display_fields(candidate_template)
@@ -3886,47 +3614,22 @@ async def _resolve_codex_oauth_account_candidate_contexts(
     pinned_hash: Optional[str] = None
     pinned_lane: Optional[str] = None
     interchangeable_affinity = bool(
-        affinity is not None
-        and affinity.get("codex_oauth_credential_affinity")
-        == "interchangeable"
+        affinity is not None and affinity.get("codex_oauth_credential_affinity") == "interchangeable"
     )
-    pin_interchangeable_account = bool(
-        interchangeable_affinity and _affinity_pins_account_identity(affinity)
-    )
+    pin_interchangeable_account = bool(interchangeable_affinity and _affinity_pins_account_identity(affinity))
     if affinity is not None:
-        pinned_label = str(
-            affinity.get("codex_oauth_account_label") or ""
-        ).strip() or None
-        pinned_hash = str(
-            affinity.get("codex_oauth_account_hash") or ""
-        ).strip() or None
-        pinned_lane = str(
-            affinity.get("codex_oauth_lane_key") or ""
-        ).strip() or None
-        if (
-            not interchangeable_affinity
-            and not all((pinned_label, pinned_hash, pinned_lane))
-        ):
+        pinned_label = str(affinity.get("codex_oauth_account_label") or "").strip() or None
+        pinned_hash = str(affinity.get("codex_oauth_account_hash") or "").strip() or None
+        pinned_lane = str(affinity.get("codex_oauth_lane_key") or "").strip() or None
+        if not interchangeable_affinity and not all((pinned_label, pinned_hash, pinned_lane)):
             return [
                 {
                     "candidate": {
                         **candidate_template,
                         "codex_oauth_inventory_generation": None,
-                        **(
-                            {"codex_oauth_account_label": pinned_label}
-                            if pinned_label
-                            else {}
-                        ),
-                        **(
-                            {"codex_oauth_account_hash": pinned_hash}
-                            if pinned_hash
-                            else {}
-                        ),
-                        **(
-                            {"codex_oauth_lane_key": pinned_lane}
-                            if pinned_lane
-                            else {}
-                        ),
+                        **({"codex_oauth_account_label": pinned_label} if pinned_label else {}),
+                        **({"codex_oauth_account_hash": pinned_hash} if pinned_hash else {}),
+                        **({"codex_oauth_lane_key": pinned_lane} if pinned_lane else {}),
                     },
                     "lane_key": pinned_lane or "codex-oauth:unavailable",
                     "auth_status": "degraded",
@@ -3938,22 +3641,15 @@ async def _resolve_codex_oauth_account_candidate_contexts(
             ]
 
     try:
-        inventory = load_codex_oauth_inventory()
+        if inventory is None:
+            inventory = await _codex_oauth_mod._load_request_codex_oauth_inventory(request)
         routing_fields = {
-            "codex_oauth_credential_affinity": (
-                inventory.routing.credential_affinity
-            ),
+            "codex_oauth_credential_affinity": (inventory.routing.credential_affinity),
             "codex_oauth_selection_strategy": inventory.routing.strategy,
-            "codex_oauth_inventory_generation": (
-                codex_oauth_inventory_generation_digest(inventory)
-            ),
+            "codex_oauth_inventory_generation": (codex_oauth_inventory_generation_digest(inventory)),
         }
-        if pinned_label is not None and (
-            not interchangeable_affinity or pin_interchangeable_account
-        ):
-            records = (
-                inventory.select_record(label=pinned_label, model=model),
-            )
+        if pinned_label is not None and (not interchangeable_affinity or pin_interchangeable_account):
+            records = (inventory.select_record(label=pinned_label, model=model),)
         else:
             records = inventory.ordered_records(
                 enabled_only=True,
@@ -3962,6 +3658,7 @@ async def _resolve_codex_oauth_account_candidate_contexts(
     except CodexOAuthInventoryError:
         records = ()
         routing_fields = {"codex_oauth_inventory_generation": None}
+        inventory = None
 
     if not records:
         unavailable_candidate = dict(candidate_template)
@@ -3978,13 +3675,9 @@ async def _resolve_codex_oauth_account_candidate_contexts(
                 "lane_key": pinned_lane or "codex-oauth:unavailable",
                 "auth_status": "degraded",
                 "skip_reason": "auth_degraded",
-                "codex_oauth_inventory_generation": routing_fields.get(
-                    "codex_oauth_inventory_generation"
-                ),
+                "codex_oauth_inventory_generation": routing_fields.get("codex_oauth_inventory_generation"),
                 "failure_phase": (
-                    "affinity_account_unavailable"
-                    if affinity is not None
-                    else "account_inventory_unavailable"
+                    "affinity_account_unavailable" if affinity is not None else "account_inventory_unavailable"
                 ),
                 "attempted_provider_call": False,
             }
@@ -4009,17 +3702,9 @@ async def _resolve_codex_oauth_account_candidate_contexts(
             "candidate": account_candidate,
             "lane_key": lane_key,
             "auth_status": "healthy",
-            "codex_oauth_inventory_generation": routing_fields.get(
-                "codex_oauth_inventory_generation"
-            ),
+            "codex_oauth_inventory_generation": routing_fields.get("codex_oauth_inventory_generation"),
         }
-        if (
-            pinned_hash is not None
-            and (
-                record.expected_account_hash != pinned_hash
-                or pinned_lane != lane_key
-            )
-        ):
+        if pinned_hash is not None and (record.expected_account_hash != pinned_hash or pinned_lane != lane_key):
             context.update(
                 {
                     "auth_status": "degraded",
@@ -4045,10 +3730,7 @@ async def _resolve_codex_oauth_account_candidate_contexts(
                 }
             )
         else:
-            if (
-                loaded.account_hash != record.expected_account_hash
-                or loaded.lane_key != lane_key
-            ):
+            if loaded.account_hash != record.expected_account_hash or loaded.lane_key != lane_key:
                 context.update(
                     {
                         "auth_status": "degraded",
@@ -4058,11 +3740,9 @@ async def _resolve_codex_oauth_account_candidate_contexts(
                     }
                 )
             else:
-                account_candidate["codex_oauth_account_display"] = (
-                    _validated_codex_account_display(
-                        candidate=account_candidate,
-                        loaded=loaded,
-                    )
+                account_candidate["codex_oauth_account_display"] = _validated_codex_account_display(
+                    candidate=account_candidate,
+                    loaded=loaded,
                 )
         contexts.append(context)
     return contexts
@@ -4110,20 +3790,11 @@ async def _resolve_xai_oauth_account_candidate_contexts(
                 pinned_values[field] = value.strip()
         if any(pinned_values.values()) and not all(pinned_values.values()):
             unavailable_candidate = dict(candidate_template)
-            unavailable_candidate.update(
-                {
-                    field: value
-                    for field, value in pinned_values.items()
-                    if value is not None
-                }
-            )
+            unavailable_candidate.update({field: value for field, value in pinned_values.items() if value is not None})
             return [
                 {
                     "candidate": unavailable_candidate,
-                    "lane_key": (
-                        pinned_values["xai_oauth_lane_key"]
-                        or "xai-oauth:unavailable"
-                    ),
+                    "lane_key": (pinned_values["xai_oauth_lane_key"] or "xai-oauth:unavailable"),
                     "auth_status": "degraded",
                     "skip_reason": "auth_degraded",
                     "failure_phase": "affinity_account_context_missing",
@@ -4137,31 +3808,18 @@ async def _resolve_xai_oauth_account_candidate_contexts(
         records = ()
     pinned_label = pinned_values["xai_oauth_account_label"]
     if pinned_label is not None:
-        records = tuple(
-            record for record in records if record.label == pinned_label
-        )
+        records = tuple(record for record in records if record.label == pinned_label)
     if not records:
         unavailable_candidate = dict(candidate_template)
-        unavailable_candidate.update(
-            {
-                field: value
-                for field, value in pinned_values.items()
-                if value is not None
-            }
-        )
+        unavailable_candidate.update({field: value for field, value in pinned_values.items() if value is not None})
         return [
             {
                 "candidate": unavailable_candidate,
-                "lane_key": (
-                    pinned_values["xai_oauth_lane_key"]
-                    or "xai-oauth:unavailable"
-                ),
+                "lane_key": (pinned_values["xai_oauth_lane_key"] or "xai-oauth:unavailable"),
                 "auth_status": "degraded",
                 "skip_reason": "auth_degraded",
                 "failure_phase": (
-                    "affinity_account_unavailable"
-                    if affinity is not None
-                    else "account_inventory_unavailable"
+                    "affinity_account_unavailable" if affinity is not None else "account_inventory_unavailable"
                 ),
                 "attempted_provider_call": False,
             }
@@ -4212,8 +3870,7 @@ async def _resolve_xai_oauth_account_candidate_contexts(
             "auth_status": "healthy",
         }
         if legacy_identity_error is None and any(
-            value is not None and account_candidate[field] != value
-            for field, value in pinned_values.items()
+            value is not None and account_candidate[field] != value for field, value in pinned_values.items()
         ):
             context.update(
                 {
@@ -4278,10 +3935,7 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
     assert _get_codex_active_cooldown_state is not None
     active_cooldown_state = _get_codex_active_cooldown_state
     candidate = dict(candidate_template)
-    account_lane_key = (
-        candidate.get("codex_oauth_lane_key")
-        or candidate.get("xai_oauth_lane_key")
-    )
+    account_lane_key = candidate.get("codex_oauth_lane_key") or candidate.get("xai_oauth_lane_key")
     if isinstance(account_lane_key, str) and account_lane_key:
         openai_lane_key = account_lane_key
     elif openai_lane_key is None:
@@ -4326,16 +3980,11 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
     )
     candidate_semantic_ineligibility = None
     if include_candidate_semantic_ineligibility:
-        candidate_semantic_ineligibility = (
-            await alias_routing_state.get_candidate_semantic_ineligibility(
-                alias_family="codex",
-                candidate_key=cooldown_key,
-            )
+        candidate_semantic_ineligibility = await alias_routing_state.get_candidate_semantic_ineligibility(
+            alias_family="codex",
+            candidate_key=cooldown_key,
         )
-    excluded_candidate = (
-        excluded_candidate_keys is not None
-        and cooldown_key in excluded_candidate_keys
-    )
+    excluded_candidate = excluded_candidate_keys is not None and cooldown_key in excluded_candidate_keys
     (
         cooldown_seconds,
         initial_cooldown_state_source,
@@ -4354,8 +4003,11 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         get_active_cooldown_state=active_cooldown_state,
     )
     cooldown_seconds, cooldown_state_source, skip_reason = await _apply_openrouter_credit_lane_cooldown(
-        candidate=candidate, lane_key=lane_key, cooldown_seconds=cooldown_seconds,
-        cooldown_state_source=cooldown_state_source, skip_reason=skip_reason,
+        candidate=candidate,
+        lane_key=lane_key,
+        cooldown_seconds=cooldown_seconds,
+        cooldown_state_source=cooldown_state_source,
+        skip_reason=skip_reason,
         get_active_cooldown_state=active_cooldown_state,
     )
     (
@@ -4480,16 +4132,11 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         cooldown_state_source = cooldown_state_source_override or "forced_candidate_cooldown"
     if (
         candidate_semantic_ineligibility is not None
-        and (
-            cooldown_seconds <= 0 or _candidate_uses_codex_oauth(candidate)
-        )
+        and (cooldown_seconds <= 0 or _candidate_uses_codex_oauth(candidate))
         and skip_reason is None
     ):
         skip_reason = "candidate_ineligible"
-    if (
-        excluded_candidate
-        and skip_reason is None
-    ):
+    if excluded_candidate and skip_reason is None:
         skip_reason = "candidate_ineligible"
     state: dict[str, Any] = {
         "candidate": candidate,
@@ -4499,15 +4146,12 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         "cooldown_state_source": cooldown_state_source,
     }
     if candidate_semantic_ineligibility is not None:
-        state["candidate_semantic_ineligibility_reason"] = (
-            candidate_semantic_ineligibility.get("reason")
-        )
+        state["candidate_semantic_ineligibility_reason"] = candidate_semantic_ineligibility.get("reason")
         state["candidate_semantic_ineligibility_state_source"] = (
-            candidate_semantic_ineligibility.get("state_source")
-            or "memory"
+            candidate_semantic_ineligibility.get("state_source") or "memory"
         )
-        state["candidate_semantic_ineligibility_remaining_seconds"] = (
-            candidate_semantic_ineligibility.get("remaining_seconds")
+        state["candidate_semantic_ineligibility_remaining_seconds"] = candidate_semantic_ineligibility.get(
+            "remaining_seconds"
         )
     if _config_epoch_tag is not None:
         state["config_epoch_tag"] = _config_epoch_tag
@@ -4526,11 +4170,8 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
     if zen_account_cooldown_scope is not None:
         state["cooldown_scope"] = zen_account_cooldown_scope
     if quota_state.get("cohere_quota_observations"):
-        state["cohere_quota_observations"] = quota_state[
-            "cohere_quota_observations"
-        ]
+        state["cohere_quota_observations"] = quota_state["cohere_quota_observations"]
     return state
-
 
 
 def _is_codex_oauth_spark_model(model: Any) -> bool:
@@ -4597,9 +4238,7 @@ def _codex_oauth_quota_validity_horizon_seconds() -> float:
     return parsed
 
 
-def _codex_oauth_expected_quota_environment(
-    *, use_shared_scope: bool = True
-) -> Optional[str]:
+def _codex_oauth_expected_quota_environment(*, use_shared_scope: bool = True) -> Optional[str]:
     if use_shared_scope:
         shared_scope = os.getenv("AAWM_CODEX_OAUTH_QUOTA_OBSERVATION_ENVIRONMENT")
         if shared_scope is not None:
@@ -4607,9 +4246,7 @@ def _codex_oauth_expected_quota_environment(
     if _get_codex_quota_observation_environment is None:
         return None
     try:
-        environment = str(
-            _get_codex_quota_observation_environment() or ""
-        ).strip()
+        environment = str(_get_codex_quota_observation_environment() or "").strip()
     except Exception:
         return None
     return environment or None
@@ -4626,9 +4263,7 @@ def _codex_oauth_window_matches_environment(
 
 
 def _codex_oauth_window_is_weekly(window: Mapping[str, Any]) -> bool:
-    period = str(
-        window.get("quota_period") or window.get("window") or ""
-    ).strip().lower()
+    period = str(window.get("quota_period") or window.get("window") or "").strip().lower()
     try:
         window_minutes = int(window.get("window_minutes"))
     except (TypeError, ValueError):
@@ -4650,11 +4285,7 @@ def _codex_oauth_dual_family_remaining(
     evidence = state.get("codex_oauth_quota_evidence") or {}
     weekly = evidence.get("weekly")
     family = evidence.get("quota_family")
-    if (
-        family in remaining_by_family
-        and isinstance(weekly, dict)
-        and evidence.get("unusable_reason") is None
-    ):
+    if family in remaining_by_family and isinstance(weekly, dict) and evidence.get("unusable_reason") is None:
         remaining_by_family[family] = weekly["remaining_pct"]
         remaining_ages_by_family[family] = weekly["observation_age_seconds"]
     return remaining_by_family, remaining_ages_by_family
@@ -4670,36 +4301,29 @@ def _select_first_available_codex_oauth_account_state(
     available = [
         state
         for state in states
-        if (
-            state.get("skip_reason") is None
-            and (
-                allow_cooled_down
-                or _is_auto_agent_candidate_state_available(state)
-            )
-        )
+        if (state.get("skip_reason") is None and (allow_cooled_down or _is_auto_agent_candidate_state_available(state)))
     ]
     if not available:
         return None
 
     available_ids = {id(state) for state in available}
     observations = [
-        _codex_quota_balance.decision_account(
-            state, eligible=id(state) in available_ids
+        _codex_quota_balance.decision_account(state, eligible=id(state) in available_ids) for state in states
+    ]
+    eligible_observations = [observation for observation in observations if observation["eligible"]]
+    comparable = (
+        all(
+            observation["unusable_reason"] is None and observation["weekly"] is not None
+            for observation in eligible_observations
         )
-        for state in states
-    ]
-    eligible_observations = [
-        observation for observation in observations if observation["eligible"]
-    ]
-    comparable = all(
-        observation["unusable_reason"] is None
-        and observation["weekly"] is not None
-        for observation in eligible_observations
-    ) and len({
-        (observation["quota_family"], observation["environment"],
-         observation["evaluated_at"])
-        for observation in eligible_observations
-    }) == 1
+        and len(
+            {
+                (observation["quota_family"], observation["environment"], observation["evaluated_at"])
+                for observation in eligible_observations
+            }
+        )
+        == 1
+    )
     threshold = _codex_oauth_weekly_balance_threshold_pct()
     quota_selection: dict[str, Any] = {
         "strategy": "weekly_quota_balance",
@@ -4716,16 +4340,12 @@ def _select_first_available_codex_oauth_account_state(
     if bypass_reason is not None:
         quota_selection["selection_reason"] = "weekly_quota_bypassed"
     elif comparable:
-        remaining_values = [
-            observation["weekly"]["remaining_pct"]
-            for observation in eligible_observations
-        ]
+        remaining_values = [observation["weekly"]["remaining_pct"] for observation in eligible_observations]
         highest = max(remaining_values)
         gap = highest - min(remaining_values)
         quota_selection["observed_gap_pct"] = gap
         quota_selection["max_observation_age_seconds"] = max(
-            observation["weekly"]["observation_age_seconds"]
-            for observation in eligible_observations
+            observation["weekly"]["observation_age_seconds"] for observation in eligible_observations
         )
         if len(available) > 1 and gap >= threshold:
             selected_index = remaining_values.index(highest)
@@ -4734,9 +4354,7 @@ def _select_first_available_codex_oauth_account_state(
         else:
             quota_selection["selection_reason"] = "weekly_quota_priority_tie"
     else:
-        quota_selection["selection_reason"] = (
-            "weekly_quota_observation_fallback"
-        )
+        quota_selection["selection_reason"] = "weekly_quota_observation_fallback"
 
     selected = available[selected_index]
     quota_selection["selected_account"] = {
@@ -4746,14 +4364,16 @@ def _select_first_available_codex_oauth_account_state(
     quota_selection["outer_candidate"] = {
         field: selected["candidate"].get(field)
         for field in (
-            "provider", "model", "route_family", "selection_group",
-            "selection_strategy", "selection_choice",
+            "provider",
+            "model",
+            "route_family",
+            "selection_group",
+            "selection_strategy",
+            "selection_choice",
             "codex_oauth_account_selection_identity",
         )
     }
-    quota_selection["cooldown_bypassed"] = bool(
-        allow_cooled_down and float(selected.get("cooldown_seconds") or 0) > 0
-    )
+    quota_selection["cooldown_bypassed"] = bool(allow_cooled_down and float(selected.get("cooldown_seconds") or 0) > 0)
     selected["quota_selection"] = quota_selection
     selected["quota_balancing"] = quota_selection
     quota_selection["quota_family"] = eligible_observations[selected_index]["quota_family"]
@@ -4783,21 +4403,13 @@ def _select_codex_oauth_account_within_identity(
     """Balance managed accounts only within the outer selected identity."""
     candidate = selected_state["candidate"]
     identity = candidate.get("codex_oauth_account_selection_identity")
-    if (
-        candidate.get("codex_oauth_account_selection_strategy")
-        != "weekly_quota_balance"
-        or identity is None
-    ):
+    if candidate.get("codex_oauth_account_selection_strategy") != "weekly_quota_balance" or identity is None:
         return selected_state
     identity_states = [
         state
         for state in tier
-        if state["candidate"].get(
-            "codex_oauth_account_selection_identity"
-        )
-        == identity
-        and state["candidate"].get("selection_choice")
-        == candidate.get("selection_choice")
+        if state["candidate"].get("codex_oauth_account_selection_identity") == identity
+        and state["candidate"].get("selection_choice") == candidate.get("selection_choice")
     ]
     return (
         _select_first_available_codex_oauth_account_state(
@@ -4813,11 +4425,7 @@ def _format_codex_oauth_quota_reset_at(value: Any) -> Optional[str]:
     if not isinstance(value, (int, float)):
         return None
     try:
-        return (
-            datetime.fromtimestamp(float(value), tz=timezone.utc)
-            .isoformat()
-            .replace("+00:00", "Z")
-        )
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat().replace("+00:00", "Z")
     except (OSError, OverflowError, ValueError):
         return None
 
@@ -4833,19 +4441,13 @@ def _codex_oauth_quota_window_public_shape(
         "quota_type": observation.get("quota_type"),
         "status": observation.get("status"),
         "exhausted": observation.get("exhausted"),
-        "reset_at": _format_codex_oauth_quota_reset_at(
-            observation.get("expected_reset_at")
-        ),
+        "reset_at": _format_codex_oauth_quota_reset_at(observation.get("expected_reset_at")),
         "snapshot_age_seconds": round(
             float(observation.get("observation_age_seconds") or 0.0),
             3,
         ),
     }
-    return {
-        key: value
-        for key, value in shaped.items()
-        if value is not None
-    }
+    return {key: value for key, value in shaped.items() if value is not None}
 
 
 def _codex_oauth_quota_window_is_confirmed_exhausted(
@@ -4861,8 +4463,7 @@ def _codex_oauth_quota_window_is_confirmed_exhausted(
     except (TypeError, ValueError):
         return False
     return (
-        (quota_period in {"five_hour", "seven_day"}
-         or window_minutes in {300, 10080})
+        (quota_period in {"five_hour", "seven_day"} or window_minutes in {300, 10080})
         and str(observation.get("status") or "").strip().lower() == "fresh"
         and observation.get("exhausted") is True
         and remaining_pct <= 0
@@ -4884,24 +4485,14 @@ def _build_codex_oauth_terminal_reset_information(
         if not isinstance(windows, list) or not windows:
             continue
         account = {
-            "account_label": candidate.get(
-                "codex_oauth_account_label"
-            ),
+            "account_label": candidate.get("codex_oauth_account_label"),
             "account_hash": candidate.get("codex_oauth_account_hash"),
             "account_lane": candidate.get("codex_oauth_lane_key"),
             "exhausted_windows": windows,
         }
-        accounts.append(
-            {
-                key: value
-                for key, value in account.items()
-                if value is not None
-            }
-        )
+        accounts.append({key: value for key, value in account.items() if value is not None})
         for window in windows:
-            if isinstance(window, dict) and isinstance(
-                window.get("reset_at"), str
-            ):
+            if isinstance(window, dict) and isinstance(window.get("reset_at"), str):
                 reset_values.append(window["reset_at"])
     if not accounts:
         return None
@@ -4938,9 +4529,7 @@ def _build_family_quota_observation(
     quota_family: str,
 ) -> Optional[dict[str, Any]]:
     remaining_values = [
-        remaining
-        for window in family_windows
-        if (remaining := _codex_oauth_window_remaining_pct(window)) is not None
+        remaining for window in family_windows if (remaining := _codex_oauth_window_remaining_pct(window)) is not None
     ]
     if not remaining_values:
         return None
@@ -4981,9 +4570,7 @@ def _build_family_quota_observation(
         )
         family_observation["observation_age_seconds"] = max(0.0, float(age_source))
     except (TypeError, ValueError):
-        family_observation["observation_age_seconds"] = observation.get(
-            "observation_age_seconds"
-        )
+        family_observation["observation_age_seconds"] = observation.get("observation_age_seconds")
     return family_observation
 
 
@@ -4997,11 +4584,7 @@ def _attach_normalized_quota_state(
     )
 
     candidate = state["candidate"]
-    selected_account_hash = (
-        account_hash
-        or candidate.get("codex_oauth_account_hash")
-        or None
-    )
+    selected_account_hash = account_hash or candidate.get("codex_oauth_account_hash") or None
     request_model = str(candidate.get("model") or "")
     quota_family = _codex_oauth_quota_family_for_model(request_model)
     evidence = state.get("codex_oauth_quota_evidence")
@@ -5018,11 +4601,7 @@ def _attach_normalized_quota_state(
     observation = _alias_routing_state.resolve_normalized_quota_observation(
         provider=str(candidate.get("provider") or ""),
         model=request_model,
-        account_hash=(
-            str(selected_account_hash)
-            if selected_account_hash is not None
-            else None
-        ),
+        account_hash=(str(selected_account_hash) if selected_account_hash is not None else None),
         max_age_seconds=_codex_oauth_quota_validity_horizon_seconds(),
     )
     if observation is None:
@@ -5037,17 +4616,15 @@ def _attach_normalized_quota_state(
         if isinstance(raw_windows, list)
         else []
     )
-    family_windows = [
-        window
-        for window in family_windows
-        if isinstance(window, dict)
-    ]
+    family_windows = [window for window in family_windows if isinstance(window, dict)]
     if not family_windows:
         # Do not let the other quota family hide or invent exhaustion/remaining.
         return state
 
     return _attach_codex_oauth_quota_windows(
-        state, observation=observation, family_windows=family_windows,
+        state,
+        observation=observation,
+        family_windows=family_windows,
         quota_family=quota_family,
     )
 
@@ -5075,24 +4652,13 @@ def _attach_codex_oauth_quota_windows(
         3,
     )
     state["quota_windows"] = _codex_oauth_public_quota_windows(family_windows)
-    exhausted_source = [
-        window
-        for window in family_windows
-        if _codex_oauth_quota_window_is_confirmed_exhausted(window)
-    ]
+    exhausted_source = [window for window in family_windows if _codex_oauth_quota_window_is_confirmed_exhausted(window)]
     if exhausted_source:
-        state["quota_exhausted_windows"] = _codex_oauth_public_quota_windows(
-            exhausted_source
-        )
-    if (
-        state.get("quota_exhausted_windows")
-        and state.get("skip_reason") is None
-    ):
+        state["quota_exhausted_windows"] = _codex_oauth_public_quota_windows(exhausted_source)
+    if state.get("quota_exhausted_windows") and state.get("skip_reason") is None:
         state["skip_reason"] = "quota_exhausted"
         state["cooldown_state_source"] = "normalized_quota_observation"
-        state["terminal_reset"] = (
-            _build_codex_oauth_terminal_reset_information([state])
-        )
+        state["terminal_reset"] = _build_codex_oauth_terminal_reset_information([state])
     return state
 
 
@@ -5107,10 +4673,7 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
 ) -> dict[str, Any]:
     assert _get_anthropic_active_cooldown_state is not None
     candidate = dict(candidate_template)
-    account_lane_key = (
-        candidate.get("codex_oauth_lane_key")
-        or candidate.get("xai_oauth_lane_key")
-    )
+    account_lane_key = candidate.get("codex_oauth_lane_key") or candidate.get("xai_oauth_lane_key")
     if isinstance(account_lane_key, str) and account_lane_key:
         openai_lane_key = account_lane_key
     elif openai_lane_key is None:
@@ -5151,16 +4714,11 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
     )
     candidate_semantic_ineligibility = None
     if include_candidate_semantic_ineligibility:
-        candidate_semantic_ineligibility = (
-            await alias_routing_state.get_candidate_semantic_ineligibility(
-                alias_family="anthropic",
-                candidate_key=cooldown_key,
-            )
+        candidate_semantic_ineligibility = await alias_routing_state.get_candidate_semantic_ineligibility(
+            alias_family="anthropic",
+            candidate_key=cooldown_key,
         )
-    excluded_candidate = (
-        excluded_candidate_keys is not None
-        and cooldown_key in excluded_candidate_keys
-    )
+    excluded_candidate = excluded_candidate_keys is not None and cooldown_key in excluded_candidate_keys
     (
         cooldown_seconds,
         initial_cooldown_state_source,
@@ -5182,8 +4740,11 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
         get_active_cooldown_state=_get_anthropic_active_cooldown_state,
     )
     cooldown_seconds, cooldown_state_source, skip_reason = await _apply_openrouter_credit_lane_cooldown(
-        candidate=candidate, lane_key=lane_key, cooldown_seconds=cooldown_seconds,
-        cooldown_state_source=cooldown_state_source, skip_reason=skip_reason,
+        candidate=candidate,
+        lane_key=lane_key,
+        cooldown_seconds=cooldown_seconds,
+        cooldown_state_source=cooldown_state_source,
+        skip_reason=skip_reason,
         get_active_cooldown_state=_get_anthropic_active_cooldown_state,
     )
     (
@@ -5269,17 +4830,11 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
         cooldown_state_source = cooldown_state_source_override or "forced_candidate_cooldown"
     if (
         candidate_semantic_ineligibility is not None
-        and (
-            cooldown_seconds <= 0 or _candidate_uses_codex_oauth(candidate)
-        )
-        and skip_reason is None
-    ):
-        skip_reason = "candidate_ineligible"
-    if (
-        excluded_candidate
         and (cooldown_seconds <= 0 or _candidate_uses_codex_oauth(candidate))
         and skip_reason is None
     ):
+        skip_reason = "candidate_ineligible"
+    if excluded_candidate and (cooldown_seconds <= 0 or _candidate_uses_codex_oauth(candidate)) and skip_reason is None:
         skip_reason = "candidate_ineligible"
     state: dict[str, Any] = {
         "candidate": candidate,
@@ -5289,15 +4844,12 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
         "cooldown_state_source": cooldown_state_source,
     }
     if candidate_semantic_ineligibility is not None:
-        state["candidate_semantic_ineligibility_reason"] = (
-            candidate_semantic_ineligibility.get("reason")
-        )
+        state["candidate_semantic_ineligibility_reason"] = candidate_semantic_ineligibility.get("reason")
         state["candidate_semantic_ineligibility_state_source"] = (
-            candidate_semantic_ineligibility.get("state_source")
-            or "memory"
+            candidate_semantic_ineligibility.get("state_source") or "memory"
         )
-        state["candidate_semantic_ineligibility_remaining_seconds"] = (
-            candidate_semantic_ineligibility.get("remaining_seconds")
+        state["candidate_semantic_ineligibility_remaining_seconds"] = candidate_semantic_ineligibility.get(
+            "remaining_seconds"
         )
     if _config_epoch_tag is not None:
         state["config_epoch_tag"] = _config_epoch_tag
@@ -5338,21 +4890,14 @@ def _apply_codex_oauth_account_context_to_state(
             state,
             account_hash=account_hash,
         )
-        if (
-            state.get("skip_reason") == "candidate_ineligible"
-            and state.get("quota_exhausted_windows")
-        ):
+        if state.get("skip_reason") == "candidate_ineligible" and state.get("quota_exhausted_windows"):
             state["skip_reason"] = "quota_exhausted"
             state["cooldown_state_source"] = "normalized_quota_observation"
             state["terminal_reset"] = _build_codex_oauth_terminal_reset_information([state])
         candidate = state["candidate"]
         if _is_codex_oauth_account_candidate(candidate):
-            candidate["codex_oauth_account_selection_strategy"] = (
-                "weekly_quota_balance"
-            )
-            candidate["codex_oauth_account_selection_choice"] = str(
-                candidate.get("codex_oauth_account_label")
-            )
+            candidate["codex_oauth_account_selection_strategy"] = "weekly_quota_balance"
+            candidate["codex_oauth_account_selection_choice"] = str(candidate.get("codex_oauth_account_label"))
     return _apply_codex_oauth_failover_context_to_state(request, state)
 
 
@@ -5404,14 +4949,10 @@ async def _build_codex_auto_agent_affinity_candidate_state(
             candidate_template=candidate_template,
             excluded_candidate_keys=excluded_candidate_keys,
         )
-        if candidate_template.get(
-            "provider"
-        ) == _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER:
+        if candidate_template.get("provider") == _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER:
             await _hydrate_alibaba_token_plan_quota_observations()
             return _attach_alibaba_token_plan_quota_state(candidate_state)
-        if candidate_template.get(
-            "provider"
-        ) == _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER:
+        if candidate_template.get("provider") == _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER:
             await _hydrate_zai_coding_plan_quota_observations()
             return _attach_zai_coding_plan_quota_state(candidate_state)
         return _attach_normalized_quota_state(candidate_state)
@@ -5436,18 +4977,12 @@ async def _build_codex_auto_agent_affinity_candidate_state(
                 context=context,
             )
         )
-    if (
-        affinity.get("codex_oauth_credential_affinity")
-        == "interchangeable"
-        and not _affinity_pins_account_identity(affinity)
+    if affinity.get("codex_oauth_credential_affinity") == "interchangeable" and not _affinity_pins_account_identity(
+        affinity
     ):
         return (
             next(
-                (
-                    state
-                    for state in states
-                    if _is_auto_agent_candidate_state_available(state)
-                ),
+                (state for state in states if _is_auto_agent_candidate_state_available(state)),
                 None,
             )
             or states[0]
@@ -5519,12 +5054,8 @@ def _candidate_state_semantic_marker_kwargs(
         signature = inspect.signature(builder)
     except (TypeError, ValueError):
         return {}
-    if (
-        "include_candidate_semantic_ineligibility" in signature.parameters
-        or any(
-            parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in signature.parameters.values()
-        )
+    if "include_candidate_semantic_ineligibility" in signature.parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()
     ):
         return {"include_candidate_semantic_ineligibility": True}
     return {}
@@ -5565,17 +5096,9 @@ async def _build_codex_auto_agent_candidate_states(
             ingress="codex",
             client_product_label=client_product_label,
         ).candidates
-    if any(
-        candidate.get("provider")
-        == _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
-        for candidate in candidates
-    ):
+    if any(candidate.get("provider") == _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER for candidate in candidates):
         await _hydrate_alibaba_token_plan_quota_observations()
-    if any(
-        candidate.get("provider")
-        == _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER
-        for candidate in candidates
-    ):
+    if any(candidate.get("provider") == _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER for candidate in candidates):
         await _hydrate_zai_coding_plan_quota_observations()
     for template_index, candidate_template in enumerate(candidates):
         if _candidate_uses_xai_oauth(candidate_template):
@@ -5610,17 +5133,13 @@ async def _build_codex_auto_agent_candidate_states(
         if _candidate_uses_codex_oauth(candidate_template):
             candidate_template = {
                 **candidate_template,
-                "codex_oauth_account_selection_identity": (
-                    "codex", alias_model, template_index
-                ),
+                "codex_oauth_account_selection_identity": ("codex", alias_model, template_index),
             }
             contexts = await _resolve_codex_oauth_account_candidate_contexts(
                 request,
                 candidate_template=candidate_template,
             )
-            await _aawm_selection._hydrate_codex_oauth_quota_observations(
-                contexts
-            )
+            await _aawm_selection._hydrate_codex_oauth_quota_observations(contexts)
             for context in contexts:
                 candidate_state_kwargs: dict[str, Any] = {
                     "candidate_template": context["candidate"],
@@ -5660,15 +5179,9 @@ async def _build_codex_auto_agent_candidate_states(
             request,
             **candidate_state_kwargs,
         )
-        if candidate_template.get(
-            "provider"
-        ) == _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER:
-            candidate_state = _attach_alibaba_token_plan_quota_state(
-                candidate_state
-            )
-        elif candidate_template.get(
-            "provider"
-        ) == _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER:
+        if candidate_template.get("provider") == _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER:
+            candidate_state = _attach_alibaba_token_plan_quota_state(candidate_state)
+        elif candidate_template.get("provider") == _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER:
             candidate_state = _attach_zai_coding_plan_quota_state(candidate_state)
         else:
             candidate_state = _attach_normalized_quota_state(candidate_state)
@@ -5727,17 +5240,13 @@ async def _build_anthropic_auto_agent_candidate_states(
         if _candidate_uses_codex_oauth(candidate_template):
             candidate_template = {
                 **candidate_template,
-                "codex_oauth_account_selection_identity": (
-                    "anthropic", alias_model, template_index
-                ),
+                "codex_oauth_account_selection_identity": ("anthropic", alias_model, template_index),
             }
             contexts = await _resolve_codex_oauth_account_candidate_contexts(
                 request,
                 candidate_template=candidate_template,
             )
-            await _aawm_selection._hydrate_codex_oauth_quota_observations(
-                contexts
-            )
+            await _aawm_selection._hydrate_codex_oauth_quota_observations(contexts)
             for context in contexts:
                 candidate_state_kwargs: dict[str, Any] = {
                     "candidate_template": context["candidate"],
@@ -5874,22 +5383,11 @@ def _select_available_state(
     ]
     if not available:
         return None
-    highest_priority = max(
-        int(state["candidate"].get("selection_priority", 0))
-        for state in available
-    )
-    tier = [
-        state
-        for state in available
-        if int(state["candidate"].get("selection_priority", 0))
-        == highest_priority
-    ]
+    highest_priority = max(int(state["candidate"].get("selection_priority", 0)) for state in available)
+    tier = [state for state in available if int(state["candidate"].get("selection_priority", 0)) == highest_priority]
     group = tier[0]["candidate"].get("selection_group")
     strategy = tier[0]["candidate"].get("selection_strategy")
-    bypass_reason = (
-        None if request_mode in {"fresh", "fresh_redispatch"}
-        else "ordinary_continuation"
-    )
+    bypass_reason = None if request_mode in {"fresh", "fresh_redispatch"} else "ordinary_continuation"
     if not group or not strategy:
         return _select_codex_oauth_account_within_identity(
             states, tier[0], last_resort=last_resort, bypass_reason=bypass_reason
@@ -5902,7 +5400,9 @@ def _select_available_state(
         choice = str(candidate.get("selection_choice") or "")
         if not choice:
             return _select_codex_oauth_account_within_identity(
-                states, tier[0], last_resort=last_resort,
+                states,
+                tier[0],
+                last_resort=last_resort,
                 bypass_reason=bypass_reason,
             )
         states_by_choice.setdefault(choice, []).append(state)
@@ -5927,9 +5427,7 @@ def _select_available_state(
                 group=str(group),
                 ingress=ingress,
             )
-            selected_choice = str(
-                selected_state["candidate"].get("selection_choice") or ""
-            )
+            selected_choice = str(selected_state["candidate"].get("selection_choice") or "")
         elif strategy in {
             "highest_quota_available",
             "lowest_quota_available",
@@ -5953,8 +5451,7 @@ def _select_available_state(
             tied = [
                 choice
                 for choice in choices
-                if choice in quota_by_choice
-                and abs(quota_by_choice[choice] - target) <= 0.001
+                if choice in quota_by_choice and abs(quota_by_choice[choice] - target) <= 0.001
             ]
             selected_choice = random.choice(tied)
         else:
@@ -5975,17 +5472,11 @@ def _select_available_state(
         "group": group,
         "available_choices": choices,
         "normalized_available_weights": {
-            choice: (
-                max(0.0, weights[choice]) / total_weight
-                if total_weight > 0
-                else 1.0 / len(choices)
-            )
+            choice: (max(0.0, weights[choice]) / total_weight if total_weight > 0 else 1.0 / len(choices))
             for choice in choices
         },
         "selected_choice": selected_choice,
-        "reselection_count": _get_request_reselection_counts(request).get(
-            str(group), 0
-        ),
+        "reselection_count": _get_request_reselection_counts(request).get(str(group), 0),
     }
     if isinstance(quota_balancing, dict):
         selected["selection_diagnostics"]["quota_balancing"] = quota_balancing
@@ -6145,9 +5636,7 @@ def _build_auto_agent_redispatch_http_exception_detail(
     if attempted_provider_call is not None:
         detail["attempted_provider_call"] = attempted_provider_call
     if account_failover_rejection_reason is not None:
-        detail["account_failover_rejection_reason"] = (
-            account_failover_rejection_reason
-        )
+        detail["account_failover_rejection_reason"] = account_failover_rejection_reason
     redact_account_identity = alias_family == "codex_auto_agent"
     if isinstance(audit_events, list):
         detail["aawm_alias_routing_audit_events"] = (
@@ -6357,19 +5846,17 @@ def _raise_anthropic_auto_agent_redispatch_required(
     )
 
 
-
 def _session_affinity_mod():
     """Lazy load session_affinity (safe under module rebinding)."""
     import sys
 
-    mod = sys.modules.get(
-        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.session_affinity"
-    )
+    mod = sys.modules.get("litellm.proxy.pass_through_endpoints.aawm_alias_routing.session_affinity")
     if mod is not None:
         return mod
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
         session_affinity as mod,
     )
+
     return mod
 
 
@@ -6381,11 +5868,7 @@ def _attach_session_owner_selection_fields(
     session_owner_identity: Optional[str] = None,
 ) -> dict[str, Any]:
     sa = _session_affinity_mod()
-    effective_owner_identity = (
-        canonical_session_identity
-        if session_owner_identity is None
-        else session_owner_identity
-    )
+    effective_owner_identity = canonical_session_identity if session_owner_identity is None else session_owner_identity
     provenance = getattr(session_owner_guard, "provenance", None) or sa.build_session_owner_provenance(
         session_identity=effective_owner_identity,
         decision=getattr(
@@ -6403,16 +5886,10 @@ def _attach_session_owner_selection_fields(
     selection["session_owner_identity"] = effective_owner_identity
     selection["session_owner_decision"] = provenance.get("session_owner_decision")
     selection["session_owner_id"] = provenance.get("session_owner_id")
-    selection["session_owner_mismatch_reason"] = provenance.get(
-        "session_owner_mismatch_reason"
-    )
+    selection["session_owner_mismatch_reason"] = provenance.get("session_owner_mismatch_reason")
     selection["session_owner_provenance"] = provenance
-    selection["session_owner_reservation_token"] = getattr(
-        session_owner_guard, "reservation_token", None
-    )
-    selection["session_owner_held_reservation"] = bool(
-        getattr(session_owner_guard, "held_reservation", False)
-    )
+    selection["session_owner_reservation_token"] = getattr(session_owner_guard, "reservation_token", None)
+    selection["session_owner_held_reservation"] = bool(getattr(session_owner_guard, "held_reservation", False))
     return selection
 
 
@@ -6467,53 +5944,52 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
     session_owner_identity = resolved_session_identity
     if is_auto_review:
         parent_session_identity = (
-            sa.get_request_codex_auto_review_parent_session_identity(request)
-            or resolved_session_identity
+            sa.get_request_codex_auto_review_parent_session_identity(request) or resolved_session_identity
         )
         sa.activate_codex_auto_review_session_identity(
             request=request,
             parent_session_identity=parent_session_identity,
         )
         canonical_session_identity = (
-            sa.get_request_codex_auto_review_parent_session_identity(request)
-            or parent_session_identity
+            sa.get_request_codex_auto_review_parent_session_identity(request) or parent_session_identity
         )
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.attempt_records import (
             _bind_auto_agent_alias_request_identity,
         )
 
-        session_owner_identity = (
-            sa.get_request_effective_session_identity(request)
-            or sa.activate_codex_auto_review_session_owner_identity(
-                request=request,
-                parent_session_identity=canonical_session_identity,
-                request_call_identity=_bind_auto_agent_alias_request_identity(request),
-            )
+        session_owner_identity = sa.get_request_effective_session_identity(
+            request
+        ) or sa.activate_codex_auto_review_session_owner_identity(
+            request=request,
+            parent_session_identity=canonical_session_identity,
+            request_call_identity=_bind_auto_agent_alias_request_identity(request),
         )
 
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
         codex_oauth as _codex_oauth_mod,
     )
 
-    codex_oauth_continuation = (
-        _codex_oauth_mod._get_codex_oauth_affinity_continuation_state(
-            request,
-            body=request_body,
-            # Alias names are not the token's model scope. The authenticated
-            # continuation freezes its signed concrete model before affinity
-            # membership and owner compatibility are evaluated below.
-            model=None,
-            session_identity=canonical_session_identity,
-        )
+    codex_oauth_inventory: Optional[CodexOAuthInventory] = None
+    try:
+        codex_oauth_inventory = await _codex_oauth_mod._load_request_codex_oauth_inventory(request)
+    except _codex_oauth_mod.CodexOAuthInventoryError:
+        codex_oauth_inventory = None
+    codex_oauth_continuation = _codex_oauth_mod._get_codex_oauth_affinity_continuation_state(
+        request,
+        body=request_body,
+        # Alias names are not the token's model scope. The authenticated
+        # continuation freezes its signed concrete model before affinity
+        # membership and owner compatibility are evaluated below.
+        model=None,
+        session_identity=canonical_session_identity,
+        inventory=codex_oauth_inventory,
     )
     if codex_oauth_continuation.invalid:
         raise _codex_oauth_mod._codex_oauth_affinity_token_invalid_exception()
     token_affinity = codex_oauth_continuation.as_affinity()
 
     replay_safety = (
-        _replay_safety
-        if _replay_safety is not None
-        else sa.classify_session_owner_replay_safety_body(request_body)
+        _replay_safety if _replay_safety is not None else sa.classify_session_owner_replay_safety_body(request_body)
     )
     replay_safe = replay_safety.safe
     if is_auto_review and not replay_safe:
@@ -6536,13 +6012,9 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         request_body,
         alias_model=alias_model,
     )
-    has_continuation_state = _has_continuation_state(
-        request_body
-    ) or codex_oauth_continuation.declared
+    has_continuation_state = _has_continuation_state(request_body) or codex_oauth_continuation.declared
     has_previous_response_id = bool(request_body.get("previous_response_id"))
-    has_account_bound_state = _has_account_bound_state(
-        request_body
-    ) or token_affinity is not None
+    has_account_bound_state = _has_account_bound_state(request_body) or token_affinity is not None
     server_validated_replay = sa.validate_cursor_replay_matches_body(
         request,
         body=request_body,
@@ -6552,9 +6024,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         request_body=request_body,
         server_validated_replay=server_validated_replay,
     )
-    provider_owned_continuation = (
-        has_continuation_state and not server_validated_replay
-    )
+    provider_owned_continuation = has_continuation_state and not server_validated_replay
 
     # Read-path ownership check before free selection. A nested Codex dispatch
     # may already have consulted this exact canonical identity; reuse only an
@@ -6577,9 +6047,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         None,
     )
     computed_cache_key = (
-        sa.build_aawm_alias_routing_session_owner_cache_key(
-            session_identity=session_owner_identity
-        )
+        sa.build_aawm_alias_routing_session_owner_cache_key(session_identity=session_owner_identity)
         if session_owner_identity is not None
         else None
     )
@@ -6607,12 +6075,10 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         _cache_key = computed_cache_key
         session_owner_error = None
     else:
-        session_owner_record, _cache_key, session_owner_error = (
-            await sa.get_session_owner_record(
-                session_identity=session_owner_identity,
-                request=request,
-                wait_for_foreign_reservation=True,
-            )
+        session_owner_record, _cache_key, session_owner_error = await sa.get_session_owner_record(
+            session_identity=session_owner_identity,
+            request=request,
+            wait_for_foreign_reservation=True,
         )
     if session_owner_error is not None:
         sa.raise_session_owner_redispatch_required(
@@ -6644,11 +6110,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
     session_owner_guard_meta = {
         "decision": "unowned",
         "owner_record": session_owner_record,
-        "owner_id": (
-            session_owner_record.get("owner")
-            if isinstance(session_owner_record, dict)
-            else None
-        ),
+        "owner_id": (session_owner_record.get("owner") if isinstance(session_owner_record, dict) else None),
         "mismatch_reason": None,
         "provenance": sa.build_session_owner_provenance(
             session_identity=session_owner_identity,
@@ -6661,9 +6123,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         "cache_key": _cache_key,
     }
 
-    async def _cross_provider_derived_owner() -> Optional[
-        tuple[str, dict[str, Any], Optional[str]]
-    ]:
+    async def _cross_provider_derived_owner() -> Optional[tuple[str, dict[str, Any], Optional[str]]]:
         """Return a derived owner already serving this alias on another host.
 
         Luna can own the canonical session while an earlier turn of a spawned
@@ -6676,36 +6136,26 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
 
         if is_auto_review or session_owner_identity is None:
             return None
-        if sa.is_session_owner_redispatch_effective_identity(
-            session_owner_identity
-        ):
+        if sa.is_session_owner_redispatch_effective_identity(session_owner_identity):
             return None
         if sa.request_has_effective_session_identity(request):
             return None
         if not isinstance(session_owner_record, dict):
             return None
-        derived_identity = sa.derive_session_owner_effective_identity(
-            session_owner_identity
-        )
+        derived_identity = sa.derive_session_owner_effective_identity(session_owner_identity)
         if derived_identity is None:
             return None
-        derived_record, derived_cache_key, derived_error = (
-            await sa.get_session_owner_record(
-                session_identity=derived_identity,
-                request=request,
-                wait_for_foreign_reservation=True,
-            )
+        derived_record, derived_cache_key, derived_error = await sa.get_session_owner_record(
+            session_identity=derived_identity,
+            request=request,
+            wait_for_foreign_reservation=True,
         )
         if derived_error is not None or not isinstance(derived_record, dict):
             return None
         if sa._record_state(derived_record) != "owned":
             return None
-        canonical_host = sa._hosted_provider_from_attributes(
-            sa._owner_attributes(session_owner_record)
-        )
-        derived_host = sa._hosted_provider_from_attributes(
-            sa._owner_attributes(derived_record)
-        )
+        canonical_host = sa._hosted_provider_from_attributes(sa._owner_attributes(session_owner_record))
+        derived_host = sa._hosted_provider_from_attributes(sa._owner_attributes(derived_record))
         if not derived_host or derived_host == canonical_host:
             return None
         derived_affinity = sa.owner_record_as_affinity_hint(derived_record)
@@ -6763,10 +6213,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 ),
                 request=request,
             )
-        if (
-            sa.request_has_effective_session_identity(request)
-            and not is_auto_review
-        ):
+        if sa.request_has_effective_session_identity(request) and not is_auto_review:
             sa.raise_session_owner_redispatch_required(
                 session_identity=session_owner_identity,
                 alias_model=alias_model,
@@ -6797,12 +6244,8 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                     session_identity=session_owner_identity,
                     cache_key=_cache_key,
                     owner_record=session_owner_record,
-                    owner_id=session_owner_record.get("owner")
-                    if isinstance(session_owner_record, dict)
-                    else None,
-                    mismatch_reason=(
-                        "session_owner: held lease cannot transition to derived identity"
-                    ),
+                    owner_id=session_owner_record.get("owner") if isinstance(session_owner_record, dict) else None,
+                    mismatch_reason=("session_owner: held lease cannot transition to derived identity"),
                 ),
                 request=request,
             )
@@ -6812,17 +6255,13 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             replace_existing_auto_review_owner=is_auto_review,
         )
         if effective_identity is None:
-            effective_identity_conflict = sa.request_has_effective_session_identity(
-                request
-            )
+            effective_identity_conflict = sa.request_has_effective_session_identity(request)
             sa.raise_session_owner_redispatch_required(
                 session_identity=session_owner_identity,
                 alias_model=alias_model,
                 candidate=candidate,
                 failure_phase=(
-                    "session_owner_effective_identity_conflict"
-                    if effective_identity_conflict
-                    else failure_phase
+                    "session_owner_effective_identity_conflict" if effective_identity_conflict else failure_phase
                 ),
                 guard=sa.SessionOwnerGuardResult(
                     decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
@@ -6834,11 +6273,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 ),
                 request=request,
             )
-        replay_safety_kwarg = (
-            {"_replay_safety": replay_safety}
-            if replay_safety is not None
-            else {}
-        )
+        replay_safety_kwarg = {"_replay_safety": replay_safety} if replay_safety is not None else {}
         return await _select_codex_auto_agent_candidate(
             request=request,
             request_body=request_body,
@@ -6852,19 +6287,12 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         cursor_effective_cache_key: Optional[str] = None
         if (
             not is_auto_review
-            and sa._hosted_provider_from_attributes(
-                sa._owner_attributes(session_owner_record)
-            )
-            == "cursor"
+            and sa._hosted_provider_from_attributes(sa._owner_attributes(session_owner_record)) == "cursor"
         ):
             cursor_effective_identity = (
                 session_owner_identity
-                if sa.is_session_owner_redispatch_effective_identity(
-                    session_owner_identity
-                )
-                else sa.derive_session_owner_effective_identity(
-                    session_owner_identity
-                )
+                if sa.is_session_owner_redispatch_effective_identity(session_owner_identity)
+                else sa.derive_session_owner_effective_identity(session_owner_identity)
             )
             if cursor_effective_identity is None:
                 sa.raise_session_owner_redispatch_required(
@@ -6881,12 +6309,14 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                     ),
                     request=request,
                 )
-            cursor_effective_record, cursor_effective_cache_key, cursor_effective_error = (
-                await sa.get_session_owner_record(
-                    session_identity=cursor_effective_identity,
-                    request=request,
-                    wait_for_foreign_reservation=True,
-                )
+            (
+                cursor_effective_record,
+                cursor_effective_cache_key,
+                cursor_effective_error,
+            ) = await sa.get_session_owner_record(
+                session_identity=cursor_effective_identity,
+                request=request,
+                wait_for_foreign_reservation=True,
             )
             if cursor_effective_error is not None:
                 sa.raise_session_owner_redispatch_required(
@@ -6899,9 +6329,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                         cache_key=cursor_effective_cache_key,
                         owner_record=cursor_effective_record,
                         owner_id=(
-                            cursor_effective_record.get("owner")
-                            if isinstance(cursor_effective_record, dict)
-                            else None
+                            cursor_effective_record.get("owner") if isinstance(cursor_effective_record, dict) else None
                         ),
                         mismatch_reason=cursor_effective_error,
                     ),
@@ -6910,9 +6338,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             if cursor_effective_record is None:
                 # The base Cursor owner remains authoritative for the initial
                 # request. Do not activate an unproven derived identity.
-                if sa.is_session_owner_redispatch_effective_identity(
-                    session_owner_identity
-                ):
+                if sa.is_session_owner_redispatch_effective_identity(session_owner_identity):
                     sa.raise_session_owner_redispatch_required(
                         session_identity=session_owner_identity,
                         alias_model=alias_model,
@@ -6923,9 +6349,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                             cache_key=_cache_key,
                             owner_record=session_owner_record,
                             owner_id=session_owner_record.get("owner"),
-                            mismatch_reason=(
-                                "session_owner: derived Cursor owner record unavailable"
-                            ),
+                            mismatch_reason=("session_owner: derived Cursor owner record unavailable"),
                         ),
                         request=request,
                     )
@@ -6935,12 +6359,10 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 )
             elif sa._record_state(cursor_effective_record) == "owned":
                 if cursor_effective_identity != session_owner_identity:
-                    activated_identity = (
-                        sa.activate_session_owner_redispatch_effective_identity(
-                            request=request,
-                            base_session_identity=session_owner_identity,
-                            replace_existing_auto_review_owner=is_auto_review,
-                        )
+                    activated_identity = sa.activate_session_owner_redispatch_effective_identity(
+                        request=request,
+                        base_session_identity=session_owner_identity,
+                        replace_existing_auto_review_owner=is_auto_review,
                     )
                     if activated_identity != cursor_effective_identity:
                         sa.raise_session_owner_redispatch_required(
@@ -6953,10 +6375,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                                 cache_key=_cache_key,
                                 owner_record=session_owner_record,
                                 owner_id=session_owner_record.get("owner"),
-                                mismatch_reason=(
-                                    "session_owner: Cursor derived identity could "
-                                    "not be activated"
-                                ),
+                                mismatch_reason=("session_owner: Cursor derived identity could " "not be activated"),
                             ),
                             request=request,
                         )
@@ -6978,27 +6397,19 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                         cache_key=cursor_effective_cache_key,
                         owner_record=cursor_effective_record,
                         owner_id=(
-                            cursor_effective_record.get("owner")
-                            if isinstance(cursor_effective_record, dict)
-                            else None
+                            cursor_effective_record.get("owner") if isinstance(cursor_effective_record, dict) else None
                         ),
-                        mismatch_reason=(
-                            "session_owner: Cursor derived owner is not owned"
-                        ),
+                        mismatch_reason=("session_owner: Cursor derived owner is not owned"),
                     ),
                     request=request,
                 )
         else:
             derived_owner = await _cross_provider_derived_owner()
             if derived_owner is not None:
-                derived_identity, derived_record, derived_cache_key = (
-                    derived_owner
-                )
-                lease_cleared = (
-                    sa.clear_expected_non_held_request_session_owner_lease(
-                        request,
-                        expected_session_identity=session_owner_identity,
-                    )
+                derived_identity, derived_record, derived_cache_key = derived_owner
+                lease_cleared = sa.clear_expected_non_held_request_session_owner_lease(
+                    request,
+                    expected_session_identity=session_owner_identity,
                 )
                 activated_identity = (
                     sa.activate_session_owner_redispatch_effective_identity(
@@ -7087,10 +6498,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
     affinity = _codex_oauth_mod._codex_oauth_resolve_affinity(
         durable_affinity=affinity,
         token_affinity=token_affinity,
-        conflict_message=(
-            "Codex OAuth continuation affinity state conflicts "
-            "with durable session affinity."
-        ),
+        conflict_message=("Codex OAuth continuation affinity state conflicts " "with durable session affinity."),
     )
 
     authenticated_token_affinity = token_affinity is not None
@@ -7117,21 +6525,15 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
     affinity = _apply_codex_oauth_inventory_affinity_policy(
         affinity,
         account_bound=account_identity_pinned,
+        inventory=codex_oauth_inventory,
     )
     affinity_selection_reason = (
-        _codex_oauth_mod._codex_oauth_affinity_selection_reason(affinity)
-        if affinity is not None
-        else None
+        _codex_oauth_mod._codex_oauth_affinity_selection_reason(affinity) if affinity is not None else None
     )
     ohmypi_client_history_without_owner = (
         _normalize_tui_family(client_product_label) == "ohmypi"
         and affinity is None
-        and (
-            sa._record_state(session_owner_record)
-            if isinstance(session_owner_record, dict)
-            else None
-        )
-        is None
+        and (sa._record_state(session_owner_record) if isinstance(session_owner_record, dict) else None) is None
         and not has_previous_response_id
     )
     if (
@@ -7140,16 +6542,8 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         and not (is_auto_review and replay_safe)
         and not ohmypi_client_history_without_owner
     ):
-        owner_state = (
-            sa._record_state(session_owner_record)
-            if isinstance(session_owner_record, dict)
-            else None
-        )
-        owner_id = (
-            session_owner_record.get("owner")
-            if isinstance(session_owner_record, dict)
-            else None
-        )
+        owner_state = sa._record_state(session_owner_record) if isinstance(session_owner_record, dict) else None
+        owner_id = session_owner_record.get("owner") if isinstance(session_owner_record, dict) else None
         mismatch_reason = (
             "session_owner: provider-owned continuation requires an "
             "owned durable owner record or compatible affinity "
@@ -7198,11 +6592,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                     # allowing portable auto-review history to move under its
                     # request-local redispatch identity.
                     (is_auto_review and replay_safe)
-                    or not (
-                        account_identity_pinned
-                        and _affinity_pins_account_identity(affinity)
-                        and replay_safe
-                    )
+                    or not (account_identity_pinned and _affinity_pins_account_identity(affinity) and replay_safe)
                 )
             ):
                 return await _reselect_owned_affinity_with_effective_identity(
@@ -7213,9 +6603,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                         "last_resort": bool(affinity.get("last_resort")),
                     },
                     failure_phase="session_owner_owned_affinity_removed",
-                    mismatch_reason=(
-                        "session_owner: no compatible alias candidate for owned route"
-                    ),
+                    mismatch_reason=("session_owner: no compatible alias candidate for owned route"),
                 )
             if account_identity_pinned and _affinity_pins_account_identity(affinity):
                 pinned_candidate_shape = {
@@ -7296,19 +6684,13 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 affinity,
             )
             and (
-                not (
-                    account_identity_pinned
-                    and _affinity_pins_account_identity(affinity)
-                )
-                or affinity_state.get("lane_key")
-                == _affinity_account_lane(affinity)
+                not (account_identity_pinned and _affinity_pins_account_identity(affinity))
+                or affinity_state.get("lane_key") == _affinity_account_lane(affinity)
             )
             and affinity_state.get("skip_reason") is None
             and 0 < affinity_state["cooldown_seconds"] <= 1.0
         ):
-            await asyncio.sleep(
-                min(affinity_state["cooldown_seconds"], 1.0)
-            )
+            await asyncio.sleep(min(affinity_state["cooldown_seconds"], 1.0))
             affinity_state = await _build_codex_auto_agent_affinity_candidate_state(
                 request,
                 candidate_template=affinity_candidate,
@@ -7322,11 +6704,8 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                         lane_key=affinity_state.get("lane_key"),
                         cooldown_seconds=affinity_state["cooldown_seconds"],
                         alias_model=alias_model,
-                        failure_phase=affinity_state.get("failure_phase")
-                        or "affinity_account_cooldown",
-                        skipped_candidates=_build_auto_agent_skipped_candidates_from_states(
-                            [affinity_state]
-                        ),
+                        failure_phase=affinity_state.get("failure_phase") or "affinity_account_cooldown",
+                        skipped_candidates=_build_auto_agent_skipped_candidates_from_states([affinity_state]),
                         terminal_reset=affinity_state.get("terminal_reset"),
                     )
                 _raise_codex_auto_agent_in_flight_cooldown(
@@ -7334,13 +6713,10 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                     lane_key=affinity_state.get("lane_key"),
                     cooldown_seconds=affinity_state["cooldown_seconds"],
                 )
-        if (
-            _candidate_matches_affinity(
-                affinity_state["candidate"],
-                affinity,
-            )
-            and _is_auto_agent_candidate_state_available(affinity_state)
-        ):
+        if _candidate_matches_affinity(
+            affinity_state["candidate"],
+            affinity,
+        ) and _is_auto_agent_candidate_state_available(affinity_state):
             return _attach_account_bound_selection_metadata(
                 _attach_session_owner_selection_fields(
                     _attach_aawm_alias_routing_state_sources(
@@ -7348,9 +6724,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                             **affinity_state,
                             "alias_model": alias_model,
                             "session_key": session_key,
-                            "selection_reason": (
-                                affinity_selection_reason or "session_affinity"
-                            ),
+                            "selection_reason": (affinity_selection_reason or "session_affinity"),
                             "skipped": [],
                             "in_flight_session": True,
                             "request_mode": request_mode,
@@ -7382,8 +6756,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             ):
                 _raise_codex_auto_agent_redispatch_required(
                     candidate=dict(affinity_state.get("candidate") or {}),
-                    lane_key=affinity_state.get("lane_key")
-                    or _affinity_account_lane(affinity),
+                    lane_key=affinity_state.get("lane_key") or _affinity_account_lane(affinity),
                     cooldown_seconds=0.0,
                     error_tokens=set(),
                     alias_model=alias_model,
@@ -7391,9 +6764,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                     cooldown_scope="account",
                     failure_phase="account_bound_owner_unavailable",
                     attempted_provider_call=False,
-                    skipped_candidates=_build_auto_agent_skipped_candidates_from_states(
-                        [affinity_state]
-                    ),
+                    skipped_candidates=_build_auto_agent_skipped_candidates_from_states([affinity_state]),
                 )
             return await _reselect_owned_affinity_with_effective_identity(
                 candidate=affinity_state.get("candidate"),
@@ -7404,21 +6775,17 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             if authenticated_token_affinity:
                 _raise_codex_auto_agent_authenticated_continuation_unavailable(
                     candidate=dict(affinity_state.get("candidate") or affinity),
-                    lane_key=affinity_state.get("lane_key")
-                    or affinity.get("codex_oauth_lane_key"),
+                    lane_key=affinity_state.get("lane_key") or affinity.get("codex_oauth_lane_key"),
                     cooldown_seconds=0.0,
                     alias_model=alias_model,
                     error_class="candidate_unavailable",
                     failure_phase="account_bound_owner_unavailable",
-                    skipped_candidates=_build_auto_agent_skipped_candidates_from_states(
-                        [affinity_state]
-                    ),
+                    skipped_candidates=_build_auto_agent_skipped_candidates_from_states([affinity_state]),
                     terminal_reset=affinity_state.get("terminal_reset"),
                 )
             _raise_codex_auto_agent_redispatch_required(
                 candidate=dict(affinity_state.get("candidate") or affinity),
-                lane_key=affinity_state.get("lane_key")
-                or _affinity_account_lane(affinity),
+                lane_key=affinity_state.get("lane_key") or _affinity_account_lane(affinity),
                 cooldown_seconds=0.0,
                 error_tokens=set(),
                 alias_model=alias_model,
@@ -7426,9 +6793,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 cooldown_scope="account",
                 failure_phase="account_bound_owner_unavailable",
                 attempted_provider_call=False,
-                skipped_candidates=_build_auto_agent_skipped_candidates_from_states(
-                    [affinity_state]
-                ),
+                skipped_candidates=_build_auto_agent_skipped_candidates_from_states([affinity_state]),
             )
         if affinity_state["cooldown_seconds"] > 0:
             # Owned/cooldown owner is unavailable: fail before free selection.
@@ -7448,11 +6813,8 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                     lane_key=affinity_state.get("lane_key"),
                     cooldown_seconds=affinity_state["cooldown_seconds"],
                     alias_model=alias_model,
-                    failure_phase=affinity_state.get("failure_phase")
-                    or "affinity_account_cooldown",
-                    skipped_candidates=_build_auto_agent_skipped_candidates_from_states(
-                        [affinity_state]
-                    ),
+                    failure_phase=affinity_state.get("failure_phase") or "affinity_account_cooldown",
+                    skipped_candidates=_build_auto_agent_skipped_candidates_from_states([affinity_state]),
                     terminal_reset=affinity_state.get("terminal_reset"),
                 )
             _raise_codex_auto_agent_in_flight_cooldown(
@@ -7460,17 +6822,11 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 lane_key=affinity_state.get("lane_key"),
                 cooldown_seconds=affinity_state["cooldown_seconds"],
             )
-        affinity_skipped = _build_auto_agent_skipped_candidates_from_states(
-            [affinity_state]
-        )
-        terminal_reset = _build_codex_oauth_terminal_reset_information(
-            [affinity_state]
-        )
+        affinity_skipped = _build_auto_agent_skipped_candidates_from_states([affinity_state])
+        terminal_reset = _build_codex_oauth_terminal_reset_information([affinity_state])
         redispatch_candidate = dict(affinity_state["candidate"])
         if terminal_reset is not None:
-            redispatch_candidate["_codex_oauth_terminal_reset"] = (
-                terminal_reset
-            )
+            redispatch_candidate["_codex_oauth_terminal_reset"] = terminal_reset
         if authenticated_token_affinity:
             _raise_codex_auto_agent_authenticated_continuation_unavailable(
                 candidate=redispatch_candidate,
@@ -7482,8 +6838,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                     if affinity_state.get("skip_reason") == "quota_exhausted"
                     else "candidate_unavailable"
                 ),
-                failure_phase=affinity_state.get("failure_phase")
-                or "affinity_account_unavailable",
+                failure_phase=affinity_state.get("failure_phase") or "affinity_account_unavailable",
                 skipped_candidates=affinity_skipped,
                 terminal_reset=terminal_reset,
             )
@@ -7499,8 +6854,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 else "candidate_unavailable"
             ),
             cooldown_scope="account",
-            failure_phase=affinity_state.get("failure_phase")
-            or "affinity_account_unavailable",
+            failure_phase=affinity_state.get("failure_phase") or "affinity_account_unavailable",
             attempted_provider_call=False,
             skipped_candidates=affinity_skipped,
         )
@@ -7509,10 +6863,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         provider_owned_continuation
         or affinity_bypassed
         or affinity is not None
-        or (
-            isinstance(session_owner_record, dict)
-            and sa._record_state(session_owner_record) == "owned"
-        )
+        or (isinstance(session_owner_record, dict) and sa._record_state(session_owner_record) == "owned")
         or sa.request_has_effective_session_identity(request)
     )
     candidates = _resolve_aawm_alias_selection_enumeration(
@@ -7521,24 +6872,14 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         ingress="codex",
         client_product_label=client_product_label,
     ).candidates
-    if any(
-        candidate.get("provider")
-        == _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
-        for candidate in candidates
-    ):
+    if any(candidate.get("provider") == _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER for candidate in candidates):
         await _hydrate_alibaba_token_plan_quota_observations()
     cleared_subscription_identities: set[str] = set()
     for candidate in candidates:
-        if (
-            candidate.get("provider")
-            != _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
-        ):
+        if candidate.get("provider") != _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER:
             continue
         subscription_identity = subscription_identity_for_candidate(candidate)
-        if (
-            not subscription_identity
-            or subscription_identity in cleared_subscription_identities
-        ):
+        if not subscription_identity or subscription_identity in cleared_subscription_identities:
             continue
         cleared_subscription_identities.add(subscription_identity)
         alibaba_evidence, _alibaba_windows = _alibaba_token_plan_quota_evidence(
@@ -7662,12 +7003,13 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             )
         if _candidate_uses_codex_oauth(state["candidate"]):
             skipped[:] = [
-                entry for entry in skipped
-                if (
-                    entry.get("provider"), entry.get("model"), entry.get("lane_key")
-                ) != (
+                entry
+                for entry in skipped
+                if (entry.get("provider"), entry.get("model"), entry.get("lane_key"))
+                != (
                     state["candidate"].get("provider"),
-                    state["candidate"].get("model"), state.get("lane_key"),
+                    state["candidate"].get("model"),
+                    state.get("lane_key"),
                 )
             ]
         if int(state.get("failover_ordinal") or 0) > 0:
@@ -7676,8 +7018,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             quota_selection = state.get("quota_selection")
             selection_reason = (
                 quota_selection.get("selection_reason")
-                if isinstance(quota_selection, dict)
-                and quota_selection.get("selection_reason")
+                if isinstance(quota_selection, dict) and quota_selection.get("selection_reason")
                 else "last_resort"
             )
         return _attach_account_bound_selection_metadata(
@@ -7706,10 +7047,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
 
     detail: dict[str, Any] = {
         "error": {
-            "message": (
-                "All Codex auto-agent alias candidates are currently "
-                "cooled down or unavailable."
-            ),
+            "message": ("All Codex auto-agent alias candidates are currently " "cooled down or unavailable."),
             "type": "rate_limit_error",
             "code": "aawm_codex_auto_agent_all_candidates_cooling_down",
         },
@@ -7717,14 +7055,10 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         "route_family": "codex_responses",
         "failure_phase": "alias_selection_cooling_down",
         "attempted_provider_call": any(
-            candidate.get("attempted_provider_call") is True
-            for candidate in skipped
-            if isinstance(candidate, dict)
+            candidate.get("attempted_provider_call") is True for candidate in skipped if isinstance(candidate, dict)
         ),
         "provider_returned": any(
-            candidate.get("provider_returned") is True
-            for candidate in skipped
-            if isinstance(candidate, dict)
+            candidate.get("provider_returned") is True for candidate in skipped if isinstance(candidate, dict)
         ),
         "status_code": 429,
         "candidates": _redact_auto_agent_account_identity(
@@ -7829,11 +7163,7 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
     session_owner_guard_meta = {
         "decision": "unowned",
         "owner_record": session_owner_record,
-        "owner_id": (
-            session_owner_record.get("owner")
-            if isinstance(session_owner_record, dict)
-            else None
-        ),
+        "owner_id": (session_owner_record.get("owner") if isinstance(session_owner_record, dict) else None),
         "mismatch_reason": None,
         "provenance": sa.build_session_owner_provenance(
             session_identity=canonical_session_identity,
@@ -7941,10 +7271,7 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
         if existing_affinity is not None:
             affinity_bypassed = True
 
-    effective_account_bound_state = bool(
-        has_account_bound_state
-        or _affinity_pins_xai_oauth_account_identity(affinity)
-    )
+    effective_account_bound_state = bool(has_account_bound_state or _affinity_pins_xai_oauth_account_identity(affinity))
     if affinity is not None:
         affinity_candidate = _find_anthropic_auto_agent_affinity_candidate(
             affinity,
@@ -7980,21 +7307,16 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
                 attempted_provider_call=False,
             )
         assert affinity_candidate is not None
-        affinity_state = (
-            await _build_anthropic_auto_agent_affinity_candidate_state(
-                request,
-                candidate_template=affinity_candidate,
-                affinity=affinity,
-                excluded_candidate_keys=excluded_candidate_keys,
-            )
+        affinity_state = await _build_anthropic_auto_agent_affinity_candidate_state(
+            request,
+            candidate_template=affinity_candidate,
+            affinity=affinity,
+            excluded_candidate_keys=excluded_candidate_keys,
         )
-        if (
-            _candidate_matches_affinity(
-                affinity_state["candidate"],
-                affinity,
-            )
-            and _is_auto_agent_candidate_state_available(affinity_state)
-        ):
+        if _candidate_matches_affinity(
+            affinity_state["candidate"],
+            affinity,
+        ) and _is_auto_agent_candidate_state_available(affinity_state):
             return _attach_session_owner_selection_fields(
                 _attach_aawm_alias_routing_state_sources(
                     {
@@ -8045,17 +7367,11 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
                 lane_key=affinity_state.get("lane_key"),
                 cooldown_seconds=affinity_state["cooldown_seconds"],
             )
-        affinity_skipped = _build_auto_agent_skipped_candidates_from_states(
-            [affinity_state]
-        )
-        terminal_reset = _build_codex_oauth_terminal_reset_information(
-            [affinity_state]
-        )
+        affinity_skipped = _build_auto_agent_skipped_candidates_from_states([affinity_state])
+        terminal_reset = _build_codex_oauth_terminal_reset_information([affinity_state])
         redispatch_candidate = dict(affinity_state["candidate"])
         if terminal_reset is not None:
-            redispatch_candidate["_codex_oauth_terminal_reset"] = (
-                terminal_reset
-            )
+            redispatch_candidate["_codex_oauth_terminal_reset"] = terminal_reset
         _raise_anthropic_auto_agent_redispatch_required(
             candidate=redispatch_candidate,
             lane_key=affinity_state.get("lane_key"),
@@ -8068,8 +7384,7 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
                 else "candidate_unavailable"
             ),
             cooldown_scope="account",
-            failure_phase=affinity_state.get("failure_phase")
-            or "affinity_account_unavailable",
+            failure_phase=affinity_state.get("failure_phase") or "affinity_account_unavailable",
             attempted_provider_call=False,
             skipped_candidates=affinity_skipped,
         )
@@ -8078,10 +7393,7 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
         has_continuation_state
         or affinity_bypassed
         or affinity is not None
-        or (
-            isinstance(session_owner_record, dict)
-            and sa._record_state(session_owner_record) == "owned"
-        )
+        or (isinstance(session_owner_record, dict) and sa._record_state(session_owner_record) == "owned")
         or sa.request_has_effective_session_identity(request)
     )
     states = await _build_anthropic_auto_agent_candidate_states(
@@ -8116,8 +7428,7 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
             quota_selection = state.get("quota_selection")
             selection_reason = (
                 quota_selection.get("selection_reason")
-                if isinstance(quota_selection, dict)
-                and quota_selection.get("selection_reason")
+                if isinstance(quota_selection, dict) and quota_selection.get("selection_reason")
                 else "first_available"
             )
         return _attach_aawm_alias_routing_state_sources(
@@ -8146,12 +7457,13 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
     if state is not None:
         if _candidate_uses_codex_oauth(state["candidate"]):
             skipped[:] = [
-                entry for entry in skipped
-                if (
-                    entry.get("provider"), entry.get("model"), entry.get("lane_key")
-                ) != (
+                entry
+                for entry in skipped
+                if (entry.get("provider"), entry.get("model"), entry.get("lane_key"))
+                != (
                     state["candidate"].get("provider"),
-                    state["candidate"].get("model"), state.get("lane_key"),
+                    state["candidate"].get("model"),
+                    state.get("lane_key"),
                 )
             ]
         if int(state.get("failover_ordinal") or 0) > 0:
@@ -8160,8 +7472,7 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
             quota_selection = state.get("quota_selection")
             selection_reason = (
                 quota_selection.get("selection_reason")
-                if isinstance(quota_selection, dict)
-                and quota_selection.get("selection_reason")
+                if isinstance(quota_selection, dict) and quota_selection.get("selection_reason")
                 else "last_resort"
             )
         return _attach_aawm_alias_routing_state_sources(
@@ -8182,10 +7493,7 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
 
     detail: dict[str, Any] = {
         "error": {
-            "message": (
-                "All Anthropic auto-agent alias candidates are currently "
-                "cooled down or unavailable."
-            ),
+            "message": ("All Anthropic auto-agent alias candidates are currently " "cooled down or unavailable."),
             "type": "rate_limit_error",
             "code": "aawm_anthropic_auto_agent_all_candidates_cooling_down",
         },
@@ -8334,9 +7642,7 @@ def install(host_globals: dict) -> None:
         # audit_build.install() publishes the distinct account-bound classifier
         # into the host module before selection install runs. Adopt it when the
         # host did not pass an explicit has_account_bound_state callback.
-        _host_classifier = host_globals.get(
-            "_aawm_auto_agent_audit_request_has_account_bound_state"
-        )
+        _host_classifier = host_globals.get("_aawm_auto_agent_audit_request_has_account_bound_state")
         if callable(_host_classifier):
             _has_account_bound_state = _host_classifier
     for _name in _HOST_FUNCTION_NAMES:
@@ -8357,12 +7663,8 @@ def install(host_globals: dict) -> None:
             _rebound.__dict__.update(_obj.__dict__)
         _mod[_name] = _rebound
         host_globals[_name] = _rebound
-    _mod["_attach_aawm_alias_routing_state_sources"] = (
-        _cooldown_state._attach_aawm_alias_routing_state_sources
-    )
-    host_globals["_attach_aawm_alias_routing_state_sources"] = (
-        _cooldown_state._attach_aawm_alias_routing_state_sources
-    )
+    _mod["_attach_aawm_alias_routing_state_sources"] = _cooldown_state._attach_aawm_alias_routing_state_sources
+    host_globals["_attach_aawm_alias_routing_state_sources"] = _cooldown_state._attach_aawm_alias_routing_state_sources
     for _name in (
         "resolve_openrouter_credential_lane_key",
         "_get_openrouter_account_lane_cooldown_state",
