@@ -8201,12 +8201,63 @@ async def _finalize_native_openai_responses_owner_wire_disposition(  # noqa: PLR
             except Exception:
                 pass
     try:
+        # For COMPLETED with a staged portable canonical-owner transition,
+        # run the strict source→destination CAS as the accepted-completion
+        # owner mutation *before* any ordinary mutable refresh.  Ordinary
+        # refresh can add ``requested_model`` to the captured source
+        # attributes, causing the subsequent CAS in
+        # ``_finalize_native_openai_responses_legacy_affinity`` to reject
+        # its own intended account transition.
+        portable_cas_applied = False
         lease = sa.get_request_session_owner_lease(request)
-        result = await sa.finalize_session_owner_lease_on_wire_disposition(
-            request,
-            disposition=disposition.value,
-        )
-        outcome = getattr(getattr(result, "outcome", None), "value", None)
+        if disposition is OpenAIResponsesWireDisposition.COMPLETED:
+            _owner_state = getattr(request, "state", None)
+            _pending = getattr(
+                _owner_state,
+                "_aawm_native_openai_responses_affinity_commitment",
+                None,
+            )
+            _staged = (
+                _pending.get("canonical_owner_transition")
+                if isinstance(_pending, dict)
+                else None
+            )
+            if isinstance(_staged, dict) and _staged:
+                _rebind = getattr(
+                    sa, "rebind_session_owner_for_portable_failover", None
+                )
+                if callable(_rebind):
+                    result = await _rebind(
+                        session_identity=_staged.get("session_identity"),
+                        source_owner_id=_staged.get("source_owner_id"),
+                        source_attributes=(
+                            _staged.get("source_attributes") or {}
+                        ),
+                        destination_attributes=(
+                            _staged.get("destination_attributes") or {}
+                        ),
+                        authorization=_staged.get("authorization"),
+                        failover_ordinal=_staged.get("failover_ordinal"),
+                    )
+                    outcome = getattr(
+                        getattr(result, "outcome", None), "value", None
+                    )
+                    if outcome in {"promoted", "already_owned"}:
+                        if lease is not None:
+                            lease.wire_disposition = disposition.value
+                            lease.wire_terminal_pending = False
+                            lease.promoted = True
+                            _stop = getattr(
+                                sa, "_stop_session_owner_lease_renewal", None
+                            )
+                            if callable(_stop):
+                                _stop(lease)
+                            lease.last_finalization_outcome = outcome
+                        portable_cas_applied = True
+        if not portable_cas_applied:
+            lease = sa.get_request_session_owner_lease(request)
+            result = await sa.finalize_session_owner_lease_on_wire_disposition(request, disposition=disposition.value)
+            outcome = getattr(getattr(result, "outcome", None), "value", None)
         if trace is not None:
             trace.metadata["session_owner_wire_disposition"] = disposition.value
             if outcome is not None:

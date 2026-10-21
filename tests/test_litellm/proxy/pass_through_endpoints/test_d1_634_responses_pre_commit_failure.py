@@ -7893,6 +7893,8 @@ def _assert_provider_overload_terminal(
             in str(error.get("message", "")).lower()
         ):
             return True
+
+
     return False
 
 
@@ -8019,3 +8021,243 @@ def _chunks_for_read_mode(
         second_nl = buf.find(b"\n\n", buf.find(b"\n\n") + 2)
         return [buf[: second_nl + 1], buf[second_nl + 1 :]]
     raise ValueError(f"unknown read_mode: {read_mode}")
+
+@pytest.mark.asyncio
+async def test_p11r1_staged_portable_transition_uses_cas_before_ordinary_refresh() -> None:
+    """P11-R1: staged portable transition runs rebind (CAS) instead of ordinary refresh.
+
+    When disposition is COMPLETED and a staged canonical_owner_transition is
+    present, the portable CAS must be the accepted-completion owner mutation
+    and the ordinary mutable refresh must NOT be called.
+    """
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+        OpenAIResponsesWireDisposition,
+    )
+
+    rebind_calls: list[dict[str, Any]] = []
+    ordinary_calls: list[dict[str, Any]] = []
+
+    async def _record_rebind(**kwargs: Any) -> MagicMock:
+        rebind_calls.append(dict(kwargs))
+        result = MagicMock()
+        result.outcome = sa.SessionOwnerMutationOutcome.PROMOTED
+        return result
+
+    async def _record_ordinary(request=None, **kwargs: Any) -> MagicMock:
+        ordinary_calls.append({"disposition": kwargs.get("disposition")})
+        result = MagicMock()
+        result.outcome = sa.SessionOwnerMutationOutcome.RELEASED
+        return result
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.state = SimpleNamespace()
+    staged_transition: dict[str, Any] = {
+        "session_identity": "sess-p11r1",
+        "source_owner_id": "owner-src",
+        "source_attributes": {
+            "provider": "openai",
+            "model": "gpt-5.6-sol",
+            "route_family": "codex_oauth",
+            "endpoint_contract": "openai_responses",
+            "state_format": "openai_responses",
+            "account_hash": "acct-src",
+            "account_label": "source",
+            "account_lane": "lane-a",
+        },
+        "destination_attributes": {
+            "provider": "openai",
+            "model": "gpt-5.6-sol",
+            "route_family": "codex_oauth",
+            "endpoint_contract": "openai_responses",
+            "state_format": "openai_responses",
+            "account_hash": "acct-dst",
+            "account_label": "destination",
+            "account_lane": "lane-a",
+        },
+        "authorization": "codex_oauth_portable_account_failover",
+        "failover_ordinal": 1,
+    }
+    setattr(
+        mock_request.state,
+        "_aawm_native_openai_responses_affinity_commitment",
+        {"canonical_owner_transition": staged_transition},
+    )
+
+    mock_lease = MagicMock()
+    mock_lease.wire_disposition = None
+    mock_lease.wire_terminal_pending = True
+
+    with patch.object(
+        sa,
+        "get_request_session_owner_lease",
+        return_value=mock_lease,
+    ), patch.object(
+        sa,
+        "rebind_session_owner_for_portable_failover",
+        side_effect=_record_rebind,
+    ), patch.object(
+        sa,
+        "finalize_session_owner_lease_on_wire_disposition",
+        side_effect=_record_ordinary,
+    ), patch.object(
+        sa,
+        "session_owner_lease_is_release_only",
+        return_value=False,
+    ), patch.object(
+        pte,
+        "_finalize_native_openai_responses_legacy_affinity",
+        new_callable=AsyncMock,
+    ):
+        await pte._finalize_native_openai_responses_owner_wire_disposition(
+            request=mock_request,
+            disposition=OpenAIResponsesWireDisposition.COMPLETED,
+            trace=None,
+        )
+
+    assert len(rebind_calls) == 1, f"rebind not called once: {rebind_calls}"
+    assert rebind_calls[0]["session_identity"] == "sess-p11r1"
+    assert rebind_calls[0]["source_owner_id"] == "owner-src"
+    assert rebind_calls[0]["authorization"] == "codex_oauth_portable_account_failover"
+    assert rebind_calls[0]["failover_ordinal"] == 1
+    assert not ordinary_calls, (
+        "ordinary finalize_session_owner_lease_on_wire_disposition was called"
+    )
+
+
+@pytest.mark.asyncio
+async def test_p11r1_no_staged_transition_uses_ordinary_refresh() -> None:
+    """P11-R1: without a staged transition, ordinary refresh still runs normally."""
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+        OpenAIResponsesWireDisposition,
+    )
+
+    ordinary_calls: list[dict[str, Any]] = []
+
+    async def _record_ordinary(request=None, **kwargs: Any) -> MagicMock:
+        ordinary_calls.append({"disposition": kwargs.get("disposition")})
+        result = MagicMock()
+        result.outcome = sa.SessionOwnerMutationOutcome.RELEASED
+        return result
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.state = SimpleNamespace()
+
+    mock_lease = MagicMock()
+    mock_lease.wire_disposition = None
+    mock_lease.wire_terminal_pending = True
+
+    with patch.object(
+        sa,
+        "get_request_session_owner_lease",
+        return_value=mock_lease,
+    ), patch.object(
+        sa,
+        "finalize_session_owner_lease_on_wire_disposition",
+        side_effect=_record_ordinary,
+    ), patch.object(
+        sa,
+        "session_owner_lease_is_release_only",
+        return_value=False,
+    ), patch.object(
+        pte,
+        "_finalize_native_openai_responses_legacy_affinity",
+        new_callable=AsyncMock,
+    ):
+        await pte._finalize_native_openai_responses_owner_wire_disposition(
+            request=mock_request,
+            disposition=OpenAIResponsesWireDisposition.COMPLETED,
+            trace=None,
+        )
+
+    assert len(ordinary_calls) == 1, f"ordinary not called exactly once: {ordinary_calls}"
+
+
+@pytest.mark.asyncio
+async def test_p11r1_non_completed_disposition_always_uses_ordinary_refresh() -> None:
+    """P11-R1: FAILED disposition always uses ordinary refresh, even with staged transition."""
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+        OpenAIResponsesWireDisposition,
+    )
+
+    ordinary_calls: list[dict[str, Any]] = []
+
+    async def _record_ordinary(request=None, **kwargs: Any) -> MagicMock:
+        ordinary_calls.append({"disposition": kwargs.get("disposition")})
+        result = MagicMock()
+        result.outcome = sa.SessionOwnerMutationOutcome.RELEASED
+        return result
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.state = SimpleNamespace()
+    staged_transition: dict[str, Any] = {
+        "session_identity": "sess-p11r1",
+        "source_owner_id": "owner-src",
+        "source_attributes": {
+            "provider": "openai",
+            "model": "gpt-5.6-sol",
+            "route_family": "codex_oauth",
+            "endpoint_contract": "openai_responses",
+            "state_format": "openai_responses",
+            "account_hash": "acct-src",
+            "account_label": "source",
+            "account_lane": "lane-a",
+        },
+        "destination_attributes": {
+            "provider": "openai",
+            "model": "gpt-5.6-sol",
+            "route_family": "codex_oauth",
+            "endpoint_contract": "openai_responses",
+            "state_format": "openai_responses",
+            "account_hash": "acct-dst",
+            "account_label": "destination",
+            "account_lane": "lane-a",
+        },
+        "authorization": "codex_oauth_portable_account_failover",
+        "failover_ordinal": 1,
+    }
+    setattr(
+        mock_request.state,
+        "_aawm_native_openai_responses_affinity_commitment",
+        {"canonical_owner_transition": staged_transition},
+    )
+
+    mock_lease = MagicMock()
+
+    with patch.object(
+        sa,
+        "get_request_session_owner_lease",
+        return_value=mock_lease,
+    ), patch.object(
+        sa,
+        "finalize_session_owner_lease_on_wire_disposition",
+        side_effect=_record_ordinary,
+    ), patch.object(
+        sa,
+        "session_owner_lease_is_release_only",
+        return_value=False,
+    ), patch.object(
+        pte,
+        "_finalize_native_openai_responses_legacy_affinity",
+        new_callable=AsyncMock,
+    ):
+        await pte._finalize_native_openai_responses_owner_wire_disposition(
+            request=mock_request,
+            disposition=OpenAIResponsesWireDisposition.FAILED,
+            trace=None,
+        )
+
+    assert len(ordinary_calls) == 1, (
+        f"ordinary not called exactly once for FAILED: {ordinary_calls}"
+    )
