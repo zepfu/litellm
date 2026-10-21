@@ -942,21 +942,27 @@ class AnthropicResponsesStreamWrapper:
                     response_obj,
                     context=f"Anthropic Responses stream event {event_type}",
                 )
-                status = getattr(response_obj, "status", None)
+                status = self._get_value(response_obj, "status")
                 if status == "incomplete":
                     stop_reason = "max_tokens"
-                usage = getattr(response_obj, "usage", None)
+                usage = self._get_value(response_obj, "usage")
                 if usage is not None:
-                    input_tokens = getattr(usage, "input_tokens", 0) or 0
-                    output_tokens = getattr(usage, "output_tokens", 0) or 0
-                    cache_creation_tokens = getattr(usage, "input_tokens_details", None)  # type: ignore[assignment]
-                    cache_read_tokens = getattr(usage, "output_tokens_details", None)  # type: ignore[assignment]
+                    input_tokens = self._get_value(usage, "input_tokens", 0) or 0
+                    output_tokens = self._get_value(usage, "output_tokens", 0) or 0
+                    cache_creation_tokens = self._get_value(
+                        usage,
+                        "input_tokens_details",
+                    )
+                    cache_read_tokens = self._get_value(
+                        usage,
+                        "output_tokens_details",
+                    )
                     # Prefer direct cache fields if present
                     cache_creation_tokens = int(
-                        getattr(usage, "cache_creation_input_tokens", 0) or 0
+                        self._get_value(usage, "cache_creation_input_tokens", 0) or 0
                     )
                     cache_read_tokens = int(
-                        getattr(usage, "cache_read_input_tokens", 0) or 0
+                        self._get_value(usage, "cache_read_input_tokens", 0) or 0
                     )
             elif event_type == "response.failed":
                 raise AnthropicResponsesProviderError(
@@ -965,11 +971,9 @@ class AnthropicResponsesStreamWrapper:
 
             # Check if tool_use was in the output to override stop_reason
             if response_obj is not None:
-                output = getattr(response_obj, "output", []) or []
+                output = self._get_value(response_obj, "output", []) or []
                 for out_item in output:
-                    out_type = getattr(out_item, "type", None) or (
-                        out_item.get("type") if isinstance(out_item, dict) else None
-                    )
+                    out_type = self._get_value(out_item, "type")
                     if out_type == "function_call":
                         stop_reason = "tool_use"
                         break
