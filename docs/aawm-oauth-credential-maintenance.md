@@ -253,6 +253,12 @@ inspection that lacks expiry retains the complete pre-inspection lifetime,
 threshold, source, and threshold-degraded tuple from that same snapshot. The
 failed post-inspection diagnostic remains separate.
 
+With a 3,600-second issued lifetime and the default 300-second buffer, Codex
+now becomes due at 300 seconds remaining rather than the previous 1,800.
+This reduces the pre-expiry window for recovering from refresh failures from
+30 minutes to five minutes. Refresh retries use the existing per-account
+token-endpoint attempt throttle.
+
 Development Compose defaults `AAWM_GROK_OIDC_FORCE_REFRESH=0` and
 `AAWM_CODEX_OAUTH_FORCE_REFRESH=0`, so normal scheduled checks use the
 credential deadline instead of bypassing half-life eligibility.
