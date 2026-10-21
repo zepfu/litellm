@@ -6338,16 +6338,13 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         ):
             return
 
-        # Query parameters may be added by the provider transport after route
-        # selection; the immutable egress binding is the authority/endpoint
-        # path, not transport-specific query decoration.
-        expected_openai_url = httpx.URL(str(expected_url)).copy_with(query=None)
-        actual_openai_url = prepared_request.url.copy_with(query=None)
+        expected_openai_url = httpx.URL(str(expected_url))
         if (
             prepared_request.url.scheme != expected_openai_url.scheme
             or prepared_request.url.host != expected_openai_url.host
             or prepared_request.url.port != expected_openai_url.port
-            or actual_openai_url.raw_path != expected_openai_url.raw_path
+            or prepared_request.url.raw_path != expected_openai_url.raw_path
+            or prepared_request.url.query != expected_openai_url.query
             or prepared_request.url.fragment != expected_openai_url.fragment
         ):
             HttpPassThroughEndpointHelpers._raise_egress_guard_block(
@@ -7398,7 +7395,7 @@ def _build_immutable_openai_binding(
         egress_credential_family=resolved_credential_family,
         route_family=route_family,
         expected_target_family=resolved_target_family,
-        target_url=str(target_url.copy_with(query=None)),
+        target_url=str(target_url),
         selected_openai_headers=tuple(
             (str(name), str(value))
             for name, value in (selected_openai_headers or {}).items()
