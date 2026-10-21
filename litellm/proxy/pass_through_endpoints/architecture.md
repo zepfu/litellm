@@ -178,6 +178,16 @@ attached as evidence when delivered output fails. Provider-stream summaries and
 delivered-stream summaries remain distinct; policy wrappers run inside the wire
 coordinator so policy rejection is represented by the same terminal outcome.
 
+Native response construction retains the original chunk processor through
+transform wrappers and closes it explicitly with the delivered source. This
+prevents competing garbage-collection finalizers during terminal bookkeeping.
+
+The wire compiler registers `web_search` for Codex OAuth text-only turns that
+retain `web_search_call` history and explicitly provide an empty tool list.
+It sets `tool_choice` to `none`, preserving the effective tool permissions and
+all history. Nonempty tool lists and forced-tool choices are preserved. The
+compiled declaration retains the conservative provider-tool replay boundary.
+
 Non-native alias candidates retain deferred success callbacks until their
 caller commits the response.
 

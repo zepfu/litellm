@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import gc
 import hashlib
 import logging
 import os
 import threading
-from types import AsyncGeneratorType
 from datetime import UTC, datetime
 from dataclasses import dataclass
 from time import monotonic
@@ -27,42 +25,6 @@ from litellm.integrations.aawm_agent_quality_rules import (
     is_malformed_grok_literal_tool_label_transcript_text,
 )
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
-
-
-def install_asyncgen_close_diagnostic() -> None:
-    """Identify the generator retained by an unobserved failed close task."""
-    loop = asyncio.get_running_loop()
-    previous = loop.get_exception_handler()
-
-    def exception_handler(loop: Any, context: Dict[str, Any]) -> None:
-        try:
-            error = context.get("exception")
-            task = context.get("future") or context.get("task")
-            if (
-                isinstance(error, RuntimeError)
-                and str(error) == "aclose(): asynchronous generator is already running"
-                and isinstance(task, asyncio.Task)
-            ):
-                for generator in gc.get_referents(task.get_coro()):
-                    if isinstance(generator, AsyncGeneratorType):
-                        code = generator.ag_code
-                        frame = generator.ag_frame
-                        logging.getLogger("LiteLLM Proxy").warning(
-                            "AAWM_ASYNCGEN_CLOSE_OWNER: generator=%s source=%s:%s task=%s",
-                            code.co_name,
-                            code.co_filename,
-                            frame.f_lineno if frame is not None else code.co_firstlineno,
-                            task.get_name(),
-                        )
-        except Exception:
-            pass
-        finally:
-            if previous is None:
-                loop.default_exception_handler(context)
-            else:
-                previous(loop, context)
-
-    loop.set_exception_handler(exception_handler)
 
 
 MALFORMED_ERROR_JSONL_FILENAME = "malformed-error.jsonl"

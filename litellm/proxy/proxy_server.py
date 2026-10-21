@@ -928,12 +928,6 @@ async def proxy_startup_event(app: FastAPI):  # noqa: PLR0915
     init_verbose_loggers()
     begin_proxy_lifecycle(verbose_proxy_logger)
 
-    from litellm.proxy.aawm_runtime_error_logging import (
-        install_asyncgen_close_diagnostic,
-    )
-
-    install_asyncgen_close_diagnostic()
-
     ## RUN WORKER STARTUP HOOKS (e.g., gflags initialization) ##
     _startup_hooks_env = os.environ.get("LITELLM_WORKER_STARTUP_HOOKS", "")
     if _startup_hooks_env:

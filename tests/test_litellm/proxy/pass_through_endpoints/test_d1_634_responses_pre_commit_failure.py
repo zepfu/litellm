@@ -4617,7 +4617,16 @@ async def test_unpeeked_native_sse_handoff_becomes_live_only(
     mock_request.query_params = {}
     mock_request.state = SimpleNamespace()
     mock_request.is_disconnected = AsyncMock(return_value=False)
-    custom_body = {"model": "gpt-5.4"}
+    custom_body = {
+        "model": "gpt-5.4",
+        "tools": [
+            {
+                "type": "function",
+                "name": "alpha_probe" * 8,
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+    }
     chunks = [
         _sse(
             "response.created",
@@ -4656,8 +4665,18 @@ async def test_unpeeked_native_sse_handoff_becomes_live_only(
         )
     )
     chunks.append(b"data: [DONE]\n\n")
+    iterator_retired = asyncio.Event()
+
+    class RetiringResponse(httpx.Response):
+        async def aiter_bytes(self, *args, **kwargs):
+            try:
+                async for chunk in super().aiter_bytes(*args, **kwargs):
+                    yield chunk
+            finally:
+                iterator_retired.set()
+
     stream = _ClosableAsyncByteStream(chunks)
-    upstream_response = httpx.Response(
+    upstream_response = RetiringResponse(
         status_code=upstream_status,
         headers={"content-type": "text/event-stream"},
         stream=stream,
@@ -4727,7 +4746,6 @@ async def test_unpeeked_native_sse_handoff_becomes_live_only(
     coordinator = mock_hidden_retry.call_args.kwargs["openai_capacity_coordinator"]
     assert (coordinator is not None) is capacity_retry_enabled
     wire = b"".join([chunk async for chunk in response.body_iterator])
-    await response.body_iterator.aclose()
     assert response.wire_trace.finalized is True
     assert (
         response.wire_trace.metadata.get("disposition_callback_error")
@@ -4748,6 +4766,7 @@ async def test_unpeeked_native_sse_handoff_becomes_live_only(
     assert wire.startswith(expected_prefix)
     assert len(_responses_sse_payloads(wire[len(expected_prefix):])) == 1
     assert wire.endswith(b"data: [DONE]\n\n")
+    assert (iterator_retired.is_set(), stream.close_calls) == (True, 1)
 
 
 @pytest.mark.asyncio
