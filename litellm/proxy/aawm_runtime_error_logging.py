@@ -47,13 +47,24 @@ def install_asyncgen_close_diagnostic() -> None:
                     if isinstance(generator, AsyncGeneratorType):
                         code = generator.ag_code
                         frame = generator.ag_frame
+                        provider = (
+                            frame.f_locals.get("custom_llm_provider")
+                            if frame is not None
+                            else None
+                        )
+                        native_trace = (
+                            frame is not None
+                            and frame.f_locals.get("openai_wire_trace") is not None
+                        )
                         logging.getLogger("LiteLLM Proxy").warning(
-                            "AAWM_ASYNCGEN_CLOSE_OWNER: pid=%s generator=%s source=%s:%s task=%s",
+                            "AAWM_ASYNCGEN_CLOSE_OWNER: pid=%s generator=%s source=%s:%s task=%s provider=%s native_trace=%s",
                             os.getpid(),
                             code.co_name,
                             code.co_filename,
                             frame.f_lineno if frame is not None else code.co_firstlineno,
                             task.get_name(),
+                            provider if isinstance(provider, str) else None,
+                            native_trace,
                         )
         except Exception:
             pass
