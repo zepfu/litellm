@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import sys
 import threading
 from datetime import UTC, datetime
 from dataclasses import dataclass
@@ -25,6 +26,33 @@ from litellm.integrations.aawm_agent_quality_rules import (
     is_malformed_grok_literal_tool_label_transcript_text,
 )
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
+
+
+def install_asyncgen_finalization_diagnostic() -> None:
+    """Identify active generators sent to the existing finalization hook."""
+    hooks = sys.get_asyncgen_hooks()
+    previous = hooks.finalizer
+    if previous is None:
+        return
+
+    def finalizer(generator: Any) -> None:
+        try:
+            if generator.ag_running:
+                code = generator.ag_code
+                frame = generator.ag_frame
+                logging.getLogger("LiteLLM Proxy").warning(
+                    "AAWM_ASYNCGEN_FINALIZE_ACTIVE: generator=%s source=%s:%s",
+                    code.co_name,
+                    code.co_filename,
+                    frame.f_lineno if frame is not None else code.co_firstlineno,
+                )
+        except Exception:
+            pass
+        finally:
+            previous(generator)
+
+    sys.set_asyncgen_hooks(firstiter=hooks.firstiter, finalizer=finalizer)
+
 
 MALFORMED_ERROR_JSONL_FILENAME = "malformed-error.jsonl"
 MALFORMED_TOOL_CALL_SCHEMA_VERSION = 1
