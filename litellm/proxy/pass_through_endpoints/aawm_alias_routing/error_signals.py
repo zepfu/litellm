@@ -3147,7 +3147,11 @@ def _is_codex_responses_capacity_returned(
     )
     return bool(
         isinstance(candidate, dict)
-        and candidate.get("route_family") == "codex_responses"
+        and candidate.get("route_family")
+        in {
+            "codex_responses",
+            "anthropic_openai_responses_adapter",
+        }
         and candidate.get("codex_oauth_account_hash")
         and attempted_provider_call
         and provider_returned
