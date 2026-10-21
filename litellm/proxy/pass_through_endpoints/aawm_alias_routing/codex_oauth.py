@@ -18,9 +18,11 @@ import json
 import os
 import math
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Iterator, Mapping, Optional, Union
 
 import httpx
 from fastapi import HTTPException, Request
@@ -33,11 +35,15 @@ from litellm.proxy.common_utils.http_parsing_utils import _safe_get_request_head
 from litellm.secret_managers.codex_oauth_inventory import (
     CodexOAuthCredentialRecord,
     CodexOAuthCredentialSnapshot,
+    CodexOAuthInventory,
     CodexOAuthInventoryError,
     CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY,
-    load_codex_oauth_credential,
     load_codex_oauth_inventory,
+    read_codex_oauth_snapshot,
+    read_codex_oauth_snapshot_sync,
 )
+
+_ORIGINAL_LOAD_CODEX_OAUTH_INVENTORY = load_codex_oauth_inventory
 
 from .policy import canonicalize_openrouter_native_responses_route_family
 
@@ -59,9 +65,7 @@ _ANTHROPIC_ADAPTER_CODEX_DEFAULT_AUTH_PATHS = (
     "~/.codex/auth.json",
     "~/.config/litellm/chatgpt/auth.json",
 )
-_DIRECT_CODEX_COOLDOWN_BYPASS_CONSUMED_STATE_KEY = (
-    "aawm_codex_oauth_direct_cooldown_bypass_consumed"
-)
+_DIRECT_CODEX_COOLDOWN_BYPASS_CONSUMED_STATE_KEY = "aawm_codex_oauth_direct_cooldown_bypass_consumed"
 _PROXY_OWNED_ACCOUNT_DISPLAY_METADATA_KEYS = (
     "codex_oauth_account_display",
     "codex_auto_agent_selected_account_display",
@@ -74,8 +78,11 @@ _CODEX_OAUTH_AFFINITY_TOKEN_ISSUER = "litellm.aawm.codex_oauth"
 _CODEX_OAUTH_AFFINITY_TOKEN_AUDIENCE = "litellm.codex_oauth.affinity"
 _CODEX_OAUTH_AFFINITY_TOKEN_TTL_SECONDS = 15 * 60
 _CODEX_OAUTH_AFFINITY_TOKEN_ACCOUNT_REF_CLAIM = "account_ref"
-_CODEX_OAUTH_AFFINITY_CONTINUATION_STATE_ATTR = (
-    "aawm_codex_oauth_affinity_continuation"
+_CODEX_OAUTH_AFFINITY_CONTINUATION_STATE_ATTR = "aawm_codex_oauth_affinity_continuation"
+_CODEX_OAUTH_REQUEST_SNAPSHOTS_STATE_ATTR = "aawm_codex_oauth_request_snapshots"
+_CODEX_OAUTH_REQUEST_INVENTORY_STATE_ATTR = "aawm_codex_oauth_request_inventory"
+_ACTIVE_CODEX_OAUTH_INVENTORY: ContextVar[Optional[Union[CodexOAuthInventory, CodexOAuthInventoryError]]] = ContextVar(
+    "aawm_codex_oauth_active_inventory", default=None
 )
 
 # ---------------------------------------------------------------------------
@@ -88,9 +95,7 @@ OAuthJsonData = dict[str, object]
 # ---------------------------------------------------------------------------
 # Injected runtime dependencies
 # ---------------------------------------------------------------------------
-_get_request_header_or_passthrough_alias: Optional[
-    Callable[[Request, str], Optional[str]]
-] = None
+_get_request_header_or_passthrough_alias: Optional[Callable[[Request, str], Optional[str]]] = None
 
 
 def configure_codex_oauth_runtime(
@@ -238,20 +243,150 @@ def _codex_oauth_account_lane_key(
     return f"codex-oauth:{account_label}:{account_hash}"
 
 
+def _codex_oauth_request_snapshot_cache_key(
+    record: CodexOAuthCredentialRecord,
+) -> tuple[str, str, Optional[str]]:
+    return (
+        record.label,
+        str(record.auth_path),
+        record.expected_account_hash,
+    )
+
+
+def _peek_request_codex_oauth_inventory(
+    request: Request,
+) -> Optional[Union[CodexOAuthInventory, CodexOAuthInventoryError]]:
+    inventory = getattr(
+        request.state,
+        _CODEX_OAUTH_REQUEST_INVENTORY_STATE_ATTR,
+        None,
+    )
+    if isinstance(inventory, (CodexOAuthInventory, CodexOAuthInventoryError)):
+        return inventory
+    return None
+
+
+def _store_request_codex_oauth_inventory(
+    request: Request,
+    inventory: Union[CodexOAuthInventory, CodexOAuthInventoryError],
+) -> None:
+    setattr(
+        request.state,
+        _CODEX_OAUTH_REQUEST_INVENTORY_STATE_ATTR,
+        inventory,
+    )
+
+
+def _request_codex_oauth_inventory_binding(
+    request: Request,
+    inventory: Optional[CodexOAuthInventory] = None,
+) -> Optional[Union[CodexOAuthInventory, CodexOAuthInventoryError]]:
+    if inventory is not None:
+        return inventory
+    return _peek_request_codex_oauth_inventory(request)
+
+
+@contextmanager
+def _bind_active_codex_oauth_inventory(
+    inventory: Optional[Union[CodexOAuthInventory, CodexOAuthInventoryError]],
+) -> Iterator[Optional[Union[CodexOAuthInventory, CodexOAuthInventoryError]]]:
+    token = _ACTIVE_CODEX_OAUTH_INVENTORY.set(inventory)
+    try:
+        yield inventory
+    finally:
+        _ACTIVE_CODEX_OAUTH_INVENTORY.reset(token)
+
+
+def _codex_oauth_inventory_unavailable_error() -> CodexOAuthInventoryError:
+    return CodexOAuthInventoryError("Codex OAuth inventory is unavailable.")
+
+
+def resolve_codex_oauth_inventory(
+    inventory: Optional[CodexOAuthInventory] = None,
+) -> CodexOAuthInventory:
+    """Reuse the request-scoped inventory, else load a fresh overlay snapshot."""
+    if inventory is not None:
+        return inventory
+    cached = _ACTIVE_CODEX_OAUTH_INVENTORY.get()
+    if isinstance(cached, CodexOAuthInventoryError):
+        raise cached
+    if isinstance(cached, CodexOAuthInventory):
+        return cached
+    from litellm.secret_managers import codex_oauth_inventory as inventory_mod
+
+    return inventory_mod.load_codex_oauth_inventory()
+
+
+async def _load_request_codex_oauth_inventory(
+    request: Request,
+) -> CodexOAuthInventory:
+    """Load inventory/overlay off-loop once and reuse it for this request."""
+    cached = _peek_request_codex_oauth_inventory(request)
+    if isinstance(cached, CodexOAuthInventoryError):
+        raise cached
+    if isinstance(cached, CodexOAuthInventory):
+        return cached
+    from litellm.secret_managers import codex_oauth_inventory as inventory_mod
+
+    local_loader = load_codex_oauth_inventory
+    live_loader = inventory_mod.load_codex_oauth_inventory
+    try:
+        if local_loader is not _ORIGINAL_LOAD_CODEX_OAUTH_INVENTORY:
+            inventory = await asyncio.to_thread(local_loader)
+        elif live_loader is _ORIGINAL_LOAD_CODEX_OAUTH_INVENTORY:
+            inventory = await inventory_mod.load_codex_oauth_inventory_async()
+        else:
+            inventory = await asyncio.to_thread(live_loader)
+    except asyncio.CancelledError:
+        raise
+    except CodexOAuthInventoryError as exc:
+        _store_request_codex_oauth_inventory(request, exc)
+        raise
+    except Exception:
+        wrapped = _codex_oauth_inventory_unavailable_error()
+        _store_request_codex_oauth_inventory(request, wrapped)
+        raise wrapped from None
+    _store_request_codex_oauth_inventory(request, inventory)
+    return inventory
+
+
+def _get_codex_oauth_request_snapshots(
+    request: Request,
+) -> dict[
+    tuple[str, str, Optional[str]],
+    Union[CodexOAuthCredentialSnapshot, CodexOAuthInventoryError],
+]:
+    snapshots = getattr(
+        request.state,
+        _CODEX_OAUTH_REQUEST_SNAPSHOTS_STATE_ATTR,
+        None,
+    )
+    if not isinstance(snapshots, dict):
+        snapshots = {}
+        setattr(
+            request.state,
+            _CODEX_OAUTH_REQUEST_SNAPSHOTS_STATE_ATTR,
+            snapshots,
+        )
+    return snapshots
+
+
+def _invalidate_codex_oauth_request_snapshot(
+    request: Request,
+    record: CodexOAuthCredentialRecord,
+) -> None:
+    snapshots = _get_codex_oauth_request_snapshots(request)
+    snapshots.pop(_codex_oauth_request_snapshot_cache_key(record), None)
+
+
 def _codex_oauth_candidate_identity(
     candidate: dict[str, Any],
 ) -> Optional[dict[str, str]]:
     """Return the safe selected-account identity carried by a candidate."""
-    account_label = _clean_codex_auth_value(
-        candidate.get("codex_oauth_account_label")
-    )
-    account_hash = _clean_codex_auth_value(
-        candidate.get("codex_oauth_account_hash")
-    )
+    account_label = _clean_codex_auth_value(candidate.get("codex_oauth_account_label"))
+    account_hash = _clean_codex_auth_value(candidate.get("codex_oauth_account_hash"))
     lane_key = _clean_codex_auth_value(candidate.get("codex_oauth_lane_key"))
-    present_count = sum(
-        value is not None for value in (account_label, account_hash, lane_key)
-    )
+    present_count = sum(value is not None for value in (account_label, account_hash, lane_key))
     if present_count == 0:
         return None
     if present_count != 3:
@@ -300,10 +435,7 @@ def _validated_codex_account_display(
         or identity["lane_key"] != loaded.lane_key
     ):
         return CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY
-    return (
-        _clean_codex_auth_value(loaded.account_display)
-        or CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY
-    )
+    return _clean_codex_auth_value(loaded.account_display) or CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY
 
 
 def _bind_codex_oauth_candidate_to_request(
@@ -324,14 +456,10 @@ def _bind_codex_oauth_candidate_to_request(
     provider = _clean_codex_auth_value(candidate.get("provider"))
     if provider == CODEX_AUTO_AGENT_NATIVE_PROVIDER:
         bound["provider"] = provider
-        account_display = _clean_codex_auth_value(
-            candidate.get("codex_oauth_account_display")
-        )
+        account_display = _clean_codex_auth_value(candidate.get("codex_oauth_account_display"))
         if account_display is not None:
             bound["account_display"] = account_display
-    credential_affinity = _clean_codex_auth_value(
-        candidate.get("codex_oauth_credential_affinity")
-    )
+    credential_affinity = _clean_codex_auth_value(candidate.get("codex_oauth_credential_affinity"))
     if credential_affinity is not None:
         bound["credential_affinity"] = credential_affinity
     setattr(request.state, "aawm_codex_oauth_selected_account", bound)
@@ -353,9 +481,7 @@ def _get_bound_codex_oauth_candidate_identity(
     if identity is None:
         return None
     identity["model"] = str(bound.get("model") or "")
-    credential_affinity = _clean_codex_auth_value(
-        bound.get("credential_affinity")
-    )
+    credential_affinity = _clean_codex_auth_value(bound.get("credential_affinity"))
     if credential_affinity is not None:
         identity["credential_affinity"] = credential_affinity
     return identity
@@ -378,12 +504,19 @@ async def _load_codex_oauth_headers_for_record(
     request: Request,
     record: CodexOAuthCredentialRecord,
 ) -> CodexOAuthRequestAuth:
-    """Build headers only from one already-selected immutable record."""
-    try:
-        credential = load_codex_oauth_credential(record)
-    except CodexOAuthInventoryError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from None
-
+    """Build headers from one bounded, generation-aware credential snapshot."""
+    snapshots = _get_codex_oauth_request_snapshots(request)
+    snapshot_key = _codex_oauth_request_snapshot_cache_key(record)
+    credential = snapshots.get(snapshot_key)
+    if isinstance(credential, CodexOAuthInventoryError):
+        raise HTTPException(status_code=500, detail=str(credential)) from None
+    if credential is None:
+        try:
+            credential = await read_codex_oauth_snapshot(record)
+        except CodexOAuthInventoryError as exc:
+            snapshots[snapshot_key] = exc
+            raise HTTPException(status_code=500, detail=str(exc)) from None
+        snapshots[snapshot_key] = credential
     if not _codex_oauth_credential_snapshot_is_valid(credential):
         raise HTTPException(
             status_code=500,
@@ -416,9 +549,7 @@ async def _load_codex_oauth_headers_for_record(
             account_id=credential.account_id,
             session_id=session_id,
         ),
-        account_display=(
-            credential.account_display or CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY
-        ),
+        account_display=(credential.account_display or CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY),
     )
 
 
@@ -427,11 +558,18 @@ def _load_codex_oauth_headers_for_record_sync(
     record: CodexOAuthCredentialRecord,
 ) -> CodexOAuthRequestAuth:
     """Run the read-only credential loader without an async credential path."""
-    try:
-        credential = load_codex_oauth_credential(record)
-    except CodexOAuthInventoryError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from None
-
+    snapshots = _get_codex_oauth_request_snapshots(request)
+    snapshot_key = _codex_oauth_request_snapshot_cache_key(record)
+    credential = snapshots.get(snapshot_key)
+    if isinstance(credential, CodexOAuthInventoryError):
+        raise HTTPException(status_code=500, detail=str(credential)) from None
+    if credential is None:
+        try:
+            credential = read_codex_oauth_snapshot_sync(record)
+        except CodexOAuthInventoryError as exc:
+            snapshots[snapshot_key] = exc
+            raise HTTPException(status_code=500, detail=str(exc)) from None
+        snapshots[snapshot_key] = credential
     if not _codex_oauth_credential_snapshot_is_valid(credential):
         raise HTTPException(
             status_code=500,
@@ -464,9 +602,7 @@ def _load_codex_oauth_headers_for_record_sync(
             account_id=credential.account_id,
             session_id=session_id,
         ),
-        account_display=(
-            credential.account_display or CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY
-        ),
+        account_display=(credential.account_display or CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY),
     )
 
 
@@ -477,6 +613,7 @@ def _load_locked_codex_oauth_headers_for_record_sync(
     """Acquire the writer lock and read one credential without blocking async."""
     from litellm.secret_managers.credential_file_lock import credential_file_lock
 
+    _invalidate_codex_oauth_request_snapshot(request, record)
     with credential_file_lock(record.lock_path):
         return _load_codex_oauth_headers_for_record_sync(request, record)
 
@@ -490,7 +627,7 @@ async def _load_local_codex_auth_selection(
 ) -> CodexOAuthRequestAuth:
     """Select from the explicit inventory and load exactly that record."""
     try:
-        inventory = load_codex_oauth_inventory()
+        inventory = await _load_request_codex_oauth_inventory(request)
         record = inventory.select_record(label=account_label, model=model)
     except CodexOAuthInventoryError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from None
@@ -508,10 +645,7 @@ async def _load_bound_codex_oauth_auth(
             status_code=429,
             detail={
                 "error": {
-                    "message": (
-                        "Codex OAuth dispatch requires a server-selected "
-                        "configured account."
-                    ),
+                    "message": ("Codex OAuth dispatch requires a server-selected " "configured account."),
                     "type": "rate_limit_error",
                     "code": "aawm_codex_auto_agent_candidate_unavailable",
                 },
@@ -530,10 +664,7 @@ async def _load_bound_codex_oauth_auth(
             status_code=429,
             detail={
                 "error": {
-                    "message": (
-                        "Selected Codex OAuth account is not currently "
-                        "authentication-ready."
-                    ),
+                    "message": ("Selected Codex OAuth account is not currently " "authentication-ready."),
                     "type": "rate_limit_error",
                     "code": "aawm_codex_auto_agent_candidate_unavailable",
                 },
@@ -541,18 +672,12 @@ async def _load_bound_codex_oauth_auth(
                 "attempted_provider_call": False,
             },
         ) from None
-    if (
-        selection.account_hash != identity["account_hash"]
-        or selection.lane_key != identity["lane_key"]
-    ):
+    if selection.account_hash != identity["account_hash"] or selection.lane_key != identity["lane_key"]:
         raise HTTPException(
             status_code=429,
             detail={
                 "error": {
-                    "message": (
-                        "Selected Codex OAuth account identity changed before "
-                        "dispatch."
-                    ),
+                    "message": ("Selected Codex OAuth account identity changed before " "dispatch."),
                     "type": "rate_limit_error",
                     "code": "aawm_codex_auto_agent_candidate_unavailable",
                 },
@@ -570,16 +695,13 @@ async def _load_local_codex_auth_headers(request: Request) -> dict[str, str]:
     return dict(selection.headers)
 
 
-
 # ---------------------------------------------------------------------------
 # OPENAI-024: token_invalidated recovery. Auth invalidation is not capacity:
 # it never applies a cooldown. Dispatched-token fingerprints are request-local
 # and secret-safe (SHA-256 over header items, never the token itself).
 # ---------------------------------------------------------------------------
 
-_CODEX_OAUTH_INVALIDATION_RECOVERY_STATE_ATTR = (
-    "aawm_codex_oauth_invalidation_recovery"
-)
+_CODEX_OAUTH_INVALIDATION_RECOVERY_STATE_ATTR = "aawm_codex_oauth_invalidation_recovery"
 
 
 def _codex_oauth_auth_fingerprint(auth: "CodexOAuthRequestAuth") -> str:
@@ -590,9 +712,7 @@ def _codex_oauth_auth_fingerprint(auth: "CodexOAuthRequestAuth") -> str:
 def _get_codex_oauth_invalidation_recovery_state(
     request: Request,
 ) -> dict[str, Any]:
-    state = getattr(
-        request.state, _CODEX_OAUTH_INVALIDATION_RECOVERY_STATE_ATTR, None
-    )
+    state = getattr(request.state, _CODEX_OAUTH_INVALIDATION_RECOVERY_STATE_ATTR, None)
     if not isinstance(state, dict):
         state = {"fingerprints": {}, "reloaded": set()}
         setattr(
@@ -652,9 +772,7 @@ def _record_codex_oauth_dispatched_auth(
     auth: "CodexOAuthRequestAuth",
 ) -> None:
     state = _get_codex_oauth_invalidation_recovery_state(request)
-    state["fingerprints"][auth.account_label] = _codex_oauth_auth_fingerprint(
-        auth
-    )
+    state["fingerprints"][auth.account_label] = _codex_oauth_auth_fingerprint(auth)
 
 
 @track_wait("credential_reload")
@@ -679,9 +797,7 @@ async def reload_codex_oauth_credential_after_token_invalidated(
     cleaned_label = _clean_codex_auth_value(account_label)
     if cleaned_label is None:
         return None
-    state = getattr(
-        request.state, _CODEX_OAUTH_INVALIDATION_RECOVERY_STATE_ATTR, None
-    )
+    state = getattr(request.state, _CODEX_OAUTH_INVALIDATION_RECOVERY_STATE_ATTR, None)
     if not isinstance(state, dict):
         return None
     reloaded = state.setdefault("reloaded", set())
@@ -703,7 +819,7 @@ async def reload_codex_oauth_credential_after_token_invalidated(
     from litellm.secret_managers.credential_file_lock import CredentialFileLockError
 
     try:
-        inventory = load_codex_oauth_inventory()
+        inventory = await _load_request_codex_oauth_inventory(request)
         record = inventory.select_record(label=cleaned_label, model=model)
     except CodexOAuthInventoryError:
         _record_codex_oauth_credential_reload_outcome(
@@ -748,15 +864,8 @@ async def reload_codex_oauth_credential_after_token_invalidated(
             outcome="unchanged_already_reloaded",
         )
         return None
-    if (
-        (
-            expected_account_hash is not None
-            and selection.account_hash != expected_account_hash
-        )
-        or (
-            expected_lane_key is not None
-            and selection.lane_key != expected_lane_key
-        )
+    if (expected_account_hash is not None and selection.account_hash != expected_account_hash) or (
+        expected_lane_key is not None and selection.lane_key != expected_lane_key
     ):
         _record_codex_oauth_credential_reload_outcome(
             request,
@@ -864,8 +973,7 @@ def _model_info_is_chatgpt_codex_inventory_target(info: Mapping[str, Any]) -> bo
     # Codex/ChatGPT inventory targets are responses-catalogued without chat
     # completions (gpt-5.6-*, exclusive codex rows, chatgpt-provider twins).
     has_chat_completions = any(
-        endpoint == "/v1/chat/completions" or endpoint.endswith("/chat/completions")
-        for endpoint in endpoints
+        endpoint == "/v1/chat/completions" or endpoint.endswith("/chat/completions") for endpoint in endpoints
     )
     return not has_chat_completions
 
@@ -895,9 +1003,7 @@ def _snapshot_lists_openai_codex_responses_model(model: str) -> bool:
         candidates = getattr(alias, "candidates", ()) or ()
         for candidate in candidates:
             provider = str(getattr(candidate, "provider", "") or "").strip().lower()
-            route_family = str(
-                getattr(candidate, "route_family", "") or ""
-            ).strip().lower()
+            route_family = str(getattr(candidate, "route_family", "") or "").strip().lower()
             candidate_model = _clean_codex_auth_value(getattr(candidate, "model", None))
             if provider != "openai" or route_family != "codex_responses":
                 continue
@@ -920,9 +1026,7 @@ def _is_direct_codex_oauth_inventory_model(model: Any) -> bool:
     # even when the bare OpenAI row also advertises dual public chat endpoints.
     for cost_map in _load_direct_codex_oauth_model_cost_maps():
         twin = cost_map.get(f"chatgpt/{bare}")
-        if isinstance(twin, dict) and _model_info_is_chatgpt_codex_inventory_target(
-            twin
-        ):
+        if isinstance(twin, dict) and _model_info_is_chatgpt_codex_inventory_target(twin):
             return True
     for info in _iter_direct_codex_oauth_model_info_entries(cleaned):
         if _model_info_is_chatgpt_codex_inventory_target(info):
@@ -983,9 +1087,7 @@ def _direct_codex_oauth_affinity_from_session_owner(
     }:
         return None
     label = _clean_codex_auth_value(owner_affinity.get("codex_oauth_account_label"))
-    account_hash = _clean_codex_auth_value(
-        owner_affinity.get("codex_oauth_account_hash")
-    )
+    account_hash = _clean_codex_auth_value(owner_affinity.get("codex_oauth_account_hash"))
     lane_key = _clean_codex_auth_value(owner_affinity.get("codex_oauth_lane_key"))
     if not all((label, account_hash, lane_key)):
         return None
@@ -997,8 +1099,9 @@ def _direct_codex_oauth_affinity_from_session_owner(
         "codex_oauth_account_label": label,
         "codex_oauth_account_hash": account_hash,
         "codex_oauth_lane_key": lane_key,
-        "affinity_state_source": owner_affinity.get("affinity_state_source")
-        or "session_owner",
+        "affinity_state_source": owner_affinity.get(
+            "affinity_state_source"
+        ) or "session_owner",
     }
 
 
@@ -1060,10 +1163,7 @@ def _codex_oauth_affinity_token_digest(token: str) -> str:
 
 def _codex_oauth_affinity_token_invalid_exception(
     *,
-    message: str = (
-        "Codex OAuth continuation affinity state is invalid, expired, "
-        "or unavailable."
-    ),
+    message: str = ("Codex OAuth continuation affinity state is invalid, expired, " "or unavailable."),
 ) -> HTTPException:
     return HTTPException(
         status_code=400,
@@ -1100,6 +1200,7 @@ def _codex_oauth_affinity_conflicts(
         "codex_responses",
         "openai_responses",
     }
+
     def _canonical_route_family(value: Any) -> Optional[str]:
         route = _clean_codex_auth_value(value)
         if route is None:
@@ -1114,11 +1215,7 @@ def _codex_oauth_affinity_conflicts(
 
     left_route = _canonical_route_family(left.get("route_family"))
     right_route = _canonical_route_family(right.get("route_family"))
-    if (
-        left_route
-        and right_route
-        and left_route != right_route
-    ):
+    if left_route and right_route and left_route != right_route:
         return True
 
     for identity_field in (
@@ -1150,16 +1247,11 @@ def _codex_oauth_resolve_affinity(
     *,
     durable_affinity: Optional[Mapping[str, Any]],
     token_affinity: Optional[Mapping[str, Any]],
-    conflict_message: str = (
-        "Codex OAuth continuation affinity state conflicts "
-        "with durable session affinity."
-    ),
+    conflict_message: str = ("Codex OAuth continuation affinity state conflicts " "with durable session affinity."),
 ) -> Optional[dict[str, Any]]:
     """Validate durable compatibility, then preserve authenticated token scope."""
     if _codex_oauth_affinity_conflicts(durable_affinity, token_affinity):
-        raise _codex_oauth_affinity_token_invalid_exception(
-            message=conflict_message
-        )
+        raise _codex_oauth_affinity_token_invalid_exception(message=conflict_message)
     if token_affinity is not None:
         return dict(token_affinity)
     if durable_affinity is None:
@@ -1173,12 +1265,17 @@ def _get_codex_oauth_affinity_continuation_state(
     body: dict[str, Any],
     model: Optional[str],
     session_identity: Optional[str],
+    inventory: Optional[CodexOAuthInventory] = None,
 ) -> CodexOAuthAffinityContinuation:
     """Validate once and retain immutable server state across retries.
 
     ``model`` is omitted for alias and model-less native requests; in those
     cases the signed token model becomes the frozen concrete scope.
     """
+    if inventory is None:
+        peeked_inventory = _peek_request_codex_oauth_inventory(request)
+        if isinstance(peeked_inventory, CodexOAuthInventory):
+            inventory = peeked_inventory
     token, token_declared = _codex_oauth_affinity_token_request_state(body=body)
     _remove_codex_oauth_affinity_token_from_body(body)
     normalized_model = _clean_codex_auth_value(model) or ""
@@ -1188,27 +1285,16 @@ def _get_codex_oauth_affinity_continuation_state(
         _CODEX_OAUTH_AFFINITY_CONTINUATION_STATE_ATTR,
         None,
     )
-    token_digest = (
-        _codex_oauth_affinity_token_digest(token)
-        if token is not None
-        else None
-    )
+    token_digest = _codex_oauth_affinity_token_digest(token) if token is not None else None
 
     if isinstance(existing, CodexOAuthAffinityContinuation):
         if existing.invalid:
             return existing
         if existing.declared:
             if (
-                (
-                    existing.model
-                    and normalized_model
-                    and existing.model != normalized_model
-                )
+                (existing.model and normalized_model and existing.model != normalized_model)
                 or existing.session_identity != normalized_session
-                or (
-                    token_declared
-                    and existing.token_digest != token_digest
-                )
+                or (token_declared and existing.token_digest != token_digest)
             ):
                 invalid = CodexOAuthAffinityContinuation(
                     declared=True,
@@ -1238,11 +1324,10 @@ def _get_codex_oauth_affinity_continuation_state(
             token=token,
             model=normalized_model or None,
             session_identity=normalized_session,
+            inventory=inventory,
         )
         authoritative_model = (
-            _clean_codex_auth_value(affinity.get("model"))
-            if affinity is not None
-            else normalized_model
+            _clean_codex_auth_value(affinity.get("model")) if affinity is not None else normalized_model
         ) or ""
         state = CodexOAuthAffinityContinuation(
             declared=True,
@@ -1250,9 +1335,7 @@ def _get_codex_oauth_affinity_continuation_state(
             token_digest=token_digest,
             model=authoritative_model,
             session_identity=normalized_session,
-            affinity_items=(
-                tuple(sorted(affinity.items())) if affinity is not None else ()
-            ),
+            affinity_items=(tuple(sorted(affinity.items())) if affinity is not None else ()),
         )
     if token_declared:
         setattr(
@@ -1293,9 +1376,7 @@ def _redact_codex_oauth_terminal_reset(
     """Keep reset evidence while omitting exhausted-account identities."""
     if not isinstance(terminal_reset, dict):
         return None
-    redacted = {
-        key: value for key, value in terminal_reset.items() if key != "accounts"
-    }
+    redacted = {key: value for key, value in terminal_reset.items() if key != "accounts"}
     accounts = terminal_reset.get("accounts")
     if isinstance(accounts, list):
         redacted_accounts: list[dict[str, Any]] = []
@@ -1390,23 +1471,15 @@ def _issue_codex_oauth_affinity_token(
     )
     if cleaned_lane != expected_lane:
         raise ValueError("Codex OAuth affinity token account lane is invalid.")
-    if (
-        not isinstance(ttl_seconds, int)
-        or isinstance(ttl_seconds, bool)
-        or ttl_seconds <= 0
-    ):
+    if not isinstance(ttl_seconds, int) or isinstance(ttl_seconds, bool) or ttl_seconds <= 0:
         raise ValueError("Codex OAuth affinity token TTL is invalid.")
     signing_key = _codex_oauth_affinity_signing_key()
     if signing_key is None:
-        raise RuntimeError(
-            "Codex OAuth affinity token issuance requires a configured server key."
-        )
+        raise RuntimeError("Codex OAuth affinity token issuance requires a configured server key.")
     try:
         import jwt
     except ImportError as exc:
-        raise RuntimeError(
-            "Codex OAuth affinity token issuance requires PyJWT."
-        ) from exc
+        raise RuntimeError("Codex OAuth affinity token issuance requires PyJWT.") from exc
     now = int(time.time())
     payload = {
         "iss": _CODEX_OAUTH_AFFINITY_TOKEN_ISSUER,
@@ -1434,6 +1507,7 @@ def _codex_oauth_affinity_from_authenticated_token(
     *,
     token: Optional[str],
     model: Optional[str],
+    inventory: Optional[CodexOAuthInventory] = None,
     session_identity: Optional[str],
 ) -> Optional[dict[str, Any]]:
     """Validate a server-issued account-affinity continuation token.
@@ -1489,9 +1563,7 @@ def _codex_oauth_affinity_from_authenticated_token(
 
     token_model = _clean_codex_auth_value(claims.get("model"))
     token_session = _clean_codex_auth_value(claims.get("session"))
-    account_ref = _clean_codex_auth_value(
-        claims.get(_CODEX_OAUTH_AFFINITY_TOKEN_ACCOUNT_REF_CLAIM)
-    )
+    account_ref = _clean_codex_auth_value(claims.get(_CODEX_OAUTH_AFFINITY_TOKEN_ACCOUNT_REF_CLAIM))
     if not all((token_model, token_session, account_ref)):
         return None
     request_model = _clean_codex_auth_value(model)
@@ -1502,18 +1574,13 @@ def _codex_oauth_affinity_from_authenticated_token(
         return None
     if request_model is not None and token_model != request_model:
         return None
+    if inventory is None:
+        return None
     if len(account_ref) != hashlib.sha256().digest_size * 2:
         return None
-    try:
-        from litellm.secret_managers.codex_oauth_inventory import (
-            load_codex_oauth_inventory,
-        )
-
-        inventory = load_codex_oauth_inventory()
-    except Exception:  # noqa: BLE001
-        return None
+    resolved_inventory = inventory
     selected_record: Optional[CodexOAuthCredentialRecord] = None
-    for record in inventory.records:
+    for record in resolved_inventory.records:
         expected_ref = _codex_oauth_affinity_account_ref(
             account_label=record.label,
             account_hash=record.expected_account_hash,
@@ -1542,30 +1609,29 @@ def _codex_oauth_affinity_from_authenticated_token(
     }
 
 
-
 async def _resolve_model_less_direct_codex_oauth_contexts(
     request: Request,
     *,
     candidate_template: dict[str, Any],
+    inventory: Optional[CodexOAuthInventory] = None,
 ) -> list[dict[str, Any]]:
     """Auth-check enabled inventory accounts without a model scope filter."""
-    # Local helpers (this module).
     from litellm.secret_managers.codex_oauth_inventory import (
         CodexOAuthInventoryError,
         codex_oauth_inventory_generation_digest,
-        load_codex_oauth_inventory,
     )
 
     inventory_generation: Optional[str] = None
     try:
-        inventory = load_codex_oauth_inventory()
-        inventory_generation = codex_oauth_inventory_generation_digest(inventory)
-        records = inventory.ordered_records(enabled_only=True, model=None)
+        resolved_inventory = inventory if inventory is not None else await _load_request_codex_oauth_inventory(request)
+        inventory_generation = codex_oauth_inventory_generation_digest(resolved_inventory)
+        records = resolved_inventory.ordered_records(
+            enabled_only=True,
+            model=None,
+        )
         routing_fields = {
-            "codex_oauth_credential_affinity": (
-                inventory.routing.credential_affinity
-            ),
-            "codex_oauth_selection_strategy": inventory.routing.strategy,
+            "codex_oauth_credential_affinity": (resolved_inventory.routing.credential_affinity),
+            "codex_oauth_selection_strategy": (resolved_inventory.routing.strategy),
             "codex_oauth_inventory_generation": inventory_generation,
         }
     except CodexOAuthInventoryError:
@@ -1576,9 +1642,7 @@ async def _resolve_model_less_direct_codex_oauth_contexts(
 
     if not records:
         unavailable_candidate = dict(candidate_template)
-        unavailable_candidate["codex_oauth_inventory_generation"] = (
-            inventory_generation
-        )
+        unavailable_candidate["codex_oauth_inventory_generation"] = inventory_generation
         return [
             {
                 "candidate": unavailable_candidate,
@@ -1625,10 +1689,7 @@ async def _resolve_model_less_direct_codex_oauth_contexts(
                 }
             )
         else:
-            if (
-                loaded.account_hash != record.expected_account_hash
-                or loaded.lane_key != lane_key
-            ):
+            if loaded.account_hash != record.expected_account_hash or loaded.lane_key != lane_key:
                 context.update(
                     {
                         "auth_status": "degraded",
@@ -1639,11 +1700,9 @@ async def _resolve_model_less_direct_codex_oauth_contexts(
                     }
                 )
             else:
-                account_candidate["codex_oauth_account_display"] = (
-                    _validated_codex_account_display(
-                        candidate=account_candidate,
-                        loaded=loaded,
-                    )
+                account_candidate["codex_oauth_account_display"] = _validated_codex_account_display(
+                    candidate=account_candidate,
+                    loaded=loaded,
                 )
         contexts.append(context)
     return contexts
@@ -1713,22 +1772,16 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     concrete_non_alias = (
         explicit_model is not None
         and not bypass_already_consumed
-        and _selection._lookup_active_snapshot_canonical_alias(
-            model, request=request
-        )
-        is None
+        and _selection._lookup_active_snapshot_canonical_alias(model, request=request) is None
     )
+    inventory: Optional[CodexOAuthInventory] = None
     try:
-        from litellm.secret_managers.codex_oauth_inventory import (
-            load_codex_oauth_inventory,
-        )
-
-        routing = load_codex_oauth_inventory().routing
+        inventory = await _load_request_codex_oauth_inventory(request)
+        routing = inventory.routing
     except Exception:  # noqa: BLE001
+        inventory = None
         routing = None
-    interchangeable_accounts = bool(
-        routing is not None and routing.accounts_are_interchangeable
-    )
+    interchangeable_accounts = bool(routing is not None and routing.accounts_are_interchangeable)
     if routing is not None:
         candidate_template.update(
             {
@@ -1750,6 +1803,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
         body=body,
         model=model,
         session_identity=session_identity,
+        inventory=inventory,
     )
     if continuation.invalid:
         raise _codex_oauth_affinity_token_invalid_exception()
@@ -1774,13 +1828,10 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     owner_affinity: Optional[dict[str, Any]] = None
     has_account_bound_state = token_affinity is not None
     if session_identity is not None and not planned_portable_failover:
-        has_body_continuation_state = _codex_auto_agent_request_has_continuation_state(
-            body
-        )
+        has_body_continuation_state = _codex_auto_agent_request_has_continuation_state(body)
         has_previous_response_id = bool(body.get("previous_response_id"))
         has_account_bound_state = (
-            _aawm_auto_agent_audit_request_has_account_bound_state(body)
-            or token_affinity is not None
+            _aawm_auto_agent_audit_request_has_account_bound_state(body) or token_affinity is not None
         )
         server_validated_replay = _sa.validate_cursor_replay_matches_body(
             request,
@@ -1802,9 +1853,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
             "_aawm_session_owner_consult_record",
             None,
         )
-        computed_cache_key = _sa.build_aawm_alias_routing_session_owner_cache_key(
-            session_identity=session_identity
-        )
+        computed_cache_key = _sa.build_aawm_alias_routing_session_owner_cache_key(session_identity=session_identity)
         consult_reuse_eligible = (
             not has_body_continuation_state
             and not has_previous_response_id
@@ -1827,12 +1876,10 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
             _cache_key = computed_cache_key
             owner_error = None
         else:
-            owner_record, _cache_key, owner_error = (
-                await _sa.get_session_owner_record(
-                    session_identity=session_identity,
-                    request=request,
-                    wait_for_foreign_reservation=True,
-                )
+            owner_record, _cache_key, owner_error = await _sa.get_session_owner_record(
+                session_identity=session_identity,
+                request=request,
+                wait_for_foreign_reservation=True,
             )
         if owner_error is not None:
             _sa.raise_session_owner_redispatch_required(
@@ -1865,17 +1912,12 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     affinity = _codex_oauth_resolve_affinity(
         durable_affinity=owner_affinity,
         token_affinity=token_affinity,
-        conflict_message=(
-            "Codex OAuth continuation affinity state conflicts "
-            "with durable session ownership."
-        ),
+        conflict_message=("Codex OAuth continuation affinity state conflicts " "with durable session ownership."),
     )
 
     affinity_selection_reason: Optional[str] = None
     if affinity is not None:
-        affinity_selection_reason = _codex_oauth_affinity_selection_reason(
-            affinity
-        )
+        affinity_selection_reason = _codex_oauth_affinity_selection_reason(affinity)
 
     if inventory_model is None and affinity is None:
         # Model-less native path: reuse inventory model=None eligibility
@@ -1883,6 +1925,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
         contexts = await _resolve_model_less_direct_codex_oauth_contexts(
             request,
             candidate_template=candidate_template,
+            inventory=inventory,
         )
     else:
         resolve_template = dict(candidate_template)
@@ -1967,8 +2010,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                 for state in states
                 if isinstance(state.get("candidate"), Mapping)
                 and all(
-                    value is None
-                    or state["candidate"].get(field) == value
+                    value is None or state["candidate"].get(field) == value
                     for field, value in pinned_account_fields.items()
                 )
             ]
@@ -1976,10 +2018,11 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     selected_state = _selection._select_first_available_codex_oauth_account_state(
         selection_states,
         bypass_reason=(
-            "account_pinned" if affinity is not None else
-            "ordinary_continuation"
-            if _codex_auto_agent_request_has_continuation_state(body)
-            and not planned_portable_failover else None
+            "account_pinned"
+            if affinity is not None
+            else "ordinary_continuation"
+            if _codex_auto_agent_request_has_continuation_state(body) and not planned_portable_failover
+            else None
         ),
     )
 
@@ -1990,8 +2033,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
         )
         if planned_portable_failover:
             unavailable_message = (
-                "No alternate Codex OAuth inventory account is available for "
-                "the planned portable account failover."
+                "No alternate Codex OAuth inventory account is available for " "the planned portable account failover."
             )
         elif affinity_selection_reason == "session_owner_pin":
             unavailable_message = (
@@ -2018,9 +2060,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
             "failure_phase": "direct_inventory_selection",
         }
         if planned_portable_failover:
-            terminal_reset = (
-                _selection._build_codex_oauth_terminal_reset_information(states)
-            )
+            terminal_reset = _selection._build_codex_oauth_terminal_reset_information(states)
             if terminal_reset is not None:
                 detail["terminal_reset"] = terminal_reset
             detail.update(
@@ -2031,13 +2071,9 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                 }
             )
         elif affinity is not None and affinity_selection_reason is not None:
-            terminal_reset = (
-                _selection._build_codex_oauth_terminal_reset_information(states)
-            )
+            terminal_reset = _selection._build_codex_oauth_terminal_reset_information(states)
             if terminal_reset is not None:
-                redacted_terminal_reset = _redact_codex_oauth_terminal_reset(
-                    terminal_reset
-                )
+                redacted_terminal_reset = _redact_codex_oauth_terminal_reset(terminal_reset)
                 if redacted_terminal_reset is not None:
                     detail["terminal_reset"] = redacted_terminal_reset
             detail.update(
@@ -2068,12 +2104,9 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
         quota_selection = selected_state.get("quota_selection")
         selection_reason = (
             quota_selection.get("selection_reason")
-            if isinstance(quota_selection, dict)
-            and quota_selection.get("selection_reason")
+            if isinstance(quota_selection, dict) and quota_selection.get("selection_reason")
             else (
-                "direct_inventory_interchangeable"
-                if interchangeable_accounts
-                else "direct_inventory_first_available"
+                "direct_inventory_interchangeable" if interchangeable_accounts else "direct_inventory_first_available"
             )
         )
     selection_state = {
@@ -2084,10 +2117,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
         "alias_model": model,
         "request_mode": (
             "ordinary_continuation"
-            if (
-                affinity is not None
-                or _codex_auto_agent_request_has_continuation_state(body)
-            )
+            if (affinity is not None or _codex_auto_agent_request_has_continuation_state(body))
             else "fresh"
         ),
     }
@@ -2104,13 +2134,12 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
             "codex_oauth_direct_inventory": True,
             "codex_oauth_quota_balancing": selected_state.get(
                 "quota_balancing",
-            ) or selected_state.get("quota_selection"),
+            )
+            or selected_state.get("quota_selection"),
             "codex_oauth_account_label": selected_auth.account_label,
             "codex_oauth_account_hash": selected_auth.account_hash,
             "codex_oauth_lane_key": selected_auth.lane_key,
-            "codex_oauth_inventory_generation": candidate.get(
-                "codex_oauth_inventory_generation"
-            ),
+            "codex_oauth_inventory_generation": candidate.get("codex_oauth_inventory_generation"),
             "codex_oauth_account_display": selected_auth.account_display,
             "codex_auto_agent_selected_provider": CODEX_AUTO_AGENT_NATIVE_PROVIDER,
             "codex_auto_agent_selected_model": model,
@@ -2118,27 +2147,14 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
             "codex_auto_agent_selected_account_label": selected_auth.account_label,
             "codex_auto_agent_selected_account_hash": selected_auth.account_hash,
             "codex_auto_agent_selected_account_lane": selected_auth.lane_key,
-            "codex_auto_agent_selected_account_display": (
-                selected_auth.account_display
-            ),
-            "codex_auto_agent_lane_key": selected_state.get("lane_key")
-            or selected_auth.lane_key,
+            "codex_auto_agent_selected_account_display": (selected_auth.account_display),
+            "codex_auto_agent_lane_key": selected_state.get("lane_key") or selected_auth.lane_key,
             "codex_auto_agent_selection_reason": selection_reason,
-            "codex_auto_agent_cooldown_state_source": selected_state.get(
-                "cooldown_state_source"
-            ),
-            "codex_auto_agent_quota_snapshot_age_seconds": selected_state.get(
-                "quota_snapshot_age_seconds"
-            ),
-            "codex_auto_agent_failover_ordinal": selected_state.get(
-                "failover_ordinal"
-            ),
-            "codex_auto_agent_prior_account_outcome": selected_state.get(
-                "prior_account_outcome"
-            ),
-            "codex_auto_agent_terminal_reset": selected_state.get(
-                "terminal_reset"
-            ),
+            "codex_auto_agent_cooldown_state_source": selected_state.get("cooldown_state_source"),
+            "codex_auto_agent_quota_snapshot_age_seconds": selected_state.get("quota_snapshot_age_seconds"),
+            "codex_auto_agent_failover_ordinal": selected_state.get("failover_ordinal"),
+            "codex_auto_agent_prior_account_outcome": selected_state.get("prior_account_outcome"),
+            "codex_auto_agent_terminal_reset": selected_state.get("terminal_reset"),
             "codex_auto_agent_skipped_candidates": skipped,
             "codex_auto_agent_attempts": [
                 _selection._codex_auto_agent_candidate_public_shape(
@@ -2201,10 +2217,7 @@ def is_direct_codex_token_invalidated_error(exc: Exception) -> bool:
     if parsed_status_code != 401 or not detail:
         return False
     error = detail.get("error")
-    return bool(
-        isinstance(error, dict)
-        and error.get("code") == "token_invalidated"
-    )
+    return bool(isinstance(error, dict) and error.get("code") == "token_invalidated")
 
 
 def direct_codex_usage_limit_retry_after_seconds(
@@ -2213,9 +2226,7 @@ def direct_codex_usage_limit_retry_after_seconds(
     now_epoch: Optional[float] = None,
 ) -> float:
     """Resolve the provider reset interval, with a bounded fallback."""
-    max_cooldown_seconds = os.getenv(
-        "LITELLM_CODEX_OAUTH_USAGE_LIMIT_COOLDOWN_MAX_SECONDS", "10800"
-    )
+    max_cooldown_seconds = os.getenv("LITELLM_CODEX_OAUTH_USAGE_LIMIT_COOLDOWN_MAX_SECONDS", "10800")
     try:
         max_cooldown_seconds = float(max_cooldown_seconds)
         if not math.isfinite(max_cooldown_seconds) or max_cooldown_seconds <= 0:

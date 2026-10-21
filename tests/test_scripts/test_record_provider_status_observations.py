@@ -25,6 +25,7 @@ from litellm.secret_managers.codex_oauth_inventory import (
     CodexOAuthCredentialRecord,
     CodexOAuthCredentialSnapshot,
     CodexOAuthInventory,
+    CodexOAuthRoutingPolicy,
     codex_oauth_account_identity_hash,
 )
 from scripts import codex_oauth_refresh
@@ -77,7 +78,8 @@ def _codex_oauth_inventory(
                 root=root,
             )
             for index, label in enumerate(selected_labels)
-        )
+        ),
+        routing=CodexOAuthRoutingPolicy(credential_affinity="interchangeable"),
     )
 
 
@@ -7033,8 +7035,10 @@ def test_passive_oauth_health_inspection_classifies_expired_and_malformed(
         ),
         encoding="utf-8",
     )
+    expired_path.chmod(0o600)
     malformed_path = tmp_path / "malformed-codex.json"
     malformed_path.write_text("{not-json", encoding="utf-8")
+    malformed_path.chmod(0o600)
 
     expired = codex_oauth_refresh.inspect_codex_oauth_credential_health(
         expired_path
@@ -7046,7 +7050,7 @@ def test_passive_oauth_health_inspection_classifies_expired_and_malformed(
     assert expired["health_status"] == "expired"
     assert expired["error_class"] == "CredentialExpiredError"
     assert malformed["health_status"] == "malformed"
-    assert malformed["error_class"] == "ValueError"
+    assert malformed["error_class"] == "CodexOAuthCredentialError"
 
 
 def _grok_oidc_auth_persist_config(**overrides):
@@ -7706,6 +7710,7 @@ def test_codex_oauth_refresh_reinspects_replaced_account_identity(
         ),
         encoding="utf-8",
     )
+    record.auth_path.chmod(0o600)
     config = _codex_oauth_auth_persist_config(
         apply=False,
         codex_oauth_inventory=inventory,
@@ -7763,6 +7768,7 @@ def test_codex_oauth_refresh_reinspects_replaced_account_identity(
         ),
         encoding="utf-8",
     )
+    replacement_path.chmod(0o600)
     os.replace(replacement_path, record.auth_path)
 
     second_events = loop._run_codex_oauth_refresh_task(
@@ -7823,6 +7829,7 @@ def test_codex_actual_attempt_throttle_retains_failed_degraded_aggregate(
         ),
         encoding="utf-8",
     )
+    record.auth_path.chmod(0o600)
     config = _codex_oauth_auth_persist_config(
         apply=False,
         codex_oauth_inventory=inventory,
@@ -7930,11 +7937,13 @@ def test_codex_failed_midpoint_attempt_retries_each_account_before_expiry(
             ),
             encoding="utf-8",
         )
+        record.auth_path.chmod(0o600)
     config = _codex_oauth_auth_persist_config(
         apply=False,
         interval_seconds=900.0,
         codex_oauth_inventory=inventory,
         codex_refresh_interval_seconds=300.0,
+        codex_refresh_buffer_seconds=450,
     )
     helper_calls: list[str] = []
 
@@ -10237,3 +10246,94 @@ def test_parse_codex_reset_credit_credit_entry_prefers_redeemed_at_for_used() ->
     )
     assert parsed["status"] == "used"
     assert parsed["redeemed_at"] == datetime(2026, 6, 21, 10, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("lifetime,buffer,expected", [
+    (None, 90, 90), (120, 30, 30), (120, 120, 60),
+    (900, 60, 60), (900, 900, 450), (900, 10000, 450),
+])
+def test_codex_scheduler_uses_configured_buffer_and_shared_cycle(
+    tmp_path, monkeypatch, lifetime, buffer, expected
+) -> None:
+    inventory = _codex_oauth_inventory("account1", root=tmp_path)
+    record = inventory.records[0]
+    now = datetime(2026, 10, 20, 12, 0, tzinfo=timezone.utc)
+    expiry = now + timedelta(seconds=20000)
+    tokens = {
+        "access_token": "synthetic-access",
+        "refresh_token": "synthetic-refresh",
+        "account_id": "acct-account1",
+        "expires_at": expiry.timestamp(),
+    }
+    if lifetime is not None:
+        tokens["expires_in"] = lifetime
+    record.auth_path.write_text(json.dumps({"tokens": tokens}))
+    record.auth_path.chmod(0o600)
+    config = _codex_oauth_auth_persist_config(
+        apply=False, codex_oauth_inventory=inventory,
+        codex_refresh_buffer_seconds=buffer,
+    )
+    monkeypatch.setattr(loop, "_persist_codex_auth_observation",
+                        lambda *args, **kwargs: (False, 0, None, "apply_disabled"))
+    calls = []
+
+    def refresh(selected, **kwargs):
+        calls.append(selected.label)
+        kwargs["on_token_endpoint_attempt"]()
+        return {"attempted": True, "refreshed": False, "skipped": False,
+                "error_class": "SyntheticProviderError"}
+
+    monkeypatch.setattr(loop.codex_oauth_refresh,
+                        "refresh_codex_oauth_inventory_record", refresh)
+    state = loop.SidecarTaskState()
+    with loop._codex_oauth_snapshot_cycle():
+        events = loop._run_codex_oauth_refresh_task(
+            config, state, now_monotonic=1, now_wall=now
+        )
+    event = next(e for e in events if e["event"] == "codex_oauth_refresh")
+    assert event["refresh_threshold_seconds"] == expected
+    assert event["refresh_threshold_degraded"] is (lifetime is None)
+    assert calls == []
+    due = expiry - timedelta(seconds=expected)
+    with loop._codex_oauth_snapshot_cycle():
+        events = loop._run_codex_oauth_refresh_task(
+            config, state, now_monotonic=20001, now_wall=due
+        )
+    event = next(e for e in events if e["event"] == "codex_oauth_refresh")
+    assert calls == ["account1"]
+    assert event["actual_attempted"] is True
+    assert event["refresh_threshold_seconds"] == expected
+
+
+@pytest.mark.parametrize("valid", [True, False])
+def test_codex_cycle_reuses_factual_load_across_consumers(
+    tmp_path, monkeypatch, valid
+) -> None:
+    inventory = _codex_oauth_inventory("account1", root=tmp_path)
+    record = inventory.records[0]
+    record.auth_path.write_text(json.dumps({"tokens": {
+        "access_token": "synthetic-access", "account_id": "acct-account1",
+        "expires_at": 2000000000,
+    }}) if valid else "{")
+    record.auth_path.chmod(0o600)
+    reads = []
+    load = loop.load_codex_oauth_credential
+
+    def counting_load(selected):
+        reads.append(selected.label)
+        return load(selected)
+
+    monkeypatch.setattr(loop, "load_codex_oauth_credential", counting_load)
+    _codex_oauth_auth_persist_config(
+        apply=False, codex_oauth_inventory=inventory
+    )
+    with loop._codex_oauth_snapshot_cycle():
+        health = loop._inspect_codex_inventory_record_health(record)
+        eligibility = loop.codex_oauth_refresh.inspect_codex_oauth_refresh_eligibility(
+            record.auth_path, credential_record=record,
+            snapshot_reader=loop._recheck_sidecar_cycle_codex_snapshot,
+            now=lambda: 1000000, poll_interval_seconds=30,
+        )
+    assert reads == ["account1"]
+    assert bool(health.get("error_class")) is (not valid)
+    assert bool(eligibility.get("error_class")) is (not valid)

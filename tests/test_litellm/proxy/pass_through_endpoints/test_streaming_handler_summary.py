@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -10,6 +11,7 @@ import pytest
 from litellm.proxy.pass_through_endpoints.streaming_handler import (
     PassThroughStreamingHandler,
     _PassThroughStreamLineAccumulator,
+    _ResponsesPreCommitPrefixStore,
 )
 from litellm.proxy.pass_through_endpoints.success_handler import PassThroughEndpointLogging
 from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
@@ -358,6 +360,78 @@ async def test_route_streaming_logging_syncs_codex_review_decision_event_to_call
     assert events[0]["parent_litellm_call_id"] == "origin-call-1"
     assert events[0]["parent_agent_id"] == "parent-actor-1"
     assert events[0]["parent_thread_id"] == "parent-thread-1"
+
+
+@pytest.mark.asyncio
+async def test_unstarted_native_stream_logs_disconnection_from_prefix_store():
+    chunks = [
+        _responses_sse_event(
+            {
+                "type": "response.created",
+                "response": {"id": "resp_unstarted", "status": "in_progress"},
+            }
+        ),
+        _responses_sse_event(
+            {
+                "type": "response.output_text.delta",
+                "delta": "buffered response",
+            }
+        ),
+    ]
+    prefix = _ResponsesPreCommitPrefixStore(max_buffer_bytes=1)
+    logging_obj = MagicMock()
+    logging_obj.model_call_details = {}
+    logging_obj.async_failure_handler = AsyncMock()
+    logging_obj.async_success_handler = AsyncMock()
+    snapshot = {
+        "disposition": "disconnected",
+        "finalized": True,
+        "asgi_delivery_complete": True,
+    }
+    request = SimpleNamespace(
+        state=SimpleNamespace(_aawm_openai_responses_delivered_snapshot=snapshot)
+    )
+    route = "https://chatgpt.com/backend-api/codex/responses"
+    module = "litellm.proxy.pass_through_endpoints.streaming_handler"
+    try:
+        for chunk in chunks:
+            prefix.append(chunk)
+        with patch(
+            f"{module}.safe_mark_phase", new=AsyncMock()
+        ), patch(
+            f"{module}.safe_finalize", new=AsyncMock()
+        ), patch(
+            f"{module}._emit_aawm_terminal_error"
+        ), patch(
+            f"{module}.record_aawm_route_rollup_failure"
+        ), patch(
+            f"{module}.OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks",
+            return_value={"result": {"response": "buffered"}, "kwargs": {}},
+        ) as collect:
+            await PassThroughStreamingHandler._finalize_unstarted_native_stream(
+                delivered_snapshot=snapshot,
+                response=httpx.Response(200, request=httpx.Request("POST", route)),
+                request_body={"model": "codex-auto-review"},
+                litellm_logging_obj=logging_obj,
+                endpoint_type=EndpointType.OPENAI,
+                start_time=datetime.now(),
+                passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
+                url_route=route,
+                custom_llm_provider="openai",
+                success_handler_kwargs={"litellm_params": {"metadata": {}}},
+                upstream_prefix_bytes=prefix,
+                operational_request=request,
+            )
+
+        logging_obj.async_failure_handler.assert_awaited_once()
+        failure = logging_obj.async_failure_handler.await_args.kwargs["exception"]
+        assert failure.delivered_disposition == "disconnected"
+        logging_obj.async_success_handler.assert_not_awaited()
+        assert collect.call_args.kwargs["all_chunks"] == [
+            line for chunk in chunks for line in chunk.decode().splitlines() if line
+        ]
+    finally:
+        prefix.close()
 
 
 @pytest.mark.asyncio

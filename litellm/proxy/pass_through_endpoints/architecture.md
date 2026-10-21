@@ -135,10 +135,11 @@ one-use authorization and preserves its logical ordinal; it does not change the
 ordinary call cap. Without that authorization, ledger exhaustion is raised
 before another send and is terminal: it does not trigger candidate cooldown,
 account failover, or another hidden retry.
-The exact OpenAI provider signature `internal_error` / `error` /
-`response protection is unavailable` remains ordinary-retry eligible but is
-never classified as capacity overload; after its bounded retries it normalizes
-to HTTP 503 and cannot receive that additional authorization.
+The OpenAI provider message `response protection is unavailable`, with type
+`internal_error` and code `error`, null, or absent, remains ordinary-retry
+eligible but is never classified as capacity overload. After its bounded
+retries it normalizes to HTTP 503 and cannot receive that additional
+authorization.
 
 Reservation closes any previously active upstream response first and disables
 opaque redirects for ledger-owned sends. Observable connection failures are
@@ -181,6 +182,20 @@ success callback or completed transfer. Provider response usage and cost remain
 attached as evidence when delivered output fails. Provider-stream summaries and
 delivered-stream summaries remain distinct; policy wrappers run inside the wire
 coordinator so policy rejection is represented by the same terminal outcome.
+
+Native OpenAI and alias-owned xAI response construction retains the original
+chunk processor through transform wrappers and closes it explicitly with the
+delivered source. This prevents competing garbage-collection finalizers during
+terminal bookkeeping.
+If the native body iterator never starts, finalization reads the buffered
+prefix through its chunk iterator and passes those bytes to logging. The
+delivered snapshot still determines the terminal callback.
+
+The wire compiler registers `web_search` for Codex OAuth text-only turns that
+retain `web_search_call` history and explicitly provide an empty tool list.
+It sets `tool_choice` to `none`, preserving the effective tool permissions and
+all history. Nonempty tool lists and forced-tool choices are preserved. The
+compiled declaration retains the conservative provider-tool replay boundary.
 
 Non-native alias candidates retain deferred success callbacks until their
 caller commits the response.

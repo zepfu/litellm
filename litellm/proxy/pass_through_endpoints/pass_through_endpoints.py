@@ -232,6 +232,7 @@ def _get_explicit_operational_passthrough_request(
 
 
 from .aawm_adapter_runtime.repetitive_output import (
+    _CleanupBoundAsyncIterator,
     bind_output_guard_to_streaming_response,
     maybe_reject_passthrough_responses_body,
     maybe_wrap_passthrough_responses_stream,
@@ -11017,6 +11018,7 @@ async def pass_through_request(  # noqa: PLR0915
                 responses_event_pipeline=responses_event_pipeline,
                 operational_request=request,
             )
+            upstream_chunk_iterator = processed_chunks
             cfg072_output_gate = (
                 _build_cfg072_send_message_output_gate(
                     request,
@@ -11092,6 +11094,13 @@ async def pass_through_request(  # noqa: PLR0915
                             getattr(getattr(request, "url", None), "path", None),
                         ),
                         event_pipeline=responses_event_pipeline,
+                    )
+                    # Transform generators need not propagate close to their
+                    # source. Retain and retire the processor before GC can
+                    # schedule competing finalizers for the wrapper chain.
+                    processed_chunks = _CleanupBoundAsyncIterator(
+                        processed_chunks,
+                        upstream_chunk_iterator.aclose,
                     )
                     wrapper_cleanup_source = processed_chunks
                     prefixed_source = _PrefixedNativeResponsesAsyncIterator(
@@ -11171,6 +11180,11 @@ async def pass_through_request(  # noqa: PLR0915
                     ),
                     event_pipeline=responses_event_pipeline,
                 )
+                if is_xai_responses_wire_owned_route:
+                    processed_chunks = _CleanupBoundAsyncIterator(
+                        processed_chunks,
+                        upstream_chunk_iterator.aclose,
+                    )
             response_headers = HttpPassThroughEndpointHelpers.get_response_headers(
                 headers=response.headers,
                 litellm_call_id=litellm_call_id,
@@ -11611,6 +11625,7 @@ async def pass_through_request(  # noqa: PLR0915
                 responses_event_pipeline=responses_event_pipeline,
                 operational_request=request,
             )
+            upstream_chunk_iterator = processed_chunks
             cfg072_output_gate = (
                 _build_cfg072_send_message_output_gate(
                     request,
@@ -11686,6 +11701,10 @@ async def pass_through_request(  # noqa: PLR0915
                             getattr(getattr(request, "url", None), "path", None),
                         ),
                         event_pipeline=responses_event_pipeline,
+                    )
+                    processed_chunks = _CleanupBoundAsyncIterator(
+                        processed_chunks,
+                        upstream_chunk_iterator.aclose,
                     )
                     wrapper_cleanup_source = processed_chunks
                     prefixed_source = _PrefixedNativeResponsesAsyncIterator(
@@ -11765,6 +11784,11 @@ async def pass_through_request(  # noqa: PLR0915
                     ),
                     event_pipeline=responses_event_pipeline,
                 )
+                if is_xai_responses_wire_owned_route:
+                    processed_chunks = _CleanupBoundAsyncIterator(
+                        processed_chunks,
+                        upstream_chunk_iterator.aclose,
+                    )
             response_headers = HttpPassThroughEndpointHelpers.get_response_headers(
                 headers=response.headers,
                 litellm_call_id=litellm_call_id,

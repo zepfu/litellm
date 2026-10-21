@@ -249,6 +249,7 @@ def _configure_selection():
         name: getattr(selection, name)
         for name in runtime_names
     }
+    previous_runtime_attributes = dict(selection.__dict__)
     runtime_globals = selection._build_codex_auto_agent_candidate_state.__globals__
     _MISSING = object()
     previous_runtime_globals = {
@@ -351,6 +352,8 @@ def _configure_selection():
     finally:
         selection.alias_routing_state = previous_alias_routing_state
         for name, value in previous_runtime.items():
+            setattr(selection, name, value)
+        for name, value in previous_runtime_attributes.items():
             setattr(selection, name, value)
         for name, value in assigned_runtime.items():
             if value is _MISSING:
@@ -4610,14 +4613,16 @@ class TestCodexAccountBound:
     ) -> None:
         from types import SimpleNamespace
 
+        inventory = SimpleNamespace(
+            routing=SimpleNamespace(accounts_are_interchangeable=True)
+        )
         monkeypatch.setattr(
             "litellm.secret_managers.codex_oauth_inventory.load_codex_oauth_inventory",
-            lambda: SimpleNamespace(
-                routing=SimpleNamespace(accounts_are_interchangeable=True)
-            ),
+            lambda: inventory,
         )
         adjusted = selection._apply_codex_oauth_inventory_affinity_policy(
-            _oauth_account_candidate()
+            _oauth_account_candidate(),
+            inventory=inventory,
         )
         assert adjusted is not None
         assert adjusted["codex_oauth_credential_affinity"] == "interchangeable"
@@ -4631,16 +4636,18 @@ class TestCodexAccountBound:
     ) -> None:
         from types import SimpleNamespace
 
+        inventory = SimpleNamespace(
+            routing=SimpleNamespace(accounts_are_interchangeable=True)
+        )
         monkeypatch.setattr(
             "litellm.secret_managers.codex_oauth_inventory.load_codex_oauth_inventory",
-            lambda: SimpleNamespace(
-                routing=SimpleNamespace(accounts_are_interchangeable=True)
-            ),
+            lambda: inventory,
         )
         affinity = _oauth_account_candidate()
         adjusted = selection._apply_codex_oauth_inventory_affinity_policy(
             affinity,
             account_bound=True,
+            inventory=inventory,
         )
         assert adjusted is not None
         assert adjusted["codex_oauth_credential_affinity"] == "interchangeable"
@@ -4681,6 +4688,8 @@ class TestCodexAccountBound:
             attempt_record={
                 "failure_phase": "direct_openai_provider_response",
                 "attempted_provider_call": True,
+                "admission_decision": "confirmed_exhausted",
+                "admission_account_hash": candidate["codex_oauth_account_hash"],
             },
             error_class="usage_limit_reached",
             has_continuation_state=True,
@@ -4789,7 +4798,7 @@ class TestCodexAccountBound:
             )
         _set_selection_runtime_value(
             "_apply_codex_oauth_inventory_affinity_policy",
-            lambda affinity, *, account_bound=False: affinity,
+            lambda affinity, inventory=None, *, account_bound=False: affinity,
             monkeypatch,
         )
         _set_selection_runtime_value(
@@ -4839,7 +4848,7 @@ class TestCodexAccountBound:
             request=_make_request(),
             request_body={"model": "basic"},
         )
-        assert result["selection_reason"] == "session_affinity"
+        assert result["selection_reason"] == "session_owner_pin"
         assert result["candidate"]["codex_oauth_account_label"] == "account1"
         assert result["has_account_bound_state"] is True
         assert result["account_bound_classification"] == "account_bound"
@@ -4912,7 +4921,7 @@ class TestCodexAccountBound:
             request=_make_request(),
             request_body={"model": "basic", "previous_response_id": "resp_123"},
         )
-        assert result["selection_reason"] == "session_affinity"
+        assert result["selection_reason"] == "session_owner_pin"
         assert result["candidate"]["codex_oauth_account_label"] == "account1"
         assert result["has_account_bound_state"] is True
         assert result["account_bound_classification"] == "account_bound"
@@ -4959,7 +4968,7 @@ class TestCodexAccountBound:
 
         sleep.assert_awaited_once_with(0.5)
         assert state_builder.await_count == 2
-        assert result["selection_reason"] == "session_affinity"
+        assert result["selection_reason"] == "session_owner_pin"
         assert result["candidate"] == pinned
         assert result["account_bound_owner_lane"] == pinned["codex_oauth_lane_key"]
         assert body == {"model": "basic", "previous_response_id": "resp_123"}
