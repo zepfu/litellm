@@ -968,7 +968,7 @@ async def _resolve_anthropic_openai_responses_adapter_auth_context(
             selected_auth.headers,
             False,
             True,
-            "openai",
+            "codex_oauth",
         )
 
     local_codex_headers = None
