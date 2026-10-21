@@ -11351,10 +11351,10 @@ async def pass_through_request(  # noqa: PLR0915
                         error_content = await wait_for(
                             "upstream_body_read", e.response.aread()
                         )
-                        await wait_for("resource_cleanup", e.response.aclose())
-                        clear_active_upstream_response(request, response=e.response)
+                        response_retired = await _retire_openai_precommit_response(
+                            e.response
+                        )
                         raw_response = None
-                        await _record_retired_openai_precommit_response()
                         _capture_passthrough_error_shape(
                             mode="stream_error",
                             provider=custom_llm_provider or endpoint_type.value,
@@ -11376,7 +11376,11 @@ async def pass_through_request(  # noqa: PLR0915
                             e,
                             error_content,
                         )
-                        _authorize_openai_capacity_retry(provider_exception, e.response)
+                        if response_retired:
+                            _authorize_openai_capacity_retry(
+                                provider_exception,
+                                e.response,
+                            )
                         raise provider_exception from e
                     pre_commit_peeked = False
                     if (
@@ -11401,7 +11405,13 @@ async def pass_through_request(  # noqa: PLR0915
                         pre_commit_peeked = True
                         if pre_commit_failure is not None:
                             retired_response = raw_response
-                            await response.aclose()
+                            try:
+                                await response.aclose()
+                            except BaseException:
+                                verbose_proxy_logger.debug(
+                                    "Failed to close OpenAI precommit stream wrapper",
+                                    exc_info=True,
+                                )
                             response_retired = (
                                 await _retire_openai_precommit_response(raw_response)
                             )
@@ -11432,8 +11442,9 @@ async def pass_through_request(  # noqa: PLR0915
                     error_content = await wait_for(
                         "upstream_body_read", e.response.aread()
                     )
-                    await wait_for("resource_cleanup", e.response.aclose())
-                    clear_active_upstream_response(request, response=e.response)
+                    response_retired = await _retire_openai_precommit_response(
+                        e.response
+                    )
                     raw_response = None
                     try:
                         error_text = error_content.decode("utf-8", errors="replace")
@@ -11460,7 +11471,11 @@ async def pass_through_request(  # noqa: PLR0915
                         e,
                         error_text,
                     )
-                    _authorize_openai_capacity_retry(provider_exception, e.response)
+                    if response_retired:
+                        _authorize_openai_capacity_retry(
+                            provider_exception,
+                            e.response,
+                        )
                     raise provider_exception from e
                 if (
                     response.status_code == status.HTTP_200_OK
@@ -11475,12 +11490,10 @@ async def pass_through_request(  # noqa: PLR0915
                     )
                     if pre_commit_failure is not None:
                         retired_response = raw_response
-                        await response.aclose()
                         response_retired = (
                             await _retire_openai_precommit_response(raw_response)
                         )
                         raw_response = None
-                        await _record_retired_openai_precommit_response()
                         if response_retired:
                             _authorize_openai_capacity_retry(
                                 pre_commit_failure,
