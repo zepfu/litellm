@@ -39,8 +39,9 @@ affinity remain request-scoped while the stream is active. A completed terminal
 can promote the owner and commit affinity. Failed, incomplete, cancelled, or
 disconnected streams release the reservation and do not write new affinity.
 
-Native stream cleanup explicitly retires the original chunk processor after
-response wrappers close, keeping its finalization out of garbage collection.
+Native OpenAI and alias-owned xAI Responses cleanup explicitly retires the
+original chunk processor after response wrappers close, keeping its
+finalization out of garbage collection.
 
 For Codex OAuth, a text-only request with `tools: []` and retained
 `web_search_call` history declares `web_search` with `tool_choice: "none"`.

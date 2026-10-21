@@ -4590,10 +4590,16 @@ async def test_alpha_openai_sse_precommit_overload_closes_and_propagates(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("capacity_retry_enabled", "upstream_status"), [(False, 200), (True, 201)]
+    ("provider", "stream_request", "capacity_retry_enabled", "upstream_status"),
+    [
+        ("openai", False, False, 200),
+        ("openai", False, True, 201),
+        ("xai", False, False, 200),
+        ("xai", True, False, 200),
+    ],
 )
-async def test_unpeeked_native_sse_handoff_becomes_live_only(
-    monkeypatch, capacity_retry_enabled, upstream_status,
+async def test_responses_sse_handoff_retires_upstream(
+    monkeypatch, provider, stream_request, capacity_retry_enabled, upstream_status,
 ):
     monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
     monkeypatch.setenv(
@@ -4609,14 +4615,26 @@ async def test_unpeeked_native_sse_handoff_becomes_live_only(
     from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
         pass_through_request,
     )
+    if provider == "xai":
+        from litellm.proxy.pass_through_endpoints.aawm_text_watermark.config import (
+            load_text_watermark_config,
+        )
 
-    mock_request = MagicMock(spec=Request)
-    mock_request.method = "POST"
-    mock_request.url = SimpleNamespace(path="/openai_passthrough/v1/responses")
-    mock_request.headers = {"content-type": "application/json"}
-    mock_request.query_params = {}
-    mock_request.state = SimpleNamespace()
-    mock_request.is_disconnected = AsyncMock(return_value=False)
+        monkeypatch.setattr(
+            pte,
+            "_get_runtime_text_watermark_config",
+            lambda: load_text_watermark_config({"mode": "detect"}),
+        )
+
+    mock_request = MagicMock(
+        spec=Request,
+        method="POST",
+        url=SimpleNamespace(path="/openai_passthrough/v1/responses"),
+        headers={"content-type": "application/json"},
+        query_params={},
+        state=SimpleNamespace(),
+        is_disconnected=AsyncMock(return_value=False),
+    )
     custom_body = {
         "model": "gpt-5.4",
         "tools": [
@@ -4627,6 +4645,7 @@ async def test_unpeeked_native_sse_handoff_becomes_live_only(
             }
         ],
     }
+    target = f"https://api.{'openai.com' if provider == 'openai' else 'x.ai'}/v1/responses"
     chunks = [
         _sse(
             "response.created",
@@ -4680,7 +4699,7 @@ async def test_unpeeked_native_sse_handoff_becomes_live_only(
         status_code=upstream_status,
         headers={"content-type": "text/event-stream"},
         stream=stream,
-        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+        request=httpx.Request("POST", target),
     )
 
     async def run_with_renewal(_lease, operation):
@@ -4722,43 +4741,57 @@ async def test_unpeeked_native_sse_handoff_becomes_live_only(
         "pass_through_async_success_handler",
         new_callable=AsyncMock,
     ):
-        mock_client_obj = MagicMock()
-        mock_client_obj.client = MagicMock()
+        mock_client_obj = SimpleNamespace(
+            client=MagicMock(
+                send=AsyncMock(return_value=upstream_response),
+                build_request=MagicMock(side_effect=httpx.Request),
+            )
+        )
         mock_get_client.return_value = mock_client_obj
-        mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
-        mock_logging_obj.post_call_success_hook = AsyncMock()
-        mock_logging_obj.post_call_failure_hook = AsyncMock()
+        mock_logging_obj.configure_mock(
+            pre_call_hook=AsyncMock(return_value=custom_body),
+            post_call_success_hook=AsyncMock(),
+            post_call_failure_hook=AsyncMock(),
+        )
 
         response = await pass_through_request(
             request=mock_request,
-            target="https://api.openai.com/v1/responses",
+            target=target,
             custom_headers={},
             user_api_key_dict=MagicMock(),
             custom_body=custom_body,
-            custom_llm_provider="openai",
-            stream=False,
+            custom_llm_provider=provider,
+            stream=stream_request,
+            responses_wire_owned=provider == "xai",
         )
 
+    if provider == "xai":
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
+            _bind_responses_wire_stream,
+        )
+
+        response = _bind_responses_wire_stream(
+            response, request=mock_request, adapter_model="gpt-5.4"
+        )
     assert isinstance(response, OpenAIResponsesStreamingResponse)
     assert response.status_code == upstream_status
-    mock_upstream_request.assert_awaited_once()
+    if stream_request:
+        mock_client_obj.client.send.assert_awaited_once()
+    else:
+        mock_upstream_request.assert_awaited_once()
     mock_peek.assert_not_awaited()
     coordinator = mock_hidden_retry.call_args.kwargs["openai_capacity_coordinator"]
-    assert (coordinator is not None) is capacity_retry_enabled
+    assert (coordinator is not None) is (capacity_retry_enabled and provider == "openai")
     wire = b"".join([chunk async for chunk in response.body_iterator])
     assert response.wire_trace.finalized is True
-    assert (
-        response.wire_trace.metadata.get("disposition_callback_error")
-        is None
-    )
-    assert (
-        response.wire_trace.metadata.get("background_callback_error")
-        is None
-    )
-    assert (
-        response.wire_trace.metadata.get("body_iterator_close_error")
-        is None
-    )
+    assert all(
+        response.wire_trace.metadata.get(key) is None
+        for key in (
+            "disposition_callback_error",
+            "background_callback_error",
+            "body_iterator_close_error",
+        )
+    ), response.wire_trace.metadata
     payloads = _responses_sse_payloads(wire)
     assert payloads[-1]["type"] == "response.completed", payloads[-1]
     assert payloads[-1]["response"]["status"] == "completed"
