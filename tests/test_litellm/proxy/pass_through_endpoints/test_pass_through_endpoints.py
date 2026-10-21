@@ -45,6 +45,7 @@ from litellm.proxy._types import ProxyException
 from litellm.proxy.pass_through_endpoints import success_handler
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     HttpPassThroughEndpointHelpers,
+    _build_immutable_openai_binding,
     _build_passthrough_input_item_shape_samples,
     _build_passthrough_request_shape_summary,
     build_aawm_route_access_log_line,
@@ -2175,6 +2176,51 @@ def test_validate_outgoing_egress_allows_matching_openai_codex_headers():
         credential_family="openai",
         expected_target_family="openai",
     )
+
+
+def test_openai_final_send_binding_preserves_selected_query():
+    request = SimpleNamespace(state=SimpleNamespace())
+    selected_url = "https://api.openai.com/v1/responses?api-version=selected"
+    binding = _build_immutable_openai_binding(
+        target_url=httpx.URL(selected_url),
+        custom_llm_provider="openai",
+        egress_credential_family="openai",
+        expected_target_family="openai",
+        selected_openai_headers=None,
+        request=request,
+        request_body={"model": "gpt-5.4-mini"},
+    )
+    prepared_request = httpx.Request(
+        "POST",
+        selected_url,
+        json={"model": "gpt-5.4-mini"},
+    )
+
+    HttpPassThroughEndpointHelpers.validate_openai_final_send_binding(
+        prepared_request=prepared_request,
+        expected_url=binding.target_url,
+        custom_llm_provider=binding.custom_llm_provider,
+        egress_credential_family=binding.egress_credential_family,
+        expected_target_family=binding.expected_target_family,
+    )
+
+    mismatched_request = httpx.Request(
+        "POST",
+        "https://api.openai.com/v1/responses?api-version=wire",
+        json={"model": "gpt-5.4-mini"},
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        HttpPassThroughEndpointHelpers.validate_openai_final_send_binding(
+            prepared_request=mismatched_request,
+            expected_url=binding.target_url,
+            custom_llm_provider=binding.custom_llm_provider,
+            egress_credential_family=binding.egress_credential_family,
+            expected_target_family=binding.expected_target_family,
+        )
+
+    assert exc_info.value.status_code == 500
+    assert "final-send target differs" in str(exc_info.value.detail)
+    reset_egress_guard_alert_state()
 
 
 def test_validate_outgoing_egress_blocks_openai_markers_to_anthropic():
