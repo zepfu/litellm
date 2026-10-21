@@ -9561,10 +9561,35 @@ async def pass_through_request(  # noqa: PLR0915
 
         async def _retire_openai_precommit_response(
             response: Optional[httpx.Response],
+            *,
+            wrapper_response: Optional[httpx.Response] = None,
         ) -> bool:
-            """Close and positively record raw-response retirement."""
+            """Close wrappers and positively record successful raw retirement.
 
+            A wrapper may close the HTTPX response before surfacing a stream
+            close error. HTTPX marks that response closed before awaiting its
+            stream, so a later raw-response close can be a no-op; retain the
+            wrapper failure rather than recording that no-op as successful.
+            """
+
+            wrapper_close_failed = False
+            if wrapper_response is not None and wrapper_response is not response:
+                try:
+                    await wait_for(
+                        "resource_cleanup",
+                        wrapper_response.aclose(),
+                    )
+                except BaseException:
+                    wrapper_close_failed = True
+                    verbose_proxy_logger.debug(
+                        "Failed to close OpenAI precommit response wrapper",
+                        exc_info=True,
+                    )
             if response is None:
+                if wrapper_close_failed:
+                    request.state.aawm_openai_precommit_retirement_failed = True
+                    request.state.aawm_openai_precommit_retirement_state = "failed"
+                    return False
                 if (
                     getattr(
                         request.state,
@@ -9579,13 +9604,11 @@ async def pass_through_request(  # noqa: PLR0915
                     "not_applicable"
                 )
                 return True
-            closed = True
+            closed = not wrapper_close_failed
             try:
                 await wait_for("resource_cleanup", response.aclose())
             except BaseException:
                 closed = False
-                request.state.aawm_openai_precommit_retirement_failed = True
-                request.state.aawm_openai_precommit_retirement_state = "failed"
                 verbose_proxy_logger.debug(
                     "Failed to close OpenAI precommit response",
                     exc_info=True,
@@ -9595,6 +9618,9 @@ async def pass_through_request(  # noqa: PLR0915
             if closed:
                 request.state.aawm_openai_precommit_retirement_failed = False
                 request.state.aawm_openai_precommit_retirement_state = "retired"
+            else:
+                request.state.aawm_openai_precommit_retirement_failed = True
+                request.state.aawm_openai_precommit_retirement_state = "failed"
             return closed
 
         async def _record_retired_openai_precommit_response() -> None:
@@ -10874,9 +10900,11 @@ async def pass_through_request(  # noqa: PLR0915
                         )
                         if pre_commit_failure is not None:
                             retired_response = raw_response
-                            await response.aclose()
                             response_retired = (
-                                await _retire_openai_precommit_response(raw_response)
+                                await _retire_openai_precommit_response(
+                                    raw_response,
+                                    wrapper_response=response,
+                                )
                             )
                             raw_response = None
                             if response_retired:
@@ -11402,15 +11430,11 @@ async def pass_through_request(  # noqa: PLR0915
                         pre_commit_peeked = True
                         if pre_commit_failure is not None:
                             retired_response = raw_response
-                            try:
-                                await response.aclose()
-                            except BaseException:
-                                verbose_proxy_logger.debug(
-                                    "Failed to close OpenAI precommit stream wrapper",
-                                    exc_info=True,
-                                )
                             response_retired = (
-                                await _retire_openai_precommit_response(raw_response)
+                                await _retire_openai_precommit_response(
+                                    raw_response,
+                                    wrapper_response=response,
+                                )
                             )
                             raw_response = None
                             if response_retired:
