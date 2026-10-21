@@ -4573,6 +4573,137 @@ async def test_openai_status_body_close_failure_preserves_provider_error(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream_request", [False, True])
+async def test_openai_precommit_sse_close_failure_preserves_classified_error(
+    monkeypatch, stream_request
+):
+    from litellm.proxy import proxy_server
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+    from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+        pass_through_request,
+    )
+
+    class CloseFailingStream(httpx.AsyncByteStream):
+        def __init__(self):
+            self.close_calls = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def aclose(self):
+            self.close_calls += 1
+            raise RuntimeError("upstream response close failed")
+
+    class CloseFailingResponse(httpx.Response):
+        def __init__(self, request, precommit_chunk, stream):
+            super().__init__(
+                status_code=200,
+                headers={"content-type": "text/event-stream"},
+                stream=stream,
+                request=request,
+            )
+            self.precommit_chunk = precommit_chunk
+
+        async def aiter_bytes(self, chunk_size=None):
+            yield self.precommit_chunk
+
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    custom_body = {"model": "gpt-5.4", "input": "test"}
+    request = _responses_request(custom_body)
+    request.scope["state"] = {}
+    request.is_disconnected = AsyncMock(return_value=False)
+    target = "https://api.openai.com/v1/responses"
+    precommit_chunk = _sse(
+        "error",
+        {
+            "type": "error",
+            "error": {
+                "type": "server_error",
+                "code": "server_overloaded",
+                "message": "Try again.",
+            },
+        },
+    )
+    upstream_stream, upstream_responses = CloseFailingStream(), []
+
+    async def dispatch(outgoing_request):
+        upstream_response = CloseFailingResponse(
+            outgoing_request,
+            precommit_chunk,
+            upstream_stream,
+        )
+        upstream_responses.append(upstream_response)
+        return upstream_response
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(dispatch),
+        timeout=2,
+    )
+    captured: dict[str, Any] = {}
+
+    async def execute_operation(**kwargs):
+        captured.update(kwargs)
+        try:
+            return await kwargs["operation"]()
+        except BaseException as exc:
+            captured["exception"] = exc
+            raise
+
+    monkeypatch.setattr(
+        pte,
+        "get_async_httpx_client",
+        lambda *_args, **_kwargs: SimpleNamespace(client=client),
+    )
+    monkeypatch.setattr(pte, "_aawm_session_owner_pre_send_guard", AsyncMock())
+    monkeypatch.setattr(
+        pte,
+        "_execute_passthrough_pre_first_byte_with_hidden_retries",
+        execute_operation,
+    )
+    _stub_session_owner_lease(monkeypatch, sa)
+    logging_obj = MagicMock()
+    logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
+    logging_obj.post_call_failure_hook = AsyncMock(return_value=None)
+    monkeypatch.setattr(proxy_server, "proxy_logging_obj", logging_obj)
+
+    try:
+        with pytest.raises(ProxyException):
+            await pass_through_request(
+                request=request,
+                target=target,
+                custom_headers={},
+                user_api_key_dict=MagicMock(),
+                custom_body=custom_body,
+                custom_llm_provider="openai",
+                stream=stream_request,
+            )
+    finally:
+        await client.aclose()
+
+    failure = captured["exception"]
+    assert isinstance(failure, ResponsesStreamPreCommitFailure)
+    assert failure.error_class == "server_overloaded"
+    assert failure.error_code == "server_overloaded"
+    assert upstream_stream.close_calls == 1
+    assert len(upstream_responses) == 1
+    upstream_response = upstream_responses[0]
+    assert upstream_response.is_closed is True
+    assert request.state.aawm_openai_precommit_retirement_state == "failed"
+    assert request.state.aawm_openai_precommit_retirement_failed is True
+    assert not any(
+        event.get("event_type") == "openai_capacity_retry_authorization"
+        and event.get("authorization_result") == "authorized"
+        for event in getattr(request.state, "aawm_openai_raw_retry_events", [])
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream_request", [False, True])
 @pytest.mark.parametrize("error_code", ["server_overloaded", "server_is_overloaded", "capacity_exhausted"])
 @pytest.mark.parametrize("event_type", ["error", "response.failed"])
 @pytest.mark.parametrize(
