@@ -4504,7 +4504,9 @@ class PassThroughStreamingHandler:
         success_handler_kwargs: Optional[Dict[str, Any]] = None,
         local_prepare_ms: Optional[float] = None,
         error_log_context: Optional[Dict[str, Any]] = None,
-        upstream_prefix_bytes: Optional[List[bytes]] = None,
+        upstream_prefix_bytes: Optional[
+            Union[List[bytes], _ResponsesPreCommitPrefixStore]
+        ] = None,
         responses_event_pipeline: Optional[ResponsesEventPipeline] = None,
         operational_request: Optional[Any] = None,
     ) -> None:
@@ -4583,7 +4585,7 @@ class PassThroughStreamingHandler:
             request_body=request_body or {},
             endpoint_type=endpoint_type,
             start_time=start_time,
-            raw_bytes=upstream_prefix_bytes or [],
+            raw_bytes=prefix_chunks,
             precomputed_lines=None,
             end_time=datetime.now(),
             passthrough_logging_payload=passthrough_logging_payload,

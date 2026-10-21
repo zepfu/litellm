@@ -182,6 +182,9 @@ Native OpenAI and alias-owned xAI response construction retains the original
 chunk processor through transform wrappers and closes it explicitly with the
 delivered source. This prevents competing garbage-collection finalizers during
 terminal bookkeeping.
+If the native body iterator never starts, finalization reads the buffered
+prefix through its chunk iterator and passes those bytes to logging. The
+delivered snapshot still determines the terminal callback.
 
 The wire compiler registers `web_search` for Codex OAuth text-only turns that
 retain `web_search_call` history and explicitly provide an empty tool list.
