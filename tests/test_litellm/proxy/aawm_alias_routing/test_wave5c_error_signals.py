@@ -1164,6 +1164,52 @@ class TestClassification:
         exc = _FakeExc(message="server_overloaded")
         assert _classify_codex_auto_agent_retryable_exhaustion(exc) == "server_overloaded"
 
+    def test_classify_managed_openai_adapter_capacity_as_codex_capacity(self):
+        exc = _FakeExc(
+            detail={
+                "error": {
+                    "code": "server_is_overloaded",
+                    "type": "server_error",
+                    "message": "Please try again later.",
+                }
+            },
+            status_code=503,
+            _aawm_provider_returned=True,
+        )
+        candidate = {
+            **_ANTHROPIC_RESPONSES_CANDIDATE,
+            "codex_oauth_account_hash": "account-hash",
+        }
+
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=candidate,
+                attempted_provider_call=True,
+            )
+            == "capacity_exhausted"
+        )
+
+    def test_managed_openai_adapter_plain_503_is_not_capacity(self):
+        exc = _FakeExc(
+            message="provider returned an error",
+            status_code=503,
+            _aawm_provider_returned=True,
+        )
+        candidate = {
+            **_ANTHROPIC_RESPONSES_CANDIDATE,
+            "codex_oauth_account_hash": "account-hash",
+        }
+
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=candidate,
+                attempted_provider_call=True,
+            )
+            is None
+        )
+
     @pytest.mark.parametrize(
         ("error", "expected"),
         [
