@@ -3113,7 +3113,7 @@ async def test_selected_account_drives_both_ingress_auth_and_redaction(
     assert custom_headers == selected_auth.headers
     assert forward_headers is False
     assert codex_defaults is True
-    assert credential_family == "openai"
+    assert credential_family == "codex_oauth"
 
     monkeypatch.setattr(
         codex_oauth,
@@ -3160,6 +3160,77 @@ async def test_selected_account_drives_both_ingress_auth_and_redaction(
     ):
         assert secret not in public_error
         assert secret not in public_candidate
+
+
+# ---------------------------------------------------------------------------
+# OPENAI-041 P06-R1: coherent managed Codex family binding
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_anthropic_openai_adapter_managed_route_uses_matching_codex_families(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = {
+        **_candidate(),
+        "codex_oauth_account_label": "account2",
+        "codex_oauth_account_hash": "hash-account-2",
+        "codex_oauth_lane_key": "codex-oauth:account2:hash-account-2",
+        "codex_oauth_account_display": _masked_account_display("account2"),
+        "raw_account_id": "raw-account-id",
+        "access_token": "selected-token",
+        "auth_path": "/private/oauth.json",
+    }
+    selected_auth = codex_oauth.CodexOAuthRequestAuth(
+        account_label="account2",
+        account_hash="hash-account-2",
+        lane_key="codex-oauth:account2:hash-account-2",
+        headers={
+            "Authorization": "Bearer selected-token",
+            "chatgpt-account-id": "selected-account-id",
+        },
+        account_display=_masked_account_display("account2"),
+    )
+    request = _request(authorization="Bearer inbound-anthropic-secret")
+    codex_oauth._bind_codex_oauth_candidate_to_request(request, candidate)
+
+    async def _load_selected(_request: Request):
+        return selected_auth
+
+    monkeypatch.setattr(
+        codex_oauth,
+        "_load_bound_codex_oauth_auth",
+        _load_selected,
+    )
+
+    plan = await lpe._prepare_anthropic_openai_responses_adapter_route(
+        request=request,
+        prepared_request_body={"model": "gpt-5.3-codex", "stream": False},
+        adapter_model="gpt-5.3-codex",
+        use_alias_candidate_probe=False,
+    )
+    perform_kwargs = plan.perform_kwargs
+    assert plan.custom_headers == selected_auth.headers
+    assert perform_kwargs["forward_headers"] is False
+    assert perform_kwargs["egress_credential_family"] == "codex_oauth"
+    assert perform_kwargs["expected_target_family"] == "codex_oauth"
+
+    async def _resolve_api_key_auth(_request: Request):
+        return ({"Authorization": "Bearer api-key"}, False, False, None)
+
+    monkeypatch.setattr(
+        lpe,
+        "_resolve_anthropic_openai_responses_adapter_auth_context",
+        _resolve_api_key_auth,
+    )
+    api_key_plan = await lpe._prepare_anthropic_openai_responses_adapter_route(
+        request=_request(),
+        prepared_request_body={"model": "gpt-4.1", "stream": False},
+        adapter_model="gpt-4.1",
+        use_alias_candidate_probe=False,
+    )
+    assert api_key_plan.perform_kwargs["egress_credential_family"] is None
+    assert api_key_plan.perform_kwargs["expected_target_family"] == "openai"
 
 
 # ---------------------------------------------------------------------------

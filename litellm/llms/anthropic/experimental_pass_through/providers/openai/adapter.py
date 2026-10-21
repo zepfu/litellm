@@ -110,7 +110,7 @@ async def prepare_responses_route(
             ),
             "custom_llm_provider": runtime.provider,
             "egress_credential_family": egress_credential_family,
-            "expected_target_family": "openai",
+            "expected_target_family": egress_credential_family or "openai",
             "use_codex_native_tools": use_chatgpt_codex_defaults,
         },
     )
