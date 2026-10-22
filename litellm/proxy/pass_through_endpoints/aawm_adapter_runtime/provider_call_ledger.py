@@ -511,12 +511,12 @@ class ProviderCallLedger:
                 model_fingerprint=model_fingerprint,
                 account_fingerprint=account_fingerprint,
             ):
+                # A coordinator may remain configured after candidate migration.
+                # A permit bound to the prior account is stale for this send;
+                # expire it and let the immutable ordinary budget decide.
                 self._capacity_retry_authorization = None
-                raise ProviderCallLedgerExhausted(
-                    ledger=self,
-                    reason="capacity_retry_authorization_mismatch",
-                )
-            capacity_retry_authorized = True
+            else:
+                capacity_retry_authorized = True
         if (
             self._logical_provider_calls >= self.max_logical_provider_calls
             and not capacity_retry_authorized
