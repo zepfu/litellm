@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -6061,6 +6062,83 @@ async def test_stream_read_retry_admits_ordinary_replacement_sends(monkeypatch):
     assert ledger.snapshot()["logical_provider_calls"] == 3
     coordinator.sleep_with_wakeup.assert_not_called()
     coordinator.record_retry.assert_not_called()
+
+
+def test_stale_capacity_retry_permit_falls_back_to_ordinary_budget():
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        ProviderCallLedger,
+    )
+
+    ledger = ProviderCallLedger(provider="openai", max_logical_provider_calls=2)
+    source_context = {
+        "model": "gpt-5.4",
+        "account_hash": "source-account",
+        "lane_key": "lane",
+    }
+    ledger.reserve(
+        target="https://example.test/responses",
+        candidate_context=source_context,
+        prior_response_closed=True,
+    )
+    assert ledger.authorize_capacity_retry(
+        target="https://example.test/responses",
+        candidate_context=source_context,
+        deadline_at_monotonic=time.monotonic() + 60,
+    )
+
+    ledger.reserve(
+        target="https://example.test/responses",
+        candidate_context={
+            "model": "gpt-5.4",
+            "account_hash": "destination-account",
+            "lane_key": "lane",
+        },
+        prior_response_closed=True,
+        allow_capacity_retry=True,
+    )
+
+    assert ledger.snapshot()["capacity_retry_authorized"] is False
+    assert ledger.snapshot()["logical_provider_calls"] == 2
+
+
+def test_stale_capacity_retry_permit_does_not_extend_exhausted_budget():
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        ProviderCallLedger,
+        ProviderCallLedgerExhausted,
+    )
+
+    ledger = ProviderCallLedger(provider="openai", max_logical_provider_calls=1)
+    source_context = {
+        "model": "gpt-5.4",
+        "account_hash": "source-account",
+        "lane_key": "lane",
+    }
+    ledger.reserve(
+        target="https://example.test/responses",
+        candidate_context=source_context,
+        prior_response_closed=True,
+    )
+    assert ledger.authorize_capacity_retry(
+        target="https://example.test/responses",
+        candidate_context=source_context,
+        deadline_at_monotonic=time.monotonic() + 60,
+    )
+
+    with pytest.raises(ProviderCallLedgerExhausted) as raised:
+        ledger.reserve(
+            target="https://example.test/responses",
+            candidate_context={
+                "model": "gpt-5.4",
+                "account_hash": "destination-account",
+                "lane_key": "lane",
+            },
+            prior_response_closed=True,
+            allow_capacity_retry=True,
+        )
+
+    assert raised.value.reason == "logical_call_cap_exhausted"
+    assert ledger.snapshot()["capacity_retry_authorized"] is False
+    assert ledger.snapshot()["logical_provider_calls"] == 1
 
 
 # ---------------------------------------------------------------------------
