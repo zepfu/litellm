@@ -1060,6 +1060,10 @@ curl http://localhost:4000/v1/chat/completions \
 
 ## Redis max_connections
 
+Each Redis cache reuses its current event loop's client and connection pool
+across generic client-cache expiry. The limit below applies to that reused
+pool; cache expiry does not create another pool of idle Redis connections.
+
 You can set the `max_connections` parameter in your `cache_params` for Redis. This is passed directly to the Redis client and controls the maximum number of simultaneous connections in the pool. If you see errors like `No connection available`, try increasing this value:
 
 ```yaml

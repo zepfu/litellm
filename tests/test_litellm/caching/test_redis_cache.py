@@ -1,9 +1,11 @@
+import asyncio
 import os
 import json
 import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
+import litellm
 
 sys.path.insert(
     0, os.path.abspath("../../..")
@@ -11,6 +13,53 @@ sys.path.insert(
 from unittest.mock import AsyncMock
 
 from litellm.caching.redis_cache import RedisCache
+from litellm.caching.llm_caching_handler import LLMClientCache
+
+
+@pytest.fixture
+def isolated_redis_clients(monkeypatch):
+    monkeypatch.setattr(litellm, "in_memory_llm_clients_cache", LLMClientCache())
+    with patch.object(RedisCache, "_setup_health_pings"), patch(
+        "litellm._redis.get_redis_client"
+    ):
+        yield RedisCache(host="127.0.0.1", port=6379)
+
+
+@pytest.mark.asyncio
+async def test_redis_client_survives_generic_cache_eviction(isolated_redis_clients):
+    cache = isolated_redis_clients
+    client = cache.init_async_client()
+    litellm.in_memory_llm_clients_cache.flush_cache()
+
+    assert cache.init_async_client() is client
+
+
+def test_redis_client_preserves_event_loop_isolation(isolated_redis_clients):
+    async def resolve_client():
+        return isolated_redis_clients.init_async_client()
+
+    first_loop = asyncio.new_event_loop()
+    second_loop = asyncio.new_event_loop()
+    try:
+        first = first_loop.run_until_complete(resolve_client())
+        second = second_loop.run_until_complete(resolve_client())
+        assert first is not second
+        assert first_loop.run_until_complete(resolve_client()) is first
+    finally:
+        first_loop.close()
+        second_loop.close()
+
+
+@pytest.mark.asyncio
+async def test_redis_disconnect_closes_shared_client_pool(isolated_redis_clients):
+    client = isolated_redis_clients.init_async_client()
+    other = RedisCache(host="127.0.0.1", port=6379)
+    assert other.init_async_client() is client
+
+    with patch.object(client.connection_pool, "disconnect", new=AsyncMock()) as close:
+        await other.disconnect()
+
+    close.assert_awaited_once_with(inuse_connections=True)
 
 
 @pytest.fixture

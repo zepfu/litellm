@@ -187,6 +187,8 @@ class RedisCache(BaseCache):
         self.redis_async_client: Optional[
             Union[async_redis_client, async_redis_cluster_client]
         ] = None
+        self._redis_async_client_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._redis_async_client_key: Optional[str] = None
         self.redis_kwargs = redis_kwargs
         self.async_redis_conn_pool = get_redis_connection_pool(**redis_kwargs)
 
@@ -293,6 +295,19 @@ class RedisCache(BaseCache):
         from .._redis import get_redis_async_client, get_redis_connection_pool
 
         cache_key = self._get_async_client_cache_key()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        # The generic client cache expires entries without closing their pools.
+        # Keep this owner's current-loop client rather than opening another pool.
+        if (
+            self.redis_async_client is not None
+            and self._redis_async_client_loop is loop
+            and self._redis_async_client_key == cache_key
+        ):
+            return self.redis_async_client
+
         cached_client = in_memory_llm_clients_cache.get_cache(key=cache_key)
         if cached_client is not None:
             redis_async_client = cast(
@@ -309,6 +324,11 @@ class RedisCache(BaseCache):
             )
 
         self.redis_async_client = redis_async_client  # type: ignore
+        self._redis_async_client_loop = loop
+        self._redis_async_client_key = cache_key
+        pool = getattr(redis_async_client, "connection_pool", None)
+        if pool is not None:
+            self.async_redis_conn_pool = pool
         return redis_async_client
 
     def check_and_fix_namespace(self, key: str) -> str:
