@@ -883,25 +883,35 @@ def _normalize_tool_schemas_without_error_mapping(
 ) -> dict[str, Any]:
     normalized_body = body
     changed = False
-    # Stock Codex Responses Lite puts the current toolset in a leading
-    # developer item rather than tools[]. Materialize that declaration before
-    # the existing schema, alias, adapter and restoration paths inspect it.
+    # Stock Codex Responses Lite can put the current toolset after initial
+    # user context. Materialize its sole developer declaration before the
+    # existing schema, alias, adapter and restoration paths inspect it.
     input_items = body.get("input")
     if isinstance(input_items, list) and input_items:
-        declaration = input_items[0]
-        if (
-            isinstance(declaration, dict)
-            and declaration.get("type") == "additional_tools"
-            and declaration.get("role") == "developer"
-        ):
+        declaration_indexes = [
+            index
+            for index, item in enumerate(input_items)
+            if isinstance(item, dict)
+            and item.get("type") == "additional_tools"
+            and item.get("role") == "developer"
+        ]
+        if declaration_indexes:
+            declaration_index = declaration_indexes[0]
+            declaration = input_items[declaration_index]
             tools = declaration.get("tools")
-            if not isinstance(tools, list) or body.get("tools") is not None:
+            if (
+                len(declaration_indexes) != 1
+                or not isinstance(tools, list)
+                or body.get("tools") is not None
+            ):
                 raise CodexCollaborationDispatchError(
                     "unsupported_collaboration_message_schema"
                 )
             normalized_body = dict(body)
             normalized_body["tools"] = tools
-            normalized_body["input"] = input_items[1:]
+            normalized_body["input"] = (
+                input_items[:declaration_index] + input_items[declaration_index + 1 :]
+            )
             changed = True
     for key in ("tools", "functions"):
         normalized_tools, tools_changed = _normalize_tool_list(

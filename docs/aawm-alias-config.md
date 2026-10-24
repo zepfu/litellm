@@ -271,11 +271,13 @@ restoring the client's tool identity and leaving arguments unchanged. Alias
 discovery survives repeated preparation of the normalized schema, including
 copies without the earlier request's local identity map.
 
-Stock Codex Responses Lite sends the current toolset in a leading developer
-`additional_tools` input item. AAWM materializes that declaration into the
-existing top-level tool pipeline before schema normalization and alias
-construction; the tool declaration is removed from conversational input.
-This also gives native completion adapters the actual advertised tools.
+Stock Codex Responses Lite sends the current toolset in a developer
+`additional_tools` input item, which may follow initial user context. AAWM
+materializes the sole declaration into the existing top-level tool pipeline
+before schema normalization and alias construction, preserving the order of
+the remaining input. Duplicate declarations or a simultaneous top-level
+`tools` declaration are rejected. Native completion adapters also receive the
+advertised tools.
 
 On recipient ingress, both `NEW_TASK` and `MESSAGE` encrypted-content slots
 must contain a complete valid frame. AAWM decodes its exact text and preserves
