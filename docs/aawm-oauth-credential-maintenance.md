@@ -39,12 +39,13 @@ without a restart. The host descriptor directory is configured by
 `/app/kimi-descriptor/native-contract.json`. The image contains the
 resolver, not a captured descriptor or OAuth credential.
 
-Alpha's verified October 10 deployment instead mounts
-`/home/zepfu/.kimi-code/native-contract-alpha` read-only at
+Alpha mounts the same host directory,
+`/home/zepfu/.kimi-code/native-contract`, read-only at
 `/run/aawm/kimi-descriptor` and sets `LITELLM_KIMI_NATIVE_CONTRACT_PATH` to
-`/run/aawm/kimi-descriptor/native-contract.json`. Read the loaded descriptor
-to establish alpha's native client identity; other retained descriptor files
-are not evidence of that identity.
+`/run/aawm/kimi-descriptor/native-contract.json`. All consumers use the one
+descriptor published by `thoth-kimi-update.service`, scheduled daily by
+`thoth-kimi-update.timer`. Read the loaded descriptor to establish each
+consumer's native client identity.
 
 The standalone image default
 `LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=false` is compatibility mode and does

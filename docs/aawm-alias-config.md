@@ -431,17 +431,13 @@ window prevents new affinity and does not evict an existing session owner.
 
 Alpha's Kimi-backed aliases require a current native-contract descriptor at
 `/run/aawm/kimi-descriptor/native-contract.json`. The host file is
-`/home/zepfu/.kimi-code/native-contract-alpha/native-contract.json`.
-Thoth's `thoth-kimi-update.service` runs the native CLI update, publishes the
-shared descriptor, then invokes `scripts/refresh_alpha_kimi_native_contract.py`
-to publish alpha's descriptor with the same installed version and existing
-96-hour lifetime. It requires the persistent root checkout, the installed
-`thoth-kimi-update.sh` helper and the existing alpha descriptor directory.
-The daily schedule belongs to `thoth-kimi-update.timer`; keep the separate
-metadata-only `litellm-alpha-kimi-contract.timer` disabled while it is active.
-For an immediate complete update, start `thoth-kimi-update.service` and
-inspect its journal. Descriptor replacement takes effect on the next Kimi
-request.
+`/home/zepfu/.kimi-code/native-contract/native-contract.json`, shared with
+the other gateways and the provider-status sidecar. Thoth's
+`thoth-kimi-update.service` runs the native CLI update and atomically publishes
+this one descriptor with the installed version and existing 96-hour lifetime.
+The daily schedule belongs to `thoth-kimi-update.timer`. For an immediate
+update, start `thoth-kimi-update.service` and inspect its journal. Descriptor
+replacement takes effect on the next Kimi request for every consumer.
 
 ## Maintained `expert` and `expert-other` alias behavior
 

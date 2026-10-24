@@ -1,9 +1,0 @@
-[Unit]
-Description=Refresh LiteLLM alpha Kimi native contract
-
-[Service]
-Type=oneshot
-User=zepfu
-Group=zepfu
-ExecStart=/usr/bin/python3 /home/zepfu/projects/litellm/scripts/refresh_alpha_kimi_native_contract.py
-TimeoutStartSec=2min
