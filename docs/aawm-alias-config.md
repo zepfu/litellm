@@ -429,6 +429,19 @@ then managed xAI/OAuth `oa_xai/grok-4.7`. Cursor Grok remains on
 on `work`, not `work-other`. Closing the
 window prevents new affinity and does not evict an existing session owner.
 
+Alpha's Kimi-backed aliases require a current native-contract descriptor at
+`/run/aawm/kimi-descriptor/native-contract.json`. The host file is
+`/home/zepfu/.kimi-code/native-contract-alpha/native-contract.json`.
+Install `scripts/litellm-alpha-kimi-contract.service` and its timer in
+`/etc/systemd/system/`, then enable the timer with `systemctl enable --now
+litellm-alpha-kimi-contract.timer`. The publisher uses the installed Kimi
+version and the installed `thoth-kimi-update.sh` validation/publishing helper
+to refresh the alpha descriptor daily with its existing 96-hour lifetime.
+It requires the persistent root checkout and existing alpha descriptor
+directory. For an immediate refresh, start
+`litellm-alpha-kimi-contract.service`; inspect its journal and the timer's next
+run. Descriptor replacement takes effect on the next Kimi request.
+
 ## Maintained `expert` and `expert-other` alias behavior
 
 The `expert` alias first references `expert-other` (priority 110), then falls
