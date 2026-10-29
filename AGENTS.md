@@ -3,7 +3,7 @@
 Global `~/.codex/AGENTS.md` governs scope, authorization, testing, orchestration,
 delivery, and cross-repository reporting. This file adds LiteLLM-specific
 requirements. Authorized implementation includes synchronizing documentation
-for the affected behavior; it does not waive global test approval.
+for the affected behavior. Apply the global Testing rules to test work.
 
 ## CLI TODO Backend
 
@@ -149,7 +149,8 @@ with the dashboard. Use repository Ruff configuration for scoped lint.
 
 Provider documentation is under `docs/my-website/docs/providers/`. Use existing
 `.github/ISSUE_TEMPLATE/` and pull-request templates when those artifacts are
-requested; template test instructions remain subject to operator approval.
+requested; template test instructions follow the global Testing rules and
+explicit operator restrictions.
 
 ### Cursor Cloud Only
 
