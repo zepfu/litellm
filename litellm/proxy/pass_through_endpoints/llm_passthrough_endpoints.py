@@ -435,7 +435,9 @@ from .aawm_alias_routing import candidate_loop as _aawm_alias_candidate_loop
 from .aawm_alias_routing import durable as _aawm_alias_durable
 from .aawm_alias_routing import dev_fault_plan as _aawm_dev_fault_plan
 from .aawm_adapter_runtime.provider_call_ledger import (
+    get_request_openai_wire_commitment,
     get_request_provider_call_ledger_snapshot,
+    is_openai_wire_replay_prohibited,
 )
 
 # Wave 4 pure-leaf extraction imports
@@ -3625,6 +3627,14 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
         selection=selection,
         attempt_record=injected_attempt_record,
     )
+    wire_commitment = get_request_openai_wire_commitment(request)
+    if is_openai_wire_replay_prohibited(wire_commitment):
+        # Preserve the provider failure without resetting ownership or planning
+        # a send that the native final-send replay guard must reject.
+        retry_attempt_record["failover_decision"] = "terminal"
+        retry_attempt_record["terminal_reason"] = "openai_wire_replay_blocked"
+        retry_attempt_record["wire_commitment"] = wire_commitment
+        return None
 
     def _raise_authenticated_continuation_unavailable(
         *,

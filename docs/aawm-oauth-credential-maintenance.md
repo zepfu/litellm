@@ -583,6 +583,13 @@ These retry policies do not establish a quota-only account-migration rule or
 prove that a transient overload is account exhaustion. Do not replay committed
 output or executed tools to recover availability.
 
+Direct Codex account-failure routing also checks the request's replay commitment
+before credential reload, ownership reset or overflow selection. If provider
+execution is possible or response delivery has begun, it preserves the original
+provider error and any account quota cooldown without attempting another send.
+For example, a quota rejection remains a structured `429` with its reset hint;
+it is not replaced by a replay-guard `409` from an attempted overflow send.
+
 The configured `credential_affinity: interchangeable` pool keeps provider,
 model, route, endpoint, and encrypted-state-format session affinity while
 treating account label/hash/lane as per-attempt telemetry. Each account keeps

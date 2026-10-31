@@ -5486,6 +5486,106 @@ async def test_openai_proxy_route_direct_cooldown_bypass_is_one_shot_before_acco
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("provider_tools_allowed", [False, True])
+async def test_openai_proxy_route_direct_quota_failover_respects_replay_commitment(
+    monkeypatch: pytest.MonkeyPatch,
+    provider_tools_allowed: bool,
+) -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        ensure_openai_wire_replay_allowed,
+        publish_responses_replay_commitment,
+        responses_effective_provider_tools_allowed,
+    )
+    from tests.test_litellm.proxy.pass_through_endpoints.test_d1_612_session_affinity import (
+        _FakeRedisCache,
+        _patch_dual,
+    )
+
+    _patch_direct_inventory_auth(monkeypatch)
+    request = _direct_request()
+    body = {
+        "model": "gpt-5.6-sol",
+        "input": "hello",
+        "tools": [{"type": "web_search"}] if provider_tools_allowed else [],
+    }
+    provider_accounts: list[str] = []
+    quota_error = HTTPException(
+        status_code=429,
+        detail={
+            "error": {"code": "usage_limit_reached"},
+            "failover_disposition": "usage_limit_reached",
+            "retry_after_seconds": 17,
+        },
+        headers={"Retry-After": "17"},
+    )
+    quota_error._aawm_provider_returned = True
+    quota_error.attempted_provider_call = True
+
+    async def _fake_get_body(req):
+        return dict(body)
+
+    async def _fake_base_handler(**kwargs):
+        # Use the native final-send boundary, including its monotonic tool latch.
+        ensure_openai_wire_replay_allowed(request)
+        if responses_effective_provider_tools_allowed(body):
+            publish_responses_replay_commitment(
+                request, reason="provider_execution_possible"
+            )
+        authorization = (kwargs.get("extra_headers") or {}).get("Authorization")
+        provider_accounts.append(authorization)
+        if authorization == "Bearer server-token-account1":
+            raise quota_error
+        return Response(content=b"ok", status_code=200)
+
+    cooldowns: list[dict[str, Any]] = []
+    persist = AsyncMock()
+    monkeypatch.setattr(lpe, "get_request_body", _fake_get_body)
+    monkeypatch.setattr(
+        lpe.BaseOpenAIPassThroughHandler,
+        "_base_openai_pass_through_handler",
+        _fake_base_handler,
+    )
+    monkeypatch.setattr(lpe, "_resolve_codex_auto_agent_alias_model", lambda *a, **k: None)
+    monkeypatch.setattr(lpe, "_is_oa_xai_request_body", lambda *_a, **_k: False)
+    monkeypatch.setattr(lpe, "_is_grok_native_oauth_request_body", lambda *_a, **_k: False)
+    monkeypatch.setattr(lpe, "_publish_codex_cooldown_memory", lambda **kw: cooldowns.append(kw))
+    monkeypatch.setattr(lpe, "_persist_codex_cooldown_durable", persist)
+    for target in (lpe, audit_persist):
+        for name in (
+            "_emit_auto_agent_alias_route_event",
+            "_persist_auto_agent_alias_audit_only_events_best_effort",
+        ):
+            monkeypatch.setattr(target, name, lambda *a, **k: None)
+
+    async def invoke():
+        with _patch_dual(_FakeRedisCache()):
+            return await lpe.openai_proxy_route(
+                endpoint="v1/responses",
+                request=request,
+                fastapi_response=Response(),
+                user_api_key_dict=object(),  # type: ignore[arg-type]
+            )
+
+    if provider_tools_allowed:
+        with pytest.raises(HTTPException) as raised:
+            await invoke()
+        assert raised.value is quota_error
+        assert raised.value.status_code == 429
+        assert raised.value.headers == {"Retry-After": "17"}
+        assert provider_accounts == ["Bearer server-token-account1"]
+    else:
+        response = await invoke()
+        assert response.status_code == 200
+        assert provider_accounts == [
+            "Bearer server-token-account1",
+            "Bearer server-token-account2",
+        ]
+    assert len(cooldowns) == 1
+    assert cooldowns[0]["seconds"] == 17
+    persist.assert_awaited_once_with(**cooldowns[0])
+
+
+@pytest.mark.asyncio
 async def test_openai_proxy_route_direct_token_invalidated_retries_next_account(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
