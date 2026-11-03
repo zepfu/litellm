@@ -403,6 +403,21 @@ authentication, and non-capacity failures are excluded. A successful
 same-upstream request on another worker can wake waiting requests, and expiry
 reports a truthful `Retry-After`.
 
+Complete SSE frames containing only blank lines or colon-led comments do not
+commit a Responses attempt. They retain the existing byte, event, and prefix
+bounds and are forwarded with a successful stream. A later precommit capacity
+failure can therefore use the existing retry policy. Empty `data:` payloads,
+malformed frames, and unknown application events remain conservative; this does
+not relax output, tool-execution, or account replay guards.
+
+Terminal diagnostics retain the first commitment cause in
+`replay_commitment_reason` and `replay_commitment_event_type`. The bounded
+`replay_rejected_field` and `replay_rejection_reason` fields distinguish
+malformed frames, missing event types, and unsupported application events from
+rejected lifecycle fields. Known `response.metadata` events retain their name
+for diagnosis and still commit the attempt. These fields contain fixed labels
+and safe field paths, without raw payloads or unknown event names.
+
 `429` rate-limit responses are not hidden-retried. They should surface to the
 client with available retry/reset metadata so alias selection and quota
 observation can make the next decision without burning extra quota. Expected

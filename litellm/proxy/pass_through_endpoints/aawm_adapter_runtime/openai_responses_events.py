@@ -469,6 +469,7 @@ class ParsedResponsesEvent:
     forward_event: Optional[bytes] = None
     raw_event: Optional[bytes] = None
     separator: bytes = b""
+    is_transport_only: bool = False
 
     @property
     def type(self) -> str:
@@ -893,7 +894,7 @@ class ResponsesEventPipeline:
         raw_event: bytes,
         *,
         malformed_tail: bool,
-    ) -> tuple[Optional[str], Optional[Dict[str, Any]], bool, bool, bytes]:
+    ) -> tuple[Optional[str], Optional[Dict[str, Any]], bool, bool, bytes, bool]:
         event_type: Optional[str] = None
         payload: Optional[Dict[str, Any]] = None
         is_done_marker = False
@@ -907,6 +908,7 @@ class ResponsesEventPipeline:
             is_malformed = True
 
         lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        transport_lines_only = all(not line or line.startswith(":") for line in lines)
         for raw_line in lines:
             line = raw_line.strip()
             if not line or line.startswith(":"):
@@ -946,7 +948,10 @@ class ResponsesEventPipeline:
 
         separator_length = _separator_length_at_end(raw_event)
         separator = raw_event[-separator_length:] if separator_length else b""
-        return event_type, payload, is_done_marker, is_malformed, separator
+        is_transport_only = bool(separator) and transport_lines_only and not (
+            is_malformed or is_done_marker
+        )
+        return event_type, payload, is_done_marker, is_malformed, separator, is_transport_only
 
     def _parse_event(
         self,
@@ -972,6 +977,7 @@ class ResponsesEventPipeline:
             is_done_marker,
             is_malformed,
             separator,
+            is_transport_only,
         ) = self._parse_event_lines(raw_event, malformed_tail=malformed_tail)
         if is_done_marker:
             self.done_marker_count += 1
@@ -990,6 +996,7 @@ class ResponsesEventPipeline:
             forward_event=raw_event,
             raw_event=retained_raw,
             separator=separator,
+            is_transport_only=is_transport_only,
         )
         self._emit(event)
         if self.summary_reducer is not None and self.summary_reducer.overflow:

@@ -86,6 +86,7 @@ from .aawm_adapter_runtime.openai_responses_events import (
 from .aawm_adapter_runtime.provider_call_ledger import (
     get_request_openai_wire_commitment,
     get_responses_replay_rejection,
+    _responses_replay_event_label,
     record_responses_replay_rejection,
     get_responses_replay_commitment_reason,
     publish_responses_replay_commitment,
@@ -661,6 +662,9 @@ class _ResponsesPreCommitSSEParser:
         )
         if not association_valid:
             commitment_reason = "unknown_semantics"
+            PassThroughStreamingHandler._reject_responses_field(
+                rejection, "$", "unsafe_event_shape"
+            )
             if decision != "failed":
                 decision = "substantive"
         if decision in {"failed", "substantive"}:
@@ -2148,16 +2152,22 @@ class PassThroughStreamingHandler:
             if parsed_event.is_done_marker:
                 return "substantive", None, "[DONE]", "terminal_marker"
             # A malformed frame must veto replay; do not forward the bad bytes.
+            PassThroughStreamingHandler._reject_responses_field(
+                rejection, "$", "malformed_frame"
+            )
             return "substantive", None, None, "unknown_semantics"
+        if parsed_event.is_transport_only:
+            return "empty", None, None, None
 
-        event_type = parsed_event.event_type
-        payload = parsed_event.payload
+        event_type, payload = parsed_event.event_type, parsed_event.payload
 
         # --- Step 1: check if this event commits the attempt ---
         commitment_reason: Optional[str] = None
 
         if event_type in (None, ""):
-            # Empty event with no type: treat as unknown semantics
+            PassThroughStreamingHandler._reject_responses_field(
+                rejection, "$.type", "missing_event_type"
+            )
             return "substantive", None, event_type, "unknown_semantics"
 
         if event_type in _RESPONSES_PRE_COMMIT_FAILURE_EVENTS and not (
@@ -2244,6 +2254,17 @@ class PassThroughStreamingHandler:
         )
         if hidden_reason is not None and commitment_reason is None:
             commitment_reason = hidden_reason
+
+        if commitment_reason == "unknown_semantics":
+            known_shape = (
+                event_type != "response.metadata"
+                and _responses_replay_event_label(event_type) != "unknown_event"
+            )
+            PassThroughStreamingHandler._reject_responses_field(
+                rejection,
+                "$" if known_shape else "$.type",
+                "unsafe_event_shape" if known_shape else "unsupported_event",
+            )
 
         # --- Step 3: extract error payload ---
         error_payload = (
@@ -6665,12 +6686,13 @@ def _maybe_set_replay_latch(
     if request is None or commitment_reason is None:
         return
     try:
+        first_commitment = get_responses_replay_commitment_reason(request) is None
         publish_responses_replay_commitment(
             request,
             reason=commitment_reason,
             event_type=event_type,
         )
-        if rejection:
+        if first_commitment and rejection:
             record_responses_replay_rejection(request, rejection)
     except Exception:
         pass

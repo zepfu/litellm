@@ -63,6 +63,7 @@ _RESPONSES_REPLAY_EVENT_LABELS = frozenset(
         "response.completed",
         "response.failed",
         "response.incomplete",
+        "response.metadata",
         "response.output_item.added",
         "response.output_item.done",
         "response.content_part.added",
@@ -882,6 +883,7 @@ async def close_active_upstream_response(request: Request) -> None:
 _RESPONSES_REPLAY_REJECTION_STATE_KEY = "_aawm_responses_replay_rejection"
 _RESPONSES_REPLAY_REJECTION_REASONS = frozenset({
     "unknown_field", "invalid_type", "invalid_value", "nonzero_usage", "missing_field",
+    "malformed_frame", "missing_event_type", "unsupported_event", "unsafe_event_shape",
 })
 
 

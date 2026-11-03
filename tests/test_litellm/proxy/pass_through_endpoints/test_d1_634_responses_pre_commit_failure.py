@@ -5500,7 +5500,8 @@ async def test_exact_capacity_sse_codes_preserve_peek_exclusions_and_bytes(
         assert failure is None
     else:
         assert failure is not None
-        assert failure.retryable is False
+        # Disabling extended backoff retains the legacy transient retry.
+        assert failure.retryable is (not enabled)
         assert failure.error_code == error_code
     assert b"".join([chunk async for chunk in peeked.aiter_bytes()]) == b"".join(chunks)
     await peeked.aclose()
@@ -8707,3 +8708,180 @@ async def test_responses_asgi_disconnect_preserves_transport_origin(abort):
     assert snapshots[0]["disposition"] == ("cancelled" if abort == "task_cancelled" else "disconnected")
     assert snapshots[0]["cancellation_origin"] == abort
     assert snapshots[0]["terminal_sent"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prefix", "split"),
+    [
+        (b": keepalive\n\n", False),
+        (": ping 東京\r\n\r\n".encode(), True),
+        (b"\n\n", False),
+    ],
+)
+async def test_transport_only_frames_preserve_capacity_recovery(monkeypatch, prefix, split):
+    """Transport frames preserve retry, original framing, and exactly-once output."""
+    failed = prefix + b"".join(_failed_lifecycle_stream())
+    recovered = prefix + b"".join(_replacement_success_stream_chunks())
+    chunks = [failed[index:index + 1] for index in range(len(failed))] if split else [failed]
+    result, client, sends, used = await _start_openai_responses_stream(
+        monkeypatch,
+        [_ClosableAsyncByteStream(chunks), _ClosableAsyncByteStream([recovered])],
+    )
+    try:
+        assert not isinstance(result, Exception)
+        body = b"".join([bytes(chunk) async for chunk in result.body_iterator])
+        assert len(sends) == 2
+        assert body.startswith(prefix + _replacement_success_stream_chunks()[0])
+        if prefix.startswith(b":"):
+            assert body.count(prefix) == 1
+        payloads = _responses_sse_payloads(body)
+        assert sum(p.get("type") == "response.completed" for p in payloads) == 1
+        assert sum(p.get("type") == "response.output_text.delta" and p.get("delta") == "Recovered 東京" for p in payloads) == 1
+        assert not any(p.get("type") in {"response.failed", "error"} for p in payloads)
+        assert not any(p.get("response", {}).get("id") == "resp_failed" for p in payloads)
+    finally:
+        for stream in used:
+            await stream.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prefix", "event_type", "field", "reason"),
+    [
+        (b": private_frame_value\xff\n\n", "unknown_event", "$", "malformed_frame"),
+        (b"id: private_frame_value\n\n", "unknown_event", "$.type", "missing_event_type"),
+        (_sse("private_frame_value", {"type": "private_frame_value"}), "unknown_event", "$.type", "unsupported_event"),
+        (_sse("response.metadata", {"type": "response.metadata", "metadata": {"opaque": "private_frame_value"}}), "response.metadata", "$.type", "unsupported_event"),
+    ],
+)
+async def test_unknown_commitment_diagnostics_preserve_replay_guard(
+    monkeypatch, tmp_path, prefix, event_type, field, reason,
+):
+    """JSONL terminal diagnostics identify the first cause without raw values."""
+    from litellm._logging import AawmErrorLogFileHandler
+    from litellm.proxy.pass_through_endpoints import streaming_handler as sh
+
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "keepalive-test")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+    handler = AawmErrorLogFileHandler()
+    sh.verbose_proxy_logger.addHandler(handler)
+    result, client, sends, used = await _start_openai_responses_stream(
+        monkeypatch, [_ClosableAsyncByteStream([prefix + b"".join(_failed_lifecycle_stream())])],
+    )
+
+    async def send(_message):
+        pass
+
+    try:
+        assert not isinstance(result, Exception)
+        await result({"type": "http", "asgi": {"spec_version": "2.4"}}, AsyncMock(), send)
+        assert len(sends) == 1
+        handler.flush()
+        logged = (tmp_path / "keepalive-test-error.jsonl").read_text()
+        records = [json.loads(line) for line in logged.splitlines()]
+        records = [r for r in records if r["message"].startswith("AAWM_TERMINAL_ERROR:")]
+        assert len(records) == 1
+        context = records[0]["context"]
+        assert context["replay_commitment_reason"] == "unknown_semantics"
+        assert context["replay_commitment_event_type"] == event_type
+        assert context["replay_rejected_field"] == field
+        assert context["replay_rejection_reason"] == reason
+        assert "private_frame_value" not in logged
+    finally:
+        sh.verbose_proxy_logger.removeHandler(handler)
+        handler.close()
+        for stream in used:
+            await stream.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("frame", [
+    b" \n\n", b" : keepalive\n\n", b"id: 1\n\n", b"retry: 1\n\n",
+    b"event: response.metadata\n\n", b"data:\n\n", b"data: {invalid}\n\n",
+    b": invalid\xff\n\n", b": incomplete tail",
+    b": comment\n" + _sse("response.output_text.delta", {"type": "response.output_text.delta", "delta": "visible"}),
+])
+async def test_transport_exemption_keeps_other_frames_committed(frame):
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        ProviderCallReplayBlocked, ensure_openai_wire_replay_allowed,
+    )
+    request = _responses_request({"model": "gpt-5.4"})
+    response = httpx.Response(200, stream=_ClosableAsyncByteStream([frame]))
+    peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+        response, request=request, provider_bound_body={"model": "gpt-5.4"},
+    )
+    try:
+        assert failure is None
+        with pytest.raises(ProviderCallReplayBlocked):
+            ensure_openai_wire_replay_allowed(request)
+        _ = b"".join([chunk async for chunk in peeked.aiter_bytes()])
+    finally:
+        await peeked.aclose()
+        await response.aclose()
+
+
+def test_adopted_event_without_payload_cannot_claim_transport_exemption():
+    event = ResponsesEventPipeline().adopt_event(None, wire_event=b": keepalive\n\n")
+    assert PassThroughStreamingHandler._inspect_responses_events(event)[0] == "substantive"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["provider_execution_possible", "unknown_semantics"])
+async def test_earlier_commitment_cannot_acquire_later_rejection_detail(reason):
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        get_responses_replay_rejection, publish_responses_replay_commitment,
+    )
+    request = _responses_request({"model": "gpt-5.4"})
+    publish_responses_replay_commitment(request, reason=reason)
+    response = httpx.Response(200, stream=_ClosableAsyncByteStream([b"data: {invalid}\n\n"]))
+    peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+        response, request=request, provider_bound_body={"model": "gpt-5.4"},
+    )
+    try:
+        assert failure is None
+        assert get_responses_replay_rejection(request) == {}
+        _ = b"".join([chunk async for chunk in peeked.aiter_bytes()])
+    finally:
+        await peeked.aclose()
+        await response.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", ["event_count", "event_bytes"])
+async def test_transport_frames_retain_admission_bounds(limit):
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        get_request_openai_wire_commitment,
+    )
+    options = {"max_stream_events": 1} if limit == "event_count" else {"max_event_bytes": 12}
+    pipeline = ResponsesEventPipeline(retain_events=True, **options)
+    prefix = b": ok\n\n"
+    rejected = b": " + b"x" * 20 + b"\n\n"
+    request = _responses_request({"model": "gpt-5.4"})
+    response = httpx.Response(200, stream=_ClosableAsyncByteStream([prefix + rejected]))
+    peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+        response, request=request, provider_bound_body={"model": "gpt-5.4"}, event_pipeline=pipeline,
+    )
+    emitted = []
+    try:
+        assert failure is None
+        assert get_request_openai_wire_commitment(request)["precommit_commitment_reason"] == "event_limit"
+        iterator = peeked.aiter_bytes()
+        try:
+            with pytest.raises(ResponsesBoundFailure):
+                async for chunk in iterator:
+                    emitted.append(bytes(chunk))
+        finally:
+            await iterator.aclose()
+        rendered = b"".join(emitted)
+        assert rendered.startswith(prefix)
+        assert (prefix + rejected).startswith(rendered)
+        if limit == "event_bytes":
+            assert len(rendered) <= len(prefix) + options["max_event_bytes"]
+    finally:
+        await peeked.aclose()
+        await response.aclose()
+        await asyncio.sleep(0)
