@@ -424,6 +424,8 @@ _AAWM_ERROR_LOG_DEFAULT_CONTEXT_FIELDS = (
     "correlation_id",
     "provider_terminal_event_type",
     "failure_origin",
+    "replay_commitment_reason",
+    "replay_commitment_event_type",
     "upstream_status_code",
     "provider_returned",
 )

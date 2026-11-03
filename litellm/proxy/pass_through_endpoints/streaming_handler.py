@@ -2,6 +2,7 @@ import asyncio
 import codecs
 import inspect
 import json
+import math
 import os
 import struct
 import tempfile
@@ -83,6 +84,7 @@ from .aawm_adapter_runtime.openai_responses_events import (
     responses_events_from_chunk,
 )
 from .aawm_adapter_runtime.provider_call_ledger import (
+    get_request_openai_wire_commitment,
     get_responses_replay_commitment_reason,
     publish_responses_replay_commitment,
     responses_effective_provider_tools_allowed,
@@ -133,6 +135,8 @@ _RESPONSES_RESPONSE_ENVELOPE_FIELDS = {
     "conversation", "max_tool_calls", "prompt",
     "prompt_cache_key", "prompt_cache_retention",
     "safety_identifier", "service_tier", "top_logprobs",
+    "completed_at", "frequency_penalty", "presence_penalty",
+    "moderation", "access_programs", "tool_usage",
 }
 _RESPONSES_ERROR_FIELDS = {"type", "code", "message", "param"}
 # OPENAI-080: Oracle-frozen exact typed allowlist for replay-safe private events.
@@ -1350,6 +1354,71 @@ class PassThroughStreamingHandler:
         return False
 
     @staticmethod
+    def _is_responses_idle_tool_usage(value: Any) -> bool:
+        """Recognize the observed accounting shape, never proof of no execution."""
+        if not isinstance(value, dict) or set(value) != {"image_gen", "web_search"}:
+            return False
+        image = value["image_gen"]
+        if not isinstance(image, dict) or set(image) != {
+            "input_tokens", "output_tokens", "total_tokens",
+            "input_tokens_details", "output_tokens_details",
+        }:
+            return False
+        counter_objects = (
+            (value["web_search"], {"num_requests"}),
+            (image["input_tokens_details"], {"text_tokens", "image_tokens"}),
+            (image["output_tokens_details"], {"text_tokens", "image_tokens"}),
+        )
+        for counters, keys in counter_objects:
+            if not isinstance(counters, dict) or set(counters) != keys:
+                return False
+            if any(
+                not PassThroughStreamingHandler._is_nonnegative_index(counter)
+                or counter != 0
+                for counter in counters.values()
+            ):
+                return False
+        return all(
+            PassThroughStreamingHandler._is_nonnegative_index(image[key])
+            and image[key] == 0
+            for key in ("input_tokens", "output_tokens", "total_tokens")
+        )
+
+    @staticmethod
+    def _has_safe_responses_metadata_extensions(payload: Dict[str, Any]) -> bool:
+        """Validate optional setup metadata without granting replay permission."""
+        if (
+            "safety_buffering" in payload
+            and payload["safety_buffering"] is not False
+        ):
+            return False
+        response = payload.get("response")
+        if not isinstance(response, dict):
+            return False
+        if (
+            response.get("completed_at") is not None
+            or response.get("moderation") is not None
+        ):
+            return False
+        if "access_programs" in response and response["access_programs"] != {
+            "cyber": "standard"
+        }:
+            return False
+        for key in ("frequency_penalty", "presence_penalty"):
+            if key not in response:
+                continue
+            value = response[key]
+            if isinstance(value, int) and not isinstance(value, bool):
+                continue
+            if not isinstance(value, float) or not math.isfinite(value):
+                return False
+        return "tool_usage" not in response or (
+            PassThroughStreamingHandler._is_responses_idle_tool_usage(
+                response["tool_usage"]
+            )
+        )
+
+    @staticmethod
     def _is_responses_non_substantive_lifecycle_event(
         event_type: Optional[str],
         payload: Optional[Dict[str, Any]] = None,
@@ -1375,7 +1444,11 @@ class PassThroughStreamingHandler:
             if not isinstance(response_payload, dict):
                 return False
             if not PassThroughStreamingHandler._has_only_fields(
-                payload, {"type", "sequence_number", "response"}
+                payload, {"type", "sequence_number", "response", "safety_buffering"}
+            ):
+                return False
+            if not PassThroughStreamingHandler._has_safe_responses_metadata_extensions(
+                payload
             ):
                 return False
             if not PassThroughStreamingHandler._has_only_fields(
@@ -1981,8 +2054,12 @@ class PassThroughStreamingHandler:
 
         if event_type != "response.failed" or not (
             PassThroughStreamingHandler._has_only_fields(
-                payload, {"type", "sequence_number", "response"}
+                payload, {"type", "sequence_number", "response", "safety_buffering"}
             )
+        ):
+            return False
+        if not PassThroughStreamingHandler._has_safe_responses_metadata_extensions(
+            payload
         ):
             return False
         response_payload = payload.get("response")
@@ -5750,6 +5827,7 @@ class PassThroughStreamingHandler:
         delivered_wire_disposition: Optional[Dict[str, Any]] = None,
         openai_alpha_capacity_retry_enabled: bool = False,
         responses_event_pipeline: Optional[ResponsesEventPipeline] = None,
+        operational_request: Optional[Any] = None,
     ) -> None:
         metadata["aawm_route_rollup_turn_suppressed"] = True
         metadata["aawm_stream_interrupted"] = True
@@ -5992,6 +6070,11 @@ class PassThroughStreamingHandler:
         if not isinstance(route_context, dict):
             route_context = {}
         redispatch_required = metadata.get("redispatch_required") is True
+        wire_commitment = (
+            get_request_openai_wire_commitment(operational_request) or {}
+            if operational_request is not None
+            else {}
+        )
         error_code = None
         if isinstance(error_payload, dict):
             error_code = error_payload.get("code") or error_payload.get("type")
@@ -6008,6 +6091,12 @@ class PassThroughStreamingHandler:
                     terminal_event_type if recognized_terminal else None
                 ),
                 "failure_origin": metadata.get("aawm_failure_origin"),
+                "replay_commitment_reason": wire_commitment.get(
+                    "precommit_commitment_reason"
+                ),
+                "replay_commitment_event_type": wire_commitment.get(
+                    "precommit_commitment_event_type"
+                ),
                 "provider_returned": provider_authored,
                 "endpoint": (
                     metadata.get("endpoint")
@@ -6274,6 +6363,7 @@ class PassThroughStreamingHandler:
                         PassThroughStreamingHandler._is_openai_capacity_retry_policy_enabled()
                     ),
                     responses_event_pipeline=responses_event_pipeline,
+                    operational_request=operational_request,
                 )
                 return
             if synthetic_terminal_event_type == "response.incomplete":

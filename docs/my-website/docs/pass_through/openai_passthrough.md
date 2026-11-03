@@ -51,6 +51,16 @@ tool choices and other provider routes retain their existing behavior.
 
 ### Responses stream limits
 
+Before output or tool execution commits an attempt, alpha can retry a transient
+capacity failure without exposing the failed attempt's setup events. Current
+Codex setup metadata is accepted through exact field and value checks, including
+`safety_buffering: false`, null completion/moderation fields, and the complete
+known tool-usage structure with integer-zero counters. Unknown fields, invalid
+values and nonzero usage retain the conservative replay boundary. Zero usage
+does not override provider-tool capability guards or an earlier commitment.
+Terminal error logs include `replay_commitment_reason` and
+`replay_commitment_event_type` when a request has crossed that boundary.
+
 Native Responses streams share one attempt-scoped event pipeline across
 precommit inspection, delivery, logging, usage and response policies. Configure
 its limits through process environment variables. Byte limits use bytes;

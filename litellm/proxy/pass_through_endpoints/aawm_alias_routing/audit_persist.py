@@ -285,6 +285,8 @@ def _build_terminal_error_log_fields(
         ("event_type", ("event_type",)),
         ("provider_terminal_event_type", ("provider_terminal_event_type",)),
         ("failure_origin", ("failure_origin", "aawm_failure_origin")),
+        ("replay_commitment_reason", ("replay_commitment_reason",)),
+        ("replay_commitment_event_type", ("replay_commitment_event_type",)),
     )
     fields: dict[str, Any] = {}
     for output_key, source_keys in label_fields:

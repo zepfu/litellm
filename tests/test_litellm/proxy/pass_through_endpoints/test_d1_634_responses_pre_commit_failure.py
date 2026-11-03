@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import time
 from datetime import datetime, timedelta
@@ -6234,6 +6235,117 @@ async def test_openai_responses_replays_safe_reasoning_prefix_once(
         close_iterator = getattr(iterator, "aclose", None)
         if callable(close_iterator):
             await close_iterator()
+        for upstream_stream in upstream_streams:
+            await upstream_stream.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("invalid_event", "invalid_path", "invalid_value"),
+    [
+        (None, (), None),
+        ("response.created", ("response", "tool_usage", "web_search", "num_requests"), 1),
+        ("response.created", ("safety_buffering",), "false"),
+        ("response.failed", ("response", "tool_usage", "web_search", "num_requests"), 1),
+        ("response.failed", ("response", "tool_usage", "web_search", "num_requests"), False),
+        ("response.failed", ("response", "tool_usage", "web_search", "num_requests"), 0.0),
+        ("response.failed", ("response", "tool_usage"), {"web_search": {"num_requests": 0}}),
+        ("response.failed", ("response", "tool_usage", "web_search"), {"num_requests": 0, "executed": True}),
+        ("response.failed", ("response", "completed_at"), 0),
+        ("response.failed", ("response", "moderation"), {}),
+        ("response.failed", ("response", "access_programs"), {"cyber": "standard", "unknown": True}),
+        ("response.failed", ("response", "frequency_penalty"), True),
+        ("response.failed", ("response", "presence_penalty"), float("inf")),
+        ("response.failed", ("safety_buffering",), True),
+    ],
+)
+async def test_current_codex_setup_envelope_preserves_capacity_retry_boundary(
+    monkeypatch, invalid_event, invalid_path, invalid_value
+):
+    """Idle setup metadata preserves the existing execution and replay guards."""
+    extensions: dict[str, Any] = {
+        "completed_at": None,
+        "frequency_penalty": 0.0,
+        "presence_penalty": 0.0,
+        "moderation": None,
+        "access_programs": {"cyber": "standard"},
+        "tool_usage": {
+            "image_gen": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "input_tokens_details": {"text_tokens": 0, "image_tokens": 0},
+                "output_tokens_details": {"image_tokens": 0, "text_tokens": 0},
+            },
+            "web_search": {"num_requests": 0},
+        },
+    }
+    frames = []
+    for sequence, (event_type, status, error) in enumerate(
+        [
+            ("response.created", "in_progress", None),
+            ("response.in_progress", "in_progress", None),
+            (
+                "response.failed",
+                "failed",
+                {
+                    "code": "server_is_overloaded",
+                    "type": "service_unavailable_error",
+                    "message": "Selected model is at capacity.",
+                },
+            ),
+        ],
+        start=1,
+    ):
+        fields: dict[str, Any] = {
+            "safety_buffering": False,
+            "response": {
+                "id": "resp_current_setup",
+                "object": "response",
+                "model": "gpt-6.1-sol",
+                "status": status,
+                "output": [],
+                "error": error,
+                "incomplete_details": None,
+                **copy.deepcopy(extensions),
+            },
+        }
+        if event_type == invalid_event:
+            target = fields
+            for key in invalid_path[:-1]:
+                target = target[key]
+            target[invalid_path[-1]] = invalid_value
+        frames.append(_responses_event(event_type, sequence, **fields))
+    result, client, sent_requests, upstream_streams = await _start_openai_responses_stream(
+        monkeypatch,
+        [
+            _ClosableAsyncByteStream(frames),
+            _ClosableAsyncByteStream(_replacement_success_stream_chunks()),
+        ],
+    )
+    try:
+        assert not isinstance(result, Exception)
+        payloads = _responses_sse_payloads(
+            b"".join([bytes(chunk) async for chunk in result.body_iterator])
+        )
+        if invalid_event is None:
+            assert len(sent_requests) == 2
+            assert sum(p.get("type") == "response.completed" for p in payloads) == 1
+            assert sum(
+                p.get("type") == "response.output_text.delta"
+                and p.get("delta") == "Recovered \u6771\u4eac"
+                for p in payloads
+            ) == 1
+            assert not any(p.get("type") == "response.failed" for p in payloads)
+            assert not any(
+                p.get("response", {}).get("id") == "resp_current_setup"
+                for p in payloads
+            )
+        else:
+            assert len(sent_requests) == 1
+            assert sum(p.get("type") == "response.failed" for p in payloads) == 1
+    finally:
         for upstream_stream in upstream_streams:
             await upstream_stream.aclose()
         await client.aclose()
