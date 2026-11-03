@@ -49,6 +49,26 @@ The provider needs that declaration to read search history. Existing history
 is preserved and new searches remain disabled. Nonempty tool lists, forced
 tool choices and other provider routes retain their existing behavior.
 
+Client disconnects and response-socket send failures retain a `disconnected`
+disposition; external task cancellation retains `cancelled`. Terminal logs
+include `cancellation_origin` (`client_disconnect`, `client_send_error`, or
+`task_cancelled`) when observed. These local aborts do not imply an upstream
+failure and cannot authorize replay. Any observed provider error remains
+attributed to the provider.
+
+A socket read timeout during private-prefix acquisition follows the existing
+bounded transport retry policy. It does not use the capacity backoff schedule
+or permit replay after output, tool capability, or delivery has committed the
+request.
+
+Setup envelopes accept `access_programs` when absent, null, or exactly
+`{"cyber":"standard"}`. Other metadata and replay guards retain their existing
+constraints. When setup validation rejects a field, existing failure logs and
+success metadata retain the first `replay_rejected_field` and
+`replay_rejection_reason`. Paths contain only known schema names; unknown names
+become `<unknown_field>`, and values are never included. The pair is bounded
+to 256 serialized bytes and does not affect replay decisions.
+
 ### Responses stream limits
 
 Before output or tool execution commits an attempt, alpha can retry a transient

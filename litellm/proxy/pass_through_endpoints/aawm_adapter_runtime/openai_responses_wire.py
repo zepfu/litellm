@@ -224,6 +224,7 @@ class OpenAIResponsesWireTrace:
             "finalization_started": self.finalization_started,
             "finalized": self.finalized,
             "asgi_delivery_complete": self.asgi_delivery_complete,
+            "cancellation_origin": self.metadata.get("cancellation_origin"),
             "policy_failure_kind": self.metadata.get("policy_failure_kind"),
             "policy_failure_code": self.metadata.get("policy_failure_code"),
             "policy_failure_class": self.metadata.get("policy_failure_class"),
@@ -1091,7 +1092,16 @@ class OpenAIResponsesWireCoordinator:
         except asyncio.CancelledError:
             self._discard_partial_buffer()
             try:
-                await self.finalize_transport(OpenAIResponsesWireDisposition.CANCELLED)
+                client_disconnected = (
+                    self.trace.metadata.get("cancellation_origin") == "client_disconnect"
+                )
+                if not client_disconnected:
+                    self.trace.metadata["cancellation_origin"] = "task_cancelled"
+                await self.finalize_transport(
+                    OpenAIResponsesWireDisposition.DISCONNECTED
+                    if client_disconnected
+                    else OpenAIResponsesWireDisposition.CANCELLED
+                )
             finally:
                 raise
         except (BrokenPipeError, ConnectionResetError):
@@ -1151,6 +1161,25 @@ class OpenAIResponsesStreamingResponse(StreamingResponse):
         self.wire_trace = wire_trace
         self._on_disposition = on_disposition
 
+    async def listen_for_disconnect(self, receive: Any) -> None:
+        while True:
+            message = await receive()
+            if message.get("type") == "http.disconnect":
+                self.wire_trace.metadata["cancellation_origin"] = "client_disconnect"
+                return
+
+    async def _tracked_send(self, send: Any, message: Dict[str, Any]) -> None:
+        try:
+            await send(message)
+        except OSError:
+            self.wire_trace.metadata["cancellation_origin"] = "client_send_error"
+            raise
+        message_type = message.get("type")
+        if message_type == "http.response.start":
+            self.wire_trace.record_response_start_delivery()
+        elif message_type == "http.response.body":
+            self.wire_trace.record_body_delivery(message.get("body"))
+
     async def _close_body_iterator(self) -> None:
         close = getattr(self.body_iterator, "aclose", None)
         if callable(close):
@@ -1164,12 +1193,7 @@ class OpenAIResponsesStreamingResponse(StreamingResponse):
         self.background = None
 
         async def tracked_send(message: Dict[str, Any]) -> None:
-            message_type = message.get("type")
-            await send(message)
-            if message_type == "http.response.start":
-                self.wire_trace.record_response_start_delivery()
-            elif message_type == "http.response.body":
-                self.wire_trace.record_body_delivery(message.get("body"))
+            await self._tracked_send(send, message)
 
         try:
             await super().__call__(scope, receive, tracked_send)

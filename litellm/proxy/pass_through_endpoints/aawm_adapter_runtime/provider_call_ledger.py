@@ -8,6 +8,7 @@ reserves the next logical-call ordinal immediately before sending it.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -877,6 +878,41 @@ async def close_active_upstream_response(request: Request) -> None:
                 close_fn()
     finally:
         setattr(state, _ACTIVE_RESPONSE_STATE_KEY, None)
+
+_RESPONSES_REPLAY_REJECTION_STATE_KEY = "_aawm_responses_replay_rejection"
+_RESPONSES_REPLAY_REJECTION_REASONS = frozenset({
+    "unknown_field", "invalid_type", "invalid_value", "nonzero_usage", "missing_field",
+})
+
+
+def record_responses_replay_rejection(request: Any, rejection: Mapping[str, str]) -> None:
+    """Retain one bounded explanatory pair without altering replay state."""
+    try:
+        state = _request_state(request)
+        if state is None or getattr(state, _RESPONSES_REPLAY_REJECTION_STATE_KEY, None) is not None:
+            return
+        path, reason = rejection.get("path"), rejection.get("reason")
+        if (
+            not isinstance(path, str) or not path.isascii() or len(path) > 128
+            or len(path.split(".")) > 8 or reason not in _RESPONSES_REPLAY_REJECTION_REASONS
+        ):
+            return
+        diagnostic = {
+            "replay_rejected_field": path, "replay_rejection_reason": reason,
+        }
+        if len(json.dumps(diagnostic).encode("ascii")) <= 256:
+            setattr(state, _RESPONSES_REPLAY_REJECTION_STATE_KEY, diagnostic)
+    except Exception:
+        pass
+
+
+def get_responses_replay_rejection(request: Any) -> dict[str, str]:
+    """Copy the request-owned diagnostic for existing terminal log consumers."""
+    try:
+        value = getattr(_request_state(request), _RESPONSES_REPLAY_REJECTION_STATE_KEY, None)
+        return dict(value) if isinstance(value, dict) else {}
+    except Exception:
+        return {}
 
 
 def publish_responses_replay_commitment(

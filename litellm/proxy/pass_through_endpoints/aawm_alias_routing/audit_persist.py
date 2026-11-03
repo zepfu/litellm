@@ -285,6 +285,9 @@ def _build_terminal_error_log_fields(
         ("event_type", ("event_type",)),
         ("provider_terminal_event_type", ("provider_terminal_event_type",)),
         ("failure_origin", ("failure_origin", "aawm_failure_origin")),
+        ("cancellation_origin", ("cancellation_origin",)),
+        ("replay_rejected_field", ("replay_rejected_field",)),
+        ("replay_rejection_reason", ("replay_rejection_reason",)),
         ("replay_commitment_reason", ("replay_commitment_reason",)),
         ("replay_commitment_event_type", ("replay_commitment_event_type",)),
     )

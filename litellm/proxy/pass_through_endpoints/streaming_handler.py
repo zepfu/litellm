@@ -85,6 +85,8 @@ from .aawm_adapter_runtime.openai_responses_events import (
 )
 from .aawm_adapter_runtime.provider_call_ledger import (
     get_request_openai_wire_commitment,
+    get_responses_replay_rejection,
+    record_responses_replay_rejection,
     get_responses_replay_commitment_reason,
     publish_responses_replay_commitment,
     responses_effective_provider_tools_allowed,
@@ -642,13 +644,15 @@ class _ResponsesPreCommitSSEParser:
         self._substantive_event: Optional[str] = None
         self._first_terminal_decision: Optional[str] = None
         self._commitment_reason: Optional[str] = None
+        self.commitment_rejection: Dict[str, str] = {}
         self._response_id: Optional[str] = None
         self._output_items: Dict[int, tuple[str, str]] = {}
 
     def _consume_event(self, parsed_event: ParsedResponsesEvent) -> None:
+        rejection: Dict[str, str] = {}
         decision, error_payload, event_type, commitment_reason = (
             PassThroughStreamingHandler._inspect_responses_events(
-                parsed_event
+                parsed_event, rejection
             )
         )
         association_valid = self._validate_event_association(
@@ -664,6 +668,8 @@ class _ResponsesPreCommitSSEParser:
             # same HTTPX read must not erase the earlier precommit outcome.
             if self._first_terminal_decision is None:
                 self._first_terminal_decision = decision
+                if commitment_reason is not None and rejection:
+                    self.commitment_rejection = rejection
         if decision == "substantive" and not self._saw_substantive:
             self._saw_substantive = True
             self._substantive_event = event_type
@@ -1188,8 +1194,34 @@ class PassThroughStreamingHandler:
         return False
 
     @staticmethod
-    def _has_only_fields(value: Dict[str, Any], fields: set[str]) -> bool:
-        return set(value).issubset(fields)
+    def _reject_responses_field(
+        rejection: Optional[Dict[str, str]], path: str, reason: str,
+    ) -> bool:
+        # Diagnostic capture is observational and must not change admission.
+        if rejection is not None:
+            try:
+                if not rejection:
+                    rejection.update(path=path, reason=reason)
+            except Exception:
+                pass
+        return False
+
+    @staticmethod
+    def _has_only_fields(
+        value: Any, fields: Union[set[str], tuple[str, ...]], *,
+        rejection: Optional[Dict[str, str]] = None, path: str = "$",
+        required: bool = False,
+    ) -> bool:
+        reject = PassThroughStreamingHandler._reject_responses_field
+        if not isinstance(value, dict):
+            return reject(rejection, path, "invalid_type")
+        if not set(value).issubset(fields):
+            return reject(rejection, path + ".<unknown_field>", "unknown_field")
+        if required:
+            for key in fields:
+                if key not in value:
+                    return reject(rejection, path + "." + key, "missing_field")
+        return True
 
     @staticmethod
     def _is_nonnegative_index(value: Any) -> bool:
@@ -1354,56 +1386,64 @@ class PassThroughStreamingHandler:
         return False
 
     @staticmethod
-    def _is_responses_idle_tool_usage(value: Any) -> bool:
-        """Recognize the observed accounting shape, never proof of no execution."""
-        if not isinstance(value, dict) or set(value) != {"image_gen", "web_search"}:
+    def _is_responses_idle_tool_usage(
+        value: Any, rejection: Optional[Dict[str, str]] = None,
+    ) -> bool:
+        """Recognize accounting metadata, never proof of no execution."""
+        fields = PassThroughStreamingHandler._has_only_fields
+        reject = PassThroughStreamingHandler._reject_responses_field
+        base = "$.response.tool_usage"
+        if not fields(value, ("image_gen", "web_search"), required=True,
+                      rejection=rejection, path=base):
             return False
         image = value["image_gen"]
-        if not isinstance(image, dict) or set(image) != {
-            "input_tokens", "output_tokens", "total_tokens",
-            "input_tokens_details", "output_tokens_details",
-        }:
+        if not fields(image, ("input_tokens", "output_tokens", "total_tokens",
+                              "input_tokens_details", "output_tokens_details"),
+                      required=True, rejection=rejection, path=base + ".image_gen"):
             return False
         counter_objects = (
-            (value["web_search"], {"num_requests"}),
-            (image["input_tokens_details"], {"text_tokens", "image_tokens"}),
-            (image["output_tokens_details"], {"text_tokens", "image_tokens"}),
+            (value["web_search"], ("num_requests",), base + ".web_search"),
+            (image["input_tokens_details"], ("text_tokens", "image_tokens"),
+             base + ".image_gen.input_tokens_details"),
+            (image["output_tokens_details"], ("text_tokens", "image_tokens"),
+             base + ".image_gen.output_tokens_details"),
         )
-        for counters, keys in counter_objects:
-            if not isinstance(counters, dict) or set(counters) != keys:
+        for counters, keys, path in counter_objects:
+            if not fields(counters, keys, required=True, rejection=rejection, path=path):
                 return False
-            if any(
-                not PassThroughStreamingHandler._is_nonnegative_index(counter)
-                or counter != 0
-                for counter in counters.values()
-            ):
-                return False
-        return all(
-            PassThroughStreamingHandler._is_nonnegative_index(image[key])
-            and image[key] == 0
-            for key in ("input_tokens", "output_tokens", "total_tokens")
-        )
+            for key in keys:
+                counter = counters[key]
+                if not isinstance(counter, int) or isinstance(counter, bool):
+                    return reject(rejection, path + "." + key, "invalid_type")
+                if counter != 0:
+                    return reject(rejection, path + "." + key, "nonzero_usage")
+        for key in ("input_tokens", "output_tokens", "total_tokens"):
+            counter = image[key]
+            path = base + ".image_gen." + key
+            if not isinstance(counter, int) or isinstance(counter, bool):
+                return reject(rejection, path, "invalid_type")
+            if counter != 0:
+                return reject(rejection, path, "nonzero_usage")
+        return True
 
     @staticmethod
-    def _has_safe_responses_metadata_extensions(payload: Dict[str, Any]) -> bool:
+    def _has_safe_responses_metadata_extensions(
+        payload: Dict[str, Any], rejection: Optional[Dict[str, str]] = None,
+    ) -> bool:
         """Validate optional setup metadata without granting replay permission."""
-        if (
-            "safety_buffering" in payload
-            and payload["safety_buffering"] is not False
-        ):
-            return False
+        reject = PassThroughStreamingHandler._reject_responses_field
+        if "safety_buffering" in payload and payload["safety_buffering"] is not False:
+            return reject(rejection, "$.safety_buffering", "invalid_value")
         response = payload.get("response")
         if not isinstance(response, dict):
-            return False
-        if (
-            response.get("completed_at") is not None
-            or response.get("moderation") is not None
-        ):
-            return False
-        if "access_programs" in response and response["access_programs"] != {
+            return reject(rejection, "$.response", "invalid_type")
+        for key in ("completed_at", "moderation"):
+            if response.get(key) is not None:
+                return reject(rejection, "$.response." + key, "invalid_value")
+        if response.get("access_programs") is not None and response["access_programs"] != {
             "cyber": "standard"
         }:
-            return False
+            return reject(rejection, "$.response.access_programs", "invalid_value")
         for key in ("frequency_penalty", "presence_penalty"):
             if key not in response:
                 continue
@@ -1411,10 +1451,10 @@ class PassThroughStreamingHandler:
             if isinstance(value, int) and not isinstance(value, bool):
                 continue
             if not isinstance(value, float) or not math.isfinite(value):
-                return False
+                return reject(rejection, "$.response." + key, "invalid_value")
         return "tool_usage" not in response or (
             PassThroughStreamingHandler._is_responses_idle_tool_usage(
-                response["tool_usage"]
+                response["tool_usage"], rejection
             )
         )
 
@@ -1422,6 +1462,7 @@ class PassThroughStreamingHandler:
     def _is_responses_non_substantive_lifecycle_event(
         event_type: Optional[str],
         payload: Optional[Dict[str, Any]] = None,
+        rejection: Optional[Dict[str, str]] = None,
     ) -> bool:
         """Frozen Oracle allowlist: return True only when the exact event name and
         full semantic shape are unconditionally safe to discard on a precommit failure.
@@ -1429,55 +1470,59 @@ class PassThroughStreamingHandler:
         This is the OPENAI-080 closed set.  Any unrecognised event, unexpected field,
         or schema conflict commits the attempt.
         """
+        reject = PassThroughStreamingHandler._reject_responses_field
         if event_type is None or not isinstance(payload, dict):
             return False
         if payload.get("type") != event_type:
-            return False
+            return reject(rejection, "$.type", "invalid_value")
         sequence_number = payload.get("sequence_number")
         if sequence_number is not None and not (
             PassThroughStreamingHandler._is_nonnegative_index(sequence_number)
         ):
-            return False
+            return reject(rejection, "$.sequence_number", "invalid_type")
 
         if event_type in ("response.created", "response.in_progress"):
             response_payload = payload.get("response")
             if not isinstance(response_payload, dict):
-                return False
+                return reject(rejection, "$.response", "invalid_type")
             if not PassThroughStreamingHandler._has_only_fields(
-                payload, {"type", "sequence_number", "response", "safety_buffering"}
+                payload, {"type", "sequence_number", "response", "safety_buffering"},
+                rejection=rejection
             ):
                 return False
             if not PassThroughStreamingHandler._has_safe_responses_metadata_extensions(
-                payload
+                payload, rejection
             ):
                 return False
             if not PassThroughStreamingHandler._has_only_fields(
-                response_payload, _RESPONSES_RESPONSE_ENVELOPE_FIELDS
+                response_payload, _RESPONSES_RESPONSE_ENVELOPE_FIELDS,
+                rejection=rejection, path="$.response"
             ):
                 return False
             if not PassThroughStreamingHandler._is_nonempty_string(
                 response_payload.get("id")
             ):
-                return False
+                return reject(rejection, "$.response.id", "invalid_value")
             if response_payload.get("status") != "in_progress":
-                return False
-            if response_payload.get("error") is not None or response_payload.get(
-                "incomplete_details"
-            ) is not None:
-                return False
+                return reject(rejection, "$.response.status", "invalid_value")
+            for key in ("error", "incomplete_details"):
+                if response_payload.get(key) is not None:
+                    return reject(rejection, "$.response." + key, "invalid_value")
             output = response_payload.get("output")
-            if not isinstance(output, list) or output:
-                return False
+            if not isinstance(output, list):
+                return reject(rejection, "$.response.output", "invalid_type")
+            if output:
+                return reject(rejection, "$.response.output", "invalid_value")
             created_at = response_payload.get("created_at")
             if created_at is not None and not (
                 PassThroughStreamingHandler._is_nonnegative_index(created_at)
             ):
-                return False
+                return reject(rejection, "$.response.created_at", "invalid_value")
             if response_payload.get("object") not in (None, "response"):
-                return False
+                return reject(rejection, "$.response.object", "invalid_value")
             model = response_payload.get("model")
             if model is not None and not isinstance(model, str):
-                return False
+                return reject(rejection, "$.response.model", "invalid_type")
             return True
 
         if event_type == "response.output_item.added":
@@ -2015,6 +2060,7 @@ class PassThroughStreamingHandler:
     def _is_responses_pre_commit_failure_shape(
         event_type: Optional[str],
         payload: Any,
+        rejection: Optional[Dict[str, str]] = None,
     ) -> bool:
         """Admit only the supported error envelopes before failure classification."""
         if (
@@ -2054,19 +2100,21 @@ class PassThroughStreamingHandler:
 
         if event_type != "response.failed" or not (
             PassThroughStreamingHandler._has_only_fields(
-                payload, {"type", "sequence_number", "response", "safety_buffering"}
+                payload, {"type", "sequence_number", "response", "safety_buffering"},
+                rejection=rejection
             )
         ):
             return False
         if not PassThroughStreamingHandler._has_safe_responses_metadata_extensions(
-            payload
+            payload, rejection
         ):
             return False
         response_payload = payload.get("response")
         if (
             not isinstance(response_payload, dict)
             or not PassThroughStreamingHandler._has_only_fields(
-                response_payload, _RESPONSES_RESPONSE_ENVELOPE_FIELDS
+                response_payload, _RESPONSES_RESPONSE_ENVELOPE_FIELDS,
+                rejection=rejection, path="$.response"
             )
             or not PassThroughStreamingHandler._is_nonempty_string(
                 response_payload.get("id")
@@ -2087,6 +2135,7 @@ class PassThroughStreamingHandler:
     @staticmethod
     def _inspect_responses_events(
         parsed_event: ParsedResponsesEvent,
+        rejection: Optional[Dict[str, str]] = None,
     ) -> tuple[str, Optional[Dict[str, Any]], Optional[str], Optional[str]]:
         """OPENAI-080: evaluate replay safety before failure classification.
 
@@ -2113,7 +2162,7 @@ class PassThroughStreamingHandler:
 
         if event_type in _RESPONSES_PRE_COMMIT_FAILURE_EVENTS and not (
             PassThroughStreamingHandler._is_responses_pre_commit_failure_shape(
-                event_type, payload
+                event_type, payload, rejection
             )
         ):
             commitment_reason = "unknown_semantics"
@@ -2125,7 +2174,7 @@ class PassThroughStreamingHandler:
             commitment_reason = "unknown_semantics"
         elif event_type not in _RECOGNIZED_PROVIDER_TERMINAL_EVENTS and not (
             PassThroughStreamingHandler._is_responses_non_substantive_lifecycle_event(
-                event_type, payload
+                event_type, payload, rejection
             )
         ):
             # This event is not in the safe allowlist.  Classify the reason.
@@ -2442,7 +2491,7 @@ class PassThroughStreamingHandler:
                 except StopAsyncIteration:
                     iterator = None
                     break
-                except httpx.ReadError as exc:
+                except (httpx.ReadError, httpx.ReadTimeout) as exc:
                     # Only this upstream read is a transport failure. Parser,
                     # prefix storage, and later remainder iteration stay raw.
                     read_failure = ResponsesStreamPreCommitFailure(
@@ -2534,7 +2583,7 @@ class PassThroughStreamingHandler:
                     )
                     if commitment_reason is not None:
                         _maybe_set_replay_latch(
-                            request, commitment_reason, event_type
+                            request, commitment_reason, event_type, parser.commitment_rejection
                         )
                         committed = _PrefixedHttpxByteStream(
                             response,
@@ -2564,7 +2613,7 @@ class PassThroughStreamingHandler:
                     pipeline.attach_to_response(prefixed)
                     # Set latch before yielding committed stream
                     _maybe_set_replay_latch(
-                        request, parser.commitment_reason, event_type
+                        request, parser.commitment_reason, event_type, parser.commitment_rejection
                     )
                     return (
                         prefixed,
@@ -2614,6 +2663,7 @@ class PassThroughStreamingHandler:
                             request,
                             commitment_reason,
                             event_type,
+                            parser.commitment_rejection,
                         )
                         committed = _PrefixedHttpxByteStream(
                             response,
@@ -2634,7 +2684,7 @@ class PassThroughStreamingHandler:
                         ),
                     )
                 _maybe_set_replay_latch(
-                    request, parser.commitment_reason, event_type
+                    request, parser.commitment_reason, event_type, parser.commitment_rejection
                 )
                 return prefixed, None
             try:
@@ -2654,7 +2704,7 @@ class PassThroughStreamingHandler:
                 commitment_reason = parser.commitment_reason
                 if commitment_reason is not None:
                     _maybe_set_replay_latch(
-                        request, commitment_reason, event_type
+                        request, commitment_reason, event_type, parser.commitment_rejection
                     )
                 return (
                     _PrefixedHttpxByteStream(response, prefix, iterator),
@@ -2710,7 +2760,7 @@ class PassThroughStreamingHandler:
             )
             pipeline.attach_to_response(prefixed)
             _maybe_set_replay_latch(
-                request, parser.commitment_reason, event_type
+                request, parser.commitment_reason, event_type, parser.commitment_rejection
             )
             return prefixed, None
         except BaseException:
@@ -5948,6 +5998,30 @@ class PassThroughStreamingHandler:
             retryable = False
             local_failure_origin = "local_policy"
         elif (
+            delivered_disposition in {"cancelled", "disconnected"}
+            and terminal_event_type is None
+            and not reconciled_provider_error
+        ):
+            cancellation_origin = (delivered_wire_disposition or {}).get(
+                "cancellation_origin"
+            )
+            error_class = (
+                "client_disconnected"
+                if cancellation_origin == "client_disconnect"
+                else "stream_cancelled"
+                if delivered_disposition == "cancelled"
+                else "transport_disconnected"
+            )
+            classification = error_class
+            retryable = False
+            local_failure_origin = (
+                "client_disconnect"
+                if cancellation_origin == "client_disconnect"
+                else "local_cancellation"
+                if delivered_disposition == "cancelled"
+                else "local_transport"
+            )
+        elif (
             delivered_disposition
             and delivered_disposition != "completed"
             and not (
@@ -5962,15 +6036,6 @@ class PassThroughStreamingHandler:
                 error_class = f"delivered_{delivered_disposition}"
                 classification = error_class
                 retryable = False
-        elif (
-            delivered_disposition == "cancelled"
-            and terminal_event_type is None
-            and not reconciled_provider_error
-        ):
-            error_class = "stream_interrupted"
-            classification = "transient_stream_interruption"
-            retryable = True
-            local_failure_origin = "local_missing_terminal"
         if (
             local_failure_origin is None
             and not recognized_terminal
@@ -6091,6 +6156,10 @@ class PassThroughStreamingHandler:
                     terminal_event_type if recognized_terminal else None
                 ),
                 "failure_origin": metadata.get("aawm_failure_origin"),
+                "cancellation_origin": (delivered_wire_disposition or {}).get(
+                    "cancellation_origin"
+                ),
+                **get_responses_replay_rejection(operational_request),
                 "replay_commitment_reason": wire_commitment.get(
                     "precommit_commitment_reason"
                 ),
@@ -6150,6 +6219,8 @@ class PassThroughStreamingHandler:
                 "attempt_count": metadata.get("attempt_count"),
                 "correlation_id": (
                     metadata.get("litellm_call_id")
+                    or kwargs.get("litellm_call_id")
+                    or getattr(litellm_logging_obj, "litellm_call_id", None)
                     or metadata.get("request_id")
                     or metadata.get("trace_id")
                 ),
@@ -6253,6 +6324,12 @@ class PassThroughStreamingHandler:
                 if isinstance(success_handler_kwargs, dict)
                 else {}
             )
+            try:
+                PassThroughStreamingHandler._ensure_streaming_metadata(kwargs).update(
+                    get_responses_replay_rejection(operational_request)
+                )
+            except Exception:
+                pass
             (
                 standard_logging_response_object,
                 kwargs,
@@ -6576,6 +6653,7 @@ def _maybe_set_replay_latch(
     request: Any,
     commitment_reason: Optional[str],
     event_type: Optional[str],
+    rejection: Optional[Dict[str, str]] = None,
 ) -> None:
     """Set the monotonic replay-commit latch when the parser detected a
     committing event and a Starlette request is available.
@@ -6592,5 +6670,7 @@ def _maybe_set_replay_latch(
             reason=commitment_reason,
             event_type=event_type,
         )
+        if rejection:
+            record_responses_replay_rejection(request, rejection)
     except Exception:
         pass

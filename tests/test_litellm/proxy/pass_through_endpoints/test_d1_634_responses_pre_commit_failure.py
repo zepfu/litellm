@@ -5796,8 +5796,9 @@ class _ReadFailingUpstream:
 
 
 @pytest.mark.asyncio
-async def test_precommit_read_error_is_transport_not_capacity():
-    upstream = _ReadFailingUpstream(httpx.ReadError("connection reset Bearer secret"))
+@pytest.mark.parametrize("error_type", [httpx.ReadError, httpx.ReadTimeout])
+async def test_precommit_read_error_is_transport_not_capacity(error_type):
+    upstream = _ReadFailingUpstream(error_type("upstream read failed Bearer secret"))
     _peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
         upstream
     )
@@ -5807,7 +5808,7 @@ async def test_precommit_read_error_is_transport_not_capacity():
     assert failure.classification == "transient_stream_interruption"
     assert failure.provider_returned is False
     assert failure.failure_origin == "local_transport"
-    assert isinstance(failure.__cause__, httpx.ReadError)
+    assert isinstance(failure.__cause__, error_type)
     assert "Bearer" not in failure.message
     http_exc = failure.as_http_exception()
     assert http_exc.status_code == 503
@@ -5949,7 +5950,16 @@ async def test_cancelled_without_terminal_keeps_reconciled_capacity_error():
 
 
 @pytest.mark.asyncio
-async def test_missing_terminal_is_local_and_not_observed_response_failed():
+@pytest.mark.parametrize(
+    ("disposition", "origin", "failure_class", "failure_origin"),
+    [
+        ("cancelled", "task_cancelled", "stream_cancelled", "local_cancellation"),
+        ("disconnected", "client_disconnect", "client_disconnected", "client_disconnect"),
+    ],
+)
+async def test_cancelled_stream_without_provider_error_is_not_retryable(
+    disposition, origin, failure_class, failure_origin
+):
     metadata: dict[str, Any] = {}
     kwargs = {"litellm_params": {"metadata": metadata}}
     logging_obj = MagicMock()
@@ -5977,14 +5987,16 @@ async def test_missing_terminal_is_local_and_not_observed_response_failed():
             terminal_event_type=None,
             terminal_payload=None,
             handler_branch_state=["initial"],
-            delivered_wire_disposition={"delivered_disposition": "cancelled"},
+            delivered_wire_disposition={"delivered_disposition": disposition, "cancellation_origin": origin},
         )
 
-    assert metadata["aawm_responses_stream_failure_class"] == "stream_interrupted"
+    assert metadata["aawm_responses_stream_failure_class"] == failure_class
+    assert metadata["aawm_responses_stream_failure_retryable"] is False
     assert metadata["provider_returned"] is False
     assert metadata["aawm_provider_terminal_event_type"] is None
-    assert metadata["aawm_failure_origin"] == "local_missing_terminal"
-    assert emitted[0]["event_type"] == "local_missing_terminal"
+    assert metadata["aawm_failure_origin"] == failure_origin
+    assert emitted[0]["event_type"] == failure_origin
+    assert emitted[0]["cancellation_origin"] == origin
     assert emitted[0]["provider_terminal_event_type"] is None
 
 
@@ -6245,6 +6257,8 @@ async def test_openai_responses_replays_safe_reasoning_prefix_once(
     ("invalid_event", "invalid_path", "invalid_value"),
     [
         (None, (), None),
+        ("all", ("response", "access_programs"), None),
+        ("response.failed", ("response", "access_programs"), None),
         ("response.created", ("response", "tool_usage", "web_search", "num_requests"), 1),
         ("response.created", ("safety_buffering",), "false"),
         ("response.failed", ("response", "tool_usage", "web_search", "num_requests"), 1),
@@ -6311,7 +6325,7 @@ async def test_current_codex_setup_envelope_preserves_capacity_retry_boundary(
                 **copy.deepcopy(extensions),
             },
         }
-        if event_type == invalid_event:
+        if event_type == invalid_event or invalid_event == "all":
             target = fields
             for key in invalid_path[:-1]:
                 target = target[key]
@@ -6329,7 +6343,9 @@ async def test_current_codex_setup_envelope_preserves_capacity_retry_boundary(
         payloads = _responses_sse_payloads(
             b"".join([bytes(chunk) async for chunk in result.body_iterator])
         )
-        if invalid_event is None:
+        if invalid_event is None or (
+            invalid_path == ("response", "access_programs") and invalid_value is None
+        ):
             assert len(sent_requests) == 2
             assert sum(p.get("type") == "response.completed" for p in payloads) == 1
             assert sum(
@@ -8476,3 +8492,218 @@ async def test_p11r1_non_completed_disposition_always_uses_ordinary_refresh() ->
     assert len(ordinary_calls) == 1, (
         f"ordinary not called exactly once for FAILED: {ordinary_calls}"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("failures", "provider_tools"), [(1, False), (3, False), (1, True)])
+async def test_precommit_read_timeout_uses_bounded_transport_retry(monkeypatch, failures, provider_tools):
+    class TimeoutStream(_ClosableAsyncByteStream):
+        async def __aiter__(self):
+            yield _responses_event("response.created", 0, response={
+                "id": "resp_timed_out", "status": "in_progress", "output": [],
+                "access_programs": None,
+            })
+            raise httpx.ReadTimeout("upstream socket idle")
+
+    ordinary_sleep = AsyncMock()
+    monkeypatch.setattr(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+        ordinary_sleep,
+    )
+    streams = [TimeoutStream([]) for _ in range(failures)]
+    if failures == 1:
+        streams.append(_ClosableAsyncByteStream(_replacement_success_stream_chunks()))
+    body = {"model": "gpt-5.4", "input": "continue"}
+    if provider_tools:
+        body["tools"] = [{"type": "web_search"}]
+    result, client, sends, used = await _start_openai_responses_stream(
+        monkeypatch, streams, custom_body=body,
+    )
+    try:
+        from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+        pte.OpenAIAlphaCapacityRetryCoordinator.sleep_with_wakeup.assert_not_awaited()
+        assert len(sends) == (1 if provider_tools else 2 if failures == 1 else 3)
+        if provider_tools:
+            assert isinstance(result, ProxyException)
+            ordinary_sleep.assert_not_awaited()
+        elif failures == 1:
+            assert not isinstance(result, Exception)
+            payloads = _responses_sse_payloads(
+                b"".join([bytes(chunk) async for chunk in result.body_iterator])
+            )
+            assert sum(p.get("type") == "response.completed" for p in payloads) == 1
+            assert not any(p.get("type") == "response.failed" for p in payloads)
+            assert not any(p.get("response", {}).get("id") == "resp_timed_out" for p in payloads)
+        else:
+            assert isinstance(result, ProxyException)
+        assert all(stream.close_calls == 1 for stream in used[:failures])
+    finally:
+        for stream in used:
+            await stream.aclose()
+        await client.aclose()
+
+
+def _rejected_setup_stream_frames(case: str, success: bool) -> list[bytes]:
+    setup = {
+        "id": "resp_replacement", "status": "in_progress", "output": [],
+    }
+    if case.startswith("unknown"):
+        key = "private_token_identifier" if case == "unknown_identifier" else "private/" + "秘密" * 500 + "\nkey"
+        setup[key] = "private_payload_value"
+    elif case == "invalid_type":
+        setup["output"] = "private_payload_value"
+    elif case == "invalid_value":
+        setup["access_programs"] = {}
+    elif case == "nonzero_usage":
+        setup["tool_usage"] = {
+            "image_gen": {
+                "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+                "input_tokens_details": {"text_tokens": 0, "image_tokens": 0},
+                "output_tokens_details": {"text_tokens": 0, "image_tokens": 0},
+            },
+            "web_search": {"num_requests": 1},
+        }
+    elif case == "missing_field":
+        setup["tool_usage"] = {"web_search": {"num_requests": 0}}
+
+    frames = [_responses_event("response.created", 0, response=setup)]
+    if success:
+        frames += _replacement_success_stream_chunks()[1:]
+    else:
+        # A later, different invalid field must not replace the setup rejection.
+        failed = {"id": "resp_replacement", "status": "failed", "output": [],
+                  "moderation": {"private_payload_value": True},
+                  "error": {"code": "server_is_overloaded", "message": "Selected model is at capacity."}}
+        frames.append(_responses_event("response.failed", 1, response=failed))
+    return frames
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "success", "broken_capture", "expected_field", "expected_reason"),
+    [
+        ("unknown_identifier", False, False, "$.response.<unknown_field>", "unknown_field"),
+        ("unknown_nonidentifier", False, False, "$.response.<unknown_field>", "unknown_field"),
+        ("invalid_type", False, False, "$.response.output", "invalid_type"),
+        ("invalid_value", False, False, "$.response.access_programs", "invalid_value"),
+        ("nonzero_usage", False, False, "$.response.tool_usage.web_search.num_requests", "nonzero_usage"),
+        ("missing_field", False, False, "$.response.tool_usage.image_gen", "missing_field"),
+        ("unknown_identifier", True, False, "$.response.<unknown_field>", "unknown_field"),
+        ("unknown_identifier", False, True, None, None),
+        ("safe", True, False, None, None),
+    ],
+)
+async def test_setup_rejection_diagnostic_follows_final_outcome(
+    monkeypatch, case, success, broken_capture, expected_field, expected_reason,
+):
+    """Real send and ASGI finalization export the first safe diagnostic only."""
+    from litellm.proxy.pass_through_endpoints import streaming_handler as sh
+
+    emitted = []
+    monkeypatch.setattr(sh, "_emit_aawm_terminal_error", lambda context, **_kw: emitted.append(dict(context)) or True)
+    success_callback = AsyncMock(return_value="success")
+    monkeypatch.setattr(sh.PassThroughStreamingHandler, "_dispatch_streaming_success_callbacks", success_callback)
+    if broken_capture:
+        monkeypatch.setattr(sh, "record_responses_replay_rejection", MagicMock(side_effect=RuntimeError("capture unavailable")))
+    result, client, sends, used = await _start_openai_responses_stream(
+        monkeypatch, [_ClosableAsyncByteStream([b"".join(_rejected_setup_stream_frames(case, success))])],
+    )
+    body = []
+
+    async def send(message):
+        if message["type"] == "http.response.body":
+            body.append(message.get("body", b""))
+
+    try:
+        assert not isinstance(result, Exception)
+        await result({"type": "http", "asgi": {"spec_version": "2.4"}}, AsyncMock(), send)
+        assert len(sends) == 1
+        payloads = _responses_sse_payloads(b"".join(body))
+        assert sum(p.get("type") == ("response.completed" if success else "response.failed") for p in payloads) == 1
+        if success:
+            success_callback.assert_awaited_once()
+            context = success_callback.await_args.kwargs["kwargs"]["litellm_params"]["metadata"]
+        else:
+            assert len(emitted) == 1
+            context = emitted[0]
+            assert context["replay_commitment_reason"] == "unknown_semantics"
+            assert context["replay_commitment_event_type"] == "response.created"
+        diagnostic = {k: context[k] for k in ("replay_rejected_field", "replay_rejection_reason") if k in context}
+        assert diagnostic == ({} if expected_field is None else {
+            "replay_rejected_field": expected_field,
+            "replay_rejection_reason": expected_reason,
+        })
+        encoded = json.dumps(diagnostic).encode("ascii")
+        assert len(encoded) <= 256
+        assert b"private" not in encoded
+        if diagnostic:
+            assert len(expected_field) <= 128
+            assert len(expected_field.split(".")) <= 8
+    finally:
+        for stream in used:
+            await stream.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("abort", ["client_disconnect", "client_send_error", "task_cancelled"])
+async def test_responses_asgi_disconnect_preserves_transport_origin(abort):
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+        OpenAIResponsesStreamingResponse,
+        OpenAIResponsesWireCoordinator,
+        OpenAIResponsesWireTrace,
+    )
+
+    body_sent = asyncio.Event()
+    source_closed = asyncio.Event()
+    stopped = asyncio.Event()
+    snapshots = []
+
+    async def source():
+        try:
+            yield _response_event("response.created", 0, response_id="resp_disconnect", status="in_progress")
+            await stopped.wait()
+        finally:
+            source_closed.set()
+
+    trace = OpenAIResponsesWireTrace()
+    coordinator = OpenAIResponsesWireCoordinator(source(), trace=trace)
+    trace._finalize_transport = coordinator.finalize_transport
+
+    async def record(snapshot):
+        snapshots.append(snapshot)
+
+    trace.register_post_finalization_callback(record)
+    response = OpenAIResponsesStreamingResponse(coordinator, wire_trace=trace)
+
+    async def receive():
+        await body_sent.wait()
+        if abort == "client_disconnect":
+            return {"type": "http.disconnect"}
+        await stopped.wait()
+
+    async def send(message):
+        if message["type"] == "http.response.body" and message.get("body"):
+            body_sent.set()
+            if abort == "client_send_error":
+                raise BrokenPipeError("peer closed the response socket")
+
+    spec = "2.4" if abort == "client_send_error" else "2.3"
+    task = asyncio.create_task(response({"type": "http", "asgi": {"spec_version": spec}}, receive, send))
+    await asyncio.wait_for(body_sent.wait(), timeout=2)
+    if abort == "task_cancelled":
+        task.cancel()
+    if abort == "client_disconnect":
+        await asyncio.wait_for(task, timeout=2)
+    elif abort == "client_send_error":
+        from starlette.requests import ClientDisconnect
+        with pytest.raises(ClientDisconnect):
+            await asyncio.wait_for(task, timeout=2)
+    else:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2)
+    assert source_closed.is_set()
+    assert len(snapshots) == 1
+    assert snapshots[0]["disposition"] == ("cancelled" if abort == "task_cancelled" else "disconnected")
+    assert snapshots[0]["cancellation_origin"] == abort
+    assert snapshots[0]["terminal_sent"] is False
