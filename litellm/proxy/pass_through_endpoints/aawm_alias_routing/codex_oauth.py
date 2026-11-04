@@ -1727,12 +1727,19 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
         session_affinity as _sa,
     )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        candidate_loop as _aawm_alias_candidate_loop,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_state import (
+        _set_codex_auto_agent_session_affinity,
+    )
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_build import (
         _aawm_auto_agent_audit_request_has_account_bound_state,
         _codex_auto_agent_request_has_continuation_state,
     )
     from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
         _merge_litellm_metadata,
+        _resolve_codex_auto_agent_session_key,
         _safe_set_request_parsed_body,
     )
 
@@ -1826,6 +1833,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     if token_affinity is not None and not portable_replay_failover:
         planned_portable_failover = False
     owner_affinity: Optional[dict[str, Any]] = None
+    owner_record_for_failover: Optional[dict[str, Any]] = None
     has_account_bound_state = token_affinity is not None
     if session_identity is not None and not planned_portable_failover:
         has_body_continuation_state = _codex_auto_agent_request_has_continuation_state(body)
@@ -1902,6 +1910,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                 request=request,
             )
         if owner_error is None and isinstance(owner_record, dict):
+            owner_record_for_failover = owner_record
             owner_affinity = _direct_codex_oauth_affinity_from_session_owner(
                 _sa.owner_record_as_affinity_hint(
                     owner_record,
@@ -2027,6 +2036,137 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     )
 
     if selected_state is None:
+        pinned_state = None
+        if affinity_selection_reason == "session_owner_pin":
+            pinned_state = next(
+                (
+                    state
+                    for state in selection_states
+                    if state.get("skip_reason") == "quota_exhausted"
+                ),
+                None,
+            )
+        replay_safe_preselection_failover = bool(
+            pinned_state is not None
+            and interchangeable_accounts
+            and token_affinity is None
+            and _sa.is_replay_safe_session_owner_redispatch_body(body)
+        )
+        if replay_safe_preselection_failover:
+            pinned_candidate = pinned_state.get("candidate")
+            if isinstance(pinned_candidate, dict):
+                attempt_record = {
+                    "failure_phase": "direct_inventory_selection",
+                    "attempted_provider_call": False,
+                    "provider_returned": False,
+                    "admission_decision": "confirmed_exhausted",
+                    "admission_account_hash": pinned_candidate.get(
+                        "codex_oauth_account_hash"
+                    ),
+                    "quota_windows": pinned_state.get("quota_exhausted_windows"),
+                    "error_code": "usage_limit_reached",
+                }
+                planned = _selection._plan_codex_oauth_account_failover(
+                    request,
+                    candidate=pinned_candidate,
+                    selection=pinned_state,
+                    attempt_record=attempt_record,
+                    error_class="usage_limit_reached",
+                    has_continuation_state=True,
+                    has_previous_response_id=bool(body.get("previous_response_id")),
+                    has_account_bound_state=has_account_bound_state,
+                    account_failover_replay_safe=True,
+                    provider_status_code=429,
+                )
+                if planned:
+                    setattr(
+                        request.state,
+                        "_aawm_direct_codex_account_failover_planned",
+                        True,
+                    )
+                    retry_auth, retry_selection, retry_metadata = (
+                        await select_and_bind_direct_codex_oauth_inventory(
+                            request,
+                            request_body=body,
+                        )
+                    )
+                    alternate_candidate = retry_selection.get("candidate")
+                    source_owner_id = (
+                        owner_record_for_failover.get("owner")
+                        if isinstance(owner_record_for_failover, dict)
+                        else None
+                    )
+                    source_attributes = (
+                        owner_record_for_failover.get("attributes")
+                        if isinstance(owner_record_for_failover, dict)
+                        else None
+                    )
+                    if (
+                        isinstance(alternate_candidate, dict)
+                        and isinstance(source_owner_id, str)
+                        and source_owner_id
+                        and isinstance(source_attributes, Mapping)
+                        and _aawm_alias_candidate_loop._is_native_openai_responses_candidate(
+                            request=request,
+                            candidate=alternate_candidate,
+                        )
+                    ):
+                        destination_model = _clean_codex_auth_value(
+                            alternate_candidate.get("model")
+                        ) or model
+                        destination_attributes = _sa.build_session_owner_attributes(
+                            provider="openai",
+                            model=destination_model,
+                            route_family=(
+                                alternate_candidate.get("route_family")
+                                or "codex_responses"
+                            ),
+                            endpoint_contract=(
+                                alternate_candidate.get("route_family")
+                                or "codex_responses"
+                            ),
+                            state_format=(
+                                alternate_candidate.get("route_family")
+                                or "codex_responses"
+                            ),
+                            ingress="pass_through_request",
+                            requested_model=body.get("model"),
+                            account_label=alternate_candidate.get(
+                                "codex_oauth_account_label"
+                            ),
+                            account_hash=alternate_candidate.get(
+                                "codex_oauth_account_hash"
+                            ),
+                            account_lane=alternate_candidate.get(
+                                "codex_oauth_lane_key"
+                            ),
+                            credential_affinity=alternate_candidate.get(
+                                "codex_oauth_credential_affinity"
+                            ),
+                            candidate=alternate_candidate,
+                        )
+                        session_key = _resolve_codex_auto_agent_session_key(
+                            request,
+                            body,
+                            alias_model=destination_model,
+                        )
+                        _aawm_alias_candidate_loop._stage_native_openai_responses_affinity_commitment(
+                            request=request,
+                            session_key=session_key,
+                            candidate=alternate_candidate,
+                            setter=_set_codex_auto_agent_session_affinity,
+                            canonical_owner_transition={
+                                "session_identity": session_identity,
+                                "source_owner_id": source_owner_id,
+                                "source_attributes": dict(source_attributes),
+                                "destination_attributes": destination_attributes,
+                                "authorization": "codex_oauth_portable_account_failover",
+                                "failover_ordinal": int(
+                                    retry_selection.get("failover_ordinal") or 1
+                                ),
+                            },
+                        )
+                    return retry_auth, retry_selection, retry_metadata
         unavailable_message = (
             "All enabled Codex OAuth inventory accounts are currently cooled "
             "down or unavailable for direct Responses traffic."
@@ -2081,6 +2221,21 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                     "selection_reason": affinity_selection_reason,
                     "alternate_accounts_considered": False,
                     "continuation_portable": False,
+                    "account": {
+                        key: value
+                        for key, value in {
+                            "account_label": affinity.get(
+                                "codex_oauth_account_label"
+                            ),
+                            "account_hash": affinity.get(
+                                "codex_oauth_account_hash"
+                            ),
+                            "account_lane": affinity.get(
+                                "codex_oauth_lane_key"
+                            ),
+                        }.items()
+                        if value is not None
+                    },
                 }
             )
         raise HTTPException(status_code=429, detail=detail)

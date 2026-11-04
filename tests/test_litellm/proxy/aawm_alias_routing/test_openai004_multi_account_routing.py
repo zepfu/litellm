@@ -3932,6 +3932,83 @@ async def test_direct_responses_fails_closed_when_interchangeable_session_owner_
 
 
 @pytest.mark.asyncio
+async def test_direct_responses_moves_replay_safe_interchangeable_owner_after_quota_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded = _patch_direct_inventory_auth(
+        monkeypatch,
+        inventory=_interchangeable_inventory(),
+    )
+    request = _direct_request()
+    body = {
+        "model": "gpt-5.3-codex",
+        "input": "continue",
+    }
+
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+
+    async def _owned(**_kwargs):
+        return (_owned_interchangeable_record("account2"), "cache-key", None)
+
+    monkeypatch.setattr(
+        sa,
+        "resolve_canonical_session_identity",
+        lambda *a, **k: "sess-direct-owner",
+    )
+    monkeypatch.setattr(sa, "get_session_owner_record", _owned)
+    now = datetime.now(timezone.utc)
+    alias_routing_state.reset_for_tests()
+    alias_routing_state.record_normalized_quota_observations(
+        [
+            _quota_observation(
+                account_hash="hash-account-2",
+                observed_at=now,
+                reset_at=now + timedelta(hours=2),
+                quota_period="five_hour",
+                window_minutes=300,
+                exhausted=True,
+                remaining_pct=0.0,
+            ),
+            _quota_observation(
+                account_hash="hash-account-1",
+                observed_at=now,
+                reset_at=now + timedelta(hours=2),
+                quota_period="five_hour",
+                window_minutes=300,
+                exhausted=False,
+                remaining_pct=90.0,
+            ),
+        ]
+    )
+    try:
+        selected_auth, selection, _metadata_body = (
+            await codex_oauth.select_and_bind_direct_codex_oauth_inventory(
+                request,
+                request_body=body,
+            )
+        )
+    finally:
+        alias_routing_state.reset_for_tests()
+
+    assert selected_auth.account_label == "account1"
+    assert selection["selection_reason"] == "codex_oauth_account_failover"
+    assert selection["failover_ordinal"] == 1
+    assert selection["prior_account_outcome"]["account_label"] == "account2"
+    assert set(loaded) == {"account1", "account2"}
+    pending = getattr(
+        request.state,
+        "_aawm_native_openai_responses_affinity_commitment",
+        None,
+    )
+    assert pending["canonical_owner_transition"]["source_owner_id"] == "owner-1"
+    assert pending["canonical_owner_transition"]["destination_attributes"][
+        "account_hash"
+    ] == "hash-account-1"
+
+
+@pytest.mark.asyncio
 async def test_direct_responses_respects_request_metadata_account_pin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
