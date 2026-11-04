@@ -150,6 +150,13 @@ def test_should_price_cursor_grok_47_at_the_256k_and_500k_boundaries(catalog):
         completion_tokens=1_000,
         usage_obj={"cache_read_input_tokens": 0},
     )
+    long_context_tier_at_boundary = aawm_agent_identity.resolve_aawm_reference_pricing(
+        provider="cursor_agent",
+        model="cursor-grok-4.7-high",
+        prompt_tokens=256_001,
+        completion_tokens=1_000,
+        usage_obj={"cache_read_input_tokens": 0},
+    )
     long_context_tier = aawm_agent_identity.resolve_aawm_reference_pricing(
         provider="cursor_agent",
         model="cursor-grok-4.7-high",
@@ -166,10 +173,14 @@ def test_should_price_cursor_grok_47_at_the_256k_and_500k_boundaries(catalog):
     )
 
     assert base_tier is not None
+    assert long_context_tier_at_boundary is not None
     assert long_context_tier is not None
     assert over_context_limit is not None
     assert base_tier["reference_cost_total_usd"] == pytest.approx(
         (256_000 * 2.0 + 1_000 * 6.0) / 1_000_000
+    )
+    assert long_context_tier_at_boundary["reference_cost_total_usd"] == pytest.approx(
+        (256_001 * 4.0 + 1_000 * 12.0) / 1_000_000
     )
     assert long_context_tier["reference_cost_total_usd"] == pytest.approx(
         (500_000 * 4.0 + 1_000 * 12.0) / 1_000_000

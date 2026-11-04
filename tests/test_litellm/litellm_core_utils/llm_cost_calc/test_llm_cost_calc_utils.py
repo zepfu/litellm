@@ -352,6 +352,36 @@ def test_generic_cost_per_token_gpt6_astra_above_272k_with_prompt_caching():
     assert round(completion_cost, 10) == round(1000 * 7.5e-05, 10)
 
 
+def test_generic_cost_per_token_gpt6_astra_above_272k_with_one_hour_prompt_caching():
+    model = "gpt-6-astra"
+    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    litellm.model_cost = litellm.get_model_cost_map(url="")
+
+    usage = Usage(
+        prompt_tokens=273000,
+        completion_tokens=1000,
+        total_tokens=274000,
+        prompt_tokens_details=PromptTokensDetailsWrapper(
+            cached_tokens=1000,
+            text_tokens=270000,
+            cache_creation_tokens=2000,
+            cache_creation_token_details=CacheCreationTokenDetails(
+                ephemeral_5m_input_tokens=0,
+                ephemeral_1h_input_tokens=2000,
+            ),
+        ),
+    )
+    prompt_cost, completion_cost = generic_cost_per_token(
+        model=model,
+        usage=usage,
+        custom_llm_provider="openai",
+    )
+
+    expected_prompt_cost = 270000 * 2e-05 + 1000 * 2e-06 + 2000 * 5e-05
+    assert round(prompt_cost, 10) == round(expected_prompt_cost, 10)
+    assert round(completion_cost, 10) == round(1000 * 7.5e-05, 10)
+
+
 def test_generic_cost_per_token_anthropic_prompt_caching():
     model = "claude-sonnet-4@20250514"
     usage = Usage(

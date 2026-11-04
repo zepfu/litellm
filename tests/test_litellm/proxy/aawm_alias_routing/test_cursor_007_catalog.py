@@ -215,8 +215,8 @@ class TestCursorAgentCatalogIdentity:
         assert composer["cache_mode"] == "provider_cache_read"
         assert cursor_grok["cache_mode"] == "provider_cache_read"
         assert catalog[_CURSOR_GROK_MODEL]["max_input_tokens"] == 500000
-        assert catalog[_CURSOR_GROK_MODEL]["max_output_tokens"] == 500000
-        assert catalog[_CURSOR_GROK_MODEL]["max_tokens"] == 500000
+        assert catalog[_CURSOR_GROK_MODEL]["max_output_tokens"] == 200000
+        assert catalog[_CURSOR_GROK_MODEL]["max_tokens"] == 200000
         assert cursor_grok["rate_schedule"] == {
             "meter": "input_tokens",
             "tiers": [

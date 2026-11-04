@@ -579,7 +579,7 @@ def test_gpt_6_astra_pricing_and_runtime_model_info(monkeypatch):
                     model_info["cache_creation_input_token_cost_above_1hr"] == 2.5e-5
                 )
                 assert (
-                    model_info["cache_creation_input_token_cost_above_1hr_above_200k_tokens"]
+                    model_info["cache_creation_input_token_cost_above_1hr_above_272k_tokens"]
                     == 5e-5
                 )
 
@@ -592,6 +592,10 @@ def test_gpt_6_astra_pricing_and_runtime_model_info(monkeypatch):
     assert (
         runtime_model_info["cache_creation_input_token_cost_above_272k_tokens"]
         == 2.5e-05
+    )
+    assert (
+        runtime_model_info["cache_creation_input_token_cost_above_1hr_above_272k_tokens"]
+        == 5e-05
     )
     assert supports_max_reasoning_effort("gpt-6-astra") is True
 
@@ -890,6 +894,9 @@ def test_aaamodel_prices_and_context_window_json_is_valid():
                 "cache_read_input_token_cost_above_200k_tokens": {"type": "number"},
                 "cache_read_input_token_cost_above_272k_tokens": {"type": "number"},
                 "cache_creation_input_token_cost_above_1hr_above_200k_tokens": {"type": "number"},
+                "cache_creation_input_token_cost_above_1hr_above_272k_tokens": {
+                    "type": "number"
+                },
                 "cache_read_input_audio_token_cost": {"type": "number"},
                 "cache_read_input_token_cost_per_audio_token": {"type": "number"},
                 "cache_read_input_image_token_cost": {"type": "number"},

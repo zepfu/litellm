@@ -20620,7 +20620,7 @@
             "top_p"
         ],
         "cache_creation_input_token_cost_above_1hr": 2.5e-05,
-        "cache_creation_input_token_cost_above_1hr_above_200k_tokens": 5e-05
+        "cache_creation_input_token_cost_above_1hr_above_272k_tokens": 5e-05
     },
     "gpt-6-sol": {
         "cache_creation_input_token_cost": 2.5e-06,
@@ -20671,7 +20671,7 @@
             "top_p"
         ],
         "cache_creation_input_token_cost_above_1hr": 5e-06,
-        "cache_creation_input_token_cost_above_1hr_above_200k_tokens": 1e-05
+        "cache_creation_input_token_cost_above_1hr_above_272k_tokens": 1e-05
     },
     "gpt-6.1-sol": {
         "cache_creation_input_token_cost": 2.5e-06,
@@ -20722,7 +20722,7 @@
             "top_p"
         ],
         "cache_creation_input_token_cost_above_1hr": 5e-06,
-        "cache_creation_input_token_cost_above_1hr_above_200k_tokens": 1e-05
+        "cache_creation_input_token_cost_above_1hr_above_272k_tokens": 1e-05
     },
     "gpt-6-luna": {
         "cache_creation_input_token_cost": 1.25e-07,
@@ -20773,7 +20773,7 @@
             "top_p"
         ],
         "cache_creation_input_token_cost_above_1hr": 2.5e-07,
-        "cache_creation_input_token_cost_above_1hr_above_200k_tokens": 5e-07
+        "cache_creation_input_token_cost_above_1hr_above_272k_tokens": 5e-07
     },
     "gpt-5.6-luna": {
         "litellm_provider": "openai",
@@ -20841,7 +20841,7 @@
         "cache_creation_input_token_cost_above_272k_tokens": 5e-06,
         "output_cost_per_token_above_272k_tokens": 1.8e-05,
         "cache_creation_input_token_cost_above_1hr": 5e-06,
-        "cache_creation_input_token_cost_above_1hr_above_200k_tokens": 1e-05
+        "cache_creation_input_token_cost_above_1hr_above_272k_tokens": 1e-05
     },
     "gpt-5.4-2026-03-05": {
         "cache_read_input_token_cost": 2.5e-07,
@@ -42756,7 +42756,7 @@
             "top_p"
         ],
         "cache_creation_input_token_cost_above_1hr": 2.5e-06,
-        "cache_creation_input_token_cost_above_1hr_above_200k_tokens": 5e-06
+        "cache_creation_input_token_cost_above_1hr_above_272k_tokens": 5e-06
     },
     "alibaba_token_plan/qwen3.8-flash": {
         "comment": "Alibaba Token Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",
@@ -43002,8 +43002,8 @@
         "comment": "Cursor Agent CLI Cursor Grok 4.7 high-effort. Distinct from oa_xai/grok-4.6 and xai/grok-4.6. Public Cursor list rates are reference-only; Cursor Models pool / subscription invoice cost is unknown. Temporary 50% Grok 4.7 launch discount is not baked in.",
         "litellm_provider": "cursor_agent",
         "max_input_tokens": 500000,
-        "max_output_tokens": 500000,
-        "max_tokens": 500000,
+        "max_output_tokens": 200000,
+        "max_tokens": 200000,
         "mode": "chat",
         "namespace_tool_function_adapters": {
             "collaboration": [
