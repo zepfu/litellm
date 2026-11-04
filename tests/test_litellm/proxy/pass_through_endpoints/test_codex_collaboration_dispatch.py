@@ -140,3 +140,35 @@ def test_should_preserve_provider_owned_opaque_single_part_agent_message(message
 
     assert result is body
     assert result["input"][0]["content"][0]["text"].endswith(payload)
+
+
+@pytest.mark.parametrize("message_type", ["NEW_TASK", "MESSAGE"])
+def test_should_materialize_readable_plaintext_agent_message(message_type):
+    """The stock collaboration layer sends readable text in encrypted_content."""
+    payload = "Review the current published revision and report any required remediation."
+    header = (
+        f"Message Type: {message_type}\n"
+        "Task name: /root/child\n"
+        "Sender: /root\n"
+        "Payload:\n"
+    )
+    body = {
+        "input": [
+            {
+                "type": "agent_message",
+                "author": "/root",
+                "recipient": "/root/child",
+                "content": [
+                    {"type": "input_text", "text": header},
+                    {"type": "encrypted_content", "encrypted_content": payload},
+                ],
+            }
+        ]
+    }
+
+    result = normalize_codex_collaboration_dispatch_body(body)
+
+    assert result is not body
+    assert result["input"][0]["content"] == [
+        {"type": "input_text", "text": header + payload}
+    ]

@@ -1655,7 +1655,7 @@ def _normalize_codex_message_payload(
     assignment = (
         parse_codex_collaboration_text_frame(normalized_payload)
         if normalized_payload is not None
-        else parse_codex_collaboration_text_frame(payload)
+        else _parse_codex_collaboration_payload(payload)
     )
     normalized_item = _NormalizedCodexAgentMessage(item)
     normalized_item["content"] = [
@@ -1757,7 +1757,7 @@ def _normalize_agent_message_item(
             raise CodexCollaborationDispatchError("invalid_envelope")
         if _is_provider_owned_opaque_representation(payload):
             return item, False
-        assignment = parse_codex_collaboration_text_frame(payload)
+        assignment = _parse_codex_collaboration_payload(payload)
         normalized_item = _NormalizedCodexAgentMessage(item)
         normalized_item["content"] = [
             {
