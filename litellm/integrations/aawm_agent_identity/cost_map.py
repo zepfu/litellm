@@ -116,6 +116,62 @@ def _extract_aawm_cached_input_tokens(usage_obj: Any) -> Optional[int]:
     return None
 
 
+def _extract_aawm_cache_write_input_tokens(usage_obj: Any) -> Optional[int]:
+    for key in (
+        "cache_write_input_tokens",
+        "cache_creation_input_tokens",
+        "cacheWriteInputTokens",
+        "cacheWriteInputTokenCount",
+        "cacheCreationInputTokens",
+    ):
+        value = _safe_int(_maybe_get(usage_obj, key))
+        if value is not None and value >= 0:
+            return value
+
+    prompt_tokens_details = _maybe_get(usage_obj, "prompt_tokens_details")
+    for key in (
+        "cache_write_tokens",
+        "cache_creation_input_tokens",
+        "cacheWriteTokens",
+        "cacheWriteInputTokens",
+    ):
+        value = _safe_int(_maybe_get(prompt_tokens_details, key))
+        if value is not None and value >= 0:
+            return value
+    return None
+
+
+def _extract_aawm_cache_read_kind(usage_obj: Any) -> Optional[str]:
+    values = [
+        _maybe_get(usage_obj, key)
+        for key in (
+            "cache_read_kind",
+            "cache_read_type",
+            "cache_kind",
+            "cache_type",
+        )
+    ]
+    prompt_tokens_details = _maybe_get(usage_obj, "prompt_tokens_details")
+    values.extend(
+        _maybe_get(prompt_tokens_details, key)
+        for key in (
+            "cache_read_kind",
+            "cache_read_type",
+            "cache_kind",
+            "cache_type",
+        )
+    )
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        normalized = value.strip().lower().replace("-", "_")
+        if normalized in {"implicit", "implicit_cache", "implicit_cache_read"}:
+            return "implicit"
+        if normalized in {"explicit", "explicit_cache", "explicit_cache_read"}:
+            return "explicit"
+    return None
+
+
 def _aawm_reference_rate(
     rates: Dict[str, Any],
     *,
@@ -147,6 +203,18 @@ def _aawm_reference_rate(
                 "cache_read_input_token_cost",
             ),
         ),
+        "cache_write": (
+            (
+                "cache_write_usd_per_million_tokens",
+                "cache_write_cost_per_million_tokens",
+                "explicit_cache_write_usd_per_million_tokens",
+            ),
+            (
+                "cache_write_usd_per_token",
+                "cache_write_cost_per_token",
+                "explicit_cache_write_usd_per_token",
+            ),
+        ),
     }
     per_million_keys, per_token_keys = rate_aliases[component]
     for key in per_million_keys:
@@ -160,6 +228,82 @@ def _aawm_reference_rate(
     return None
 
 
+def _aawm_reference_cache_read_rate(
+    rates: Dict[str, Any],
+    *,
+    cache_kind: Optional[str],
+) -> Optional[Tuple[float, str]]:
+    kind_rate_aliases = {
+        "implicit": (
+            (
+                "implicit_cache_read_usd_per_million_tokens",
+                "implicit_cache_read_cost_per_million_tokens",
+            ),
+            (
+                "implicit_cache_read_usd_per_token",
+                "implicit_cache_read_cost_per_token",
+            ),
+        ),
+        "explicit": (
+            (
+                "explicit_cache_read_usd_per_million_tokens",
+                "explicit_cache_read_cost_per_million_tokens",
+            ),
+            (
+                "explicit_cache_read_usd_per_token",
+                "explicit_cache_read_cost_per_token",
+            ),
+        ),
+    }
+    has_implicit_rates = any(
+        key in rates
+        for key_group in kind_rate_aliases["implicit"]
+        for key in key_group
+    )
+    has_explicit_rates = any(
+        key in rates
+        for key_group in kind_rate_aliases["explicit"]
+        for key in key_group
+    )
+    has_kind_specific_rates = has_implicit_rates or has_explicit_rates
+    has_distinct_kind_rates = has_implicit_rates and has_explicit_rates
+    if cache_kind is None and has_distinct_kind_rates:
+        return None
+    if cache_kind in kind_rate_aliases:
+        per_million_keys, per_token_keys = kind_rate_aliases[cache_kind]
+        for key in per_million_keys:
+            value = _safe_float(rates.get(key))
+            if value is not None and value >= 0:
+                return value, "per_million"
+        for key in per_token_keys:
+            value = _safe_float(rates.get(key))
+            if value is not None and value >= 0:
+                return value, "per_token"
+        if has_kind_specific_rates:
+            return None
+    if cache_kind is None and has_implicit_rates:
+        per_million_keys, per_token_keys = kind_rate_aliases["implicit"]
+        for key in per_million_keys:
+            value = _safe_float(rates.get(key))
+            if value is not None and value >= 0:
+                return value, "per_million"
+        for key in per_token_keys:
+            value = _safe_float(rates.get(key))
+            if value is not None and value >= 0:
+                return value, "per_token"
+    if cache_kind is None and has_explicit_rates:
+        per_million_keys, per_token_keys = kind_rate_aliases["explicit"]
+        for key in per_million_keys:
+            value = _safe_float(rates.get(key))
+            if value is not None and value >= 0:
+                return value, "per_million"
+        for key in per_token_keys:
+            value = _safe_float(rates.get(key))
+            if value is not None and value >= 0:
+                return value, "per_token"
+    return _aawm_reference_rate(rates, component="cache_read")
+
+
 def _aawm_reference_component_cost(
     rates: Dict[str, Any],
     *,
@@ -167,6 +311,14 @@ def _aawm_reference_component_cost(
     tokens: int,
 ) -> Optional[float]:
     rate = _aawm_reference_rate(rates, component=component)
+    return _aawm_reference_cost_from_rate(rate, tokens=tokens)
+
+
+def _aawm_reference_cost_from_rate(
+    rate: Optional[Tuple[float, str]],
+    *,
+    tokens: int,
+) -> Optional[float]:
     if rate is None:
         return None
     value, unit = rate
@@ -324,21 +476,37 @@ def resolve_aawm_reference_pricing(  # noqa: PLR0915
     prompt_tokens = max(_safe_int(prompt_tokens) or 0, 0)
     completion_tokens = max(_safe_int(completion_tokens) or 0, 0)
     cached_input_tokens = _extract_aawm_cached_input_tokens(usage_obj)
+    cache_write_input_tokens = _extract_aawm_cache_write_input_tokens(usage_obj)
+    cache_read_kind = _extract_aawm_cache_read_kind(usage_obj)
     cache_mode = contract.get("cache_mode")
     if cache_mode == "none":
-        if cached_input_tokens not in (None, 0):
+        if cached_input_tokens not in (None, 0) or cache_write_input_tokens not in (
+            None,
+            0,
+        ):
             metadata["reference_cost_status"] = "unpriced"
             metadata["reference_cost_unpriced_reason"] = (
                 "cache_reported_for_uncached_route"
             )
             return metadata
         cached_input_tokens = 0
-    elif cache_mode == "provider_cache_read":
+        cache_write_input_tokens = 0
+    elif cache_mode in {
+        "cache_read",
+        "provider_cache_read",
+        "provider_cache_read_write",
+    }:
         if cached_input_tokens is None:
             metadata["reference_cost_status"] = "unpriced"
             metadata["reference_cost_unpriced_reason"] = "cache_token_count_unknown"
             return metadata
         cached_input_tokens = min(cached_input_tokens, prompt_tokens)
+        if cache_write_input_tokens is None:
+            cache_write_input_tokens = 0
+        cache_write_input_tokens = min(
+            cache_write_input_tokens,
+            max(prompt_tokens - cached_input_tokens, 0),
+        )
     else:
         metadata["reference_cost_status"] = "unpriced"
         metadata["reference_cost_unpriced_reason"] = "unsupported_cache_mode"
@@ -375,7 +543,59 @@ def resolve_aawm_reference_pricing(  # noqa: PLR0915
     if isinstance(selected_rates.get("rates"), dict):
         selected_rates = selected_rates["rates"]
 
-    uncached_input_tokens = prompt_tokens - (cached_input_tokens or 0)
+    cache_write_mode = cache_mode == "provider_cache_read_write"
+    if cache_write_input_tokens and not cache_write_mode:
+        metadata["reference_cost_status"] = "unpriced"
+        metadata["reference_cost_unpriced_reason"] = (
+            "cache_write_reported_for_read_only_route"
+        )
+        return metadata
+
+    cache_read_rate = None
+    if cached_input_tokens:
+        cache_read_rate = _aawm_reference_cache_read_rate(
+            selected_rates,
+            cache_kind=cache_read_kind,
+        )
+        if cache_read_rate is None:
+            metadata["reference_cost_status"] = "unpriced"
+            metadata["reference_cost_unpriced_reason"] = (
+                "cache_read_kind_unknown"
+                if cache_read_kind is None
+                and any(
+                    key in selected_rates
+                    for key in (
+                        "implicit_cache_read_usd_per_million_tokens",
+                        "implicit_cache_read_cost_per_million_tokens",
+                        "implicit_cache_read_usd_per_token",
+                        "implicit_cache_read_cost_per_token",
+                        "explicit_cache_read_usd_per_million_tokens",
+                        "explicit_cache_read_cost_per_million_tokens",
+                        "explicit_cache_read_usd_per_token",
+                        "explicit_cache_read_cost_per_token",
+                    )
+                )
+                else "reference_rates_incomplete"
+            )
+            return metadata
+
+    cache_write_cost = 0.0
+    if cache_write_input_tokens:
+        cache_write_cost = _aawm_reference_component_cost(
+            selected_rates,
+            component="cache_write",
+            tokens=cache_write_input_tokens,
+        )
+        if cache_write_cost is None:
+            metadata["reference_cost_status"] = "unpriced"
+            metadata["reference_cost_unpriced_reason"] = (
+                "cache_write_rates_incomplete"
+            )
+            return metadata
+
+    uncached_input_tokens = prompt_tokens - (cached_input_tokens or 0) - (
+        cache_write_input_tokens or 0
+    )
     input_cost = _aawm_reference_component_cost(
         selected_rates,
         component="input",
@@ -386,12 +606,21 @@ def resolve_aawm_reference_pricing(  # noqa: PLR0915
         component="output",
         tokens=completion_tokens,
     )
-    if cache_mode == "provider_cache_read":
-        cache_cost = _aawm_reference_component_cost(
-            selected_rates,
-            component="cache_read",
+    if cache_mode in {
+        "cache_read",
+        "provider_cache_read",
+        "provider_cache_read_write",
+    } and cached_input_tokens:
+        cache_cost = _aawm_reference_cost_from_rate(
+            cache_read_rate,
             tokens=cached_input_tokens or 0,
         )
+    elif cache_mode in {
+        "cache_read",
+        "provider_cache_read",
+        "provider_cache_read_write",
+    }:
+        cache_cost = 0.0
     else:
         cache_cost = 0.0
     if input_cost is None or output_cost is None or cache_cost is None:
@@ -399,16 +628,20 @@ def resolve_aawm_reference_pricing(  # noqa: PLR0915
         metadata["reference_cost_unpriced_reason"] = "reference_rates_incomplete"
         return metadata
 
-    total_cost = input_cost + cache_cost + output_cost
+    total_cost = input_cost + cache_cost + cache_write_cost + output_cost
     metadata.update(
         {
             "reference_cost_uncached_input_usd": input_cost,
             "reference_cost_cached_input_usd": cache_cost,
+            "reference_cost_cache_read_kind": cache_read_kind,
+            "reference_cost_cache_write_input_tokens": cache_write_input_tokens or 0,
+            "reference_cost_cache_write_usd": cache_write_cost,
             "reference_cost_output_usd": output_cost,
             "reference_cost_total_usd": total_cost,
             "reference_cost_components": {
                 "uncached_input_usd": input_cost,
                 "cached_input_usd": cache_cost,
+                "cache_write_usd": cache_write_cost,
                 "output_usd": output_cost,
                 "total_usd": total_cost,
             },
@@ -423,8 +656,12 @@ _HOST_FUNCTION_NAMES = (
     "_lookup_bundled_model_cost_info",
     "_calculate_response_cost_from_bundled_model_cost_map",
     "_extract_aawm_cached_input_tokens",
+    "_extract_aawm_cache_write_input_tokens",
+    "_extract_aawm_cache_read_kind",
     "_aawm_reference_rate",
+    "_aawm_reference_cache_read_rate",
     "_aawm_reference_component_cost",
+    "_aawm_reference_cost_from_rate",
     "resolve_aawm_reference_pricing",
 )
 

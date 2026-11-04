@@ -1033,20 +1033,28 @@ integration and Anthropic testing or acceptance are outside Cohere work.
 Migration, deployment, and authenticated acceptance have not been performed
 and remain separately authorized.
 
-The 2026-08-12 catalog includes the current undiscounted international Alibaba
-Cloud Model Studio direct list rates as references: Qwen 3.6 uses the base
-`$0.25/$1.50` per million input/output tier through 256000 whole-request input
-tokens and `$1/$4` above that; output tokens do not select the tier. Qwen 3.7
-uses `$2.50/$7.50`, and Alibaba DeepSeek V4 Pro uses `$2.40/$4.80`. These
+The 2026-11-04 catalog includes undiscounted Alibaba Cloud Model Studio direct
+list rates as references. Qwen 3.8 Max uses
+`$2/$0.25/$0.17/$2.50/$6` per million input, implicit-cache-read,
+explicit-cache-read, explicit-cache-write, and output tokens. Qwen 3.7 Max
+uses `$2.50/$0.25/$0.25/$3.125/$7.50`, and Qwen 3.8 Flash uses
+`$0.15/$0.016/$0.016/$0.20/$0.47`. The retained Qwen 3.6 Flash schedule uses
+`$0.25/$0.025/$0.025/$0.3125/$1.50` through 256K whole-request input tokens
+and `$1/$0.10/$0.10/$1.25/$4` through 1M; output tokens do not select its tier.
+DeepSeek V4.1 Flash uses `$0.30/$0.03/$1.20`, GLM 5.2 and 5.3 use
+`$1.40/$0.28/$4.40`, and DeepSeek V4 Pro uses `$2.40/$0.20/$4.80`, each in
+input, implicit-cache-read, and output order. The dated
+`deepseek-v4-pro-0813` tariff is not assigned to the current alias. These
 direct list rates are distinct from Token Plan subscription economics and do
-not claim subscription invoice cost. Direct DeepSeek Flash and Pro reference
-rates include provider cache reads. OpenRouter North uses the NanoGPT and
-Routeway hosted-model catalog consensus for
-`openrouter/cohere/north-mini-code:free`, not
-direct Cohere pricing. Owl Alpha, Big Pickle, and OpenCode's free DeepSeek
-route remain explicitly unpriced because their required equivalence evidence is
-absent. Alibaba subscription routes retain unknown invoice cost even when a
-direct list-rate reference is available.
+not claim subscription invoice cost. Off-peak PAYG and promotional discounts
+are excluded; missing cache-kind attribution remains unpriced when implicit and
+explicit cache rates differ. OpenRouter North uses the NanoGPT and Routeway
+hosted-model catalog consensus for
+`openrouter/cohere/north-mini-code:free`, not direct Cohere pricing. Owl Alpha,
+Big Pickle, and OpenCode's free DeepSeek route remain explicitly unpriced
+because their required equivalence evidence is absent. Alibaba subscription
+routes retain unknown invoice cost even when a direct list-rate reference is
+available.
 
 Managed Kimi Code uses the same non-invoice semantics. Callback observers may
 persist its provenance metadata, but they do not turn its reference total into
@@ -1898,7 +1906,7 @@ The logical `sota` alias selects the producer-family `sota-*` alias from TUI
 origin and defaults to `sota-openai`. `sota-alibaba` uses
 `alibaba_token_plan/qwen3.8-max`, then
 `alibaba_token_plan/qwen3.7-max`. Public `sota-zai` prefers Z.AI Coding
-Plan `zai_coding_plan/glm-5.3` first; Alibaba Token Plan `glm-5.2` is the
+Plan `zai_coding_plan/glm-5.3` first; Alibaba Token Plan `glm-5.3` is the
 last-resort leaf on the same alias.
 
 `basic` is the config-driven low-cost alias: native Cohere

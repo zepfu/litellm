@@ -131,8 +131,8 @@
             "alibaba_token_plan": {
                 "aawm_reference_pricing": {
                     "schema_version": 1,
-                    "status": "unpriced",
-                    "kind": "provider_subscription_reference",
+                    "status": "priced",
+                    "kind": "provider_catalog_reference_tariff",
                     "billing_mode": "alibaba_token_plan_subscription",
                     "actual_invoice_cost_known": false,
                     "currency": "USD",
@@ -140,19 +140,25 @@
                         "provider": "alibaba_token_plan",
                         "model": "alibaba_token_plan/qwen3.8-max"
                     },
-                    "cache_mode": "none",
-                    "equivalence_status": "not_applicable",
-                    "equivalence_evidence": "Subscription invoice tariff is not exposed.",
+                    "cache_mode": "provider_cache_read_write",
+                    "equivalence_status": "direct_reference",
+                    "equivalence_evidence": "Alibaba Qwen 3.8 Max undiscounted international Model Studio direct list-rate reference: input is $2.00/1M, implicit cache read is $0.25/1M, explicit cache read is $0.17/1M, explicit cache write is $2.50/1M, and output is $6.00/1M. Not Token Plan subscription invoice pricing.",
                     "source": {
-                        "kind": "official_provider_catalog",
-                        "label": "Alibaba Model Studio Coding Plan",
+                        "kind": "official_provider_direct_list_rate_catalog",
+                        "label": "Alibaba Cloud Model Studio international direct list rates",
                         "urls": [
-                            "https://www.alibabacloud.com/help/en/model-studio/coding-plan"
+                            "https://www.alibabacloud.com/help/en/model-studio/model-pricing"
                         ],
-                        "version": "2026-08-12",
-                        "verified_on": "2026-08-12"
+                        "version": "2026-11-04",
+                        "verified_on": "2026-11-04"
                     },
-                    "unpriced_reason": "public_per_token_rate_unavailable"
+                    "rates": {
+                        "input_usd_per_million_tokens": 2.0,
+                        "implicit_cache_read_usd_per_million_tokens": 0.25,
+                        "explicit_cache_read_usd_per_million_tokens": 0.17,
+                        "explicit_cache_write_usd_per_million_tokens": 2.5,
+                        "output_usd_per_million_tokens": 6.0
+                    }
                 },
                 "reasoning_effort_wire": {
                     "policy": "map_reasoning_effort",
@@ -334,19 +340,22 @@
                     },
                     "rates": {
                         "input_usd_per_million_tokens": 2.5,
+                        "implicit_cache_read_usd_per_million_tokens": 0.25,
+                        "explicit_cache_read_usd_per_million_tokens": 0.25,
+                        "explicit_cache_write_usd_per_million_tokens": 3.125,
                         "output_usd_per_million_tokens": 7.5
                     },
-                    "cache_mode": "none",
+                    "cache_mode": "provider_cache_read_write",
                     "equivalence_status": "direct_reference",
-                    "equivalence_evidence": "Alibaba Qwen 3.7 undiscounted international Model Studio direct list-rate reference; not Token Plan subscription invoice pricing.",
+                    "equivalence_evidence": "Alibaba Qwen 3.7 Max undiscounted international Model Studio direct list-rate reference: input is $2.50/1M, implicit cache read is $0.25/1M, explicit cache read is $0.25/1M, explicit cache write is $3.125/1M, and output is $7.50/1M. Not Token Plan subscription invoice pricing.",
                     "source": {
                         "kind": "official_provider_direct_list_rate_catalog",
                         "label": "Alibaba Cloud Model Studio international direct list rates",
                         "urls": [
                             "https://www.alibabacloud.com/help/en/model-studio/model-pricing"
                         ],
-                        "version": "2026-08-12",
-                        "verified_on": "2026-08-12"
+                        "version": "2026-11-04",
+                        "verified_on": "2026-11-04"
                     }
                 },
                 "reasoning_effort_wire": {
@@ -428,7 +437,7 @@
                         "provider": "alibaba_token_plan",
                         "model": "alibaba_token_plan/qwen3.6-flash"
                     },
-                    "cache_mode": "none",
+                    "cache_mode": "provider_cache_read_write",
                     "rate_schedule": {
                         "meter": "input_tokens",
                         "tiers": [
@@ -437,28 +446,35 @@
                                 "max_tokens": 256000,
                                 "rates": {
                                     "input_usd_per_million_tokens": 0.25,
+                                    "implicit_cache_read_usd_per_million_tokens": 0.025,
+                                    "explicit_cache_read_usd_per_million_tokens": 0.025,
+                                    "explicit_cache_write_usd_per_million_tokens": 0.3125,
                                     "output_usd_per_million_tokens": 1.5
                                 }
                             },
                             {
                                 "min_tokens": 256001,
+                                "max_tokens": 1048576,
                                 "rates": {
                                     "input_usd_per_million_tokens": 1.0,
+                                    "implicit_cache_read_usd_per_million_tokens": 0.1,
+                                    "explicit_cache_read_usd_per_million_tokens": 0.1,
+                                    "explicit_cache_write_usd_per_million_tokens": 1.25,
                                     "output_usd_per_million_tokens": 4.0
                                 }
                             }
                         ]
                     },
                     "equivalence_status": "direct_reference",
-                    "equivalence_evidence": "Alibaba Qwen 3.6 undiscounted international Model Studio direct list-rate reference; not Token Plan subscription invoice pricing.",
+                    "equivalence_evidence": "Alibaba Qwen 3.6 Flash undiscounted international Model Studio direct list-rate reference: through 256K whole-request input tokens, input / implicit cache read / explicit cache read / explicit cache write / output are $0.25/$0.025/$0.025/$0.3125/$1.50 per 1M; from 256K through 1M they are $1/$0.10/$0.10/$1.25/$4.00 per 1M. Output tokens do not select the tier. Not Token Plan subscription invoice pricing.",
                     "source": {
                         "kind": "official_provider_direct_list_rate_catalog",
                         "label": "Alibaba Cloud Model Studio international direct list rates",
                         "urls": [
                             "https://www.alibabacloud.com/help/en/model-studio/model-pricing"
                         ],
-                        "version": "2026-08-12",
-                        "verified_on": "2026-08-12"
+                        "version": "2026-11-04",
+                        "verified_on": "2026-11-04"
                     }
                 },
                 "reasoning_effort_wire": {
@@ -629,12 +645,12 @@
                     },
                     "rates": {
                         "input_usd_per_million_tokens": 0.3,
-                        "cache_read_usd_per_million_tokens": 0.03,
+                        "implicit_cache_read_usd_per_million_tokens": 0.03,
                         "output_usd_per_million_tokens": 1.2
                     },
                     "cache_mode": "provider_cache_read",
                     "equivalence_status": "direct_reference",
-                    "equivalence_evidence": "Alibaba DeepSeek V4.1 Flash Singapore International base Model Studio direct list-rate reference: cached input is $0.03/1M, input is $0.30/1M, and output is $1.20/1M. Not Token Plan subscription invoice pricing.",
+                    "equivalence_evidence": "Alibaba DeepSeek V4.1 Flash Singapore International base Model Studio direct list-rate reference: input is $0.30/1M, implicit cache read is $0.03/1M, and output is $1.20/1M. Off-peak PAYG discounts are excluded. Not Token Plan subscription invoice pricing.",
                     "source": {
                         "kind": "official_provider_direct_list_rate_catalog",
                         "label": "Alibaba Cloud Model Studio Singapore International direct list rates",
@@ -642,8 +658,8 @@
                             "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
                             "https://www.alibabacloud.com/help/en/model-studio/context-cache"
                         ],
-                        "version": "2026-09-14",
-                        "verified_on": "2026-09-14"
+                        "version": "2026-11-04",
+                        "verified_on": "2026-11-04"
                     }
                 },
                 "reasoning_effort_wire": {
@@ -723,19 +739,20 @@
                     },
                     "rates": {
                         "input_usd_per_million_tokens": 2.4,
+                        "implicit_cache_read_usd_per_million_tokens": 0.2,
                         "output_usd_per_million_tokens": 4.8
                     },
-                    "cache_mode": "none",
+                    "cache_mode": "provider_cache_read",
                     "equivalence_status": "direct_reference",
-                    "equivalence_evidence": "Alibaba DeepSeek V4 Pro undiscounted international Model Studio direct list-rate reference; not Token Plan subscription invoice pricing.",
+                    "equivalence_evidence": "Alibaba DeepSeek V4 Pro undiscounted international Model Studio direct list-rate reference: input is $2.40/1M, implicit cache read is $0.20/1M, and output is $4.80/1M. The distinct dated deepseek-v4-pro-0813 tariff is not assigned to this current alias. Not Token Plan subscription invoice pricing.",
                     "source": {
                         "kind": "official_provider_direct_list_rate_catalog",
                         "label": "Alibaba Cloud Model Studio international direct list rates",
                         "urls": [
                             "https://www.alibabacloud.com/help/en/model-studio/model-pricing"
                         ],
-                        "version": "2026-08-12",
-                        "verified_on": "2026-08-12"
+                        "version": "2026-11-04",
+                        "verified_on": "2026-11-04"
                     }
                 },
                 "reasoning_effort_wire": {
@@ -845,6 +862,31 @@
                         "max": "max"
                     },
                     "source": "https://docs.qwencloud.com/api-reference/chat/openai-chat"
+                },
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "priced",
+                    "kind": "provider_catalog_reference_tariff",
+                    "billing_mode": "alibaba_token_plan_subscription",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "cache_mode": "provider_cache_read",
+                    "equivalence_status": "direct_reference",
+                    "equivalence_evidence": "Alibaba GLM-5.2 undiscounted international Model Studio direct list-rate reference: input is $1.40/1M, implicit cache read is $0.28/1M, and output is $4.40/1M. Not Token Plan subscription invoice pricing.",
+                    "source": {
+                        "kind": "official_provider_direct_list_rate_catalog",
+                        "label": "Alibaba Cloud Model Studio international direct list rates",
+                        "urls": [
+                            "https://www.alibabacloud.com/help/en/model-studio/model-pricing"
+                        ],
+                        "version": "2026-11-04",
+                        "verified_on": "2026-11-04"
+                    },
+                    "rates": {
+                        "input_usd_per_million_tokens": 1.4,
+                        "implicit_cache_read_usd_per_million_tokens": 0.28,
+                        "output_usd_per_million_tokens": 4.4
+                    }
                 }
             }
         }
@@ -42769,8 +42811,8 @@
             "alibaba_token_plan": {
                 "aawm_reference_pricing": {
                     "schema_version": 1,
-                    "status": "unpriced",
-                    "kind": "provider_subscription_reference",
+                    "status": "priced",
+                    "kind": "provider_catalog_reference_tariff",
                     "billing_mode": "alibaba_token_plan_subscription",
                     "actual_invoice_cost_known": false,
                     "currency": "USD",
@@ -42778,19 +42820,18 @@
                         "provider": "alibaba_token_plan",
                         "model": "alibaba_token_plan/qwen3.8-flash"
                     },
-                    "cache_mode": "none",
-                    "equivalence_status": "not_applicable",
-                    "equivalence_evidence": "Alibaba Model Studio International qwen3.8-flash standard reference; not Token Plan invoice pricing.",
+                    "cache_mode": "provider_cache_read_write",
+                    "equivalence_status": "direct_reference",
+                    "equivalence_evidence": "Alibaba Qwen 3.8 Flash undiscounted international Model Studio direct list-rate reference: input is $0.15/1M, implicit and explicit cache read are $0.016/1M, explicit cache write is $0.20/1M, and output is $0.47/1M. Not Token Plan subscription invoice pricing.",
                     "source": {
                         "kind": "official_provider_direct_list_rate_catalog",
-                        "label": "Alibaba Cloud Model Studio International model pricing",
+                        "label": "Alibaba Cloud Model Studio international direct list rates",
                         "urls": [
                             "https://www.alibabacloud.com/help/en/model-studio/model-pricing"
                         ],
                         "version": "2026-11-04",
                         "verified_on": "2026-11-04"
                     },
-                    "unpriced_reason": "public_per_token_rate_unavailable",
                     "rates": {
                         "input_usd_per_million_tokens": 0.15,
                         "implicit_cache_read_usd_per_million_tokens": 0.016,
@@ -42931,15 +42972,15 @@
                     },
                     "rates": {
                         "input_usd_per_million_tokens": 1.4,
-                        "cache_read_usd_per_million_tokens": 0.28,
+                        "implicit_cache_read_usd_per_million_tokens": 0.28,
                         "output_usd_per_million_tokens": 4.4
                     },
                     "cache_mode": "provider_cache_read",
                     "equivalence_status": "direct_reference",
-                    "equivalence_evidence": "Alibaba Model Studio International GLM-5.3 standard reference; not Token Plan invoice pricing.",
+                    "equivalence_evidence": "Alibaba GLM-5.3 undiscounted international Model Studio direct list-rate reference: input is $1.40/1M, implicit cache read is $0.28/1M, and output is $4.40/1M. Not Token Plan subscription invoice pricing.",
                     "source": {
                         "kind": "official_provider_direct_list_rate_catalog",
-                        "label": "Alibaba Cloud Model Studio International model pricing",
+                        "label": "Alibaba Cloud Model Studio international direct list rates",
                         "urls": [
                             "https://www.alibabacloud.com/help/en/model-studio/model-pricing"
                         ],

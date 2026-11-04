@@ -34,12 +34,26 @@ def test_should_keep_reference_pricing_catalogs_equal_and_gate_unverified_routes
     bundled = json.loads(BUNDLED_CATALOG.read_text(encoding="utf-8"))
 
     assert canonical == bundled
+    qwen38_max = canonical["alibaba_token_plan/qwen3.8-max"][
+        "provider_specific_entry"
+    ]["alibaba_token_plan"]["aawm_reference_pricing"]
+    assert qwen38_max["status"] == "priced"
+    assert qwen38_max["actual_invoice_cost_known"] is False
+    assert qwen38_max["cache_mode"] == "provider_cache_read_write"
+    assert qwen38_max["rates"] == {
+        "input_usd_per_million_tokens": 2.0,
+        "implicit_cache_read_usd_per_million_tokens": 0.25,
+        "explicit_cache_read_usd_per_million_tokens": 0.17,
+        "explicit_cache_write_usd_per_million_tokens": 2.5,
+        "output_usd_per_million_tokens": 6.0,
+    }
     assert (
-        canonical["alibaba_token_plan/qwen3.8-max"]["provider_specific_entry"][
+        canonical["alibaba_token_plan/qwen3.8-flash"]["provider_specific_entry"][
             "alibaba_token_plan"
         ]["aawm_reference_pricing"]["status"]
-        == "unpriced"
+        == "priced"
     )
+    assert "alibaba_token_plan/deepseek-v4-pro-0813" not in canonical
     assert (
         canonical["openrouter/owl-alpha"]["provider_specific_entry"]["openrouter"][
             "aawm_reference_pricing"
@@ -109,28 +123,29 @@ def test_should_price_alibaba_qwen36_at_the_256k_boundary(catalog):
         model="qwen3.6-flash",
         prompt_tokens=256_000,
         completion_tokens=100_000,
-        usage_obj={},
+        usage_obj={"cache_read_input_tokens": 0},
     )
     high_tier = aawm_agent_identity.resolve_aawm_reference_pricing(
         provider="alibaba_token_plan",
         model="qwen3.6-flash",
         prompt_tokens=256_001,
         completion_tokens=1,
-        usage_obj={},
+        usage_obj={"cache_read_input_tokens": 0},
     )
 
     assert base_tier is not None
     assert high_tier is not None
     assert contract["billing_mode"] == "alibaba_token_plan_subscription"
     assert contract["actual_invoice_cost_known"] is False
+    assert contract["cache_mode"] == "provider_cache_read_write"
     assert contract["source"] == {
         "kind": "official_provider_direct_list_rate_catalog",
         "label": "Alibaba Cloud Model Studio international direct list rates",
         "urls": [
             "https://www.alibabacloud.com/help/en/model-studio/model-pricing"
         ],
-        "version": "2026-08-12",
-        "verified_on": "2026-08-12",
+        "version": "2026-11-04",
+        "verified_on": "2026-11-04",
     }
     assert base_tier["reference_cost_model"] == "alibaba_token_plan/qwen3.6-flash"
     assert base_tier["reference_cost_rate_schedule"]["meter"] == "input_tokens"
@@ -190,6 +205,70 @@ def test_should_price_cursor_grok_47_at_the_256k_and_500k_boundaries(catalog):
         over_context_limit["reference_cost_unpriced_reason"]
         == "rate_schedule_no_match"
     )
+def test_should_price_alibaba_qwen38_cache_kinds_and_writes(catalog):
+    implicit = aawm_agent_identity.resolve_aawm_reference_pricing(
+        provider="alibaba_token_plan",
+        model="qwen3.8-max",
+        prompt_tokens=1_000,
+        completion_tokens=100,
+        usage_obj={
+            "cache_read_input_tokens": 200,
+            "cache_read_kind": "implicit",
+            "cache_write_input_tokens": 100,
+        },
+    )
+    explicit = aawm_agent_identity.resolve_aawm_reference_pricing(
+        provider="alibaba_token_plan",
+        model="qwen3.8-max",
+        prompt_tokens=1_000,
+        completion_tokens=100,
+        usage_obj={
+            "cache_read_input_tokens": 200,
+            "cache_read_kind": "explicit",
+            "cache_write_input_tokens": 100,
+        },
+    )
+    unknown_kind = aawm_agent_identity.resolve_aawm_reference_pricing(
+        provider="alibaba_token_plan",
+        model="qwen3.8-max",
+        prompt_tokens=1_000,
+        completion_tokens=100,
+        usage_obj={"cache_read_input_tokens": 200},
+    )
+
+    assert implicit is not None
+    assert implicit["reference_cost_total_usd"] == pytest.approx(
+        (700 * 2.0 + 200 * 0.25 + 100 * 2.50 + 100 * 6.0) / 1_000_000
+    )
+    assert implicit["reference_cost_cache_read_kind"] == "implicit"
+    assert implicit["reference_cost_cache_write_input_tokens"] == 100
+    assert implicit["reference_cost_cache_write_usd"] == pytest.approx(
+        100 * 2.50 / 1_000_000
+    )
+    assert explicit is not None
+    assert explicit["reference_cost_total_usd"] == pytest.approx(
+        (700 * 2.0 + 200 * 0.17 + 100 * 2.50 + 100 * 6.0) / 1_000_000
+    )
+    assert unknown_kind is not None
+    assert unknown_kind["reference_cost_status"] == "unpriced"
+    assert unknown_kind["reference_cost_unpriced_reason"] == "cache_read_kind_unknown"
+
+
+def test_should_price_alibaba_implicit_cache_reference_without_cache_kind(catalog):
+    result = aawm_agent_identity.resolve_aawm_reference_pricing(
+        provider="alibaba_token_plan",
+        model="deepseek-v4.1-flash",
+        prompt_tokens=1_000,
+        completion_tokens=200,
+        usage_obj={"cache_read_input_tokens": 100},
+    )
+
+    assert result is not None
+    assert result["reference_cost_status"] == "priced"
+    assert result["reference_cost_total_usd"] == pytest.approx(
+        (900 * 0.30 + 100 * 0.03 + 200 * 1.20) / 1_000_000
+    )
+    assert result["reference_cost_cache_read_kind"] is None
 
 
 def test_should_price_direct_deepseek_with_cache_and_mark_unknown_cache_unpriced(

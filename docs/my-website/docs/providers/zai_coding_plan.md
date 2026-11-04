@@ -94,7 +94,7 @@ Public `sota-zai` prefers this provider first:
 
 1. `zai_coding_plan/glm-5.3` on
    `codex_zai_coding_plan_chat_completions_adapter` (priority 110)
-2. last-resort `alibaba_token_plan/glm-5.2` on
+2. last-resort `alibaba_token_plan/glm-5.3` on
    `codex_alibaba_token_plan_chat_completions_adapter` (priority 100)
 
 Usage is `POST /openai_passthrough/v1/responses` with `model=sota-zai` or

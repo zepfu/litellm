@@ -19,10 +19,10 @@ alias routes remain separate.
 - `alibaba_token_plan/qwen3.8-max`
 - `alibaba_token_plan/qwen3.7-plus`
 - `alibaba_token_plan/qwen3.7-max`
-- `alibaba_token_plan/qwen3.6-flash`
+- `alibaba_token_plan/qwen3.8-flash`
 - `alibaba_token_plan/deepseek-v4.1-flash`
 - `alibaba_token_plan/deepseek-v4-pro`
-- `alibaba_token_plan/glm-5.2`
+- `alibaba_token_plan/glm-5.3`
 
 The configured DeepSeek Flash model is `deepseek-v4.1-flash`; the provider
 receives that exact unprefixed ID.
@@ -38,14 +38,14 @@ body. Source: the QwenCloud OpenAI chat API reference.
 | Model | Configured effort | Serialized field |
 | --- | --- | --- |
 | `qwen3.8-max` | `max` | `reasoning_effort=xhigh` (`max` and `high` map to `xhigh`; `none` sets `enable_thinking=false`) |
-| `qwen3.7-max`, `qwen3.7-plus`, `qwen3.6-flash` | `max` when set | `enable_thinking=true`. `reasoning_effort` is not a supported wire field |
-| `deepseek-v4-pro`, `glm-5.2` | `max` | `reasoning_effort=max` (native `high` or `max`; `low`/`medium` map to `high`; `xhigh` maps to `max`) |
+| `qwen3.7-max`, `qwen3.7-plus` | `max` when set | `enable_thinking=true`. `reasoning_effort` is not a supported wire field |
+| `deepseek-v4-pro`, `glm-5.3` | `max` | `reasoning_effort=max` (native `high` or `max`; `low`/`medium` map to `high`; `xhigh` maps to `max`) |
 | `deepseek-v4.1-flash` | omitted | no effort field; provider default is `high` |
+| `qwen3.8-flash` | omitted | no effort field; provider default is unchanged |
 | `qwen3.8-max-preview` | — | reasoning effort is rejected |
 
-`qwen3.6-flash` has no configured effort, so the request omits both fields and
-leaves the provider thinking default in place. A caller-supplied effort on
-that model still serializes only `enable_thinking`.
+`qwen3.8-flash` has no configured effort, so the request omits both fields and
+leaves the provider thinking default in place.
 
 Other model IDs are rejected locally. The provider always resolves the public
 LiteLLM model identity to the unprefixed provider model before egress. A public
@@ -109,7 +109,7 @@ The AAWM proxy configuration may expose:
 
 - `sota-alibaba`: Qwen 3.8 Max, then Qwen 3.7 Max.
 - `sota-deepseek`: DeepSeek V4 Pro.
-- `sota-zai`: last-resort Alibaba Token Plan GLM 5.2 after Z.AI Coding
+- `sota-zai`: last-resort Alibaba Token Plan GLM 5.3 after Z.AI Coding
   Plan `zai_coding_plan/glm-5.3`. Do not invent a second public name.
 
 Codex Responses ingress uses
@@ -141,20 +141,27 @@ Token Plan generations record:
 - `reference_cost_kind` and the source/version/equivalence provenance from the
   catalog reference contract
 
-The catalog carries the current undiscounted international Alibaba Cloud Model
-Studio direct list rates as non-invoice references for Qwen 3.6
-(`$0.25/$1.50` per million input/output tokens through 256000 whole-request
-input tokens, then `$1/$4`), Qwen 3.7 (`$2.50/$7.50`), and DeepSeek V4 Pro
-(`$2.40/$4.80`). Output tokens do not select the Qwen 3.6 tier. These direct
-list rates are distinct from Token Plan subscription economics and do not claim
-the subscription invoice cost. Qwen 3.8 remains explicitly unpriced. Reference
-totals are metadata only and do not populate `response_cost` or
-`session_history.response_cost_usd`.
+The catalog carries current undiscounted International and Singapore Alibaba
+Cloud Model Studio direct list rates as non-invoice references. Qwen 3.8 Max
+uses `$2/$0.25/$0.17/$2.50/$6` per million input, implicit-cache-read,
+explicit-cache-read, explicit-cache-write, and output tokens. Qwen 3.7 Max uses
+`$2.50/$0.25/$0.25/$3.125/$7.50`; Qwen 3.8 Flash uses
+`$0.15/$0.016/$0.016/$0.20/$0.47`.
 
-DeepSeek V4.1 Flash uses Singapore/International Model Studio direct reference
-base rates of `$0.30/$1.20` per million input/output tokens and `$0.03` per
-million cached input tokens. Off-peak and promotional discounts are excluded.
-These are reference rates, not known Token Plan invoice costs.
+Retained Qwen 3.6 Flash reference tiers use
+`$0.25/$0.025/$0.025/$0.3125/$1.50` through 256K whole-request input tokens
+and `$1/$0.10/$0.10/$1.25/$4` through 1M. Output tokens do not select that
+tier. DeepSeek V4.1 Flash uses `$0.30/$0.03/$1.20` for input,
+implicit-cache-read, and output; GLM 5.2 and 5.3 use `$1.40/$0.28/$4.40`;
+DeepSeek V4 Pro uses `$2.40/$0.20/$4.80`. The dated
+`deepseek-v4-pro-0813` tariff is not assigned to the current alias.
+
+These direct list rates are distinct from Token Plan subscription economics and
+do not claim the subscription invoice cost. Off-peak PAYG and promotional
+discounts are excluded. When a contract has separate implicit and explicit
+cache rates, the resolver requires the usage record to identify the cache kind;
+missing attribution remains unpriced. Reference totals are metadata only and do
+not populate `response_cost` or `session_history.response_cost_usd`.
 Sources: [Model pricing](https://www.alibabacloud.com/help/en/model-studio/model-pricing)
 and [context cache](https://www.alibabacloud.com/help/en/model-studio/context-cache).
 
