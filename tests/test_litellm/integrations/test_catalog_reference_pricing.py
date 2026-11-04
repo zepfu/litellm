@@ -142,6 +142,45 @@ def test_should_price_alibaba_qwen36_at_the_256k_boundary(catalog):
     )
 
 
+def test_should_price_cursor_grok_47_at_the_256k_and_500k_boundaries(catalog):
+    base_tier = aawm_agent_identity.resolve_aawm_reference_pricing(
+        provider="cursor_agent",
+        model="cursor-grok-4.7-high",
+        prompt_tokens=256_000,
+        completion_tokens=1_000,
+        usage_obj={"cache_read_input_tokens": 0},
+    )
+    long_context_tier = aawm_agent_identity.resolve_aawm_reference_pricing(
+        provider="cursor_agent",
+        model="cursor-grok-4.7-high",
+        prompt_tokens=500_000,
+        completion_tokens=1_000,
+        usage_obj={"cache_read_input_tokens": 0},
+    )
+    over_context_limit = aawm_agent_identity.resolve_aawm_reference_pricing(
+        provider="cursor_agent",
+        model="cursor-grok-4.7-high",
+        prompt_tokens=500_001,
+        completion_tokens=1_000,
+        usage_obj={"cache_read_input_tokens": 0},
+    )
+
+    assert base_tier is not None
+    assert long_context_tier is not None
+    assert over_context_limit is not None
+    assert base_tier["reference_cost_total_usd"] == pytest.approx(
+        (256_000 * 2.0 + 1_000 * 6.0) / 1_000_000
+    )
+    assert long_context_tier["reference_cost_total_usd"] == pytest.approx(
+        (500_000 * 4.0 + 1_000 * 12.0) / 1_000_000
+    )
+    assert over_context_limit["reference_cost_status"] == "unpriced"
+    assert (
+        over_context_limit["reference_cost_unpriced_reason"]
+        == "rate_schedule_no_match"
+    )
+
+
 def test_should_price_direct_deepseek_with_cache_and_mark_unknown_cache_unpriced(
     catalog,
 ):

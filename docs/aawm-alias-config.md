@@ -208,8 +208,8 @@ thirteen mixed `orchestration_children`. Provider coverage is selected with
 `sota` / OpenAI is a provider-specific failure, not a pass.
 
 `provider-openai` is the closed egress-validation sequence
-`gpt-6-luna` (priority 100), `gpt-5.6-terra` (priority 90),
-`gpt-6-sol` (priority 80), then `gpt-6-astra` (priority 0). All candidates use
+`gpt-6-luna` (priority 100), `gpt-6.1-terra` (priority 90),
+`gpt-6.1-sol` (priority 80), then `gpt-6-astra` (priority 0). All candidates use
 `reasoning_effort: low`; this does not change `sota-openai`.
 
 ## Maintained `basic` and `basic-other` alias behavior

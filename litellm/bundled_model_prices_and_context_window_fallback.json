@@ -10462,7 +10462,7 @@
                         "cache_read_usd_per_million_tokens": 0.2,
                         "output_usd_per_million_tokens": 2.5
                     },
-                    "cache_mode": "cache_read",
+                    "cache_mode": "provider_cache_read",
                     "equivalence_status": "direct_reference",
                     "equivalence_evidence": "Public Cursor Composer 2.5 standard list rates from cursor.com/docs/models-and-pricing; not Cursor Models pool or subscription invoice economics. Distinct from Composer 2.5 Fast ($3/$0.50/$15) and from xAI grok-composer-2.5-fast.",
                     "source": {
@@ -20618,7 +20618,9 @@
             "max_output_tokens",
             "temperature",
             "top_p"
-        ]
+        ],
+        "cache_creation_input_token_cost_above_1hr": 2.5e-05,
+        "cache_creation_input_token_cost_above_1hr_above_200k_tokens": 5e-05
     },
     "gpt-6-sol": {
         "cache_creation_input_token_cost": 2.5e-06,
@@ -20667,7 +20669,9 @@
             "max_output_tokens",
             "temperature",
             "top_p"
-        ]
+        ],
+        "cache_creation_input_token_cost_above_1hr": 5e-06,
+        "cache_creation_input_token_cost_above_1hr_above_200k_tokens": 1e-05
     },
     "gpt-6.1-sol": {
         "cache_creation_input_token_cost": 2.5e-06,
@@ -20716,7 +20720,9 @@
             "max_output_tokens",
             "temperature",
             "top_p"
-        ]
+        ],
+        "cache_creation_input_token_cost_above_1hr": 5e-06,
+        "cache_creation_input_token_cost_above_1hr_above_200k_tokens": 1e-05
     },
     "gpt-6-luna": {
         "cache_creation_input_token_cost": 1.25e-07,
@@ -20765,7 +20771,9 @@
             "max_output_tokens",
             "temperature",
             "top_p"
-        ]
+        ],
+        "cache_creation_input_token_cost_above_1hr": 2.5e-07,
+        "cache_creation_input_token_cost_above_1hr_above_200k_tokens": 5e-07
     },
     "gpt-5.6-luna": {
         "litellm_provider": "openai",
@@ -20815,10 +20823,10 @@
         "supported_endpoints": [
             "/v1/responses"
         ],
-        "input_cost_per_token": 2.5e-06,
-        "output_cost_per_token": 1.5e-05,
-        "cache_creation_input_token_cost": 3.125e-06,
-        "cache_read_input_token_cost": 2.5e-07,
+        "input_cost_per_token": 2e-06,
+        "output_cost_per_token": 1.2e-05,
+        "cache_creation_input_token_cost": 2.5e-06,
+        "cache_read_input_token_cost": 2e-07,
         "supports_reasoning": true,
         "supports_none_reasoning_effort": true,
         "supports_xhigh_reasoning_effort": true,
@@ -20827,7 +20835,13 @@
             "max_output_tokens",
             "temperature",
             "top_p"
-        ]
+        ],
+        "input_cost_per_token_above_272k_tokens": 4e-06,
+        "cache_read_input_token_cost_above_272k_tokens": 4e-07,
+        "cache_creation_input_token_cost_above_272k_tokens": 5e-06,
+        "output_cost_per_token_above_272k_tokens": 1.8e-05,
+        "cache_creation_input_token_cost_above_1hr": 5e-06,
+        "cache_creation_input_token_cost_above_1hr_above_200k_tokens": 1e-05
     },
     "gpt-5.4-2026-03-05": {
         "cache_read_input_token_cost": 2.5e-07,
@@ -42740,7 +42754,9 @@
             "max_output_tokens",
             "temperature",
             "top_p"
-        ]
+        ],
+        "cache_creation_input_token_cost_above_1hr": 2.5e-06,
+        "cache_creation_input_token_cost_above_1hr_above_200k_tokens": 5e-06
     },
     "alibaba_token_plan/qwen3.8-flash": {
         "comment": "Alibaba Token Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",
@@ -42985,9 +43001,9 @@
     "cursor_agent/cursor-grok-4.7-high": {
         "comment": "Cursor Agent CLI Cursor Grok 4.7 high-effort. Distinct from oa_xai/grok-4.6 and xai/grok-4.6. Public Cursor list rates are reference-only; Cursor Models pool / subscription invoice cost is unknown. Temporary 50% Grok 4.7 launch discount is not baked in.",
         "litellm_provider": "cursor_agent",
-        "max_input_tokens": 200000,
-        "max_output_tokens": 200000,
-        "max_tokens": 200000,
+        "max_input_tokens": 500000,
+        "max_output_tokens": 500000,
+        "max_tokens": 500000,
         "mode": "chat",
         "namespace_tool_function_adapters": {
             "collaboration": [
@@ -43017,7 +43033,7 @@
                         "cache_read_usd_per_million_tokens": 0.5,
                         "output_usd_per_million_tokens": 6.0
                     },
-                    "cache_mode": "cache_read",
+                    "cache_mode": "provider_cache_read",
                     "equivalence_status": "direct_reference",
                     "equivalence_evidence": "Public Cursor Grok 4.7 list rates from cursor.com/docs/models-and-pricing; not Cursor Models pool or subscription invoice economics. Distinct from xai/grok-4.6 and oa_xai/grok-4.6. Temporary 50% launch discount starting 2026-08-12 is not represented.",
                     "source": {
@@ -43029,6 +43045,29 @@
                         ],
                         "version": "2026-08-19",
                         "verified_on": "2026-08-19"
+                    },
+                    "rate_schedule": {
+                        "meter": "input_tokens",
+                        "tiers": [
+                            {
+                                "min_tokens": 0,
+                                "max_tokens": 256000,
+                                "rates": {
+                                    "input_usd_per_million_tokens": 2.0,
+                                    "cache_read_usd_per_million_tokens": 0.5,
+                                    "output_usd_per_million_tokens": 6.0
+                                }
+                            },
+                            {
+                                "min_tokens": 256001,
+                                "max_tokens": 500000,
+                                "rates": {
+                                    "input_usd_per_million_tokens": 4.0,
+                                    "cache_read_usd_per_million_tokens": 1.0,
+                                    "output_usd_per_million_tokens": 12.0
+                                }
+                            }
+                        ]
                     }
                 }
             }

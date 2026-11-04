@@ -574,6 +574,14 @@ def test_gpt_6_astra_pricing_and_runtime_model_info(monkeypatch):
             assert model_info["supports_none_reasoning_effort"] is False
             assert model_info["supports_xhigh_reasoning_effort"] is True
             assert model_info["supports_max_reasoning_effort"] is True
+            if model == "gpt-6-astra":
+                assert (
+                    model_info["cache_creation_input_token_cost_above_1hr"] == 2.5e-5
+                )
+                assert (
+                    model_info["cache_creation_input_token_cost_above_1hr_above_200k_tokens"]
+                    == 5e-5
+                )
 
     local_model_cost = GetModelCostMap.load_local_model_cost_map()
     monkeypatch.setattr(litellm, "model_cost", local_model_cost)

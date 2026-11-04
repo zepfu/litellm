@@ -26,7 +26,7 @@ CATALOG_PATHS = (
     REPO_ROOT / "model_prices_and_context_window.json",
     REPO_ROOT / "litellm/bundled_model_prices_and_context_window_fallback.json",
 )
-CURSOR_GROK_46_HIGH = "cursor_agent/cursor-grok-4.6-high"
+CURSOR_GROK_47_HIGH = "cursor_agent/cursor-grok-4.7-high"
 
 
 @pytest.fixture(autouse=True)
@@ -49,7 +49,7 @@ def test_should_keep_grok_47_catalog_entries_in_parity() -> None:
         native = catalog["xai/grok-4.7"]
         managed = catalog["oa_xai/grok-4.7"]
         grok_46 = catalog["xai/grok-4.6"]
-        cursor_grok = catalog[CURSOR_GROK_46_HIGH]
+        cursor_grok = catalog[CURSOR_GROK_47_HIGH]
 
         assert {
             key: value
@@ -162,7 +162,7 @@ def test_should_activate_grok_47_for_sota_xai_oidc_then_oauth() -> None:
     assert "model: oa_xai/grok-4.7" in yaml_text
     assert "model: xai/grok-4.6" not in yaml_text
     assert "model: oa_xai/grok-4.6" not in yaml_text
-    assert "cursor_agent/cursor-grok-4.6-high" not in yaml_text
+    assert "cursor_agent/cursor-grok-4.7-high" not in yaml_text
     assert "reasoning_effort: max" not in yaml_text
     assert "reasoning_effort" not in yaml_text
 
@@ -181,7 +181,7 @@ def test_should_activate_grok_47_for_sota_xai_oidc_then_oauth() -> None:
     assert "oa_xai/grok-4.6" not in xai_basic
     assert "xai/grok-4.7" in expert_other
     assert "xai/grok-4.6" not in expert_other
-    assert sota_cursor == ["cursor_agent/cursor-grok-4.6-high"]
+    assert sota_cursor == ["cursor_agent/cursor-grok-4.7-high"]
 
 
 def test_should_register_native_and_managed_grok_47_descriptors() -> None:

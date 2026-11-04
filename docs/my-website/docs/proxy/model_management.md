@@ -22,32 +22,39 @@ Retrieve detailed information about each model listed in the `/model/info` endpo
 
 ## AAWM OpenAI catalog
 
-The canonical and bundled cost maps include `gpt-6-sol` and `gpt-6-luna`
-at standard list prices, excluding promotional, Batch, and Flex discounts.
-Per million tokens, Sol costs $2 input, $0.20 cache read, $2.50 cache write,
-and $10 output; Luna costs $0.10 input, $0.01 cache read, $0.125 cache write,
-and $0.50 output. Above 272K input tokens, input and cache rates double
-and output rates increase by 50%. Sources:
-[OpenAI pricing](https://developers.openai.com/api/docs/pricing),
-[GPT-6 Sol](https://developers.openai.com/api/docs/models/gpt-6-sol), and
-[GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna).
+The canonical and bundled cost maps include `gpt-6-astra`, `gpt-6-sol`,
+`gpt-6.1-sol`, `gpt-6.1-terra`, and `gpt-6-luna` at standard synchronous
+OpenAI API list prices. Batch, Flex, Fast, Ultrafast, regional, and
+subscription pricing are separate and excluded from this reference valuation.
 
-LiteLLM's canonical cost map includes `gpt-5.6-sol`, `gpt-5.6-terra`, and
-`gpt-5.6-luna` in both `model_prices_and_context_window.json` and
-`litellm/bundled_model_prices_and_context_window_fallback.json`. Sol and Terra
-pricing and cache billing fields are sourced from
-[Previewing GPT-5.6 Sol](https://openai.com/index/previewing-gpt-5-6-sol/)
-(per 1M tokens: Sol $5/$30, Terra $2.50/$15; cache write 1.25× input;
-cache read 10% of input). Luna uses current standard, non-promotional API
-pricing: $0.20 input, $1.20 output, $0.02 cache read, and $0.25 cache write
-per 1M tokens; its catalog entry records the current source.
-All three entries advertise reasoning efforts through
-API value `max` (`none`, `low`, `medium`, `high`, `xhigh`, `max`) using the
-config-driven `supports_max_reasoning_effort` capability. Context-window and
-unrelated capability fields remain omitted until independently verified.
+Per 1M tokens, the entries use input/cache-read/cache-write-30m/
+cache-write-12h/output:
 
-The user-level Codex model catalog includes GPT-6 Sol and Luna alongside
-the retained GPT-5.6 entries, with `max` available for Sol, Terra, and Luna.
+- `gpt-6-astra`: $10/$1/$12.50/$25/$50
+- `gpt-6-sol`: $2/$0.20/$2.50/$5/$10
+- `gpt-6.1-sol`: $2/$0.10/$2.50/$5/$10
+- `gpt-6.1-terra`: $1/$0.05/$1.25/$2.50/$5
+- `gpt-6-luna`: $0.10/$0.01/$0.125/$0.25/$0.50
+
+For prompt input above 272K tokens, the corresponding full-request tariffs
+are Astra $20/$2/$25/$50/$75, GPT-6 Sol $4/$0.40/$5/$10/$15, GPT-6.1 Sol
+$4/$0.20/$5/$10/$15, GPT-6.1 Terra $2/$0.10/$2.50/$5/$7.50, and Luna
+$0.20/$0.02/$0.25/$0.50/$0.75. The retained `gpt-5.6-terra` entry uses
+$2/$0.20/$2.50/$5/$12 at the base tier and
+$4/$0.40/$5/$10/$18 above 272K. Cache-write prices use the published
+30-minute and 12-hour fields; unpublished cache-write prices remain absent.
+
+Sources: [OpenAI pricing](https://developers.openai.com/api/docs/pricing),
+[GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra),
+[GPT-6 Sol](https://developers.openai.com/api/docs/models/gpt-6-sol),
+[GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol),
+[GPT-6.1 Terra](https://developers.openai.com/api/docs/models/gpt-6.1-terra),
+[GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna), and
+[GPT-5.6 Terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra).
+
+The user-level Codex model catalog includes GPT-6.1 Sol, Terra, and Luna
+alongside the retained GPT-5.6 entries, with `max` available for Sol, Terra,
+and Luna.
 `ultra` is exposed only for Sol: it is a Codex product intelligence mode that
 combines maximum reasoning with proactive subagent delegation, not an API
 `reasoning.effort` value sent by LiteLLM.
@@ -65,15 +72,15 @@ Config-driven alias routing uses:
   `grok-4.7(sota-xai):xhigh`. The managed candidate is last after native
   xAI OIDC; the two xAI routes remain distinct.
 - `sota`: selects the producer-family `sota-*` alias from TUI origin, defaulting to `sota-openai`.
-- Grok 4.7 (`xai/grok-4.6`, `oa_xai/grok-4.6`): 500k context; created 1785974400 (2026-08-06T00:00:00Z), owned by xAI, no aliases, source `https://docs.x.ai/developers/models/grok-4.6`, verified 2026-08-12; input $2/M, output $6/M, cached input $0.50/M, image input $2/M image tokens; above 200k whole-request input tokens, input/cache/output are $4/$1/$12 per million; managed-route session history records this as a reference rate with invoice cost unknown
+- Grok 4.6 (`xai/grok-4.6`, `oa_xai/grok-4.6`): 500k context; created 1785974400 (2026-08-06T00:00:00Z), owned by xAI, no aliases, source `https://docs.x.ai/developers/models/grok-4.6`, verified 2026-08-12; input $2/M, output $6/M, cached input $0.50/M, image input $2/M image tokens; above 200k whole-request input tokens, input/cache/output are $4/$1/$12 per million; managed-route session history records this as a reference rate with invoice cost unknown
 - Grok 4.7 (`xai/grok-4.7`, `oa_xai/grok-4.7`): 500k context; created 1790035200 (2026-09-22T00:00:00Z), owned by xAI, no aliases, source `https://docs.x.ai/developers/models/grok-4.7`, verified 2026-09-22; input $2/M, output $6/M, cached input $0.50/M, image input $2/M image tokens; above 200k whole-request input tokens, input/cache/output are $4/$1/$12 per million; managed-route session history records this as a reference rate with invoice cost unknown. Grok 4.7 always returns Responses `reasoning.encrypted_content` even when not requested.
 - Cursor Agent Composer 2.5 standard (`cursor_agent/composer-2.5`): CLI slug `composer-2.5`, not Fast and not xAI `grok-composer-2.5-fast`; public list $0.50/$0.20/$2.50 per million input/cache-read/output, reference-only with invoice cost unknown
-- Cursor Grok 4.7 (`cursor_agent/cursor-grok-4.7-high`): CLI slug `cursor-grok-4.7-high`, distinct from `oa_xai/grok-4.6` and `xai/grok-4.6`; public list $2/$0.50/$6 per million input/cache-read/output, reference-only with invoice cost unknown; temporary launch discount is not baked in
+- Cursor Grok 4.7 (`cursor_agent/cursor-grok-4.7-high`): CLI slug `cursor-grok-4.7-high`, distinct from `oa_xai/grok-4.6` and `xai/grok-4.6`; standard 256K context is $2/$0.50/$6 per million input/cache-read/output, and the documented 500K long-context tier is $4/$1/$12; reference-only with invoice cost unknown, with no cache-write price published and no temporary launch discount baked in
 - `sota-alibaba`: `alibaba_token_plan/qwen3.8-max` → `alibaba_token_plan/qwen3.7-max`
 - `sota-zai`: `zai_coding_plan/glm-5.3` (priority 110), then last-resort
   `alibaba_token_plan/glm-5.3` (priority 100)
 - `provider-openai`: egress-validation order `gpt-6-luna` (priority 100) →
-  `gpt-5.6-terra` (priority 90) → `gpt-6-sol` (priority 80) → `gpt-6-astra`
+  `gpt-6.1-terra` (priority 90) → `gpt-6.1-sol` (priority 80) → `gpt-6-astra`
   (priority 0), all with `reasoning_effort: low`
 - `basic`: Cohere `cohere/north-mini-code-1-0` (90) → OpenRouter `openrouter/cohere/north-mini-code:free` (80) → OpenCode Zen `big-pickle` (50) → `basic-other`
 - `basic-other`: Z.AI `glm-5.3-flash` (170, `23:00-09:00 UTC+8`),

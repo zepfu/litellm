@@ -1867,7 +1867,7 @@ normal upstream usage and cost calculation path.
 
 The config-driven `sota-openai` route uses this order:
 
-1. `gpt-5.6-sol`
+1. `gpt-6-astra`
 
 The config-driven `sota-xai` route uses this order:
 
@@ -1910,11 +1910,11 @@ uses Z.AI Flash and Cursor Composer before mutually exclusive priority-zero
 Luna/Haiku tails.
 
 `work` first references `work-other`, then for Claude origins only keeps the
-native Anthropic Sonnet tail, and finally uses `gpt-5.6-luna`. During
+native Anthropic Sonnet tail, and finally uses `gpt-6-luna`. During
 `22:00-08:00 UTC+8`, `work-other` orders `sota-deepseek`, Z.AI Flash,
 `sota-moonshot`, then `sota-xai`; outside that window new selection begins
 with Z.AI Flash. `expert` references `expert-other` before the final
-OpenAI/Codex `gpt-5.6-terra` fallback. `expert-other` admits Alibaba Qwen Max
+OpenAI/Codex `gpt-6.1-terra` fallback. `expert-other` admits Alibaba Qwen Max
 during the same window, then uses Cursor Grok and native xAI.
 
 `auto-review` references `auto-review-other`, then uses low-effort Luna and
@@ -1923,18 +1923,16 @@ during the same window before low-effort Z.AI Flash and Cursor Composer.
 `codex-auto-review` remains a public alias reference to `auto-review`, so both
 public names share one concrete candidate graph.
 
-OpenAI `gpt-5.6-sol` and `gpt-5.6-terra` pricing in
-`model_prices_and_context_window.json` follows the official GPT-5.6 preview page
-(`https://openai.com/index/previewing-gpt-5-6-sol/`): per-token input/output
-costs, cache write at 1.25× uncached input, and cache read at 10% of uncached
-input. `gpt-5.6-luna` uses the current standard, non-promotional API rates:
-$0.20 input, $1.20 output, $0.02 cache read, and $0.25 cache write per million
-tokens. Its catalog entry records the current pricing source.
-Official GPT-5.6 API documentation also verifies reasoning efforts
-`none`, `low`, `medium`, `high`, `xhigh`, and `max`; all three entries therefore
-set `supports_reasoning`, `supports_none_reasoning_effort`,
-`supports_xhigh_reasoning_effort`, and `supports_max_reasoning_effort`.
-Unverified context-window and unrelated capability metadata remain omitted.
+OpenAI GPT-6.1 Sol and Terra pricing in `model_prices_and_context_window.json`
+follows the official API list: Sol is $2/$0.10/$2.50/$5/$10 and Terra is
+$1/$0.05/$1.25/$2.50/$5 per million input/cache-read/cache-write-30m/
+cache-write-12h/output, with the published long-context tiers. The retained
+`gpt-5.6-terra` row is $2/$0.20/$2.50/$5/$12 at base and
+$4/$0.40/$5/$10/$18 above 272K input tokens. These are reference rates;
+Batch, Flex, and subscription consumption are separate. The GPT-5.6 entries
+retain the documented `none`, `low`, `medium`, `high`, `xhigh`, and `max`
+reasoning capabilities. Unverified context-window and unrelated capability
+metadata remain omitted.
 
 ### Codex reasoning-effort reconciliation
 
@@ -2257,7 +2255,7 @@ interval elapses. Each rollup subline uses
 ` - model(alias):effort-or-none - Turns: N` with a mandatory
 `:<effort-or-none>` segment and an optional trailing status tag (`[Degraded]`,
 `[Cooling Down]`, `[Failed]`, or `[Exhausted]`). Existing aliases remain inside
-the model label, producing shapes such as `gpt-5.6-luna(work):max`.
+the model label, producing shapes such as `gpt-6-luna(work):max`.
 Requests classified as `workload_type=agent_memory` and
 `workload_subtype=codex_memory_writer` use `AUTO-MEMORY` in the alias position
 and aggregate separately from ordinary requests for the same model. This

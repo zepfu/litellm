@@ -115,6 +115,11 @@ are stored as reference-only catalog rows with
 | `cursor_agent/composer-2.5` | $0.50 | $0.20 | $2.50 |
 | `cursor_agent/cursor-grok-4.7-high` | $2.00 | $0.50 | $6.00 |
 
+Cursor Grok 4.7 uses the $2/$0.50/$6 standard tier through 256K input
+tokens. Cursor documents a 500K long-context tier at $4/$1/$12 per million
+input/cache-read/output tokens. Cache-write pricing is not published and is
+omitted from both reference rows.
+
 These are not Cursor Models pool / subscription invoice economics. Do not
 bake the temporary Grok 4.7 launch discount into the cost map. Alias
 dispatch for these families uses official schema field 2,

@@ -212,6 +212,34 @@ class TestCursorAgentCatalogIdentity:
             "cache_read_usd_per_million_tokens": 0.5,
             "output_usd_per_million_tokens": 6.0,
         }
+        assert composer["cache_mode"] == "provider_cache_read"
+        assert cursor_grok["cache_mode"] == "provider_cache_read"
+        assert catalog[_CURSOR_GROK_MODEL]["max_input_tokens"] == 500000
+        assert catalog[_CURSOR_GROK_MODEL]["max_output_tokens"] == 500000
+        assert catalog[_CURSOR_GROK_MODEL]["max_tokens"] == 500000
+        assert cursor_grok["rate_schedule"] == {
+            "meter": "input_tokens",
+            "tiers": [
+                {
+                    "min_tokens": 0,
+                    "max_tokens": 256000,
+                    "rates": {
+                        "input_usd_per_million_tokens": 2.0,
+                        "cache_read_usd_per_million_tokens": 0.5,
+                        "output_usd_per_million_tokens": 6.0,
+                    },
+                },
+                {
+                    "min_tokens": 256001,
+                    "max_tokens": 500000,
+                    "rates": {
+                        "input_usd_per_million_tokens": 4.0,
+                        "cache_read_usd_per_million_tokens": 1.0,
+                        "output_usd_per_million_tokens": 12.0,
+                    },
+                },
+            ],
+        }
         assert "input_cost_per_token" not in catalog[_COMPOSER_MODEL]
         assert "output_cost_per_token" not in catalog[_COMPOSER_MODEL]
         assert "input_cost_per_token" not in catalog[_CURSOR_GROK_MODEL]
