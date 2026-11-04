@@ -96,11 +96,11 @@ response = completion(
 print(response)
 ```
 
-Supported first slugs: `composer-2.5`, `cursor-grok-4.6-high`. Catalog keys
-are `cursor_agent/composer-2.5` and `cursor_agent/cursor-grok-4.6-high`.
+Supported first slugs: `composer-2.5`, `cursor-grok-4.7-high`. Catalog keys
+are `cursor_agent/composer-2.5` and `cursor_agent/cursor-grok-4.7-high`.
 
 Composer 2.5 standard is not Fast (`composer-2.5-fast`) and is not xAI
-`grok-composer-2.5-fast`. Cursor Grok 4.6 is not `oa_xai/grok-4.6` or
+`grok-composer-2.5-fast`. Cursor Grok 4.7 is not `oa_xai/grok-4.6` or
 `xai/grok-4.6`. Alias YAML uses `provider: cursor_agent` with
 `codex_cursor_agent_aiserver_adapter` /
 `anthropic_cursor_agent_aiserver_adapter`. Cloud Agents `cursor` stays
@@ -113,10 +113,10 @@ are stored as reference-only catalog rows with
 | Catalog key | Input / M | Cache read / M | Output / M |
 |---|---:|---:|---:|
 | `cursor_agent/composer-2.5` | $0.50 | $0.20 | $2.50 |
-| `cursor_agent/cursor-grok-4.6-high` | $2.00 | $0.50 | $6.00 |
+| `cursor_agent/cursor-grok-4.7-high` | $2.00 | $0.50 | $6.00 |
 
 These are not Cursor Models pool / subscription invoice economics. Do not
-bake the temporary Grok 4.6 launch discount into the cost map. Alias
+bake the temporary Grok 4.7 launch discount into the cost map. Alias
 dispatch for these families uses official schema field 2,
 `UserMessageAction.requestContext`. For a fresh clean dispatch, LiteLLM
 intentionally sends that field as an empty message (`requestContext: {}`).

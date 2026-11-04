@@ -21,8 +21,8 @@ CURSOR_AGENT_AUTH_FILE_ENV = "LITELLM_CURSOR_AGENT_AUTH_FILE"
 # Cursor CLI catalog selectors can resolve to a backend model plus parameters.
 # Keep this provider-local so aliases can continue exposing the native selector.
 CURSOR_AGENT_REQUESTED_MODEL_OVERRIDES = {
-    "cursor-grok-4.6-high": {
-        "modelId": "grok-4.6",
+    "cursor-grok-4.7-high": {
+        "modelId": "grok-4.7",
         "parameters": [
             {"id": "effort", "value": "high"},
             {"id": "fast", "value": "false"},

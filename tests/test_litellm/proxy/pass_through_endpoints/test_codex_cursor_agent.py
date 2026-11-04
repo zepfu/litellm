@@ -52,7 +52,7 @@ def _request(*, selected_account: dict[str, Any] | None = None) -> Request:
 
 def _candidate(**overrides: str) -> dict[str, str]:
     candidate = {
-        "model": "cursor_agent/cursor-grok-4.6-high",
+        "model": "cursor_agent/cursor-grok-4.7-high",
         "route_family": "codex_cursor_agent_aiserver_adapter",
     }
     candidate.update(overrides)
@@ -4777,7 +4777,7 @@ async def test_cursor_local_4xx_stops_alias_without_cooldown_or_fallback(
             "candidate": cursor_candidate,
             "alias_model": "work",
             "lane_key": "cursor-agent",
-            "cooldown_key": "cursor-agent:cursor-grok-4.6-high",
+            "cooldown_key": "cursor-agent:cursor-grok-4.7-high",
             "selection_reason": "first_choice",
             "skipped": [],
         },
@@ -4935,9 +4935,9 @@ def test_cursor_provider_http_error_preserves_sanitized_attribution() -> None:
     provider_body = {
         "error": {
             "code": "model_not_found",
-            "message": "Unknown model: cursor-grok-4.6-high",
+            "message": "Unknown model: cursor-grok-4.7-high",
             "type": "invalid_request_error",
-            "model": "cursor-grok-4.6-high",
+            "model": "cursor-grok-4.7-high",
             "secret": "do-not-leak",
         },
         "request_id": "provider-request-secret",
@@ -4957,8 +4957,8 @@ def test_cursor_provider_http_error_preserves_sanitized_attribution() -> None:
     sanitized_body = {
         "error": {
             "code": "model_not_found",
-            "message": "Unknown model: cursor-grok-4.6-high",
-            "model": "cursor-grok-4.6-high",
+            "message": "Unknown model: cursor-grok-4.7-high",
+            "model": "cursor-grok-4.7-high",
             "type": "invalid_request_error",
         }
     }
@@ -4968,7 +4968,7 @@ def test_cursor_provider_http_error_preserves_sanitized_attribution() -> None:
     assert exc.body == sanitized_body
     assert exc.detail["error"]["code"] == "model_not_found"
     assert exc.detail["error"]["message"] == (
-        "Unknown model: cursor-grok-4.6-high"
+        "Unknown model: cursor-grok-4.7-high"
     )
     assert exc.detail["cursor_sanitized_provider_error"] == sanitized_body
     assert (

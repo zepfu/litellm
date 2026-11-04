@@ -3605,7 +3605,7 @@ def test_should_plan_grok_defaults_from_latest_catalog_minor(
     assert "oa_xai/grok-4.9" in served
     assert "latest_grok" not in served
     assert "xai/grok-4.7" not in served
-    assert "cursor_agent/cursor-grok-4.6-high" in served
+    assert "cursor_agent/cursor-grok-4.7-high" in served
 
 
 def test_should_not_name_retired_grok_4_6_served_ids_in_harness_tree() -> None:
@@ -3621,8 +3621,8 @@ def test_should_not_name_retired_grok_4_6_served_ids_in_harness_tree() -> None:
         for needle in banned:
             if needle not in text:
                 continue
-            if needle == "xai/grok-4.6" and "cursor_agent/cursor-grok-4.6-high" in text:
-                stripped = text.replace("cursor_agent/cursor-grok-4.6-high", "")
+            if needle == "xai/grok-4.6" and "cursor_agent/cursor-grok-4.7-high" in text:
+                stripped = text.replace("cursor_agent/cursor-grok-4.7-high", "")
                 if needle not in stripped:
                     continue
             offenders.append(f"{path.relative_to(root)}:{needle}")

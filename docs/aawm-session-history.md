@@ -1874,7 +1874,7 @@ The config-driven `sota-xai` route uses this order:
 1. `xai/grok-4.7` via native xAI OIDC
 2. `oa_xai/grok-4.7` via managed xAI OAuth Responses adapter
 
-Cursor Agent `cursor_agent/cursor-grok-4.6-high` stays on `sota-cursor`.
+Cursor Agent `cursor_agent/cursor-grok-4.7-high` stays on `sota-cursor`.
 The two xAI candidate lanes remain distinct. `work` and its nested `work-other`
 alias reference inherit this `sota-xai` order. The managed
 `sota-xai` candidate has no candidate-level reasoning override. For caller
@@ -2159,7 +2159,7 @@ closed before provider egress rather than selecting a fresh account.
 Grok native and `oa_xai/*` Responses candidates remove request fields, hosted
 tools, and unsupported `reasoning` input items that the selected Grok-family
 model declares unsupported. This does not strip the supported
-`reasoning.effort=xhigh` field on managed `sota-xai` Grok 4.6. This includes
+`reasoning.effort=xhigh` field on managed `sota-xai` Grok 4.7. This includes
 `reasoning` items that carry `encrypted_content` from
 another provider's compacted Responses state; forwarding those blobs to Grok can
 trigger provider errors such as `Could not decode the compaction blob`. Ordinary
@@ -2770,7 +2770,7 @@ top-level fields.
 
 The active `sota-xai` alias order is native xAI OIDC (`xai/grok-4.7`) ->
 managed xAI OAuth (`oa_xai/grok-4.7`). Cursor Agent
-(`cursor_agent/cursor-grok-4.6-high`) stays on `sota-cursor`. The managed
+(`cursor_agent/cursor-grok-4.7-high`) stays on `sota-cursor`. The managed
 candidate's session-history record keeps the managed rate as reference
 metadata rather than an invoice cost: `actual_invoice_cost_known` is `false`
 and `response_cost_usd` remains `NULL`. The reference provenance is the xAI
@@ -2800,7 +2800,7 @@ egress. The encoded id is only for LiteLLM deployment affinity; xAI and Grok
 must receive the raw upstream id, otherwise compacted continuations can fail
 with provider errors such as `Could not decode the compaction blob`.
 
-For managed `oa_xai`/`sota-xai` flows only, Grok 4.6 adapts both the
+For managed `oa_xai`/`sota-xai` flows only, Grok 4.7 adapts both the
 `collaboration` and `multi_agent_v1` namespaces. Those children are flattened
 into provider-bound function tools and sanitized before egress. The resulting
 function calls and results are restored to stock Codex collaboration and

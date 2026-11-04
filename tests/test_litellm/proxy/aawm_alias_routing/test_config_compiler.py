@@ -95,7 +95,7 @@ def test_canonical_sota_zai_compiles_coding_plan_ahead_of_alibaba() -> None:
         ),
         (
             "alibaba_token_plan",
-            "alibaba_token_plan/glm-5.2",
+            "alibaba_token_plan/glm-5.3",
             "codex_alibaba_token_plan_chat_completions_adapter",
             100,
         ),
@@ -528,7 +528,7 @@ def test_canonical_work_compiles_current_graph() -> None:
     assert direct_models.isdisjoint(
         {
             "zai_coding_plan/glm-5.3-flash",
-            "cursor_agent/cursor-grok-4.6-high",
+            "cursor_agent/cursor-grok-4.7-high",
             "xai/grok-4.7",
             "oa_xai/grok-4.7",
         }

@@ -240,7 +240,7 @@ there is no weekday distinction. The `work-other` Alibaba gate is on its
 
 `sota-xai` follows native xAI/OIDC (`xai/grok-4.7`, priority 100), then
 managed xAI/OAuth (`oa_xai/grok-4.7`, priority 90). Cursor Grok stays on
-`sota-cursor` (`cursor_agent/cursor-grok-4.6-high`). `work-other` inherits
+`sota-cursor` (`cursor_agent/cursor-grok-4.7-high`). `work-other` inherits
 the `sota-xai` order through `alias_reference: sota-xai`, and the two xAI
 lanes remain distinct. The managed OAuth candidate has no candidate-level
 reasoning override: caller `reasoning.effort=xhigh` is sent unchanged to
@@ -557,7 +557,7 @@ The public `sota-zai` alias is compiled from `sota-zai.yaml`. Codex
 `POST /openai_passthrough/v1/responses` prefers Z.AI Coding Plan
 `zai_coding_plan/glm-5.3` on
 `codex_zai_coding_plan_chat_completions_adapter` (priority 110). Alibaba
-Token Plan `alibaba_token_plan/glm-5.2` stays as the last-resort leaf on
+Token Plan `alibaba_token_plan/glm-5.3` stays as the last-resort leaf on
 the same alias (priority 100). Coding Plan is Codex-only: do not set
 `anthropic_route_family` on that candidate. Anthropic ingress therefore
 sees only the Alibaba leaf. This public alias has no schedule and remains

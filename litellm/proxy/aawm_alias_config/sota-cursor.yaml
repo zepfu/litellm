@@ -5,6 +5,6 @@ aliases:
   - name: sota-cursor
     candidates:
       - provider: cursor_agent
-        model: cursor_agent/cursor-grok-4.6-high
+        model: cursor_agent/cursor-grok-4.7-high
         route_family: codex_cursor_agent_aiserver_adapter
         priority: 100

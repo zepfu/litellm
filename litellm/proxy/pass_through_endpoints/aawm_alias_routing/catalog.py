@@ -18,8 +18,8 @@ AAWM_ALIAS_OWNED_BY = "aawm_alias"
 SERVED_CONCRETE_MODELS: Tuple[Tuple[str, str, str], ...] = (
     ("cursor_agent/composer-2.5", "cursor_agent/composer-2.5", "cursor_agent"),
     (
-        "cursor_agent/cursor-grok-4.6-high",
-        "cursor_agent/cursor-grok-4.6-high",
+        "cursor_agent/cursor-grok-4.7-high",
+        "cursor_agent/cursor-grok-4.7-high",
         "cursor_agent",
     ),
     ("oa_xai/grok-4.6", "oa_xai/grok-4.6", "oa_xai"),
@@ -27,7 +27,7 @@ SERVED_CONCRETE_MODELS: Tuple[Tuple[str, str, str], ...] = (
     ("oa_xai/grok-4.7", "oa_xai/grok-4.7", "oa_xai"),
     ("kimi_code/k3", "kimi_code/k3", "kimi_code"),
     ("cohere/north-mini-code-1-0", "cohere/north-mini-code-1-0", "cohere"),
-    ("alibaba_token_plan/glm-5.2", "alibaba_token_plan/glm-5.2", "alibaba_token_plan"),
+    ("alibaba_token_plan/glm-5.3", "alibaba_token_plan/glm-5.3", "alibaba_token_plan"),
     (
         "alibaba_token_plan/qwen3.8-max",
         "alibaba_token_plan/qwen3.8-max",
@@ -44,8 +44,8 @@ SERVED_CONCRETE_MODELS: Tuple[Tuple[str, str, str], ...] = (
         "openrouter",
     ),
     (
-        "opencode_zen/deepseek-v4-flash-free",
-        "opencode/deepseek-v4-flash-free",
+        "opencode_zen/deepseek-v4.1-flash-free",
+        "opencode/deepseek-v4.1-flash-free",
         "opencode_zen",
     ),
     (

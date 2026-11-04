@@ -149,7 +149,7 @@ def test_validate_environment_uses_http2_headers(monkeypatch):
 def test_sign_request_uses_connect_proto_framing():
     config = CursorAgentConfig()
     request_data = build_run_request(
-        model="cursor_agent/cursor-grok-4.6-high",
+        model="cursor_agent/cursor-grok-4.7-high",
         messages=[{"role": "user", "content": "ping"}],
         optional_params={
             "message_id": "message-1",
@@ -323,7 +323,7 @@ def test_requested_model_preserves_unmapped_model_slug():
 
 
 def test_requested_model_translates_cursor_catalog_selector():
-    selector = "cursor-grok-4.6-high"
+    selector = "cursor-grok-4.7-high"
     request = build_run_request(
         model=f"cursor_agent/{selector}",
         messages=[{"role": "user", "content": "ping"}],

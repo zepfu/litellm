@@ -15,7 +15,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.catalog import (
 
 SERVED_CONCRETE_MODELS = (
     "cursor_agent/composer-2.5",
-    "cursor_agent/cursor-grok-4.6-high",
+    "cursor_agent/cursor-grok-4.7-high",
     "oa_xai/grok-4.6",
     "xai/grok-4.7",
     "oa_xai/grok-4.7",
@@ -168,7 +168,7 @@ def test_overlay_rows_have_explicit_pricing_provenance() -> None:
 
 def test_cursor_grok_cost_is_not_copied_from_oa_xai_grok() -> None:
     rows = _catalog_rows()
-    cursor_grok = _row_by_id(rows, "cursor_agent/cursor-grok-4.6-high")
+    cursor_grok = _row_by_id(rows, "cursor_agent/cursor-grok-4.7-high")
     oa_xai_grok = _row_by_id(rows, "oa_xai/grok-4.6")
 
     cursor_input = cursor_grok.get("input_cost_per_token")

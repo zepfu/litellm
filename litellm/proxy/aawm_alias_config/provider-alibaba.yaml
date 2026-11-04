@@ -27,7 +27,7 @@ aliases:
         reasoning_effort: max
 
       - provider: alibaba_token_plan
-        model: alibaba_token_plan/glm-5.2
+        model: alibaba_token_plan/glm-5.3
         route_family: codex_alibaba_token_plan_chat_completions_adapter
         priority: 70
         # Wire: reasoning_effort=max. Native values are high and max.
@@ -40,7 +40,7 @@ aliases:
         # No configured effort. Provider default is reasoning_effort=high.
 
       - provider: alibaba_token_plan
-        model: alibaba_token_plan/qwen3.6-flash
+        model: alibaba_token_plan/qwen3.8-flash
         route_family: codex_alibaba_token_plan_chat_completions_adapter
         priority: 50
         # No configured effort. reasoning_effort is unsupported;

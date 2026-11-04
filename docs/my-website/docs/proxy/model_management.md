@@ -57,7 +57,7 @@ Config-driven alias routing uses:
 - `sota-openai`: `gpt-6-astra` (priority 100) with `reasoning_effort: high`
 - `sota-xai`: `xai/grok-4.7` via native xAI OIDC (priority 100), then
   `oa_xai/grok-4.7` via managed xAI OAuth (priority 90). Cursor Agent
-  `cursor_agent/cursor-grok-4.6-high` stays on `sota-cursor`.
+  `cursor_agent/cursor-grok-4.7-high` stays on `sota-cursor`.
 - Managed `sota-xai` has no candidate-level reasoning override: caller
   `reasoning.effort=xhigh` is sent unchanged to `oa_xai/grok-4.7`. Request
   metadata records the requested/native effort as `xhigh` and the
@@ -65,13 +65,13 @@ Config-driven alias routing uses:
   `grok-4.7(sota-xai):xhigh`. The managed candidate is last after native
   xAI OIDC; the two xAI routes remain distinct.
 - `sota`: selects the producer-family `sota-*` alias from TUI origin, defaulting to `sota-openai`.
-- Grok 4.6 (`xai/grok-4.6`, `oa_xai/grok-4.6`): 500k context; created 1785974400 (2026-08-06T00:00:00Z), owned by xAI, no aliases, source `https://docs.x.ai/developers/models/grok-4.6`, verified 2026-08-12; input $2/M, output $6/M, cached input $0.50/M, image input $2/M image tokens; above 200k whole-request input tokens, input/cache/output are $4/$1/$12 per million; managed-route session history records this as a reference rate with invoice cost unknown
+- Grok 4.7 (`xai/grok-4.6`, `oa_xai/grok-4.6`): 500k context; created 1785974400 (2026-08-06T00:00:00Z), owned by xAI, no aliases, source `https://docs.x.ai/developers/models/grok-4.6`, verified 2026-08-12; input $2/M, output $6/M, cached input $0.50/M, image input $2/M image tokens; above 200k whole-request input tokens, input/cache/output are $4/$1/$12 per million; managed-route session history records this as a reference rate with invoice cost unknown
 - Grok 4.7 (`xai/grok-4.7`, `oa_xai/grok-4.7`): 500k context; created 1790035200 (2026-09-22T00:00:00Z), owned by xAI, no aliases, source `https://docs.x.ai/developers/models/grok-4.7`, verified 2026-09-22; input $2/M, output $6/M, cached input $0.50/M, image input $2/M image tokens; above 200k whole-request input tokens, input/cache/output are $4/$1/$12 per million; managed-route session history records this as a reference rate with invoice cost unknown. Grok 4.7 always returns Responses `reasoning.encrypted_content` even when not requested.
 - Cursor Agent Composer 2.5 standard (`cursor_agent/composer-2.5`): CLI slug `composer-2.5`, not Fast and not xAI `grok-composer-2.5-fast`; public list $0.50/$0.20/$2.50 per million input/cache-read/output, reference-only with invoice cost unknown
-- Cursor Grok 4.6 (`cursor_agent/cursor-grok-4.6-high`): CLI slug `cursor-grok-4.6-high`, distinct from `oa_xai/grok-4.6` and `xai/grok-4.6`; public list $2/$0.50/$6 per million input/cache-read/output, reference-only with invoice cost unknown; temporary launch discount is not baked in
+- Cursor Grok 4.7 (`cursor_agent/cursor-grok-4.7-high`): CLI slug `cursor-grok-4.7-high`, distinct from `oa_xai/grok-4.6` and `xai/grok-4.6`; public list $2/$0.50/$6 per million input/cache-read/output, reference-only with invoice cost unknown; temporary launch discount is not baked in
 - `sota-alibaba`: `alibaba_token_plan/qwen3.8-max` → `alibaba_token_plan/qwen3.7-max`
 - `sota-zai`: `zai_coding_plan/glm-5.3` (priority 110), then last-resort
-  `alibaba_token_plan/glm-5.2` (priority 100)
+  `alibaba_token_plan/glm-5.3` (priority 100)
 - `provider-openai`: egress-validation order `gpt-6-luna` (priority 100) →
   `gpt-5.6-terra` (priority 90) → `gpt-6-sol` (priority 80) → `gpt-6-astra`
   (priority 0), all with `reasoning_effort: low`

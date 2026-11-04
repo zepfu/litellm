@@ -14,7 +14,7 @@ aliases:
         reasoning_effort: max
 
       - provider: alibaba_token_plan
-        model: alibaba_token_plan/glm-5.2
+        model: alibaba_token_plan/glm-5.3
         route_family: codex_alibaba_token_plan_chat_completions_adapter
         priority: 100
         reasoning_effort: max

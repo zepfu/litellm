@@ -46,7 +46,7 @@ _BUNDLED_CATALOG = (
 )
 
 _COMPOSER_MODEL = "cursor_agent/composer-2.5"
-_CURSOR_GROK_MODEL = "cursor_agent/cursor-grok-4.6-high"
+_CURSOR_GROK_MODEL = "cursor_agent/cursor-grok-4.7-high"
 _CODEX_CURSOR_ROUTE_FAMILY = "codex_cursor_agent_aiserver_adapter"
 _ANTHROPIC_CURSOR_ROUTE_FAMILY = "anthropic_cursor_agent_aiserver_adapter"
 

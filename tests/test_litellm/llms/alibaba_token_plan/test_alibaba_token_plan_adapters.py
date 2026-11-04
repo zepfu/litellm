@@ -33,7 +33,7 @@ _ALLOWED_MODELS = {
     "alibaba_token_plan/qwen3.7-max",
     "alibaba_token_plan/qwen3.6-flash",
     "alibaba_token_plan/deepseek-v4-pro",
-    "alibaba_token_plan/glm-5.2",
+    "alibaba_token_plan/glm-5.3",
 }
 
 
@@ -121,7 +121,7 @@ async def _stream_text(response: StreamingResponse) -> str:
         ("alibaba_token_plan/qwen3.7-max", "alibaba_token_plan/qwen3.7-max"),
         ("alibaba_token_plan/qwen3.6-flash", "alibaba_token_plan/qwen3.6-flash"),
         ("alibaba_token_plan/deepseek-v4-pro", "alibaba_token_plan/deepseek-v4-pro"),
-        ("alibaba_token_plan/glm-5.2", "alibaba_token_plan/glm-5.2"),
+        ("alibaba_token_plan/glm-5.3", "alibaba_token_plan/glm-5.3"),
         ("alibaba_token_plan/future-model-2026", "alibaba_token_plan/future-model-2026"),
         ("qwen3.8-max-preview", None),
         ("dashscope/qwen3.8-max-preview", None),

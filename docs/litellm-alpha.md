@@ -173,7 +173,7 @@ The current alpha alias YAML exposes these test paths:
   concrete `gpt-6.1-sol` model through alpha's Responses passthrough.
 - `sota-xai` orders native xAI/OIDC `xai/grok-4.7`, then managed
   xAI/OAuth `oa_xai/grok-4.7`. Cursor Agent
-  `cursor_agent/cursor-grok-4.6-high` stays on `sota-cursor`.
+  `cursor_agent/cursor-grok-4.7-high` stays on `sota-cursor`.
   `UserMessageAction.requestContext` is official schema field 2. For a fresh
   clean alias dispatch, LiteLLM intentionally sends it as an empty message
   (`requestContext: {}`). The official CLI normally computes and populates

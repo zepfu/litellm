@@ -146,12 +146,12 @@ def test_should_prefer_coding_plan_then_alibaba_on_public_sota_zai() -> None:
         ),
         (
             "alibaba_token_plan",
-            "alibaba_token_plan/glm-5.2",
+            "alibaba_token_plan/glm-5.3",
             "codex_alibaba_token_plan_chat_completions_adapter",
         ),
     ]
     assert [candidate["model"] for candidate in anthropic_candidates] == [
-        "alibaba_token_plan/glm-5.2"
+        "alibaba_token_plan/glm-5.3"
     ]
     assert all(
         candidate["provider"] == "alibaba_token_plan"
