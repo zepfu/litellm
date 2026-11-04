@@ -26,7 +26,7 @@ SERVED_CONCRETE_MODELS = (
 )
 
 ALIBABA_CHAT_PREFIX = "alibaba_token_plan/"
-OPENCODE_ZEN_YAML_IDS = ("deepseek-v4-flash-free", "big-pickle")
+OPENCODE_ZEN_YAML_IDS = ("deepseek-v4.1-flash-free", "big-pickle")
 TRUTHFUL_PROVENANCE = {
     "bundled map",
     "bundled_map",

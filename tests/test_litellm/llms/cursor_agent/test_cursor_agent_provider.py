@@ -217,7 +217,7 @@ def test_sign_request_uses_connect_proto_framing():
     model_fields = cursor_connect._decode_proto_fields(requested_model)
     assert cursor_connect._decode_proto_string(
         cursor_connect._proto_last_field(model_fields, 1, wire_type=2)
-    ) == "grok-4.6"
+    ) == "grok-4.7"
     parameters = cursor_connect._proto_field_values(
         model_fields,
         3,
@@ -331,7 +331,7 @@ def test_requested_model_translates_cursor_catalog_selector():
 
     assert strip_provider_prefix(f"cursor_agent/{selector}") == selector
     assert request["runRequest"]["requestedModel"] == {
-        "modelId": "grok-4.6",
+        "modelId": "grok-4.7",
         "parameters": [
             {"id": "effort", "value": "high"},
             {"id": "fast", "value": "false"},
