@@ -5409,22 +5409,28 @@ class TestPassThroughTerminalFailureLogging:
         tmp_path,
     ):
         mock_request = MagicMock(spec=Request)
+        mock_request.state = SimpleNamespace()
         mock_request.method = "POST"
         mock_request.url = "http://localhost:4001/anthropic/v1/messages?beta=true"
         mock_request.headers = {"content-type": "application/json"}
         mock_request.query_params = {"beta": "true"}
 
         target_url = "https://api.anthropic.com/v1/messages"
-        upstream_response = httpx.Response(
-            status_code=429,
-            content=(
-                b'{"type":"error","error":{"type":"rate_limit_error",'
-                b'"message":"Rate limited"},"request_id":"req_test"}'
-            ),
-            headers={"retry-after": "17"},
-            request=httpx.Request("POST", target_url),
+        upstream_body = (
+            b'{"type":"error","error":{"type":"rate_limit_error",'
+            b'"message":"Rate limited"},"request_id":"req_test"}'
         )
-        handler = AsyncMock(return_value=upstream_response)
+        handler = AsyncMock(
+            side_effect=[
+                httpx.Response(
+                    status_code=429,
+                    content=upstream_body,
+                    headers={"retry-after": "17"},
+                    request=httpx.Request("POST", target_url),
+                )
+                for _ in range(6)
+            ]
+        )
 
         (
             saved_handlers,
@@ -5473,8 +5479,9 @@ class TestPassThroughTerminalFailureLogging:
                     )
 
                 assert exc_info.value.code == "429"
-                assert handler.await_count == 1
-                mock_sleep.assert_not_awaited()
+                assert handler.await_count == 6
+                assert mock_sleep.await_count == 5
+                assert mock_sleep.await_args_list[0].args == (5.0,)
                 mock_warning.assert_not_called()
                 rate_limit_debug = next(
                     call
@@ -7802,8 +7809,9 @@ class TestPassThroughHiddenRetry:
         assert metadata["aawm_passthrough_hidden_retry_count"] == 2
 
     @pytest.mark.asyncio
-    async def test_pass_through_request_does_not_retry_429(self):
+    async def test_pass_through_request_retries_provider_429(self):
         mock_request = MagicMock(spec=Request)
+        mock_request.state = SimpleNamespace()
         mock_request.method = "POST"
         mock_request.url = MagicMock()
         mock_request.url.path = "/anthropic/v1/messages"
@@ -7817,7 +7825,13 @@ class TestPassThroughHiddenRetry:
             headers={"retry-after": "17"},
             request=httpx.Request("POST", target_url),
         )
-        handler = AsyncMock(return_value=upstream_response)
+        success_response = httpx.Response(
+            status_code=200,
+            content=b'{"id":"message_1"}',
+            headers={"content-type": "application/json"},
+            request=httpx.Request("POST", target_url),
+        )
+        handler = AsyncMock(side_effect=[upstream_response, success_response])
 
         with patch(
             "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
@@ -7841,18 +7855,17 @@ class TestPassThroughHiddenRetry:
             )
             mock_logging_obj.post_call_failure_hook = AsyncMock()
 
-            with pytest.raises(ProxyException) as exc_info:
-                await pass_through_request(
-                    request=mock_request,
-                    target=target_url,
-                    custom_headers={"authorization": "Bearer test"},
-                    user_api_key_dict=MagicMock(),
-                    stream=False,
-                )
+            response = await pass_through_request(
+                request=mock_request,
+                target=target_url,
+                custom_headers={"authorization": "Bearer test"},
+                user_api_key_dict=MagicMock(),
+                stream=False,
+            )
 
-        assert exc_info.value.code == "429"
-        assert handler.await_count == 1
-        mock_sleep.assert_not_awaited()
+        assert response.status_code == 200
+        assert handler.await_count == 2
+        mock_sleep.assert_awaited_once_with(5.0)
 
     @pytest.mark.asyncio
     async def test_pass_through_request_retries_stream_pre_yield_status(self):

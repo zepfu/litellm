@@ -2448,7 +2448,7 @@ async def handle_alias_route(  # noqa: PLR0915
             )
         provider_capacity_returned = (
             error_class
-            in {"capacity_exhausted", "server_overloaded"}
+            in {"capacity_exhausted", "server_overloaded", "rate_limited"}
             and attempt_record.get("attempted_provider_call") is True
             and attempt_record.get("provider_returned") is True
         )

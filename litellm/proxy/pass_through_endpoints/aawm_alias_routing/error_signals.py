@@ -3393,6 +3393,11 @@ _RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES = frozenset(
         "upstream_overloaded",
         "capacity_exhausted",
         "upstream_transient_internal",
+        # Provider HTTP 429s that are not account-usage exhaustion are
+        # recoverable rate limits. Keep them in the pre-commit retry policy so
+        # the alias loop can retry or advance to another candidate instead of
+        # surfacing a terminal 429 to the client.
+        "rate_limited",
     }
 )
 _RESPONSES_PRE_COMMIT_ORDINARY_RETRY_CLASSES = frozenset(

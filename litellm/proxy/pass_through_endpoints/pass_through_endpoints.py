@@ -3098,7 +3098,13 @@ def _classify_passthrough_raw_http_error(
     code, error_type, message = (
         PassThroughStreamingHandler._extract_responses_stream_error_fields(payload)
     )
+    payload_text = ""
+    try:
+        payload_text = json.dumps(payload, sort_keys=True, default=str).lower()
+    except Exception:
+        payload_text = str(payload).lower()
     fields = " ".join(value or "" for value in (code, error_type, message)).lower()
+    fields = f"{fields} {payload_text}"
     if any(
         marker in fields
         for marker in (
@@ -3127,16 +3133,16 @@ def _classify_passthrough_raw_http_error(
     # shape that the shared Responses classifier cannot recognize. The
     # provider-returned marker is required so local/pre-egress 429s remain
     # terminal instead of entering the long capacity retry budget.
-    # Preserve terminal classifications for provider 429s with any
-    # recognizable error fields. Only an otherwise unrecognized body can use
-    # the provider-attributed status as capacity evidence.
-    if provider_returned_429 and not any(
-        value is not None and str(value).strip()
-        for value in (code, error_type, message)
-    ):
+    # A provider-attributed 429 is a transient capacity/rate-limit signal when
+    # the payload did not carry one of the explicit account/quota semantics
+    # above. Providers commonly return an arbitrary string such as
+    # ``{"error":"throttled"}``; treating that unknown envelope as a
+    # terminal provider error is what stopped lncrawl/egress sessions instead
+    # of allowing the normal retry/failover path to run.
+    if provider_returned_429 and classified[0] == "provider_terminal_error":
         return _finish(
             ("server_overloaded", "transient_capacity", True),
-            reason="provider_429_empty_fields",
+            reason="provider_429_unclassified_payload",
         )
     if provider_returned_429 and (
         code in {"capacity_exhausted", "server_is_overloaded"}
@@ -3159,6 +3165,7 @@ def _is_passthrough_pre_first_byte_hidden_retryable(
     failure_class: str,
     url: Optional[httpx.URL] = None,
     custom_llm_provider: Optional[str] = None,
+    raw_http_classification: Optional[Tuple[str, str, bool]] = None,
 ) -> bool:
     if (
         getattr(exc, "aawm_call_ledger_exhausted", False)
@@ -3191,7 +3198,17 @@ def _is_passthrough_pre_first_byte_hidden_retryable(
             and not exc.pre_commit_retry_exhausted
         )
     if status_code == 429:
-        return False
+        # Retry only provider-returned rate limits that the raw classifier
+        # identifies as transient. Account-usage/quota 429s remain terminal so
+        # alias routing can apply its normal account failover semantics.
+        classification = raw_http_classification
+        if classification is None:
+            classification = _classify_passthrough_raw_http_error(
+                exc,
+                status_code=status_code,
+                custom_llm_provider=custom_llm_provider,
+            )
+        return bool(classification is not None and classification[2])
     if status_code in PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES:
         return True
     if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError)):
@@ -3837,13 +3854,6 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         detail=str(exc),
                     )
                 ) from exc
-            should_retry = _is_passthrough_pre_first_byte_hidden_retryable(
-                exc,
-                status_code=status_code,
-                failure_class=failure_class,
-                url=url,
-                custom_llm_provider=custom_llm_provider,
-            )
             raw_http_classification = (
                 _classify_passthrough_raw_http_error(
                     exc,
@@ -3854,8 +3864,16 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     event_stage="retry_loop",
                     diagnostic_enabled=True,
                 )
-                if openai_capacity_coordinator is not None
+                if openai_capacity_coordinator is not None or status_code == 429
                 else None
+            )
+            should_retry = _is_passthrough_pre_first_byte_hidden_retryable(
+                exc,
+                status_code=status_code,
+                failure_class=failure_class,
+                url=url,
+                custom_llm_provider=custom_llm_provider,
+                raw_http_classification=raw_http_classification,
             )
             if raw_http_classification is not None:
                 raw_error_class, raw_failure_classification, _ = raw_http_classification

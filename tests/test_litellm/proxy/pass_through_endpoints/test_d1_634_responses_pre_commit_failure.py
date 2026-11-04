@@ -2151,6 +2151,17 @@ def test_plan_capacity_exhausted_uses_progressive_schedule():
     assert plan["wait_seconds"] == 15.0
 
 
+def test_plan_provider_rate_limit_retries_instead_of_terminalizing():
+    plan = plan_responses_pre_commit_retry(
+        error_class="rate_limited",
+        same_account_transient_attempts=0,
+        openai_alpha_capacity_retry_enabled=True,
+    )
+    assert plan["action"] == "retry_same_account"
+    assert plan["retryable"] is True
+    assert plan["wait_seconds"] == 15.0
+
+
 def test_plan_upstream_transient_internal_uses_progressive_schedule():
     plan = plan_responses_pre_commit_retry(
         error_class="upstream_transient_internal",
