@@ -142,8 +142,9 @@ _RESPONSES_RESPONSE_ENVELOPE_FIELDS = {
     "moderation", "access_programs", "tool_usage",
 }
 _RESPONSES_ERROR_FIELDS = {"type", "code", "message", "param"}
-# OPENAI-080: Oracle-frozen exact typed allowlist for replay-safe private events.
-# These are exact event-name-and-shape gates, not prefix matching.
+# OPENAI-080: typed allowlist for replay-safe private event families.
+# Event names and nested semantic fields remain closed; response-envelope
+# metadata extensions are tolerated so provider additions do not block setup.
 _RESPONSES_SAFE_ITEM_ADDED_TYPES = frozenset({"message", "function_call", "custom_tool_call", "reasoning"})
 _RESPONSES_SAFE_CONTENT_PART_ADDED_TYPES = frozenset({"output_text", "refusal", "reasoning_text"})
 _RESPONSES_SUBSTANTIVE_EVENT_PREFIXES = (
@@ -1226,12 +1227,19 @@ class PassThroughStreamingHandler:
     def _has_only_fields(
         value: Any, fields: Union[set[str], tuple[str, ...]], *,
         rejection: Optional[Dict[str, str]] = None, path: str = "$",
-        required: bool = False,
+        required: bool = False, allow_unknown: bool = False,
     ) -> bool:
+        """Validate a known shape, optionally tolerating additive fields.
+
+        Responses providers may add metadata to an otherwise valid response
+        envelope.  Callers opt into that compatibility only for envelopes whose
+        extra fields cannot change the event's execution semantics.  Required
+        fields and the value checks made by callers remain enforced.
+        """
         reject = PassThroughStreamingHandler._reject_responses_field
         if not isinstance(value, dict):
             return reject(rejection, path, "invalid_type")
-        if not set(value).issubset(fields):
+        if not allow_unknown and not set(value).issubset(fields):
             return reject(rejection, path + ".<unknown_field>", "unknown_field")
         if required:
             for key in fields:
@@ -1287,8 +1295,7 @@ class PassThroughStreamingHandler:
 
     @staticmethod
     def _is_safe_output_item_added_shape(item: Any) -> bool:
-        """Return True when *item* is one of the four permitted safe-private
-        ``response.output_item.added`` shapes (OPENAI-080 closed set)."""
+        """Return True for a supported safe-private output-item shape."""
         if not isinstance(item, dict):
             return False
         item_type = item.get("type")
@@ -1358,8 +1365,7 @@ class PassThroughStreamingHandler:
 
     @staticmethod
     def _is_safe_content_part_added_shape(part: Any) -> bool:
-        """Return True when *part* is one of the three permitted safe-private
-        ``response.content_part.added`` shapes (OPENAI-080 closed set)."""
+        """Return True for a supported safe-private content-part shape."""
         if not isinstance(part, dict):
             return False
         part_type = part.get("type")
@@ -1480,11 +1486,10 @@ class PassThroughStreamingHandler:
         payload: Optional[Dict[str, Any]] = None,
         rejection: Optional[Dict[str, str]] = None,
     ) -> bool:
-        """Frozen Oracle allowlist: return True only when the exact event name and
-        full semantic shape are unconditionally safe to discard on a precommit failure.
+        """Return True for a known lifecycle event with safe semantics.
 
-        This is the OPENAI-080 closed set.  Any unrecognised event, unexpected field,
-        or schema conflict commits the attempt.
+        Event names and interpreted values remain validated.  Only additive
+        fields on the response envelope are ignored by the shape helper.
         """
         reject = PassThroughStreamingHandler._reject_responses_field
         if event_type is None or not isinstance(payload, dict):
@@ -1512,7 +1517,7 @@ class PassThroughStreamingHandler:
                 return False
             if not PassThroughStreamingHandler._has_only_fields(
                 response_payload, _RESPONSES_RESPONSE_ENVELOPE_FIELDS,
-                rejection=rejection, path="$.response"
+                rejection=rejection, path="$.response", allow_unknown=True
             ):
                 return False
             if not PassThroughStreamingHandler._is_nonempty_string(
@@ -2130,7 +2135,7 @@ class PassThroughStreamingHandler:
             not isinstance(response_payload, dict)
             or not PassThroughStreamingHandler._has_only_fields(
                 response_payload, _RESPONSES_RESPONSE_ENVELOPE_FIELDS,
-                rejection=rejection, path="$.response"
+                rejection=rejection, path="$.response", allow_unknown=True
             )
             or not PassThroughStreamingHandler._is_nonempty_string(
                 response_payload.get("id")

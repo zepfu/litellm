@@ -6728,7 +6728,6 @@ async def test_openai_responses_incomplete_terminal_freezes_before_later_overloa
 @pytest.mark.parametrize(
     "scenario",
     [
-        "unsupported_lifecycle_extension",
         "mismatched_response_identity",
         "mismatched_output_index",
         "conflicting_event_payload_type",
@@ -8605,13 +8604,13 @@ def _rejected_setup_stream_frames(case: str, success: bool) -> list[bytes]:
 @pytest.mark.parametrize(
     ("case", "success", "broken_capture", "expected_field", "expected_reason"),
     [
-        ("unknown_identifier", False, False, "$.response.<unknown_field>", "unknown_field"),
-        ("unknown_nonidentifier", False, False, "$.response.<unknown_field>", "unknown_field"),
+        ("unknown_identifier", False, False, "$.response.moderation", "invalid_value"),
+        ("unknown_nonidentifier", False, False, "$.response.moderation", "invalid_value"),
         ("invalid_type", False, False, "$.response.output", "invalid_type"),
         ("invalid_value", False, False, "$.response.access_programs", "invalid_value"),
         ("nonzero_usage", False, False, "$.response.tool_usage.web_search.num_requests", "nonzero_usage"),
         ("missing_field", False, False, "$.response.tool_usage.image_gen", "missing_field"),
-        ("unknown_identifier", True, False, "$.response.<unknown_field>", "unknown_field"),
+        ("unknown_identifier", True, False, None, None),
         ("unknown_identifier", False, True, None, None),
         ("safe", True, False, None, None),
     ],
@@ -8650,7 +8649,9 @@ async def test_setup_rejection_diagnostic_follows_final_outcome(
             assert len(emitted) == 1
             context = emitted[0]
             assert context["replay_commitment_reason"] == "unknown_semantics"
-            assert context["replay_commitment_event_type"] == "response.created"
+            assert context["replay_commitment_event_type"] == (
+                "response.failed" if case.startswith("unknown") else "response.created"
+            )
         diagnostic = {k: context[k] for k in ("replay_rejected_field", "replay_rejection_reason") if k in context}
         assert diagnostic == ({} if expected_field is None else {
             "replay_rejected_field": expected_field,
@@ -8666,6 +8667,31 @@ async def test_setup_rejection_diagnostic_follows_final_outcome(
         for stream in used:
             await stream.aclose()
         await client.aclose()
+
+
+@pytest.mark.parametrize("event_type", ["response.created", "response.in_progress"])
+def test_additive_response_fields_remain_replay_safe(event_type):
+    """Provider metadata additions do not block a lifecycle replay decision."""
+    pipeline = ResponsesEventPipeline()
+    event = pipeline.adopt_event(
+        {
+            "type": event_type,
+            "sequence_number": 0,
+            "response": {
+                "id": "resp_extension",
+                "status": "in_progress",
+                "output": [],
+                "provider_response_state": "opaque",
+            },
+        },
+        event_type=event_type,
+    )
+    rejection = {}
+
+    assert PassThroughStreamingHandler._inspect_responses_events(
+        event, rejection
+    ) == ("lifecycle", None, None, None)
+    assert rejection == {}
 
 
 @pytest.mark.asyncio
