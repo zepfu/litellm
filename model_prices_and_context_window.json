@@ -29746,7 +29746,190 @@
             }
         }
     },
+"nvidia_nim/openai/gpt-oss-20b": {
+        "litellm_provider": "nvidia_nim",
+        "mode": "chat",
+        "provider_specific_entry": {
+            "nvidia_nim": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "unpriced",
+                    "kind": "hosted_route_reference",
+                    "billing_mode": "nvidia_nim_hosted_route",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "nvidia_nim",
+                        "model": "nvidia/openai/gpt-oss-20b"
+                    },
+                    "cache_mode": "none",
+                    "equivalence_status": "not_exact",
+                    "equivalence_evidence": "NVIDIA Build hosted model page does not expose a verified undiscounted tariff for this exact route; no zero price is inferred.",
+                    "source": {
+                        "kind": "official_provider_model_catalog",
+                        "label": "NVIDIA Build model catalog",
+                        "urls": [
+                            "https://build.nvidia.com/models"
+                        ],
+                        "version": "2026-11-04",
+                        "verified_on": "2026-11-04"
+                    },
+                    "unpriced_reason": "exact_tariff_unavailable"
+                }
+            }
+        }
+    },
+"nvidia_nim/deepseek-ai/deepseek-v4-flash-0731": {
+        "litellm_provider": "nvidia_nim",
+        "mode": "chat",
+        "provider_specific_entry": {
+            "nvidia_nim": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "unpriced",
+                    "kind": "hosted_route_reference",
+                    "billing_mode": "nvidia_nim_hosted_route",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "nvidia_nim",
+                        "model": "nvidia/deepseek-ai/deepseek-v4-flash-0731"
+                    },
+                    "cache_mode": "none",
+                    "equivalence_status": "not_exact",
+                    "equivalence_evidence": "NVIDIA Build hosted model page does not expose a verified undiscounted tariff for this exact route; no zero price is inferred.",
+                    "source": {
+                        "kind": "official_provider_model_catalog",
+                        "label": "NVIDIA Build model catalog",
+                        "urls": [
+                            "https://build.nvidia.com/models"
+                        ],
+                        "version": "2026-11-04",
+                        "verified_on": "2026-11-04"
+                    },
+                    "unpriced_reason": "exact_tariff_unavailable"
+                }
+            }
+        }
+    },
+"nvidia_nim/nvidia/nemotron-3-super-120b-a12b": {
+        "litellm_provider": "nvidia_nim",
+        "mode": "chat",
+        "provider_specific_entry": {
+            "nvidia_nim": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "unpriced",
+                    "kind": "hosted_route_reference",
+                    "billing_mode": "nvidia_nim_hosted_route",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "nvidia_nim",
+                        "model": "nvidia/nvidia/nemotron-3-super-120b-a12b"
+                    },
+                    "cache_mode": "none",
+                    "equivalence_status": "not_exact",
+                    "equivalence_evidence": "NVIDIA Build hosted model page does not expose a verified undiscounted tariff for this exact route; no zero price is inferred.",
+                    "source": {
+                        "kind": "official_provider_model_catalog",
+                        "label": "NVIDIA Build model catalog",
+                        "urls": [
+                            "https://build.nvidia.com/models"
+                        ],
+                        "version": "2026-11-04",
+                        "verified_on": "2026-11-04"
+                    },
+                    "unpriced_reason": "exact_tariff_unavailable"
+                }
+            }
+        }
+    },
+"nvidia_nim/minimaxai/minimax-m3": {
+        "litellm_provider": "nvidia_nim",
+        "mode": "chat",
+        "provider_specific_entry": {
+            "nvidia_nim": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "unpriced",
+                    "kind": "hosted_route_reference",
+                    "billing_mode": "nvidia_nim_hosted_route",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "nvidia_nim",
+                        "model": "nvidia/minimaxai/minimax-m3"
+                    },
+                    "cache_mode": "none",
+                    "equivalence_status": "not_exact",
+                    "equivalence_evidence": "NVIDIA Build hosted model page does not expose a verified undiscounted tariff for this exact route; no zero price is inferred.",
+                    "source": {
+                        "kind": "official_provider_model_catalog",
+                        "label": "NVIDIA Build model catalog",
+                        "urls": [
+                            "https://build.nvidia.com/models"
+                        ],
+                        "version": "2026-11-04",
+                        "verified_on": "2026-11-04"
+                    },
+                    "unpriced_reason": "exact_tariff_unavailable"
+                }
+            }
+        }
+    },
+"nvidia_nim/openai/gpt-oss-120b": {
+        "litellm_provider": "nvidia_nim",
+        "mode": "chat",
+        "provider_specific_entry": {
+            "nvidia_nim": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "unpriced",
+                    "kind": "hosted_route_reference",
+                    "billing_mode": "nvidia_nim_hosted_route",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "nvidia_nim",
+                        "model": "nvidia/openai/gpt-oss-120b"
+                    },
+                    "cache_mode": "none",
+                    "equivalence_status": "not_exact",
+                    "equivalence_evidence": "NVIDIA Build hosted model page does not expose a verified undiscounted tariff for this exact route; no zero price is inferred.",
+                    "source": {
+                        "kind": "official_provider_model_catalog",
+                        "label": "NVIDIA Build model catalog",
+                        "urls": [
+                            "https://build.nvidia.com/models"
+                        ],
+                        "version": "2026-11-04",
+                        "verified_on": "2026-11-04"
+                    },
+                    "unpriced_reason": "exact_tariff_unavailable"
+                }
+            }
+        }
+    },
     "nvidia/moonshotai/kimi-k3": {
+        "provider_specific_entry": {
+            "nvidia_nim": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "unpriced",
+                    "kind": "hosted_route_reference",
+                    "billing_mode": "nvidia_nim_hosted_route",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {"provider": "nvidia_nim", "model": "nvidia/moonshotai/kimi-k3"},
+                    "cache_mode": "none",
+                    "equivalence_status": "not_exact",
+                    "equivalence_evidence": "NVIDIA Build hosted model page does not expose a verified undiscounted tariff for this exact route; no zero price is inferred.",
+                    "source": {"kind": "official_provider_model_catalog", "label": "NVIDIA Build model catalog", "urls": ["https://build.nvidia.com/models"], "version": "2026-11-04", "verified_on": "2026-11-04"},
+                    "unpriced_reason": "exact_tariff_unavailable"
+                }
+            }
+        },
         "custom_tool_function_adapters": [
             "apply_patch"
         ],
@@ -29774,6 +29957,209 @@
             "custom_tool_call",
             "custom_tool_call_output"
         ]
+    },
+"nvidia_nim/nvidia/openai/gpt-oss-20b": {
+        "litellm_provider": "nvidia_nim",
+        "mode": "chat",
+        "provider_specific_entry": {
+            "nvidia_nim": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "unpriced",
+                    "kind": "hosted_route_reference",
+                    "billing_mode": "nvidia_nim_hosted_route",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "nvidia_nim",
+                        "model": "nvidia/openai/gpt-oss-20b"
+                    },
+                    "cache_mode": "none",
+                    "equivalence_status": "not_exact",
+                    "equivalence_evidence": "NVIDIA Build hosted model page does not expose a verified undiscounted tariff for this exact route; no zero price is inferred.",
+                    "source": {
+                        "kind": "official_provider_model_catalog",
+                        "label": "NVIDIA Build model catalog",
+                        "urls": [
+                            "https://build.nvidia.com/models"
+                        ],
+                        "version": "2026-11-04",
+                        "verified_on": "2026-11-04"
+                    },
+                    "unpriced_reason": "exact_tariff_unavailable"
+                }
+            }
+        }
+    },
+"nvidia_nim/nvidia/deepseek-ai/deepseek-v4-flash-0731": {
+        "litellm_provider": "nvidia_nim",
+        "mode": "chat",
+        "provider_specific_entry": {
+            "nvidia_nim": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "unpriced",
+                    "kind": "hosted_route_reference",
+                    "billing_mode": "nvidia_nim_hosted_route",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "nvidia_nim",
+                        "model": "nvidia/deepseek-ai/deepseek-v4-flash-0731"
+                    },
+                    "cache_mode": "none",
+                    "equivalence_status": "not_exact",
+                    "equivalence_evidence": "NVIDIA Build hosted model page does not expose a verified undiscounted tariff for this exact route; no zero price is inferred.",
+                    "source": {
+                        "kind": "official_provider_model_catalog",
+                        "label": "NVIDIA Build model catalog",
+                        "urls": [
+                            "https://build.nvidia.com/models"
+                        ],
+                        "version": "2026-11-04",
+                        "verified_on": "2026-11-04"
+                    },
+                    "unpriced_reason": "exact_tariff_unavailable"
+                }
+            }
+        }
+    },
+"nvidia_nim/nvidia/nvidia/nemotron-3-super-120b-a12b": {
+        "litellm_provider": "nvidia_nim",
+        "mode": "chat",
+        "provider_specific_entry": {
+            "nvidia_nim": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "unpriced",
+                    "kind": "hosted_route_reference",
+                    "billing_mode": "nvidia_nim_hosted_route",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "nvidia_nim",
+                        "model": "nvidia/nvidia/nemotron-3-super-120b-a12b"
+                    },
+                    "cache_mode": "none",
+                    "equivalence_status": "not_exact",
+                    "equivalence_evidence": "NVIDIA Build hosted model page does not expose a verified undiscounted tariff for this exact route; no zero price is inferred.",
+                    "source": {
+                        "kind": "official_provider_model_catalog",
+                        "label": "NVIDIA Build model catalog",
+                        "urls": [
+                            "https://build.nvidia.com/models"
+                        ],
+                        "version": "2026-11-04",
+                        "verified_on": "2026-11-04"
+                    },
+                    "unpriced_reason": "exact_tariff_unavailable"
+                }
+            }
+        }
+    },
+"nvidia_nim/nvidia/minimaxai/minimax-m3": {
+        "litellm_provider": "nvidia_nim",
+        "mode": "chat",
+        "provider_specific_entry": {
+            "nvidia_nim": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "unpriced",
+                    "kind": "hosted_route_reference",
+                    "billing_mode": "nvidia_nim_hosted_route",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "nvidia_nim",
+                        "model": "nvidia/minimaxai/minimax-m3"
+                    },
+                    "cache_mode": "none",
+                    "equivalence_status": "not_exact",
+                    "equivalence_evidence": "NVIDIA Build hosted model page does not expose a verified undiscounted tariff for this exact route; no zero price is inferred.",
+                    "source": {
+                        "kind": "official_provider_model_catalog",
+                        "label": "NVIDIA Build model catalog",
+                        "urls": [
+                            "https://build.nvidia.com/models"
+                        ],
+                        "version": "2026-11-04",
+                        "verified_on": "2026-11-04"
+                    },
+                    "unpriced_reason": "exact_tariff_unavailable"
+                }
+            }
+        }
+    },
+"nvidia_nim/nvidia/openai/gpt-oss-120b": {
+        "litellm_provider": "nvidia_nim",
+        "mode": "chat",
+        "provider_specific_entry": {
+            "nvidia_nim": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "unpriced",
+                    "kind": "hosted_route_reference",
+                    "billing_mode": "nvidia_nim_hosted_route",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "nvidia_nim",
+                        "model": "nvidia/openai/gpt-oss-120b"
+                    },
+                    "cache_mode": "none",
+                    "equivalence_status": "not_exact",
+                    "equivalence_evidence": "NVIDIA Build hosted model page does not expose a verified undiscounted tariff for this exact route; no zero price is inferred.",
+                    "source": {
+                        "kind": "official_provider_model_catalog",
+                        "label": "NVIDIA Build model catalog",
+                        "urls": [
+                            "https://build.nvidia.com/models"
+                        ],
+                        "version": "2026-11-04",
+                        "verified_on": "2026-11-04"
+                    },
+                    "unpriced_reason": "exact_tariff_unavailable"
+                }
+            }
+        }
+    },
+"nvidia_nim/nvidia/moonshotai/kimi-k3": {
+        "litellm_provider": "nvidia_nim",
+        "mode": "chat",
+        "supports_function_calling": true,
+        "custom_tool_function_adapters": ["apply_patch"],
+        "namespace_tool_function_adapters": {"collaboration": ["followup_task", "interrupt_agent", "list_agents", "send_message", "spawn_agent", "wait_agent"]},
+        "unsupported_hosted_tools": ["custom", "image_generation", "namespace", "tool_search", "web_search"],
+        "unsupported_input_item_types": ["custom_tool_call", "custom_tool_call_output"],
+        "provider_specific_entry": {
+            "nvidia_nim": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "unpriced",
+                    "kind": "hosted_route_reference",
+                    "billing_mode": "nvidia_nim_hosted_route",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "nvidia_nim",
+                        "model": "nvidia/moonshotai/kimi-k3"
+                    },
+                    "cache_mode": "none",
+                    "equivalence_status": "not_exact",
+                    "equivalence_evidence": "NVIDIA Build hosted model page does not expose a verified undiscounted tariff for this exact route; no zero price is inferred.",
+                    "source": {
+                        "kind": "official_provider_model_catalog",
+                        "label": "NVIDIA Build model catalog",
+                        "urls": [
+                            "https://build.nvidia.com/models"
+                        ],
+                        "version": "2026-11-04",
+                        "verified_on": "2026-11-04"
+                    },
+                    "unpriced_reason": "exact_tariff_unavailable"
+                }
+            }
+        }
     },
     "nvidia_nim/deepseek-ai/deepseek-v3.1-terminus": {
         "input_cost_per_token": 2e-07,
@@ -41594,16 +41980,13 @@
         "max_tokens": 500000,
         "max_input_tokens": 500000,
         "max_output_tokens": 128000,
-        "input_cost_per_token": 0,
-        "output_cost_per_token": 0,
-        "cache_read_input_token_cost": 0,
         "litellm_provider": "opencode_go",
         "mode": "chat",
         "provider_specific_entry": {
             "opencode_go": {
                 "aawm_reference_pricing": {
                     "schema_version": 1,
-                    "status": "priced",
+                    "status": "unpriced",
                     "kind": "hosted_route_reference",
                     "billing_mode": "opencode_go_hosted_route",
                     "actual_invoice_cost_known": false,
@@ -41612,14 +41995,10 @@
                         "provider": "opencode_go",
                         "model": "opencode/omen-alpha"
                     },
-                    "rates": {
-                        "input_usd_per_million_tokens": 0.2,
-                        "cache_read_usd_per_million_tokens": 0.04,
-                        "output_usd_per_million_tokens": 0.66
-                    },
                     "cache_mode": "provider_cache_read",
-                    "equivalence_status": "direct_reference",
-                    "equivalence_evidence": "OpenCode Go Omen Alpha rates from the provider-maintained models.dev catalog.",
+                    "equivalence_status": "not_exact",
+                    "equivalence_evidence": "Deprecated OpenCode Go Omen Alpha route; no current undiscounted tariff is retained.",
+                    "unpriced_reason": "deprecated_route_no_current_tariff",
                     "source": {
                         "kind": "models_dev_model_catalog",
                         "label": "models.dev OpenCode Go Omen Alpha metadata",
