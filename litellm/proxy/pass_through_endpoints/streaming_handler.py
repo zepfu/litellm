@@ -268,6 +268,18 @@ class ResponsesStreamPreCommitFailure(Exception):
             detail=self.detail,
             headers=headers,
         )
+        if (
+            self.error_class == "usage_limit_reached"
+            and self.provider_returned
+        ):
+            # The direct Codex OAuth failover gate needs an explicit
+            # provider-attributed quota marker. Preserve it when a
+            # provider-authored Responses SSE failure is normalized into an
+            # HTTPException; the full upstream payload remains in finalizer
+            # metadata for audit and replay diagnostics.
+            http_exception.detail["failover_disposition"] = (
+                "usage_limit_reached"
+            )
         setattr(http_exception, "_aawm_provider_returned", self.provider_returned)
         if self.error_class == "openai_response_protection_unavailable":
             setattr(

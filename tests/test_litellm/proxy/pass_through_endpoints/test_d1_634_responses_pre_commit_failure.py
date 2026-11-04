@@ -1637,6 +1637,28 @@ def test_pre_commit_failure_http_exception_is_503_with_retry_after():
     assert http_exc.detail["error"]["type"] == "server_overloaded"
 
 
+def test_provider_quota_pre_commit_http_exception_is_failover_bound():
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
+        is_direct_codex_usage_limit_error,
+    )
+
+    failure = ResponsesStreamPreCommitFailure(
+        error_class="usage_limit_reached",
+        classification="usage_limit_reached",
+        retryable=False,
+        error_code="usage_limit_reached",
+        error_type="usage_limit_reached",
+        status_code=429,
+        provider_returned=True,
+    )
+
+    http_exc = failure.as_http_exception()
+
+    assert http_exc.status_code == 429
+    assert http_exc.detail["failover_disposition"] == "usage_limit_reached"
+    assert is_direct_codex_usage_limit_error(http_exc) is True
+
+
 @pytest.mark.asyncio
 async def test_hidden_retry_retries_same_account_then_returns_503():
     attempts: list[int] = []
