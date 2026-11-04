@@ -464,10 +464,10 @@ def _is_provider_owned_opaque_representation(value: Any) -> bool:
     if not isinstance(value, str):
         return False
     stripped = value.strip()
-    if stripped.startswith("aawm_erp:"):
-        # AAWM may retain the native ciphertext behind its provenance wrapper.
-        # The wrapper and ciphertext are one provider-owned value for the
-        # native Codex route and must remain byte-for-byte intact.
+    if any(stripped.startswith(prefix) for prefix in _OPAQUE_PREFIXES):
+        # AAWM or affinity routing may retain native ciphertext behind a
+        # provenance wrapper. The wrapper and ciphertext are one opaque value
+        # for the native Codex route and must remain byte-for-byte intact.
         return ";" in stripped
     return (
         len(stripped) >= 64

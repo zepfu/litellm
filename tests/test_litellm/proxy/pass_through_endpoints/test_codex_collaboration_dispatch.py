@@ -79,6 +79,7 @@ def test_should_reject_ambiguous_declarations(declaration, conflict):
     [
         "gAAAAABn" + "A" * 200,
         "aawm_erp:eyJwcm92aWRlciI6Im9wZW5haSJ9;gAAAAABn" + "A" * 200,
+        "litellm_enc:eyJtb2RlbF9pZCI6ImdwdC02LjEifQ==;gAAAAABn" + "A" * 200,
     ],
 )
 def test_should_preserve_provider_owned_opaque_agent_message(message_type, payload):
