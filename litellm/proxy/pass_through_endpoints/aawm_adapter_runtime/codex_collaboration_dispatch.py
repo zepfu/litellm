@@ -459,6 +459,18 @@ def _is_opaque_representation(value: str) -> bool:
     )
 
 
+def _is_provider_owned_opaque_representation(value: Any) -> bool:
+    """Recognize opaque Codex ciphertext that the selected native route owns."""
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    return (
+        len(stripped) >= 64
+        and stripped.startswith("gAAAA")
+        and re.fullmatch(r"[A-Za-z0-9_=-]+", stripped) is not None
+    )
+
+
 def _schema_has_unsupported_composition(schema: Mapping[str, Any]) -> bool:
     return any(key in schema for key in _UNSUPPORTED_SCHEMA_KEYS)
 
@@ -1622,6 +1634,13 @@ def _normalize_codex_message_payload(
     *,
     capture_evidence: Any = None,
 ) -> tuple[dict[str, Any], bool]:
+    # Codex 0.166 can carry a provider-owned Fernet assignment in the
+    # encrypted slot.  LiteLLM cannot decrypt or safely reinterpret that
+    # value; leave the complete agent_message intact so the native route can
+    # consume it.  Local CFG-047 frames still go through strict validation
+    # below.
+    if _is_provider_owned_opaque_representation(payload):
+        return item, False
     normalized_payload = _replay_canonical_codex_message_payload(
         item,
         visible_text,
@@ -1729,6 +1748,8 @@ def _normalize_agent_message_item(
         payload = payload_part.get("encrypted_content")
         if not isinstance(payload, str) or not payload:
             raise CodexCollaborationDispatchError("invalid_envelope")
+        if _is_provider_owned_opaque_representation(payload):
+            return item, False
         assignment = parse_codex_collaboration_text_frame(payload)
         normalized_item = _NormalizedCodexAgentMessage(item)
         normalized_item["content"] = [

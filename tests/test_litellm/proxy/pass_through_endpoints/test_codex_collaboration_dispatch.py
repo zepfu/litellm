@@ -71,3 +71,35 @@ def test_should_reject_ambiguous_declarations(declaration, conflict):
 
     assert raised.value.status_code == 409
     assert raised.value.detail["error"]["code"] == "aawm_codex_assignment_unreadable"
+
+
+@pytest.mark.parametrize("message_type", ["NEW_TASK", "MESSAGE"])
+def test_should_preserve_provider_owned_opaque_agent_message(message_type):
+    """Native Codex ciphertext must reach its route without proxy reinterpretation."""
+    payload = "gAAAAABn" + "A" * 200
+    body = {
+        "input": [
+            {
+                "type": "agent_message",
+                "author": "/root",
+                "recipient": "/root/child",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            f"Message Type: {message_type}\n"
+                            "Task name: /root/child\n"
+                            "Sender: /root\n"
+                            "Payload:\n"
+                        ),
+                    },
+                    {"type": "encrypted_content", "encrypted_content": payload},
+                ],
+            }
+        ]
+    }
+
+    result = normalize_codex_collaboration_dispatch_body(body)
+
+    assert result is body
+    assert result["input"][0]["content"][1]["encrypted_content"] == payload
