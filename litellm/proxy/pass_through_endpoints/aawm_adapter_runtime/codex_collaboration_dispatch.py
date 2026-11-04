@@ -1688,6 +1688,8 @@ def _validate_visible_agent_message(
     if not remainder:
         raise CodexCollaborationDispatchError("invalid_envelope")
     if remainder:
+        if _is_provider_owned_opaque_representation(remainder):
+            return None
         assignment = _parse_codex_collaboration_payload(remainder)
         normalized_item = _NormalizedCodexAgentMessage(item)
         normalized_item["content"] = [

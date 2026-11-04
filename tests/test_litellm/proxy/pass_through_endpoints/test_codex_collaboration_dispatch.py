@@ -109,3 +109,33 @@ def test_should_preserve_provider_owned_opaque_agent_message(message_type, paylo
 
     assert result is body
     assert result["input"][0]["content"][1]["encrypted_content"] == payload
+
+
+@pytest.mark.parametrize("message_type", ["NEW_TASK", "MESSAGE"])
+def test_should_preserve_provider_owned_opaque_single_part_agent_message(message_type):
+    payload = "aawm_erp:eyJwcm92aWRlciI6Im9wZW5haSJ9;gAAAAABn" + "A" * 200
+    body = {
+        "input": [
+            {
+                "type": "agent_message",
+                "author": "/root",
+                "recipient": "/root/child",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            f"Message Type: {message_type}\n"
+                            "Task name: /root/child\n"
+                            "Sender: /root\n"
+                            f"Payload:\n{payload}"
+                        ),
+                    }
+                ],
+            }
+        ]
+    }
+
+    result = normalize_codex_collaboration_dispatch_body(body)
+
+    assert result is body
+    assert result["input"][0]["content"][0]["text"].endswith(payload)
