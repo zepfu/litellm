@@ -74,9 +74,15 @@ def test_should_reject_ambiguous_declarations(declaration, conflict):
 
 
 @pytest.mark.parametrize("message_type", ["NEW_TASK", "MESSAGE"])
-def test_should_preserve_provider_owned_opaque_agent_message(message_type):
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "gAAAAABn" + "A" * 200,
+        "aawm_erp:eyJwcm92aWRlciI6Im9wZW5haSJ9;gAAAAABn" + "A" * 200,
+    ],
+)
+def test_should_preserve_provider_owned_opaque_agent_message(message_type, payload):
     """Native Codex ciphertext must reach its route without proxy reinterpretation."""
-    payload = "gAAAAABn" + "A" * 200
     body = {
         "input": [
             {
