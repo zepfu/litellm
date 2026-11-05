@@ -456,6 +456,218 @@ async def test_candidate_loop_typed_redispatch_429_emits_terminal_event(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "selection_boundary",
+    [False, True],
+    ids=["after-provider-attempt", "selector-boundary"],
+)
+async def test_candidate_loop_provider_429_exhaustion_redispatches_without_killing_session(
+    selection_boundary: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provider-returned transient 429s must use redispatch telemetry."""
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/openai_passthrough/v1/responses",
+            "headers": [(b"user-agent", b"codex-cli/1.0")],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("testclient", 123),
+            "scheme": "http",
+        }
+    )
+    body = {"model": "basic", "input": "hello", "stream": False}
+    candidate = {
+        "provider": "alibaba_token_plan",
+        "model": "alibaba_token_plan/qwen3.8-flash",
+        "route_family": "codex_alibaba_token_plan_chat_completions_adapter",
+    }
+    selection = {
+        "candidate": candidate,
+        "cooldown_key": "alibaba_token_plan:qwen3.8-flash",
+        "lane_key": "alibaba_token_plan",
+        "selection_reason": "first_choice",
+        "skipped": [],
+    }
+    provider_error = HTTPException(
+        status_code=429,
+        detail={
+            "error": {
+                "type": "throttling_error",
+                "code": "rate_limited",
+                "message": "token-plan quota exhausted",
+            }
+        },
+    )
+    provider_error.error_class = "rate_limited"
+    provider_error._aawm_provider_returned = True
+    terminal_events: list[dict[str, Any]] = []
+    no_candidate_events: list[dict[str, Any]] = []
+    redispatch_calls: list[dict[str, Any]] = []
+    provider_calls: list[dict[str, Any]] = []
+
+    async def _select(**_kwargs: Any) -> dict[str, Any]:
+        if selection_boundary:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": {
+                        "code": (
+                            "aawm_codex_auto_agent_all_candidates_cooling_down"
+                        ),
+                        "type": "rate_limit_error",
+                    },
+                    "candidates": [
+                        {
+                            **candidate,
+                            "lane_key": "alibaba_token_plan",
+                            "cooldown_seconds": 60.0,
+                            "cooldown_scope": "candidate",
+                            "error_class": "rate_limited",
+                            "error_status_code": 429,
+                            "error_type": "throttling_error",
+                            "error_code": "rate_limited",
+                            "attempted_provider_call": True,
+                            "provider_returned": True,
+                        }
+                    ],
+                },
+            )
+        return selection
+
+    async def _perform(**kwargs: Any) -> object:
+        provider_calls.append(kwargs)
+        raise provider_error
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def _no_active_cooldown(_key: str) -> tuple[float, str]:
+        return 0.0, "memory"
+
+    async def _owner_guard(**_kwargs: Any) -> object:
+        return SimpleNamespace(
+            decision=SimpleNamespace(value="no_session"),
+            reservation_token=None,
+            held_reservation=False,
+            provenance=None,
+        )
+
+    class _Admission:
+        async def admit_selected_candidate(self, **_kwargs: Any) -> object:
+            return SimpleNamespace(allowed=True, lease=None)
+
+        async def release_provider_lane_admission(self, _lease: object) -> None:
+            return None
+
+    monkeypatch.setattr(candidate_loop, "alias_routing_state", AliasRoutingStateManager())
+    monkeypatch.setattr(
+        candidate_loop,
+        "_session_affinity_mod",
+        lambda: SimpleNamespace(
+            DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS=0,
+            is_replay_safe_session_owner_redispatch_body=lambda _body: True,
+            set_competing_reservation_log_deferred=lambda *_a, **_k: None,
+            competing_reservation_retry_attempts=lambda *_a, **_k: 0,
+            resolve_canonical_session_identity=lambda *_a, **_k: None,
+            get_request_codex_auto_review_parent_session_identity=lambda _request: None,
+            get_request_session_owner_lease=lambda _request: None,
+            ensure_session_owner_guard_for_request=_owner_guard,
+            finalize_session_owner_lease_on_success=_noop_async,
+            finalize_session_owner_lease_on_failure=_noop_async,
+            build_session_owner_attributes=lambda **_kwargs: {},
+        ),
+    )
+    monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_started",
+        lambda **kwargs: kwargs["prepared_request_body"],
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_failure",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_emit_auto_agent_alias_pre_attempt_terminal_event",
+        lambda **kwargs: terminal_events.append(kwargs),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_emit_auto_agent_alias_no_candidate_event",
+        lambda **kwargs: no_candidate_events.append(kwargs),
+    )
+    monkeypatch.setattr(lpe, "_record_codex_failure_evidence", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        lpe,
+        "_classify_codex_auto_agent_retryable_exhaustion",
+        lambda _exc, **_kwargs: "rate_limited",
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_plan_codex_oauth_account_failover",
+        lambda *_args, **_kwargs: False,
+    )
+
+    def _raise_redispatch(**kwargs: Any) -> None:
+        redispatch_calls.append(kwargs)
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": {
+                    "code": "aawm_codex_auto_agent_redispatch_required",
+                    "type": "rate_limit_error",
+                },
+                "redispatch_required": True,
+            },
+            headers={"Retry-After": "1"},
+        )
+
+    services = SimpleNamespace(
+        select_candidate_fn=_select,
+        perform_candidate_request_fn=_perform,
+        resolve_cooldown_publication_fn=lambda **_kwargs: candidate_loop.CooldownPublicationPlan(),
+        publish_cooldown_memory_fn=_noop_async,
+        persist_cooldown_fn=_noop_async,
+        set_session_affinity_fn=_noop_async,
+        add_alias_metadata_fn=lambda request_body, **_kwargs: request_body,
+        raise_redispatch_fn=_raise_redispatch,
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await candidate_loop.handle_alias_route(
+            services,
+            alias_family="codex_auto_agent",
+            alias_model="basic",
+            request=request,
+            prepared_request_body=body,
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_no_active_cooldown,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidates",
+            log_label="Codex",
+        )
+
+    assert caught.value.status_code == 429
+    assert caught.value.detail["redispatch_required"] is True
+    assert len(redispatch_calls) == 1
+    assert redispatch_calls[0]["error_class"] == "rate_limited"
+    assert terminal_events and terminal_events[0]["redispatch_required"] is True
+    assert terminal_events[0]["event_type"] == "redispatch_required"
+    assert no_candidate_events == []
+    if selection_boundary:
+        assert provider_calls == []
+        assert redispatch_calls[0]["attempts"] == []
+        assert terminal_events[0]["attempts"] == []
+
+
+@pytest.mark.asyncio
 async def test_candidate_loop_records_non_failover_admission_denial_before_raise(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

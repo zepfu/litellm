@@ -2573,6 +2573,66 @@ async def handle_alias_route(  # noqa: PLR0915
             candidate=candidate,
             request=request,
         )
+
+        # A fresh auto-agent dispatch may exhaust every provider candidate on
+        # an upstream transient 429/5xx before any semantic output or effect
+        # is committed.  That is a recoverable provider-lane condition: the
+        # caller must redispatch the child so selection can run again.  Keep
+        # replay/auth/semantic failures on the terminal path below, and leave
+        # the OpenAI capacity-deadline path to its dedicated coordinator.
+        transient_provider_exhaustion = (
+            not capacity_retry_expired
+            and is_codex_alias
+            and callable(raise_redispatch_required_fn)
+            and isinstance(last_attempt, dict)
+            and last_attempt.get("attempted_provider_call") is True
+            and last_attempt.get("provider_returned") is True
+            and str(last_attempt.get("error_class") or "")
+            in _error_signals._RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES
+            and not _provider_owned_continuation()
+            and not getattr(exc, "aawm_openai_wire_replay_blocked", False)
+            and not getattr(exc, "aawm_call_ledger_exhausted", False)
+        )
+        if transient_provider_exhaustion:
+            try:
+                raise_redispatch_required_fn(
+                    candidate=candidate,
+                    lane_key=selection.get("lane_key"),
+                    cooldown_seconds=float(
+                        last_attempt.get("cooldown_seconds") or 0.0
+                    ),
+                    error_tokens=set(last_attempt.get("error_tokens") or ()),
+                    alias_model=alias_model,
+                    error_class=last_attempt.get("error_class"),
+                    cooldown_scope=last_attempt.get("cooldown_scope"),
+                    error_status_code=last_attempt.get("error_status_code"),
+                    error_type=last_attempt.get("error_type"),
+                    error_code=last_attempt.get("error_code"),
+                    retry_after_seconds=last_attempt.get("retry_after_seconds"),
+                    failure_phase=last_attempt.get("failure_phase")
+                    or "provider_attempt",
+                    attempted_provider_call=True,
+                    attempts=attempts,
+                    skipped_candidates=getattr(
+                        request.state,
+                        "aawm_alias_terminal_skipped_candidates",
+                        None,
+                    ),
+                )
+            except HTTPException as redispatch_exc:
+                _emit_validated_redispatch_terminal_event(
+                    exc=redispatch_exc,
+                    request=request,
+                    alias_family=alias_family,
+                    alias_model=alias_model,
+                    request_body=prepared_request_body,
+                    selection=selection,
+                    attempts=attempts,
+                    emit_pre_attempt_terminal_event=(
+                        _emit_auto_agent_alias_pre_attempt_terminal_event
+                    ),
+                )
+                raise
         terminal_exc: Optional[HTTPException] = None
         if getattr(exc, "aawm_cleanup_timeout", False):
             # Local cleanup is terminal for this logical request, not capacity.
@@ -3123,6 +3183,76 @@ async def handle_alias_route(  # noqa: PLR0915
                                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                             )
                             continue
+                # Non-OpenAI provider lanes do not use the OpenAI deadline
+                # coordinator.  If their provider-marked transient failures
+                # have cooled every candidate, preserve the child session and
+                # ask the caller to redispatch instead of emitting a killed
+                # no-candidate terminal error at the selector boundary.
+                if callable(raise_redispatch_required_fn):
+                    redispatch_candidate = next(
+                        (
+                            candidate
+                            for candidate in cooling_candidates or []
+                            if isinstance(candidate, dict)
+                            and str(candidate.get("provider") or "")
+                            .strip()
+                            .lower()
+                            != "openai"
+                            and candidate.get("attempted_provider_call") is True
+                            and candidate.get("provider_returned") is True
+                            and str(candidate.get("error_class") or "")
+                            in _error_signals._RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES
+                            and float(candidate.get("cooldown_seconds") or 0.0) > 0
+                        ),
+                        None,
+                    )
+                else:
+                    redispatch_candidate = None
+                if redispatch_candidate is not None:
+                    try:
+                        raise_redispatch_required_fn(
+                            candidate=redispatch_candidate,
+                            lane_key=redispatch_candidate.get("lane_key"),
+                            cooldown_seconds=float(
+                                redispatch_candidate.get("cooldown_seconds") or 0.0
+                            ),
+                            error_tokens=set(
+                                redispatch_candidate.get("error_tokens") or ()
+                            ),
+                            alias_model=alias_model,
+                            error_class=redispatch_candidate.get("error_class"),
+                            cooldown_scope=redispatch_candidate.get(
+                                "cooldown_scope"
+                            ),
+                            error_status_code=redispatch_candidate.get(
+                                "error_status_code"
+                            ),
+                            error_type=redispatch_candidate.get("error_type"),
+                            error_code=redispatch_candidate.get("error_code"),
+                            retry_after_seconds=redispatch_candidate.get(
+                                "retry_after_seconds"
+                            ),
+                            failure_phase=redispatch_candidate.get(
+                                "failure_phase"
+                            )
+                            or "alias_selection_cooling_down",
+                            attempted_provider_call=True,
+                            attempts=attempts,
+                            skipped_candidates=cooling_candidates,
+                        )
+                    except HTTPException as redispatch_exc:
+                        _emit_validated_redispatch_terminal_event(
+                            exc=redispatch_exc,
+                            request=request,
+                            alias_family=alias_family,
+                            alias_model=alias_model,
+                            request_body=prepared_request_body,
+                            attempts=attempts,
+                            emit_pre_attempt_terminal_event=(
+                                _emit_auto_agent_alias_pre_attempt_terminal_event
+                            ),
+                        )
+                        raise
             if (
                 exc.status_code == status.HTTP_409_CONFLICT
                 and selection_error_code
