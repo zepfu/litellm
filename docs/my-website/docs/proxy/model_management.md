@@ -85,7 +85,7 @@ Config-driven alias routing uses:
 - `basic`: Cohere `cohere/north-mini-code-1-0` (90) → OpenRouter `openrouter/cohere/north-mini-code:free` (80) → OpenCode Zen `big-pickle` (50) → `basic-other`
 - `basic-other`: Z.AI `glm-5.3-flash` (170, `23:00-09:00 UTC+8`),
   Cohere (160), Nous (150), NVIDIA (140), OpenRouter (130), OpenCode Go
-  OpenCode Go `muse-spark-1.3-contributor` (110), then
+  `muse-spark-1.3-contributor` (110), then
   Alibaba `deepseek-v4.1-flash` (100, `22:00-08:00 UTC+8`).
 - `work`: nested `work-other` alias reference (priority 110) → Claude-only native
   Sonnet tail → `gpt-6-luna` (priority 0) with `reasoning_effort: high`

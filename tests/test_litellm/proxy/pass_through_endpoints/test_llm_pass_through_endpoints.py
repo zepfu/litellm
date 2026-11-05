@@ -4952,7 +4952,7 @@ class TestOpenRouterAdapterRetry:
             "mini-v2.5",
             "north-mini-code",
             "nemotron-3-ultra",
-            "deepseek-v4-flash-free",
+            "deepseek-v4.1-flash-free",
         }
 
     @pytest.mark.asyncio
@@ -16030,7 +16030,7 @@ async def test_anthropic_auto_agent_alias_low_missing_opencode_auth_reaches_haik
         attempt for attempt in metadata["anthropic_auto_agent_attempts"] if attempt["provider"] == "opencode_zen"
     ]
     assert [attempt["model"] for attempt in opencode_attempts] == [
-        "deepseek-v4-flash-free",
+        "deepseek-v4.1-flash-free",
         "big-pickle",
     ]
     assert all(attempt["status"] == "cooldown_set" for attempt in opencode_attempts)
@@ -16046,7 +16046,7 @@ async def test_anthropic_auto_agent_alias_low_missing_opencode_auth_reaches_haik
     skipped_models = {candidate["model"] for candidate in metadata["anthropic_auto_agent_skipped_candidates"]}
     assert "openrouter/cohere/north-mini-code:free" in skipped_models
     assert "openrouter/owl-alpha" in skipped_models
-    assert "deepseek-v4-flash-free" in skipped_models
+    assert "deepseek-v4.1-flash-free" in skipped_models
     assert "big-pickle" in skipped_models
     assert "alibaba_token_plan/qwen3.6-flash" in skipped_models
 
@@ -16122,7 +16122,7 @@ async def test_anthropic_auto_agent_alias_low_fails_over_after_free_usage_limit_
         attempt for attempt in metadata["anthropic_auto_agent_attempts"] if attempt["provider"] == "opencode_zen"
     ]
     assert [attempt["model"] for attempt in opencode_attempts] == [
-        "deepseek-v4-flash-free",
+        "deepseek-v4.1-flash-free",
         "big-pickle",
     ]
     assert all(attempt["status"] == "cooldown_set" for attempt in opencode_attempts)
@@ -16138,7 +16138,7 @@ async def test_anthropic_auto_agent_alias_low_fails_over_after_free_usage_limit_
     skipped_models = {candidate["model"] for candidate in metadata["anthropic_auto_agent_skipped_candidates"]}
     assert "openrouter/cohere/north-mini-code:free" in skipped_models
     assert "openrouter/owl-alpha" in skipped_models
-    assert "deepseek-v4-flash-free" in skipped_models
+    assert "deepseek-v4.1-flash-free" in skipped_models
     assert "big-pickle" in skipped_models
     assert "alibaba_token_plan/qwen3.6-flash" in skipped_models
 
@@ -20221,7 +20221,7 @@ def test_codex_auto_agent_alias_metadata_uses_requested_alias():
         selection={
             "candidate": {
                 "provider": "opencode_zen",
-                "model": "deepseek-v4-flash-free",
+                "model": "deepseek-v4.1-flash-free",
                 "route_family": "codex_opencode_zen_adapter",
                 "last_resort": False,
             },
@@ -20242,7 +20242,7 @@ def test_codex_auto_agent_alias_metadata_uses_requested_alias():
         attempts=[
             {
                 "provider": "opencode_zen",
-                "model": "deepseek-v4-flash-free",
+                "model": "deepseek-v4.1-flash-free",
                 "route_family": "codex_opencode_zen_adapter",
                 "last_resort": False,
                 "lane_key": "opencode_zen",
@@ -20256,7 +20256,7 @@ def test_codex_auto_agent_alias_metadata_uses_requested_alias():
     assert metadata["requested_model_alias"] == "basic"
     assert metadata["codex_auto_agent_alias"] == "basic"
     assert metadata["codex_auto_agent_selected_provider"] == "opencode_zen"
-    assert metadata["codex_auto_agent_selected_model"] == "deepseek-v4-flash-free"
+    assert metadata["codex_auto_agent_selected_model"] == "deepseek-v4.1-flash-free"
     assert metadata["codex_auto_agent_selected_route_family"] == ("codex_opencode_zen_adapter")
     assert metadata["codex_auto_agent_selection_reason"] == "first_available"
     assert metadata["codex_auto_agent_lane_key"] == "opencode_zen"
