@@ -29180,6 +29180,97 @@ class TestOpenAIPassthroughRoute:
             }
         )
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("error_code", "error_type"),
+        [
+            ("rate_limited", "rate_limit_error"),
+            ("server_overloaded", "server_error"),
+        ],
+    )
+    async def test_openai006_fresh_direct_provider_429_retries_same_account(
+        self, monkeypatch, error_code, error_type
+    ):
+        """A provider 429 must not terminate a fresh direct Codex turn."""
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            codex_oauth,
+        )
+
+        monkeypatch.setenv("LITELLM_CODEX_OAUTH_INVENTORY", '{"schema_version":1}')
+        body = {"model": "gpt-5.6-sol", "input": "hello"}
+        request = self._openai006_request()
+        lane = "codex-oauth:account1:hash-account-1"
+        selected = codex_oauth.CodexOAuthRequestAuth(
+            account_label="account1",
+            account_hash="hash-account-1",
+            lane_key=lane,
+            headers={"Authorization": "Bearer account1"},
+        )
+        selection = {
+            "candidate": {
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+                "route_family": "codex_responses",
+                "codex_oauth_account_label": "account1",
+                "codex_oauth_account_hash": "hash-account-1",
+                "codex_oauth_lane_key": lane,
+            },
+            "lane_key": lane,
+            "cooldown_key": f"openai:gpt-5.6-sol:{lane}",
+            "failover_ordinal": 0,
+            "request_mode": "fresh",
+        }
+        attempts: list[str] = []
+
+        async def _fake_base(**kwargs):
+            attempts.append((kwargs.get("extra_headers") or {}).get("Authorization"))
+            if len(attempts) == 1:
+                error = HTTPException(
+                    status_code=429,
+                    detail={
+                        "error": {
+                            "message": "provider rate limit",
+                            "type": error_type,
+                            "code": error_code,
+                        }
+                    },
+                )
+                error._aawm_provider_returned = True
+                raise error
+            return Response(content=b"ok", status_code=200)
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_alias_model",
+            return_value=None,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_oa_xai_request_body",
+            return_value=False,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_grok_native_oauth_request_body",
+            return_value=False,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth.select_and_bind_direct_codex_oauth_inventory",
+            new=AsyncMock(return_value=(selected, selection, body)),
+        ) as mock_bind, patch.object(
+            llm_passthrough_endpoints.BaseOpenAIPassThroughHandler,
+            "_base_openai_pass_through_handler",
+            new=_fake_base,
+        ):
+            response = await openai_proxy_route(
+                endpoint="v1/responses",
+                request=request,
+                fastapi_response=Response(),
+                user_api_key_dict=object(),  # type: ignore[arg-type]
+            )
+
+        assert response.status_code == 200
+        assert attempts == ["Bearer account1", "Bearer account1"]
+        mock_bind.assert_awaited_once()
+        assert request.state._aawm_direct_codex_capacity_retries == 1
+
     @pytest.mark.parametrize(
         ("inventory_env", "endpoint", "model", "expected"),
         [

@@ -600,6 +600,8 @@ def update_direct_openai_managed_failure_attempt(
         "provider_terminal_error",
         "token_invalidated",
         "usage_limit_reached",
+        "capacity_exhausted",
+        "rate_limited",
     }:
         return None
     attempt_record = _current_direct_attempt(request)
@@ -638,6 +640,8 @@ def note_direct_openai_managed_failure(
         "provider_terminal_error",
         "usage_limit_reached",
         "token_invalidated",
+        "capacity_exhausted",
+        "rate_limited",
     }:
         return
     _attempt_records._mark_auto_agent_alias_request_failover_pending(

@@ -3537,6 +3537,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
     error_class: str,
     attempted_provider_call: bool,
     provider_returned: bool,
+    current_auth: Optional[Any] = None,
 ) -> Optional[tuple[Any, dict[str, Any]]]:
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
         session_affinity as _sa,
@@ -3639,6 +3640,43 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
         retry_attempt_record["terminal_reason"] = "openai_wire_replay_blocked"
         retry_attempt_record["wire_commitment"] = wire_commitment
         return None
+
+    # A provider-returned transient capacity response is a known no-effect
+    # pre-commit outcome. Direct Codex OAuth traffic bypasses the candidate
+    # loop, so it must consume the same bounded same-account retry before
+    # account-failover eligibility is evaluated. Keep this request-local and
+    # one-shot; semantic output, provider execution, and unknown transport
+    # outcomes remain replay-blocked.
+    if (
+        error_class
+        in {
+            "rate_limited",
+            "server_overloaded",
+            "upstream_overloaded",
+            "capacity_exhausted",
+        }
+        and attempted_provider_call
+        and provider_returned
+        and current_auth is not None
+    ):
+        request_state = getattr(request, "state", None)
+        retry_count = (
+            int(getattr(request_state, "_aawm_direct_codex_capacity_retries", 0))
+            if request_state is not None
+            else 0
+        )
+        if retry_count < 1:
+            if request_state is not None:
+                setattr(
+                    request_state,
+                    "_aawm_direct_codex_capacity_retries",
+                    retry_count + 1,
+                )
+            retry_attempt_record["failover_decision"] = "retry_same_account"
+            retry_attempt_record["terminal_reason"] = "success"
+            retry_attempt_record["same_account_retry"] = True
+            retry_attempt_record["same_account_retry_ordinal"] = retry_count + 1
+            return current_auth, dict(selection)
 
     def _raise_authenticated_continuation_unavailable(
         *,
@@ -6811,6 +6849,7 @@ async def openai_proxy_route(  # noqa: PLR0915
                 error_class=direct_account_error_class,
                 attempted_provider_call=attempted_provider_call,
                 provider_returned=provider_returned,
+                current_auth=selected_auth,
             )
             if retry is None:
                 _aawm_dev_fault_plan.note_direct_openai_managed_terminal_exhaustion(
@@ -6820,6 +6859,7 @@ async def openai_proxy_route(  # noqa: PLR0915
                 )
                 raise
             retry_auth, direct_codex_selection_state = retry
+            selected_auth = retry_auth
             prior_account_outcome = (
                 direct_codex_selection_state.get("prior_account_outcome")
                 if isinstance(direct_codex_selection_state, dict)
