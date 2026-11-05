@@ -1364,6 +1364,7 @@ def test_admission_remaining_lane_peek_skips_cooled_leftovers() -> None:
         native_denied,
         remaining_candidate=remaining_managed,
     )
+
     request = Request(
         {
             "type": "http",
@@ -1416,6 +1417,53 @@ def test_admission_remaining_lane_peek_skips_cooled_leftovers() -> None:
         denied_selection={"lane_key": "grok-native"},
     )
     assert remaining is remaining_managed
+
+
+@pytest.mark.parametrize(
+    "error_class, expected_confirmed",
+    [
+        ("rate_limited", False),
+        ("server_overloaded", False),
+        ("capacity_exhausted", False),
+    ],
+)
+def test_provider_capacity_does_not_prefer_failover_without_account_exhaustion(
+    error_class: str,
+    expected_confirmed: bool,
+) -> None:
+    """A bare provider 429/overload leaves the same-account retry available."""
+    candidate = {
+        "provider": "openai",
+        "model": "gpt-5.4-codex",
+        "codex_oauth_account_hash": "acct1-hash",
+        "codex_oauth_lane_key": "codex-oauth:test",
+        "codex_oauth_credential_affinity": "interchangeable",
+    }
+    attempt_record = {
+        "attempted_provider_call": True,
+        "provider_returned": True,
+    }
+    assert candidate_loop._codex_oauth_provider_capacity_failover_is_confirmed(
+        candidate=candidate,
+        selection={"lane_key": "codex-oauth:test"},
+        attempt_record=attempt_record,
+        error_class=error_class,
+        provider_status_code=429,
+    ) is expected_confirmed
+
+    attempt_record.update(
+        {
+            "admission_decision": "confirmed_exhausted",
+            "admission_account_hash": "acct1-hash",
+        }
+    )
+    assert candidate_loop._codex_oauth_provider_capacity_failover_is_confirmed(
+        candidate=candidate,
+        selection={"lane_key": "codex-oauth:test"},
+        attempt_record=attempt_record,
+        error_class=error_class,
+        provider_status_code=429,
+    ) is (error_class != "rate_limited")
 
 
 @pytest.mark.asyncio
@@ -3641,6 +3689,9 @@ async def test_candidate_loop_capacity_retries_use_one_request_coordinator(  # n
         "provider": "openai",
         "model": "gpt-5.4-codex",
         "route_family": "codex_responses",
+        "codex_oauth_account_hash": "acct1-hash",
+        "codex_oauth_lane_key": "codex-oauth:test",
+        "codex_oauth_credential_affinity": "interchangeable",
     }
     target_identity = _build_openai_capacity_target_identity(
         provider="openai",
@@ -3707,14 +3758,6 @@ async def test_candidate_loop_capacity_retries_use_one_request_coordinator(  # n
     async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
         return None
 
-    async def _owner_guard(**_kwargs: Any) -> object:
-        return SimpleNamespace(
-            decision=SimpleNamespace(value="no_session"),
-            reservation_token=None,
-            held_reservation=False,
-            provenance=None,
-        )
-
     async def _sleep_with_wakeup(
         _coordinator: object,
         wait_seconds: float,
@@ -3731,15 +3774,12 @@ async def test_candidate_loop_capacity_retries_use_one_request_coordinator(  # n
         async def release_provider_lane_admission(self, _lease: object) -> None:
             return None
 
-    session_affinity_seam = SimpleNamespace(
-        is_replay_safe_session_owner_redispatch_body=lambda _body: True,
-        resolve_canonical_session_identity=lambda *_args, **_kwargs: None,
-        get_request_codex_auto_review_parent_session_identity=lambda _request: None,
-        build_session_owner_attributes=lambda **_kwargs: {},
-        ensure_session_owner_guard_for_request=_owner_guard,
-        get_request_session_owner_lease=lambda _request: None,
-        finalize_session_owner_lease_on_success=_noop_async,
-        finalize_session_owner_lease_on_failure=_noop_async,
+    session_affinity_seam = _session_owner_no_redis_seam()
+    session_affinity_seam.is_replay_safe_session_owner_redispatch_body = (
+        lambda _body: True
+    )
+    session_affinity_seam.classify_session_owner_replay_safety_body = (
+        lambda _body: SimpleNamespace(safe=True)
     )
 
     monkeypatch.setattr(candidate_loop, "alias_routing_state", AliasRoutingStateManager())
@@ -3828,7 +3868,7 @@ async def test_candidate_loop_capacity_retries_use_one_request_coordinator(  # n
     if not non_capacity_terminal:
         assert response is success_response
     assert provider_calls == ["gpt-5.4-codex"] * 3
-    assert waits == [15.0, 30.0]
+    assert waits == [30.0, 60.0]
     assert wait_metadata == [
         {"error_class": "server_overloaded", "status_code": 502},
     ] * 2

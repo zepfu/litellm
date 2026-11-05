@@ -233,6 +233,36 @@ def _admission_denial_shares_account_hash(
     )
 
 
+def _codex_oauth_provider_capacity_failover_is_confirmed(
+    *,
+    candidate: Mapping[str, Any],
+    selection: Mapping[str, Any],
+    attempt_record: Mapping[str, Any],
+    error_class: Optional[str],
+    provider_status_code: Optional[int],
+) -> bool:
+    """Return whether a provider capacity failure proves account exhaustion.
+
+    A provider-returned 429/overload is normally transient capacity.  Account
+    rotation is allowed only for the same read-only attribution predicate used
+    by the mutating failover planner; keeping this check separate prevents the
+    preliminary preference gate from suppressing a valid same-account retry.
+    """
+    if error_class == "rate_limited":
+        return False
+    if error_class not in {"capacity_exhausted", "server_overloaded"}:
+        return False
+    from . import selection as _selection
+
+    return _selection._codex_oauth_account_exhaustion_is_confirmed(
+        candidate=dict(candidate),
+        selection=selection,
+        attempt_record=attempt_record,
+        error_class=str(error_class),
+        provider_status_code=provider_status_code,
+    )
+
+
 def _candidate_admission_identity_key(
     candidate: Mapping[str, Any],
     selection: Optional[Mapping[str, Any]] = None,
@@ -2452,6 +2482,23 @@ async def handle_alias_route(  # noqa: PLR0915
             and attempt_record.get("attempted_provider_call") is True
             and attempt_record.get("provider_returned") is True
         )
+        if provider_capacity_returned:
+            # Provider capacity is a transient lane failure by default.  Only
+            # suppress the bounded same-account retry when the read-only
+            # account-attribution predicate proves that this account is
+            # exhausted.  The mutating failover planner applies the same
+            # predicate later; keeping this preference aligned prevents a
+            # bare provider 429 from becoming terminal before that planner
+            # can either rotate or allow the retry permit to be consumed.
+            account_exhaustion_confirmed = _codex_oauth_provider_capacity_failover_is_confirmed(
+                candidate=candidate,
+                selection=selection,
+                attempt_record=attempt_record,
+                error_class=error_class,
+                provider_status_code=provider_status_code,
+            )
+            if not account_exhaustion_confirmed:
+                return False
         if (
             error_class in _error_signals._RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES
             and not provider_capacity_returned
@@ -5989,6 +6036,7 @@ async def handle_alias_route(  # noqa: PLR0915
                 )
                 if (
                     not prefer_account_failover
+                    and not _provider_owned_continuation()
                     and pre_commit_retry_plan["action"] == "retry_same_account"
                 ):
                     wait_seconds = float(pre_commit_retry_plan["wait_seconds"] or 0.0)
