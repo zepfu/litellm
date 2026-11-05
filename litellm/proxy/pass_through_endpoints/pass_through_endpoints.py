@@ -10692,6 +10692,7 @@ async def pass_through_request(  # noqa: PLR0915
                         )
                     if validate_prepared_request_fn is not None:
                         validate_prepared_request_fn(prepared_request)
+                    provider_tools_for_send = False
                     if is_native_openai_responses_route:
                         try:
                             prepared_body = prepared_request.content
@@ -10704,13 +10705,11 @@ async def pass_through_request(  # noqa: PLR0915
                             )
                         except Exception:
                             effective_body = None
-                        if responses_effective_provider_tools_allowed(
-                            effective_body
-                        ):
-                            publish_responses_replay_commitment(
-                                request,
-                                reason="provider_execution_possible",
+                        provider_tools_for_send = (
+                            responses_effective_provider_tools_allowed(
+                                effective_body
                             )
+                        )
                     if managed_xai_oauth_request:
                         record_managed_xai_actual_send(
                             request,
@@ -10721,14 +10720,26 @@ async def pass_through_request(  # noqa: PLR0915
                             ),
                         )
                     ensure_precommit_send_active()
-                    response = await wait_for(
-                        "upstream_response",
-                        async_client.send(
-                            prepared_request,
-                            stream=send_stream,
-                            follow_redirects=immutable_openai_binding.follow_redirects,
-                        ),
-                    )
+                    try:
+                        response = await wait_for(
+                            "upstream_response",
+                            async_client.send(
+                                prepared_request,
+                                stream=send_stream,
+                                follow_redirects=immutable_openai_binding.follow_redirects,
+                            ),
+                        )
+                    except BaseException:
+                        # A transport exception after dispatch has unknown
+                        # provider effect.  Preserve the replay veto, while
+                        # allowing the Responses precommit parser to classify
+                        # an explicit no-effect capacity response first.
+                        if provider_tools_for_send:
+                            publish_responses_replay_commitment(
+                                request,
+                                reason="provider_execution_possible",
+                            )
+                        raise
                     try:
                         register_active_upstream_response(request, response)
                         _record_openai_final_send_binding_observation(

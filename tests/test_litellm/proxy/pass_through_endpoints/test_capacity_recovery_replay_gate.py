@@ -19,6 +19,10 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_led
 from litellm.proxy.pass_through_endpoints.streaming_handler import (
     PassThroughStreamingHandler,
 )
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry import (
+    OpenAIAlphaCapacityRetryBudget,
+    OpenAIAlphaCapacityRetryCoordinator,
+)
 
 
 def _request_with_commitment(reason: str) -> SimpleNamespace:
@@ -124,7 +128,12 @@ def test_unknown_response_field_does_not_block_empty_capacity_failure():
 @pytest.mark.asyncio
 async def test_hidden_retry_crosses_dispatch_commitment_for_provider_429(monkeypatch):
     request = _request_with_commitment("provider_execution_possible")
+    request.is_disconnected = AsyncMock(return_value=False)
     attempts = 0
+    coordinator = OpenAIAlphaCapacityRetryCoordinator(
+        target_identity="https://api.openai.com/v1/responses",
+        budget=OpenAIAlphaCapacityRetryBudget(deadline_seconds=60),
+    )
 
     async def operation():
         nonlocal attempts
@@ -136,12 +145,18 @@ async def test_hidden_retry_crosses_dispatch_commitment_for_provider_429(monkeyp
         return "recovered"
 
     monkeypatch.setattr(pte, "_passthrough_hidden_retry_sleep", AsyncMock())
+    monkeypatch.setattr(
+        coordinator,
+        "sleep_with_wakeup",
+        AsyncMock(return_value="timer"),
+    )
     result = await pte._execute_passthrough_pre_first_byte_with_hidden_retries(
         kwargs={"litellm_params": {"metadata": {}}},
         operation_name="test_capacity_recovery",
         operation=operation,
         caller_managed_hidden_retry=False,
         request=request,
+        openai_capacity_coordinator=coordinator,
     )
     assert result == "recovered"
     assert attempts == 2

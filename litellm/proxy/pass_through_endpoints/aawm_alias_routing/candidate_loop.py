@@ -5136,6 +5136,62 @@ async def handle_alias_route(  # noqa: PLR0915
                         )
                     if early_pre_commit_error_class is None:
                         early_pre_commit_error_class = fresh_codex_auth_error_class
+                    # A provider-confirmed pre-commit capacity rejection may
+                    # cross the provisional dispatch latch, but that decision
+                    # must happen before retry planning.  A late-only check
+                    # still selects ``wire_commitment_blocked`` and
+                    # terminalizes the request before this relaxation can take
+                    # effect.
+                    if wire_replay_prohibited:
+                        provider_returned = getattr(
+                            probe_failure_exc,
+                            "_aawm_provider_returned",
+                            None,
+                        )
+                        if not isinstance(provider_returned, bool):
+                            provider_returned = getattr(
+                                probe_failure_exc,
+                                "provider_returned",
+                                None,
+                            )
+                        error_payload = getattr(
+                            probe_failure_exc,
+                            "error_payload",
+                            None,
+                        )
+                        event_type = (
+                            error_payload.get("type")
+                            if isinstance(error_payload, Mapping)
+                            else None
+                        )
+                        request_ledger = get_request_provider_call_ledger(request)
+                        capacity_retry_authorized = None
+                        if request_ledger is not None:
+                            capacity_retry_authorized = bool(
+                                request_ledger.snapshot().get(
+                                    "capacity_retry_authorized"
+                                )
+                                is True
+                            )
+                        if (
+                            capacity_retry_coordinator is not None
+                            and is_openai_capacity_recovery_safe(
+                                wire_commitment,
+                                provider_returned=provider_returned,
+                                capacity_retry_authorized=capacity_retry_authorized,
+                                status_code=_extract_adapter_exception_status_code(
+                                    probe_failure_exc
+                                ),
+                                error_class=early_pre_commit_error_class,
+                                error_payload=(
+                                    error_payload
+                                    if isinstance(error_payload, Mapping)
+                                    else None
+                                ),
+                                event_type=event_type,
+                            )
+                        ):
+                            wire_replay_prohibited = False
                     early_account_slot = _codex_oauth_candidate_slot(candidate)
                     early_pre_commit_retry_plan = (
                         {"action": "wire_commitment_blocked", "wait_seconds": 0.0}

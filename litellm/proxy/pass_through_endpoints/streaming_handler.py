@@ -2600,26 +2600,31 @@ class PassThroughStreamingHandler:
 
         OPENAI-080: applies the Oracle-frozen semantic allowlist to classify
         each event.  Sets the monotonic replay-commit latch on the request
-        *before* yielding any committed output.  When *request* is supplied
-        and a provider-executable tool body is detected, dispatch commits
-        at ``provider_execution_possible`` regardless of observed events.
+        *before* yielding any committed output.  Provider-executable tool
+        bodies defer their provisional commitment until the stream proves an
+        effect or an unknown outcome; an explicit no-effect capacity failure
+        remains eligible for the bounded retry owner.
         """
         pipeline = event_pipeline or create_responses_event_pipeline(
             retain_events=True,
         )
 
-        # OPENAI-080: when the effective body carries provider-executable
-        # tools, lock the latch at dispatch so no internal resend can
-        # proceed regardless of what events arrive.
+        # Provider-executable tools make an unknown or effect-bearing result
+        # replay-unsafe, but dispatch alone does not prove an effect.  Defer
+        # this latch until the first non-retryable outcome so an explicit
+        # provider capacity rejection can use the one authorized replacement
+        # send.
         provider_tools_detected = (
             request is not None
             and responses_effective_provider_tools_allowed(provider_bound_body)
         )
-        if provider_tools_detected:
-            publish_responses_replay_commitment(
-                request,
-                reason="provider_execution_possible",
-            )
+
+        def _commit_provider_execution_if_needed() -> None:
+            if provider_tools_detected:
+                publish_responses_replay_commitment(
+                    request,
+                    reason="provider_execution_possible",
+                )
 
         prefix = _ResponsesPreCommitPrefixStore(
             max_buffer_bytes,
@@ -2680,6 +2685,7 @@ class PassThroughStreamingHandler:
                 except (httpx.ReadError, httpx.ReadTimeout) as exc:
                     # Only this upstream read is a transport failure. Parser,
                     # prefix storage, and later remainder iteration stay raw.
+                    _commit_provider_execution_if_needed()
                     read_failure = ResponsesStreamPreCommitFailure(
                         error_class="stream_interrupted",
                         classification="transient_stream_interruption",
@@ -2752,10 +2758,12 @@ class PassThroughStreamingHandler:
                             bound_failure=bound_failure,
                         )
                         pipeline.attach_to_response(prefixed)
+                        _commit_provider_execution_if_needed()
                         _maybe_set_replay_latch(
                             request, "event_limit", event_type
                         )
                         return prefixed, None
+                    _commit_provider_execution_if_needed()
                     await _close_precommit_resources()
                     return response, _bound_failure(exc)
                 if decision == "failed":
@@ -2767,7 +2775,25 @@ class PassThroughStreamingHandler:
                         if request is not None
                         else None
                     )
-                    if commitment_reason is not None:
+                    failure = PassThroughStreamingHandler._build_responses_pre_commit_failure(
+                        error_payload=error_payload,
+                        event_type=event_type,
+                        openai_alpha_capacity_retry_enabled=(
+                            openai_alpha_capacity_retry_enabled
+                        ),
+                    )
+                    no_effect_capacity_failure = (
+                        failure.provider_returned
+                        and PassThroughStreamingHandler._is_no_effect_capacity_failure_payload(
+                            error_payload
+                        )
+                    )
+                    if commitment_reason is None and not no_effect_capacity_failure:
+                        _commit_provider_execution_if_needed()
+                        commitment_reason = get_responses_replay_commitment_reason(
+                            request
+                        )
+                    if commitment_reason is not None and not no_effect_capacity_failure:
                         _maybe_set_replay_latch(
                             request, commitment_reason, event_type, parser.commitment_rejection
                         )
@@ -2781,13 +2807,7 @@ class PassThroughStreamingHandler:
                         return committed, None
                     return (
                         _PrefixedHttpxByteStream(response, prefix, iterator),
-                        PassThroughStreamingHandler._build_responses_pre_commit_failure(
-                            error_payload=error_payload,
-                            event_type=event_type,
-                            openai_alpha_capacity_retry_enabled=(
-                                openai_alpha_capacity_retry_enabled
-                            ),
-                        ),
+                        failure,
                     )
                 if decision == "substantive":
                     prefixed = _PrefixedHttpxByteStream(
@@ -2797,6 +2817,7 @@ class PassThroughStreamingHandler:
                         event_pipeline=pipeline,
                     )
                     pipeline.attach_to_response(prefixed)
+                    _commit_provider_execution_if_needed()
                     # Set latch before yielding committed stream
                     _maybe_set_replay_latch(
                         request, parser.commitment_reason, event_type, parser.commitment_rejection
@@ -2813,6 +2834,7 @@ class PassThroughStreamingHandler:
                         event_pipeline=pipeline,
                     )
                     pipeline.attach_to_response(prefixed)
+                    _commit_provider_execution_if_needed()
                     _maybe_set_replay_latch(
                         request,
                         "event_limit",
@@ -2844,7 +2866,25 @@ class PassThroughStreamingHandler:
                 pipeline.attach_to_response(prefixed)
                 if decision == "failed":
                     commitment_reason = parser.commitment_reason
-                    if commitment_reason is not None:
+                    failure = PassThroughStreamingHandler._build_responses_pre_commit_failure(
+                        error_payload=error_payload,
+                        event_type=event_type,
+                        openai_alpha_capacity_retry_enabled=(
+                            openai_alpha_capacity_retry_enabled
+                        ),
+                    )
+                    no_effect_capacity_failure = (
+                        failure.provider_returned
+                        and PassThroughStreamingHandler._is_no_effect_capacity_failure_payload(
+                            error_payload
+                        )
+                    )
+                    if commitment_reason is None and not no_effect_capacity_failure:
+                        _commit_provider_execution_if_needed()
+                        commitment_reason = get_responses_replay_commitment_reason(
+                            request
+                        )
+                    if commitment_reason is not None and not no_effect_capacity_failure:
                         _maybe_set_replay_latch(
                             request,
                             commitment_reason,
@@ -2861,14 +2901,9 @@ class PassThroughStreamingHandler:
                         return committed, None
                     return (
                         prefixed,
-                        PassThroughStreamingHandler._build_responses_pre_commit_failure(
-                            error_payload=error_payload,
-                            event_type=event_type,
-                            openai_alpha_capacity_retry_enabled=(
-                                openai_alpha_capacity_retry_enabled
-                            ),
-                        ),
+                        failure,
                     )
+                _commit_provider_execution_if_needed()
                 _maybe_set_replay_latch(
                     request, parser.commitment_reason, event_type, parser.commitment_rejection
                 )
@@ -2888,21 +2923,34 @@ class PassThroughStreamingHandler:
                 return response, _bound_failure(exc)
             if decision == "failed":
                 commitment_reason = parser.commitment_reason
-                if commitment_reason is not None:
+                failure = PassThroughStreamingHandler._build_responses_pre_commit_failure(
+                    error_payload=error_payload,
+                    event_type=event_type,
+                    openai_alpha_capacity_retry_enabled=(
+                        openai_alpha_capacity_retry_enabled
+                    ),
+                )
+                no_effect_capacity_failure = (
+                    failure.provider_returned
+                    and PassThroughStreamingHandler._is_no_effect_capacity_failure_payload(
+                        error_payload
+                    )
+                )
+                if commitment_reason is None and not no_effect_capacity_failure:
+                    _commit_provider_execution_if_needed()
+                    commitment_reason = get_responses_replay_commitment_reason(
+                        request
+                    )
+                if commitment_reason is not None and not no_effect_capacity_failure:
                     _maybe_set_replay_latch(
                         request, commitment_reason, event_type, parser.commitment_rejection
                     )
                 return (
                     _PrefixedHttpxByteStream(response, prefix, iterator),
-                    PassThroughStreamingHandler._build_responses_pre_commit_failure(
-                        error_payload=error_payload,
-                        event_type=event_type,
-                        openai_alpha_capacity_retry_enabled=(
-                            openai_alpha_capacity_retry_enabled
-                        ),
-                    ),
+                    failure,
                 )
             if decision in {"empty", "lifecycle"}:
+                _commit_provider_execution_if_needed()
                 missing_terminal = (
                     PassThroughStreamingHandler._build_responses_pre_commit_failure(
                         error_payload={
@@ -2925,6 +2973,7 @@ class PassThroughStreamingHandler:
                 # safe events commits with "prefix_limit".  Replay the
                 # exact prefix and let the live pipeline finish.
                 if prefix.byte_count > 0 and leftover_incomplete:
+                    _commit_provider_execution_if_needed()
                     _maybe_set_replay_latch(
                         request, "prefix_limit", event_type
                     )
@@ -2945,6 +2994,7 @@ class PassThroughStreamingHandler:
                 event_pipeline=pipeline,
             )
             pipeline.attach_to_response(prefixed)
+            _commit_provider_execution_if_needed()
             _maybe_set_replay_latch(
                 request, parser.commitment_reason, event_type, parser.commitment_rejection
             )
