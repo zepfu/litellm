@@ -738,6 +738,64 @@ def is_openai_wire_replay_prohibited(
     return commitment.get("disposition") in _WIRE_REPLAY_BLOCKING_DISPOSITIONS
 
 
+def is_openai_capacity_recovery_safe(
+    commitment: Optional[Mapping[str, Any]],
+    *,
+    provider_returned: Optional[bool],
+    capacity_retry_authorized: Optional[bool] = None,
+    status_code: Optional[int] = None,
+    error_class: Optional[str] = None,
+    error_payload: Optional[Mapping[str, Any]] = None,
+    event_type: Optional[str] = None,
+) -> bool:
+    """Allow only a provider-confirmed, pre-commit capacity replacement send."""
+    if provider_returned is not True or capacity_retry_authorized is False:
+        return False
+    normalized_status = (
+        int(status_code)
+        if isinstance(status_code, int) and not isinstance(status_code, bool)
+        else None
+    )
+    normalized_class = str(error_class or "").strip().lower()
+    if normalized_status not in {429, 529} and normalized_class not in {
+        "server_overloaded",
+        "upstream_overloaded",
+        "capacity_exhausted",
+        "rate_limited",
+    }:
+        return False
+    if not isinstance(commitment, Mapping):
+        return True
+    if any(
+        commitment.get(flag) is True
+        for flag in (
+            "response_start_sent",
+            "first_body_sent",
+            "terminal_wire_committed",
+            "done_wire_committed",
+        )
+    ):
+        return False
+    if commitment.get("disposition") in _WIRE_REPLAY_BLOCKING_DISPOSITIONS:
+        return False
+    reason = commitment.get(_RESPONSES_REPLAY_LATCH_REASON_KEY)
+    if reason in {None, "provider_execution_possible"}:
+        return True
+    if reason != "unknown_semantics" or event_type != "response.failed":
+        return False
+    response_payload = (
+        error_payload.get("response")
+        if isinstance(error_payload, Mapping)
+        else None
+    )
+    output = (
+        response_payload.get("output")
+        if isinstance(response_payload, Mapping)
+        else None
+    )
+    return isinstance(output, list) and not output
+
+
 def ensure_openai_wire_replay_allowed(
     request: Request,
     *,

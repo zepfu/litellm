@@ -2103,7 +2103,9 @@ class PassThroughStreamingHandler:
             parser._consume_event(event)
         decision = parser.decision()
         parsed_reason = parser.commitment_reason
-        effective_reason = parsed_reason or "unknown_semantics"
+        effective_reason = parsed_reason
+        if decision[0] == "substantive" and effective_reason is None:
+            effective_reason = "unknown_semantics"
         return decision[0], decision[1], decision[2], effective_reason
 
 
@@ -2153,6 +2155,32 @@ class PassThroughStreamingHandler:
             # Unknown item type in snapshot: conservative commit
             return "unknown_semantics"
         return None
+
+    @staticmethod
+    def _is_no_effect_capacity_failure_payload(
+        payload: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Recognize an explicit overload/rate-limit failure with no output."""
+
+        if not isinstance(payload, dict):
+            return False
+        error_class, classification, retryable = (
+            PassThroughStreamingHandler._classify_responses_pre_commit_error(
+                payload,
+                openai_alpha_capacity_retry_enabled=True,
+            )
+        )
+        if (
+            not retryable
+            or classification != "transient_capacity"
+            or error_class not in _RESPONSES_TRANSIENT_CAPACITY_CLASSES
+        ):
+            return False
+        response_payload = payload.get("response")
+        if not isinstance(response_payload, dict):
+            return False
+        output = response_payload.get("output")
+        return isinstance(output, list) and not output
 
     @staticmethod
     def _is_responses_error_details_shape(error_payload: Any) -> bool:
@@ -2261,7 +2289,7 @@ class PassThroughStreamingHandler:
         )
 
     @staticmethod
-    def _inspect_responses_events(
+    def _inspect_responses_events(  # noqa: PLR0915
         parsed_event: ParsedResponsesEvent,
         rejection: Optional[Dict[str, str]] = None,
     ) -> tuple[str, Optional[Dict[str, Any]], Optional[str], Optional[str]]:
@@ -2378,6 +2406,19 @@ class PassThroughStreamingHandler:
         )
         if hidden_reason is not None and commitment_reason is None:
             commitment_reason = hidden_reason
+
+        # Providers sometimes append a harmless response-envelope field to a
+        # no-output overload failure.  The schema diagnostic must not turn
+        # that known no-effect capacity response into an irreversible replay
+        # commitment.
+        if (
+            event_type == "response.failed"
+            and commitment_reason == "unknown_semantics"
+            and PassThroughStreamingHandler._is_no_effect_capacity_failure_payload(
+                payload
+            )
+        ):
+            commitment_reason = None
 
         if commitment_reason == "unknown_semantics":
             known_shape = (

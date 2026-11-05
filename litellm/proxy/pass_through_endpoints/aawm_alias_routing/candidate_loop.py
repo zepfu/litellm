@@ -72,6 +72,7 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_led
     bind_openai_candidate_context,
     get_request_provider_call_ledger,
     get_request_openai_wire_commitment,
+    is_openai_capacity_recovery_safe,
     is_openai_wire_replay_prohibited,
 )
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.deferred_success import (
@@ -5732,6 +5733,44 @@ async def handle_alias_route(  # noqa: PLR0915
                         failure_class=error_class,
                         error_code=attempt_record.get("error_code"),
                     )
+                if wire_replay_prohibited:
+                    provider_returned = getattr(
+                        failure_exc, "_aawm_provider_returned", None
+                    )
+                    if not isinstance(provider_returned, bool):
+                        provider_returned = getattr(
+                            failure_exc, "provider_returned", None
+                        )
+                    error_payload = getattr(failure_exc, "error_payload", None)
+                    event_type = (
+                        error_payload.get("type")
+                        if isinstance(error_payload, dict)
+                        else None
+                    )
+                    request_ledger = get_request_provider_call_ledger(request)
+                    capacity_retry_authorized = None
+                    if request_ledger is not None:
+                        capacity_retry_authorized = bool(
+                            request_ledger.snapshot().get(
+                                "capacity_retry_authorized"
+                            )
+                            is True
+                        )
+                    if (
+                        capacity_retry_coordinator is not None
+                        and is_openai_capacity_recovery_safe(
+                            wire_commitment,
+                            provider_returned=provider_returned,
+                            capacity_retry_authorized=capacity_retry_authorized,
+                            status_code=_extract_adapter_exception_status_code(
+                                failure_exc
+                            ),
+                            error_class=error_class,
+                            error_payload=error_payload,
+                            event_type=event_type,
+                        )
+                    ):
+                        wire_replay_prohibited = False
                 if wire_replay_prohibited:
                     terminal_error_class = (
                         error_class
