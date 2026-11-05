@@ -3357,7 +3357,9 @@ def _derive_eligible_candidates_from_snapshot(
             continue
         # Schedule window check.
         if cand.schedule is not None:
-            if not (cand.schedule.start <= now_utc <= cand.schedule.end):
+            if cand.schedule.start is not None and now_utc < cand.schedule.start:
+                continue
+            if cand.schedule.end is not None and now_utc > cand.schedule.end:
                 continue
         # Positive availability requirement (strict boundary validation).
         if require_availability:

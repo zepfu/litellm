@@ -12,6 +12,7 @@ import importlib.util
 import json
 import pathlib
 import sys
+from dataclasses import replace
 
 import pytest
 
@@ -838,6 +839,42 @@ def _snapshot_eligible_fields(snapshot_candidates: list[dict[str, str]]):
 
 
 class TestAliasReferenceResolution:
+    def test_unbounded_schedule_does_not_crash_snapshot_eligibility(self, ra):
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
+            RoutingAlias,
+            RoutingSnapshot,
+            ScheduleWindow,
+        )
+
+        snapshot = _compile_snapshot()
+        candidate = next(
+            entry
+            for entry in snapshot.aliases["basic"].candidates
+            if hasattr(entry, "provider")
+        )
+        unbounded = replace(
+            candidate,
+            schedule=ScheduleWindow(kind="absolute"),
+        )
+        test_snapshot = RoutingSnapshot(
+            aliases={
+                "test": RoutingAlias(
+                    name="test",
+                    distribution_strategy=None,
+                    candidates=(unbounded,),
+                )
+            },
+            config_epoch=1,
+            config_hash="test",
+            config_version="test",
+        )
+
+        eligible = ra._derive_eligible_candidates_from_snapshot(
+            test_snapshot,
+            alias_name="test",
+        )
+        assert eligible[0]["model"] == candidate.model
+
     def test_derive_ingresses_resolves_reference_aliases(self, ra):
         snap = _compile_snapshot()
         ingresses = ra._derive_ingresses_from_snapshot(snap, alias_name="work")
