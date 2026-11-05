@@ -1,5 +1,5 @@
 # Provider-pinned acceptance alias (CFG-029). Closed Z.AI Coding Plan set.
-# One-model limitation: glm-5.2 on sota-zai is Alibaba Token Plan, not this
+# One-model limitation: glm-5.3 on sota-zai is Alibaba Token Plan, not this
 # provider. Codex-only route family; do not set anthropic_route_family.
 
 defaults: {}

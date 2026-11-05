@@ -102,7 +102,7 @@ _OPERATIONAL_ALIAS_ORDER = {
         ("REF", "expert-other", None, 100),
         (
             "openai",
-            "gpt-5.6-terra",
+            "gpt-6.1-terra",
             "codex_responses",
             0,
         ),
@@ -281,9 +281,10 @@ def test_provider_openai_keeps_cheapest_first_low_effort_order() -> None:
         )
         for entry in alias.candidates
     ] == [
-        ("openai", "gpt-5.6-luna", "codex_responses", 100, "low"),
-        ("openai", "gpt-5.6-terra", "codex_responses", 90, "low"),
-        ("openai", "gpt-5.6-sol", "codex_responses", 0, "low"),
+        ("openai", "gpt-6-luna", "codex_responses", 100, "low"),
+        ("openai", "gpt-6.1-terra", "codex_responses", 90, "low"),
+        ("openai", "gpt-6.1-sol", "codex_responses", 80, "low"),
+        ("openai", "gpt-6-astra", "codex_responses", 0, "low"),
     ]
 
 

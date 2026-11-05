@@ -1,5 +1,5 @@
 # Public sota-zai alias (CFG-021 + ZAI-009 Wave 3).
-# Prefer Z.AI Coding Plan GLM-5.3. Alibaba Token Plan GLM-5.2 is the
+# Prefer Z.AI Coding Plan GLM-5.3. Alibaba Token Plan GLM-5.3 is the
 # last-resort leaf on this same alias. Do not invent aawm-sota-zai.
 # Do not add this alias to sota.yaml TUI dispatch.
 defaults: {}

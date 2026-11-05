@@ -51,7 +51,7 @@ _PROVIDER_XAI_YAML = (
     _REPO_ROOT / "litellm" / "proxy" / "aawm_alias_config" / "provider-xai.yaml"
 )
 
-_CURSOR_MODEL = "cursor_agent/cursor-grok-4.6-high"
+_CURSOR_MODEL = "cursor_agent/cursor-grok-4.7-high"
 _OIDC_MODEL = "xai/grok-4.7"
 _OAUTH_MODEL = "oa_xai/grok-4.7"
 _CURSOR_ROUTE = "codex_cursor_agent_aiserver_adapter"

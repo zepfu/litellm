@@ -98,7 +98,7 @@ def test_canonical_sota_zai_prefers_coding_plan_on_codex_ingress() -> None:
         )
         assert [candidate.model for candidate in ordered] == [
             "zai_coding_plan/glm-5.3",
-            "alibaba_token_plan/glm-5.2",
+            "alibaba_token_plan/glm-5.3",
         ]
         assert [candidate.priority for candidate in ordered] == [110, 100]
         codex = snapshot_select._select_snapshot_candidates(
@@ -111,10 +111,10 @@ def test_canonical_sota_zai_prefers_coding_plan_on_codex_ingress() -> None:
         )
         assert [candidate["model"] for candidate in codex] == [
             "zai_coding_plan/glm-5.3",
-            "alibaba_token_plan/glm-5.2",
+            "alibaba_token_plan/glm-5.3",
         ]
         assert [candidate["model"] for candidate in anthropic] == [
-            "alibaba_token_plan/glm-5.2"
+            "alibaba_token_plan/glm-5.3"
         ]
         assert (
             codex[0]["route_family"]

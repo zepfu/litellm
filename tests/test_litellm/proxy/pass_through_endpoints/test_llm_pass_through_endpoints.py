@@ -23122,7 +23122,7 @@ async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
         ),
         (
             "opencode_zen",
-            "deepseek-v4-flash-free",
+            "deepseek-v4.1-flash-free",
             "candidate_ineligible_no_cooldown",
             "candidate_deterministically_ineligible",
             "ineligible",
@@ -23341,7 +23341,7 @@ _LOW_ALIAS_NO_OPENCODE_AUTH_SELECTIONS = [
     ),
     _build_test_codex_auto_agent_selection(
         "opencode_zen",
-        "deepseek-v4-flash-free",
+        "deepseek-v4.1-flash-free",
         "codex_opencode_zen_adapter",
         1,
     ),
@@ -23656,15 +23656,15 @@ async def test_codex_auto_agent_alias_low_opencode_error_reaches_mini(
     assert terminal_opencode_attempts
     assert len(terminal_opencode_attempts) == 2
     assert [attempt["model"] for attempt in terminal_opencode_attempts] == [
-        "deepseek-v4-flash-free",
+        "deepseek-v4.1-flash-free",
         "big-pickle",
     ]
     assert all(attempt["status"] == "cooldown_set" for attempt in terminal_opencode_attempts)
     assert all(attempt["error_class"] == expected_error_class for attempt in terminal_opencode_attempts)
     assert all(expected_error_token in attempt["error_tokens"] for attempt in terminal_opencode_attempts)
-    expected_opencode_models = ["deepseek-v4-flash-free", "big-pickle"]
+    expected_opencode_models = ["deepseek-v4.1-flash-free", "big-pickle"]
     if case_name == "high_demand":
-        expected_opencode_models.insert(1, "deepseek-v4-flash-free")
+        expected_opencode_models.insert(1, "deepseek-v4.1-flash-free")
     assert [attempt["model"] for attempt in opencode_attempts] == expected_opencode_models
 
 
