@@ -436,6 +436,7 @@ from .aawm_alias_routing import durable as _aawm_alias_durable
 from .aawm_alias_routing import dev_fault_plan as _aawm_dev_fault_plan
 from .aawm_adapter_runtime.provider_call_ledger import (
     get_request_openai_wire_commitment,
+    get_request_provider_call_ledger,
     get_request_provider_call_ledger_snapshot,
     is_openai_wire_replay_prohibited,
 )
@@ -3628,7 +3629,10 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
         attempt_record=injected_attempt_record,
     )
     wire_commitment = get_request_openai_wire_commitment(request)
-    if is_openai_wire_replay_prohibited(wire_commitment):
+    if is_openai_wire_replay_prohibited(
+        wire_commitment,
+        ledger=get_request_provider_call_ledger(request),
+    ):
         # Preserve the provider failure without resetting ownership or planning
         # a send that the native final-send replay guard must reject.
         retry_attempt_record["failover_decision"] = "terminal"

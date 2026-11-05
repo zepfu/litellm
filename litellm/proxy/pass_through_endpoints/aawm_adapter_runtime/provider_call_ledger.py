@@ -703,15 +703,38 @@ def get_request_openai_wire_commitment(
 
 def is_openai_wire_replay_prohibited(
     commitment: Optional[Mapping[str, Any]],
+    *,
+    ledger: Optional[ProviderCallLedger] = None,
 ) -> bool:
-    """Return whether a request-scoped wire state forbids another provider send."""
+    """Return whether a request-scoped wire state forbids another provider send.
+
+    A provider-confirmed pre-first-byte capacity rejection is the sole bounded
+    exception to the provisional ``provider_execution_possible`` latch.  The
+    request ledger's one-shot authorization is required; without it, callers
+    must continue to treat the latch as an unknown-outcome replay barrier.
+    """
 
     if not isinstance(commitment, Mapping):
         return False
     if any(
-        commitment.get(flag) is True for flag in _WIRE_REPLAY_BLOCKING_FLAGS
+        commitment.get(flag) is True for flag in _WIRE_REPLAY_BLOCKING_FLAGS[:-1]
     ):
         return True
+    if commitment.get("precommit_replay_committed") is True:
+        capacity_retry_permitted = False
+        if (
+            commitment.get(_RESPONSES_REPLAY_LATCH_REASON_KEY)
+            == "provider_execution_possible"
+            and ledger is not None
+        ):
+            try:
+                capacity_retry_permitted = (
+                    ledger.snapshot().get("capacity_retry_authorized") is True
+                )
+            except Exception:
+                capacity_retry_permitted = False
+        if not capacity_retry_permitted:
+            return True
     return commitment.get("disposition") in _WIRE_REPLAY_BLOCKING_DISPOSITIONS
 
 
@@ -730,20 +753,7 @@ def ensure_openai_wire_replay_allowed(
     # was delivered, and the ledger's one-shot capacity permit authorizes the
     # replacement send.  The permit is consumed by ``reserve`` after this
     # check; all other commitment reasons remain fail-closed.
-    capacity_retry_permitted = False
-    if (
-        isinstance(commitment, Mapping)
-        and commitment.get(_RESPONSES_REPLAY_LATCH_REASON_KEY)
-        == "provider_execution_possible"
-        and ledger is not None
-    ):
-        try:
-            capacity_retry_permitted = bool(
-                ledger.snapshot().get("capacity_retry_authorized") is True
-            )
-        except Exception:
-            capacity_retry_permitted = False
-    if is_openai_wire_replay_prohibited(commitment) and not capacity_retry_permitted:
+    if is_openai_wire_replay_prohibited(commitment, ledger=ledger):
         raise ProviderCallReplayBlocked(
             commitment=commitment or {},
             ledger=ledger,

@@ -4710,7 +4710,8 @@ async def handle_alias_route(  # noqa: PLR0915
                         else None
                     )
                     wire_replay_prohibited = is_openai_wire_replay_prohibited(
-                        wire_commitment
+                        wire_commitment,
+                        ledger=get_request_provider_call_ledger(request),
                     )
 
                     renewal_error_type = getattr(
