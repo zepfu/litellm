@@ -74,6 +74,13 @@ requested reasoning effort is supported. Missing or unrecognized capability
 data does not justify inventing output ceilings, translating to another model,
 or silently substituting an effort.
 
+Kimi K3.1 Pro has published native API pricing, but the retained evidence does
+not verify its managed Kimi Code model ID or plan entitlement. Native API
+naming alone is insufficient to replace the configured `kimi_code/k3-256k`
+route. Keep the current managed routes unchanged until authenticated
+`/models`, entitlement, and route acceptance evidence identify a supported
+managed model.
+
 AAWM may use internal `k3-low`, `k3-high`, and `k3-max` labels while resolving
 capabilities and public reference pricing. Those labels are observability and
 routing identities only; they are normalized to `k3` for introspection and are

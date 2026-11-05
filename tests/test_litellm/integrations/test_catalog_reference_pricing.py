@@ -34,6 +34,8 @@ def test_should_keep_reference_pricing_catalogs_equal_and_gate_unverified_routes
     bundled = json.loads(BUNDLED_CATALOG.read_text(encoding="utf-8"))
 
     assert canonical == bundled
+    assert "alibaba_token_plan/deepseek-v4.1-flash-1017" not in canonical
+    assert "kimi_code/kimi-k3.1-pro" not in canonical
     qwen38_max = canonical["alibaba_token_plan/qwen3.8-max"][
         "provider_specific_entry"
     ]["alibaba_token_plan"]["aawm_reference_pricing"]

@@ -1056,9 +1056,20 @@ because their required equivalence evidence is absent. Alibaba subscription
 routes retain unknown invoice cost even when a direct list-rate reference is
 available.
 
+The configured Alibaba Flash route is `deepseek-v4.1-flash`. No retained
+evidence establishes that `deepseek-v4.1-flash-1017` is exactly equivalent,
+entitled under Token Plan, or separately reference-priced. That identifier
+remains absent from the provider metadata and catalog; the current Flash
+reference tariff is not assigned to it.
+
 Managed Kimi Code uses the same non-invoice semantics. Callback observers may
 persist its provenance metadata, but they do not turn its reference total into
 a standard response cost or callback generation cost.
+
+Kimi K3.1 Pro's published native API pricing does not establish a managed Kimi
+Code model ID or entitlement. The configured `kimi_code/k3-256k` route remains
+unchanged pending authenticated `/models`, entitlement, and route acceptance
+evidence.
 
 ## Rate Limit And Billing Observations
 

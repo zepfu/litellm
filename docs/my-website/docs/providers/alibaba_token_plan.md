@@ -27,6 +27,13 @@ alias routes remain separate.
 The configured DeepSeek Flash model is `deepseek-v4.1-flash`; the provider
 receives that exact unprefixed ID.
 
+`deepseek-v4.1-flash-1017` remains an unresolved provider identifier. Retained
+evidence does not establish exact equivalence to `deepseek-v4.1-flash`, active
+Token Plan entitlement, or a separate reference tariff. It is intentionally
+absent from this provider's model metadata and reference catalog; do not apply
+the current Flash reference rates to it until exact provider evidence is
+available.
+
 ## Reasoning effort
 
 Each Token Plan model carries a `reasoning_effort_wire` contract in
