@@ -333,6 +333,28 @@ def test_compiled_aliases_exclude_withdrawn_ox_alpha_routes() -> None:
                 assert entry.model not in _WITHDRAWN_OX_ALPHA_MODELS
 
 
+def test_opencode_basic_selects_supported_go_replacement() -> None:
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    alias = snapshot.aliases["opencode_basic"]
+    assert alias.candidates[0].provider == "opencode_go"
+    assert alias.candidates[0].model == "muse-spark-1.3-contributor"
+    assert alias.candidates[0].route_family == "codex_opencode_go_adapter"
+    assert all(
+        not (
+            isinstance(entry, RoutingCandidate)
+            and entry.model == "opencode/omen-alpha"
+        )
+        for entry in alias.candidates
+    )
+    basic_other_models = {
+        entry.model
+        for entry in snapshot.aliases["basic-other"].candidates
+        if isinstance(entry, RoutingCandidate)
+    }
+    assert "muse-spark-1.3-contributor" in basic_other_models
+    assert "opencode/omen-alpha" not in basic_other_models
+
+
 def test_provider_opencode_zen_keeps_both_adapter_forms_distinct() -> None:
     snapshot = compile_directory(DEFAULT_CONFIG_DIR)
     alias = snapshot.aliases["provider-opencode_zen"]
