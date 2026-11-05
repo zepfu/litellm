@@ -3206,6 +3206,59 @@ async def handle_alias_route(  # noqa: PLR0915
                         ),
                         None,
                     )
+                    # The selector's cooldown snapshot is intentionally
+                    # compact and may not retain the typed provider failure
+                    # that caused the cooldown.  The request-local attempt
+                    # ledger is authoritative for this decision: use it only
+                    # when it proves a provider call returned a known
+                    # pre-commit transient capacity error.  Local admission,
+                    # quota, and auth skips never satisfy these predicates.
+                    if redispatch_candidate is None:
+                        provider_attempt = next(
+                            (
+                                attempt
+                                for attempt in reversed(attempts)
+                                if isinstance(attempt, dict)
+                                and str(attempt.get("provider") or "")
+                                .strip()
+                                .lower()
+                                != "openai"
+                                and attempt.get("attempted_provider_call") is True
+                                and attempt.get("provider_returned") is True
+                                and str(attempt.get("error_class") or "")
+                                in _error_signals._RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES
+                            ),
+                            None,
+                        )
+                        if provider_attempt is not None:
+                            cooled_snapshot = next(
+                                (
+                                    candidate
+                                    for candidate in cooling_candidates or []
+                                    if isinstance(candidate, dict)
+                                    and str(candidate.get("provider") or "")
+                                    .strip()
+                                    .lower()
+                                    == str(provider_attempt.get("provider") or "")
+                                    .strip()
+                                    .lower()
+                                    and all(
+                                        not str(provider_attempt.get(field) or "").strip()
+                                        or not str(candidate.get(field) or "").strip()
+                                        or str(provider_attempt.get(field)).strip()
+                                        == str(candidate.get(field)).strip()
+                                        for field in ("model", "route_family")
+                                    )
+                                    and float(candidate.get("cooldown_seconds") or 0.0)
+                                    > 0
+                                ),
+                                None,
+                            )
+                            if cooled_snapshot is not None:
+                                redispatch_candidate = {
+                                    **provider_attempt,
+                                    **cooled_snapshot,
+                                }
                 else:
                     redispatch_candidate = None
                 if redispatch_candidate is not None:

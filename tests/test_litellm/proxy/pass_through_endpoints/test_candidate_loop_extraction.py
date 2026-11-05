@@ -458,13 +458,13 @@ async def test_candidate_loop_typed_redispatch_429_emits_terminal_event(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "selection_boundary",
-    [False, True],
-    ids=["after-provider-attempt", "selector-boundary"],
+    [False, True, "dehydrated"],
+    ids=["after-provider-attempt", "selector-boundary", "selector-boundary-dehydrated"],
 )
-async def test_candidate_loop_provider_429_exhaustion_redispatches_without_killing_session(
-    selection_boundary: bool,
+async def test_candidate_loop_provider_429_exhaustion_redispatches_without_killing_session(  # noqa: PLR0915
+    selection_boundary: bool | str,
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+) -> None:  # noqa: PLR0915
     """Provider-returned transient 429s must use redispatch telemetry."""
 
     request = Request(
@@ -508,9 +508,31 @@ async def test_candidate_loop_provider_429_exhaustion_redispatches_without_killi
     no_candidate_events: list[dict[str, Any]] = []
     redispatch_calls: list[dict[str, Any]] = []
     provider_calls: list[dict[str, Any]] = []
+    selection_calls = 0
 
     async def _select(**_kwargs: Any) -> dict[str, Any]:
-        if selection_boundary:
+        nonlocal selection_calls
+        selection_calls += 1
+        if selection_boundary is True or (
+            selection_boundary == "dehydrated" and selection_calls > 1
+        ):
+            cooling_candidate = {
+                **candidate,
+                "lane_key": "alibaba_token_plan",
+                "cooldown_seconds": 60.0,
+                "cooldown_scope": "candidate",
+                "attempted_provider_call": True,
+                "provider_returned": True,
+            }
+            if selection_boundary != "dehydrated":
+                cooling_candidate.update(
+                    {
+                        "error_class": "rate_limited",
+                        "error_status_code": 429,
+                        "error_type": "throttling_error",
+                        "error_code": "rate_limited",
+                    }
+                )
             raise HTTPException(
                 status_code=429,
                 detail={
@@ -520,20 +542,7 @@ async def test_candidate_loop_provider_429_exhaustion_redispatches_without_killi
                         ),
                         "type": "rate_limit_error",
                     },
-                    "candidates": [
-                        {
-                            **candidate,
-                            "lane_key": "alibaba_token_plan",
-                            "cooldown_seconds": 60.0,
-                            "cooldown_scope": "candidate",
-                            "error_class": "rate_limited",
-                            "error_status_code": 429,
-                            "error_type": "throttling_error",
-                            "error_code": "rate_limited",
-                            "attempted_provider_call": True,
-                            "provider_returned": True,
-                        }
-                    ],
+                    "candidates": [cooling_candidate],
                 },
             )
         return selection
@@ -661,10 +670,12 @@ async def test_candidate_loop_provider_429_exhaustion_redispatches_without_killi
     assert terminal_events and terminal_events[0]["redispatch_required"] is True
     assert terminal_events[0]["event_type"] == "redispatch_required"
     assert no_candidate_events == []
-    if selection_boundary:
+    if selection_boundary is True:
         assert provider_calls == []
         assert redispatch_calls[0]["attempts"] == []
         assert terminal_events[0]["attempts"] == []
+    elif selection_boundary == "dehydrated":
+        assert provider_calls
 
 
 @pytest.mark.asyncio
