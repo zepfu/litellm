@@ -600,6 +600,25 @@ def test_gpt_6_astra_pricing_and_runtime_model_info(monkeypatch):
     assert supports_max_reasoning_effort("gpt-6-astra") is True
 
 
+def test_bedrock_200k_cache_creation_ttl_pricing_propagates(monkeypatch):
+    from litellm.utils import get_model_info
+
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+    monkeypatch.setattr(litellm, "model_cost", litellm.get_model_cost_map(url=""))
+
+    runtime_model_info = get_model_info(
+        "anthropic.claude-3-5-sonnet-20240620-v1:0",
+        custom_llm_provider="bedrock",
+    )
+
+    assert (
+        runtime_model_info[
+            "cache_creation_input_token_cost_above_1hr_above_200k_tokens"
+        ]
+        == 1.5e-05
+    )
+
+
 def test_codex_chatgpt_unsupported_request_params_in_cost_map():
     import json
     from pathlib import Path

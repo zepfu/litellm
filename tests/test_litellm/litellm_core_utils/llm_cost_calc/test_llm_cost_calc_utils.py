@@ -382,6 +382,35 @@ def test_generic_cost_per_token_gpt6_astra_above_272k_with_one_hour_prompt_cachi
     assert round(completion_cost, 10) == round(1000 * 7.5e-05, 10)
 
 
+def test_generic_cost_per_token_bedrock_sonnet_above_200k_with_one_hour_prompt_caching():
+    model = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    litellm.model_cost = litellm.get_model_cost_map(url="")
+
+    usage = Usage(
+        prompt_tokens=201000,
+        completion_tokens=1000,
+        total_tokens=202000,
+        prompt_tokens_details=PromptTokensDetailsWrapper(
+            text_tokens=199000,
+            cache_creation_tokens=2000,
+            cache_creation_token_details=CacheCreationTokenDetails(
+                ephemeral_5m_input_tokens=0,
+                ephemeral_1h_input_tokens=2000,
+            ),
+        ),
+    )
+    prompt_cost, completion_cost = generic_cost_per_token(
+        model=model,
+        usage=usage,
+        custom_llm_provider="bedrock",
+    )
+
+    expected_prompt_cost = 199000 * 6e-06 + 2000 * 1.5e-05
+    assert round(prompt_cost, 10) == round(expected_prompt_cost, 10)
+    assert round(completion_cost, 10) == round(1000 * 3e-05, 10)
+
+
 def test_generic_cost_per_token_anthropic_prompt_caching():
     model = "claude-sonnet-4@20250514"
     usage = Usage(

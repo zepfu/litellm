@@ -195,6 +195,7 @@ class ModelInfoBase(ProviderSpecificModelInfo, total=False):
         float
     ]  # OpenAI long-context cache writes
     cache_creation_input_token_cost_above_1hr: Optional[float]
+    cache_creation_input_token_cost_above_1hr_above_200k_tokens: Optional[float]
     cache_creation_input_token_cost_above_1hr_above_272k_tokens: Optional[float]
     cache_read_input_token_cost: Optional[float]
     cache_read_input_token_cost_flex: Optional[
@@ -3028,6 +3029,9 @@ class CustomPricingLiteLLMParams(BaseModel):
     input_cost_per_token_priority: Optional[float] = None
     cache_creation_input_token_cost: Optional[float] = None
     cache_creation_input_token_cost_above_1hr: Optional[float] = None
+    cache_creation_input_token_cost_above_1hr_above_200k_tokens: Optional[
+        float
+    ] = None
     cache_creation_input_token_cost_above_1hr_above_272k_tokens: Optional[
         float
     ] = None
