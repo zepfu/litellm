@@ -4994,6 +4994,53 @@ def test_provider_returned_server_overload_is_account_attributed() -> None:
     )
 
 
+def test_provider_capacity_rotation_after_same_account_retry_is_explicit() -> None:
+    """A second fresh provider 429 may rotate without quota proof."""
+    request = _request()
+    candidate = {
+        **_candidate(),
+        "codex_oauth_account_label": "account1",
+        "codex_oauth_account_hash": "hash-account-1",
+        "codex_oauth_lane_key": "codex-oauth:account1:hash-account-1",
+    }
+    selection_state = {
+        "candidate": candidate,
+        "failover_ordinal": 0,
+        "lane_key": candidate["codex_oauth_lane_key"],
+    }
+    attempt = {
+        "failure_phase": "direct_openai_provider_response",
+        "attempted_provider_call": True,
+        "provider_returned": True,
+    }
+
+    assert not selection._plan_codex_oauth_account_failover(
+        request,
+        candidate=candidate,
+        selection=selection_state,
+        attempt_record=dict(attempt),
+        error_class="rate_limited",
+        has_continuation_state=False,
+        account_failover_replay_safe=True,
+        provider_status_code=429,
+    )
+    assert selection._plan_codex_oauth_account_failover(
+        request,
+        candidate=candidate,
+        selection=selection_state,
+        attempt_record=attempt,
+        error_class="rate_limited",
+        has_continuation_state=False,
+        account_failover_replay_safe=True,
+        provider_status_code=429,
+        allow_provider_capacity_rotation=True,
+    )
+    assert (
+        attempt["account_failover_reason"]
+        == "provider_capacity_retry_after_same_account"
+    )
+
+
 @pytest.mark.asyncio
 async def test_resp_previous_response_id_pins_creating_lane(
     monkeypatch: pytest.MonkeyPatch,

@@ -3641,6 +3641,13 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
         retry_attempt_record["wire_commitment"] = wire_commitment
         return None
 
+    request_state = getattr(request, "state", None)
+    retry_count = (
+        int(getattr(request_state, "_aawm_direct_codex_capacity_retries", 0))
+        if request_state is not None
+        else 0
+    )
+
     # A provider-returned transient capacity response is a known no-effect
     # pre-commit outcome. Direct Codex OAuth traffic bypasses the candidate
     # loop, so it must consume the same bounded same-account retry before
@@ -3659,12 +3666,6 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
         and provider_returned
         and current_auth is not None
     ):
-        request_state = getattr(request, "state", None)
-        retry_count = (
-            int(getattr(request_state, "_aawm_direct_codex_capacity_retries", 0))
-            if request_state is not None
-            else 0
-        )
         if retry_count < 1:
             if request_state is not None:
                 setattr(
@@ -3938,6 +3939,21 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
                 )
             ),
             provider_status_code=retry_attempt_record["error_status_code"],
+            allow_provider_capacity_rotation=(
+                retry_count >= 1
+                and error_class
+                in {
+                    "rate_limited",
+                    "server_overloaded",
+                    "upstream_overloaded",
+                    "capacity_exhausted",
+                }
+                and attempted_provider_call
+                and provider_returned
+                and not has_continuation_state
+                and not bool(request_body.get("previous_response_id"))
+                and account_failover_replay_safe
+            ),
         )
     )
     if retry_planned and hasattr(request, "state"):

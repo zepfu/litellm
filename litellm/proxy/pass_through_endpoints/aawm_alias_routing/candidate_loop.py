@@ -6129,6 +6129,30 @@ async def handle_alias_route(  # noqa: PLR0915
                         failure_exc
                     ),
                 )
+                provider_capacity_rotation_due = (
+                    same_account_transient_attempts_by_slot.get(account_slot, 0)
+                    >= _error_signals.RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS
+                    and error_class
+                    in {
+                        "rate_limited",
+                        "server_overloaded",
+                        "upstream_overloaded",
+                        "capacity_exhausted",
+                    }
+                    and attempted_provider_call
+                    and attempt_record.get("provider_returned") is True
+                    and not _provider_owned_continuation()
+                    and not has_previous_response_id
+                    and account_failover_replay_safe
+                    and _is_codex_oauth_account_candidate is not None
+                    and _is_codex_oauth_account_candidate(candidate)
+                )
+                if provider_capacity_rotation_due:
+                    # The bounded same-account retry has already been
+                    # consumed. A fresh provider-confirmed no-effect failure
+                    # may now rotate to the portable acct1/acct2 lane instead
+                    # of entering another long capacity wait or terminalizing.
+                    prefer_account_failover = True
                 if (
                     not prefer_account_failover
                     and not _provider_owned_continuation()
@@ -6363,6 +6387,9 @@ async def handle_alias_route(  # noqa: PLR0915
                         account_failover_replay_safe=account_failover_replay_safe,
                         provider_status_code=attempt_record.get(
                             "error_status_code"
+                        ),
+                        allow_provider_capacity_rotation=(
+                            provider_capacity_rotation_due
                         ),
                     )
                 )

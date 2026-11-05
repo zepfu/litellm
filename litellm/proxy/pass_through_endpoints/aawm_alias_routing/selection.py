@@ -1523,6 +1523,7 @@ def _plan_codex_oauth_account_failover(
     has_account_bound_state: bool = False,
     account_failover_replay_safe: bool = False,
     provider_status_code: Optional[int] = None,
+    allow_provider_capacity_rotation: bool = False,
 ) -> bool:
     """Plan a request-local move to another eligible account for one slot."""
 
@@ -1563,14 +1564,40 @@ def _plan_codex_oauth_account_failover(
         attempt_record["account_failover_limit_reached"] = True
         return reject("account_failover_limit_reached")
 
-    if not _codex_oauth_account_exhaustion_is_confirmed(
+    account_exhaustion_confirmed = _codex_oauth_account_exhaustion_is_confirmed(
         candidate=candidate,
         selection=selection,
         attempt_record=attempt_record,
         error_class=error_class,
         provider_status_code=provider_status_code,
-    ):
-        return reject("account_exhaustion_not_confirmed")
+    )
+    if not account_exhaustion_confirmed:
+        provider_capacity_rotation = (
+            allow_provider_capacity_rotation
+            and error_class
+            in {
+                "rate_limited",
+                "server_overloaded",
+                "upstream_overloaded",
+                "capacity_exhausted",
+            }
+            and attempt_record.get("attempted_provider_call") is True
+            and attempt_record.get("provider_returned") is True
+            and (
+                provider_status_code in {429, 529}
+                or error_class
+                in {
+                    "server_overloaded",
+                    "upstream_overloaded",
+                    "capacity_exhausted",
+                }
+            )
+        )
+        if not provider_capacity_rotation:
+            return reject("account_exhaustion_not_confirmed")
+        attempt_record["account_failover_reason"] = (
+            "provider_capacity_retry_after_same_account"
+        )
 
     prior_account_outcome: dict[str, Any] = {
         "account_label": candidate.get("codex_oauth_account_label"),
