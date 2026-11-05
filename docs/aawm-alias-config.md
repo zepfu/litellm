@@ -339,7 +339,7 @@ These Codex aliases select a native provider first, then OpenAI
 | `nvidia_basic` | `nvidia/moonshotai/kimi-k3` |
 | `cohere_basic` | `cohere/north-mini-code-1-0` |
 | `nous_basic` | `nous/upstage/solar-mini4:free` |
-| `opencode_basic` | OpenCode Go `muse-spark-1.3-contributor`, then `muse-spark-1.3-contributor` |
+| `opencode_basic` | OpenCode Go `muse-spark-1.3-contributor` |
 
 Native candidates have no configured reasoning-effort override. Provider
 capability and admission checks still apply; configuring an alias does not

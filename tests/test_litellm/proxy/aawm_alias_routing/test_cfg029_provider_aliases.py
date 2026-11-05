@@ -340,7 +340,7 @@ def test_provider_opencode_zen_keeps_both_adapter_forms_distinct() -> None:
         for entry in alias.candidates
     ]
     assert (
-        "deepseek-v4-flash-free",
+        "deepseek-v4.1-flash-free",
         "codex_opencode_zen_adapter",
         "anthropic_opencode_zen_responses_adapter",
     ) in pairs
