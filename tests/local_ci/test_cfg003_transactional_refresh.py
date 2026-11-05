@@ -839,7 +839,7 @@ def _snapshot_eligible_fields(snapshot_candidates: list[dict[str, str]]):
 
 
 class TestAliasReferenceResolution:
-    def test_unbounded_schedule_does_not_crash_snapshot_eligibility(self, ra):
+    def test_invalid_absolute_schedule_is_ineligible(self, ra):
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
             RoutingAlias,
             RoutingSnapshot,
@@ -873,7 +873,65 @@ class TestAliasReferenceResolution:
             test_snapshot,
             alias_name="test",
         )
-        assert eligible[0]["model"] == candidate.model
+        assert eligible == []
+
+    def test_daily_schedule_respects_local_clock_date_and_weekday(self, ra):
+        import datetime as dt
+
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
+            RoutingAlias,
+            RoutingSnapshot,
+            ScheduleWindow,
+        )
+
+        snapshot = _compile_snapshot()
+        candidate = next(
+            entry
+            for entry in snapshot.aliases["basic"].candidates
+            if hasattr(entry, "provider")
+        )
+        scheduled = replace(
+            candidate,
+            schedule=ScheduleWindow(
+                kind="daily",
+                start_time=dt.time(9),
+                end_time=dt.time(17),
+                start_date=dt.date(2026, 1, 5),
+                end_date=dt.date(2026, 1, 11),
+                timezone="America/New_York",
+                weekdays=(0,),
+            ),
+        )
+        test_snapshot = RoutingSnapshot(
+            aliases={
+                "test": RoutingAlias(
+                    name="test",
+                    distribution_strategy=None,
+                    candidates=(scheduled,),
+                )
+            },
+            config_epoch=1,
+            config_hash="test",
+            config_version="test",
+        )
+
+        def eligible_at(now):
+            return ra._derive_eligible_candidates_from_snapshot(
+                test_snapshot,
+                alias_name="test",
+                now=now,
+            )
+
+        # A naive timestamp is interpreted as UTC, then converted to 09:00
+        # America/New_York at the inclusive start boundary.
+        assert eligible_at(dt.datetime(2026, 1, 5, 14, 0))
+        # The daily end boundary is exclusive.
+        assert not eligible_at(dt.datetime(2026, 1, 5, 22, 0, tzinfo=dt.timezone.utc))
+        # Tuesday is outside the Monday-only weekday gate.
+        assert not eligible_at(dt.datetime(2026, 1, 6, 14, 0, tzinfo=dt.timezone.utc))
+        # The local date range is inclusive.
+        assert not eligible_at(dt.datetime(2026, 1, 4, 14, 0, tzinfo=dt.timezone.utc))
+        assert not eligible_at(dt.datetime(2026, 1, 12, 14, 0, tzinfo=dt.timezone.utc))
 
     def test_derive_ingresses_resolves_reference_aliases(self, ra):
         snap = _compile_snapshot()

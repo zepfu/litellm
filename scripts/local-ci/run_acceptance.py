@@ -3351,16 +3351,21 @@ def _derive_eligible_candidates_from_snapshot(
     alias_candidates = _concretize_alias_candidates(snapshot, alias_name=alias_name)
 
     now_utc = now if now is not None else dt.datetime.now(dt.timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=dt.timezone.utc)
+    else:
+        now_utc = now_utc.astimezone(dt.timezone.utc)
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
+        _is_snapshot_candidate_in_schedule_window,
+    )
+
     eligible: list[dict[str, Any]] = []
     for idx, cand in enumerate(alias_candidates):
         if cand.provider in excluded_providers:
             continue
         # Schedule window check.
-        if cand.schedule is not None:
-            if cand.schedule.start is not None and now_utc < cand.schedule.start:
-                continue
-            if cand.schedule.end is not None and now_utc > cand.schedule.end:
-                continue
+        if not _is_snapshot_candidate_in_schedule_window(cand, now_utc=now_utc):
+            continue
         # Positive availability requirement (strict boundary validation).
         if require_availability:
             info = (positive_availability or {}).get(
