@@ -9,11 +9,6 @@ aliases:
         route_family: codex_opencode_go_adapter
         priority: 100
 
-      - provider: opencode_go
-        model: omen-alpha
-        route_family: codex_opencode_go_adapter
-        priority: 90
-
       - provider: openai
         model: gpt-6-luna
         route_family: codex_responses

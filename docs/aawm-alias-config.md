@@ -220,7 +220,6 @@ OpenAI `gpt-6-luna` (priority 0, `reasoning_effort: low`).
 `basic-other` orders Z.AI Coding Plan `zai_coding_plan/glm-5.3-flash`
 (priority 170, admitted only from `23:00-09:00 UTC+8`), Cohere (160),
 Nous Solar Mini 4 (150), NVIDIA (140), OpenRouter (130),
-OpenCode Go `omen-alpha` (120),
 OpenCode Go `muse-spark-1.3-contributor` (110), then Alibaba Token Plan
 `alibaba_token_plan/deepseek-v4.1-flash` (100, `22:00-08:00 UTC+8`).
 These candidates have no configured reasoning-effort override.
@@ -340,7 +339,7 @@ These Codex aliases select a native provider first, then OpenAI
 | `nvidia_basic` | `nvidia/moonshotai/kimi-k3` |
 | `cohere_basic` | `cohere/north-mini-code-1-0` |
 | `nous_basic` | `nous/upstage/solar-mini4:free` |
-| `opencode_basic` | OpenCode Go `muse-spark-1.3-contributor`, then `omen-alpha` |
+| `opencode_basic` | OpenCode Go `muse-spark-1.3-contributor`, then `muse-spark-1.3-contributor` |
 
 Native candidates have no configured reasoning-effort override. Provider
 capability and admission checks still apply; configuring an alias does not

@@ -60,7 +60,6 @@ OPENCODE_GO_MODEL_PREFIXES = frozenset({"opencode_go", "opencode-go"})
 OPENCODE_GO_ALLOWED_MODELS = frozenset(
     {
         "muse-spark-1.3-contributor",
-        "omen-alpha",
         "ox-alpha-free",
     }
 )
