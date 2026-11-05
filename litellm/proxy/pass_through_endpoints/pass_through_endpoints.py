@@ -3923,13 +3923,31 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                 and not getattr(exc, "aawm_call_ledger_exhausted", False)
                 and not getattr(exc, "aawm_openai_wire_replay_blocked", False)
             )
-            # A commitment vetoes every resend class, including raw status
-            # failures and the ordinary retry path without a capacity owner.
-            # Keep the current attempt's exception as the terminal failure.
-            if (
-                request is not None
-                and get_responses_replay_commitment_reason(request) is not None
-            ):
+            # The send path publishes ``provider_execution_possible`` before
+            # handing the request to httpx so an unknown cancellation cannot
+            # be replayed.  A provider-returned pre-first-byte capacity error
+            # is different: the provider has explicitly rejected the request
+            # before producing output, and the coordinator has granted one
+            # bounded replacement send.  Keep that retry eligible while
+            # retaining the fail-closed rule for unknown outcomes, delivered
+            # effects, and every other commitment reason.
+            commitment_reason = (
+                get_responses_replay_commitment_reason(request)
+                if request is not None
+                else None
+            )
+            provider_returned = getattr(exc, "_aawm_provider_returned", None)
+            if not isinstance(provider_returned, bool):
+                provider_returned = getattr(exc, "provider_returned", None)
+            provisional_capacity_retry = bool(
+                capacity_failure
+                and openai_capacity_coordinator is not None
+                and commitment_reason == "provider_execution_possible"
+                and provider_returned is True
+                and not getattr(exc, "aawm_call_ledger_exhausted", False)
+                and not getattr(exc, "aawm_openai_wire_replay_blocked", False)
+            )
+            if commitment_reason is not None and not provisional_capacity_retry:
                 if openai_capacity_coordinator is not None:
                     openai_capacity_coordinator.record_terminal(
                         "wire_replay_committed",

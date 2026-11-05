@@ -723,7 +723,27 @@ def ensure_openai_wire_replay_allowed(
     """Fail closed before reservation when the delivered wire forbids replay."""
 
     commitment = get_request_openai_wire_commitment(request)
-    if is_openai_wire_replay_prohibited(commitment):
+    # ``provider_execution_possible`` is published before the first upstream
+    # send so a cancellation with an unknown provider outcome cannot be
+    # replayed.  A provider-confirmed pre-first-byte capacity response is the
+    # one bounded exception: the response proves that no model output/effect
+    # was delivered, and the ledger's one-shot capacity permit authorizes the
+    # replacement send.  The permit is consumed by ``reserve`` after this
+    # check; all other commitment reasons remain fail-closed.
+    capacity_retry_permitted = False
+    if (
+        isinstance(commitment, Mapping)
+        and commitment.get(_RESPONSES_REPLAY_LATCH_REASON_KEY)
+        == "provider_execution_possible"
+        and ledger is not None
+    ):
+        try:
+            capacity_retry_permitted = bool(
+                ledger.snapshot().get("capacity_retry_authorized") is True
+            )
+        except Exception:
+            capacity_retry_permitted = False
+    if is_openai_wire_replay_prohibited(commitment) and not capacity_retry_permitted:
         raise ProviderCallReplayBlocked(
             commitment=commitment or {},
             ledger=ledger,

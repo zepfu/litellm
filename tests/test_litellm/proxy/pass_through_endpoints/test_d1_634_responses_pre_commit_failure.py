@@ -4119,6 +4119,8 @@ async def test_direct_capacity_owner_cancels_inflight_operation_on_disconnect():
     coordinator = MagicMock()
     coordinator.deadline_seconds = 60.0
     coordinator.remaining_seconds = 60.0
+    coordinator.elapsed_seconds = 0.0
+    coordinator.remaining_seconds = 60.0
     coordinator.signal_success = AsyncMock()
     coordinator.record_terminal = MagicMock()
     attempts = 0
@@ -9158,6 +9160,166 @@ async def test_transport_exemption_keeps_other_frames_committed(frame):
     finally:
         await peeked.aclose()
         await response.aclose()
+
+
+@pytest.mark.asyncio
+async def test_provider_capacity_retry_can_cross_provisional_execution_commitment():
+    """A provider-confirmed pre-first-byte capacity failure gets one retry."""
+
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        ensure_openai_wire_replay_allowed,
+        get_or_create_openai_provider_call_ledger,
+        publish_responses_replay_commitment,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry import (
+        OpenAIAlphaCapacityRetryCoordinator,
+    )
+
+    request = _responses_request({"model": "gpt-5.4"})
+    target = "https://api.openai.com/v1/responses"
+    candidate_context = {
+        "provider": "openai",
+        "model": "gpt-5.4",
+        "account_hash": "account-hash",
+        "lane_key": "codex-oauth:account1:account-hash",
+    }
+    ledger = get_or_create_openai_provider_call_ledger(
+        request,
+        custom_llm_provider="openai",
+        target=target,
+    )
+    assert ledger is not None
+    ledger.reserve(
+        target=target,
+        candidate_context=candidate_context,
+        prior_response_closed=True,
+    )
+    coordinator = OpenAIAlphaCapacityRetryCoordinator(
+        target_identity=target,
+        account_context=candidate_context,
+    )
+    assert ledger.authorize_capacity_retry(
+        target=target,
+        candidate_context=candidate_context,
+        deadline_at_monotonic=coordinator.deadline_at_monotonic,
+    )
+    publish_responses_replay_commitment(
+        request,
+        reason="provider_execution_possible",
+    )
+    # The permit is the only condition that may cross the provisional latch;
+    # the subsequent reservation consumes it before the retry send.
+    ensure_openai_wire_replay_allowed(request, ledger=ledger)
+
+    failure = ResponsesStreamPreCommitFailure(
+        error_class="server_overloaded",
+        classification="transient_capacity",
+        retryable=True,
+        status_code=429,
+        provider_returned=True,
+        message="upstream capacity",
+    )
+    calls = 0
+
+    async def operation() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise failure
+        return "recovered"
+
+    async def run_operation(operation, request):
+        return await operation()
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.await_with_client_disconnect",
+        side_effect=run_operation,
+    ), patch.object(coordinator, "next_wait_seconds", return_value=0.0), patch.object(
+        coordinator,
+        "sleep_with_wakeup",
+        new=AsyncMock(return_value="timer"),
+    ):
+        result = await _execute_passthrough_pre_first_byte_with_hidden_retries(
+            kwargs={},
+            operation=operation,
+            operation_name="stream_pre_first_byte",
+            caller_managed_hidden_retry=False,
+            request=request,
+            url=httpx.URL(target),
+            custom_llm_provider="openai",
+            openai_capacity_coordinator=coordinator,
+        )
+
+    assert result == "recovered"
+    assert calls == 2
+    assert coordinator.retry_count == 1
+
+
+def test_provisional_execution_commitment_still_blocks_without_capacity_grant():
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        ProviderCallReplayBlocked,
+        ensure_openai_wire_replay_allowed,
+        publish_responses_replay_commitment,
+    )
+
+    request = _responses_request({"model": "gpt-5.4"})
+    publish_responses_replay_commitment(
+        request,
+        reason="provider_execution_possible",
+    )
+    with pytest.raises(ProviderCallReplayBlocked):
+        ensure_openai_wire_replay_allowed(request)
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_capacity_failure_keeps_provisional_commitment_terminal():
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        publish_responses_replay_commitment,
+    )
+
+    request = _responses_request({"model": "gpt-5.4"})
+    publish_responses_replay_commitment(
+        request,
+        reason="provider_execution_possible",
+    )
+    failure = ResponsesStreamPreCommitFailure(
+        error_class="server_overloaded",
+        classification="transient_capacity",
+        retryable=True,
+        provider_returned=False,
+        message="provider outcome unknown",
+    )
+    coordinator = MagicMock()
+    coordinator.deadline_seconds = 60.0
+    coordinator.remaining_seconds = 60.0
+    coordinator.elapsed_seconds = 0.0
+    calls = 0
+
+    async def operation() -> None:
+        nonlocal calls
+        calls += 1
+        raise failure
+
+    async def run_operation(operation, request):
+        return await operation()
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.await_with_client_disconnect",
+        side_effect=run_operation,
+    ), pytest.raises(ResponsesStreamPreCommitFailure) as raised:
+        await _execute_passthrough_pre_first_byte_with_hidden_retries(
+                kwargs={},
+                operation=operation,
+                operation_name="stream_pre_first_byte",
+                caller_managed_hidden_retry=False,
+                request=request,
+                url=httpx.URL("https://api.openai.com/v1/responses"),
+                custom_llm_provider="openai",
+                openai_capacity_coordinator=coordinator,
+            )
+
+    assert raised.value is failure
+    assert calls == 1
 
 
 def test_adopted_event_without_payload_cannot_claim_transport_exemption():
