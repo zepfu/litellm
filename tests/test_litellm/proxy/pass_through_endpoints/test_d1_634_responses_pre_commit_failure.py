@@ -3307,6 +3307,41 @@ def test_selected_model_at_capacity_message_is_retryable_pre_commit():
     assert retryable is True
 
 
+@pytest.mark.parametrize("status_code", [500, 502, 503, 504, 529])
+def test_provider_availability_opaque_http_error_is_transient_capacity(status_code):
+    """Provider availability errors retry even with opaque bodies."""
+    exc = HTTPException(
+        status_code=status_code,
+        detail={"message": "temporarily unavailable"},
+    )
+    exc._aawm_provider_returned = True
+    assert _classify_passthrough_raw_http_error(
+        exc, status_code=status_code
+    ) == ("upstream_transient_internal", "transient_upstream", True)
+
+
+def test_local_opaque_availability_error_does_not_infer_provider_capacity():
+    exc = HTTPException(
+        status_code=529,
+        detail={"message": "temporarily unavailable"},
+    )
+    classified = _classify_passthrough_raw_http_error(exc, status_code=529)
+    assert classified is None or classified[2] is False
+
+
+def test_provider_quota_429_remains_account_exhaustion_terminal():
+    exc = HTTPException(
+        status_code=429,
+        detail={"error": {"code": "usage_limit_reached", "message": "quota"}},
+    )
+    exc._aawm_provider_returned = True
+    assert _classify_passthrough_raw_http_error(exc, status_code=429) == (
+        "usage_limit_reached",
+        "usage_limit_reached",
+        False,
+    )
+
+
 def test_selected_model_at_capacity_http_error_is_transient_capacity():
     exc = HTTPException(
         status_code=503,
@@ -3324,6 +3359,43 @@ def test_selected_model_at_capacity_http_error_is_transient_capacity():
     assert error_class == "server_overloaded"
     assert classification == "transient_capacity"
     assert retryable is True
+
+
+@pytest.mark.asyncio
+async def test_provider_529_opaque_hidden_retry_recovers():
+    """Provider 529 availability without a structured body still retries."""
+    coordinator = MagicMock()
+    coordinator.deadline_seconds = 7200.0
+    coordinator.remaining_seconds = 7200.0
+    coordinator.within_deadline.return_value = True
+    coordinator.next_wait_seconds.return_value = 0.0
+    coordinator.sleep_with_wakeup = AsyncMock(return_value="timer")
+    coordinator.record_retry = MagicMock()
+    coordinator.record_terminal = MagicMock()
+    coordinator.signal_success = AsyncMock()
+    attempts = 0
+    failure = HTTPException(529, detail={"message": "temporarily unavailable"})
+    failure._aawm_provider_returned = True
+
+    async def operation():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise failure
+        return "committed"
+
+    result = await _execute_passthrough_pre_first_byte_with_hidden_retries(
+        kwargs={},
+        operation_name="stream_pre_first_byte",
+        operation=operation,
+        caller_managed_hidden_retry=False,
+        openai_capacity_coordinator=coordinator,
+    )
+    assert result == "committed"
+    assert attempts == 2
+    coordinator.record_retry.assert_called_once_with(
+        "timer", error_class="http_status_529", status_code=529
+    )
 
 
 @pytest.mark.asyncio
@@ -5585,6 +5657,163 @@ async def test_response_metadata_does_not_block_capacity_retry():
         assert b"".join([chunk async for chunk in peeked.aiter_bytes()]) == b"".join(
             chunks
         )
+    finally:
+        await peeked.aclose()
+
+
+@pytest.mark.asyncio
+async def test_additive_setup_and_failure_fields_remain_capacity_retryable():
+    """Inert provider extensions must not become replay commitments."""
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        get_request_openai_wire_commitment,
+    )
+
+    response_id = "resp_additive_capacity"
+    created = _response_event(
+        "response.created",
+        1,
+        response_id=response_id,
+        status="in_progress",
+    )
+    created_payload = json.loads(created.split(b"data: ", 1)[1])
+    created_payload["setup_extension"] = {"provider_request_id": "opaque"}
+    created = _sse("response.created", created_payload)
+    metadata = _responses_event(
+        "response.metadata",
+        2,
+        metadata={"provider_request_id": "opaque"},
+        provider_extension={"revision": "2026-11-05"},
+    )
+    failed = _response_event(
+        "response.failed",
+        3,
+        response_id=response_id,
+        status="failed",
+        error={
+            "code": "server_is_overloaded",
+            "type": "server_error",
+            "message": "Selected model is at capacity.",
+        },
+    )
+    failed_payload = json.loads(failed.split(b"data: ", 1)[1])
+    failed_payload["failure_extension"] = {"provider_request_id": "opaque"}
+    failed = _sse("response.failed", failed_payload)
+
+    request = _responses_request({"model": "gpt-5.4", "input": "continue"})
+    response = httpx.Response(
+        200,
+        stream=_ClosableAsyncByteStream([created, metadata, failed]),
+        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+    )
+    peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+        response,
+        request=request,
+        provider_bound_body={"model": "gpt-5.4", "tools": []},
+        openai_alpha_capacity_retry_enabled=True,
+    )
+    try:
+        assert failure is not None
+        assert failure.error_class == "server_overloaded"
+        assert failure.retryable is True
+        assert get_request_openai_wire_commitment(request) is None
+        assert b"".join([chunk async for chunk in peeked.aiter_bytes()]) == b"".join(
+            [created, metadata, failed]
+        )
+    finally:
+        await peeked.aclose()
+
+
+@pytest.mark.asyncio
+async def test_unknown_setup_effect_field_keeps_replay_veto():
+    """An additive field carrying tool data remains fail-closed."""
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        get_request_openai_wire_commitment,
+        get_responses_replay_rejection,
+    )
+
+    response_id = "resp_effectful_extension"
+    created = _response_event(
+        "response.created",
+        1,
+        response_id=response_id,
+        status="in_progress",
+    )
+    created_payload = json.loads(created.split(b"data: ", 1)[1])
+    created_payload["provider_extension"] = {
+        "tool_call": {"name": "dangerous"}
+    }
+    failed = _response_event(
+        "response.failed",
+        2,
+        response_id=response_id,
+        status="failed",
+        error={"code": "server_is_overloaded", "message": "capacity"},
+    )
+    request = _responses_request({"model": "gpt-5.4", "input": "continue"})
+    response = httpx.Response(
+        200,
+        stream=_ClosableAsyncByteStream([_sse("response.created", created_payload), failed]),
+        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+    )
+    peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+        response,
+        request=request,
+        provider_bound_body={"model": "gpt-5.4", "tools": []},
+        openai_alpha_capacity_retry_enabled=True,
+    )
+    try:
+        assert failure is None
+        commitment = get_request_openai_wire_commitment(request)
+        assert commitment is not None
+        assert commitment["precommit_commitment_reason"] == "unknown_semantics"
+        assert get_responses_replay_rejection(request) == {
+            "replay_rejected_field": "$.provider_extension",
+            "replay_rejection_reason": "unsafe_event_shape",
+        }
+    finally:
+        await peeked.aclose()
+
+
+@pytest.mark.asyncio
+async def test_unknown_response_envelope_field_is_capacity_retryable():
+    """Unknown response-envelope metadata remains setup-only when inert."""
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        get_request_openai_wire_commitment,
+    )
+
+    response_id = "resp_unknown_response_field"
+    created = _response_event(
+        "response.created",
+        1,
+        response_id=response_id,
+        status="in_progress",
+    )
+    created_payload = json.loads(created.split(b"data: ", 1)[1])
+    created_payload["response"]["future_metadata"] = {"opaque": True}
+    failed = _response_event(
+        "response.failed",
+        2,
+        response_id=response_id,
+        status="failed",
+        error={"code": "server_is_overloaded", "message": "capacity"},
+    )
+    request = _responses_request({"model": "gpt-5.4", "input": "continue"})
+    response = httpx.Response(
+        200,
+        stream=_ClosableAsyncByteStream([_sse("response.created", created_payload), failed]),
+        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+    )
+    peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+        response,
+        request=request,
+        provider_bound_body={"model": "gpt-5.4", "tools": []},
+        openai_alpha_capacity_retry_enabled=True,
+    )
+    try:
+        assert failure is not None
+        assert failure.error_class == "server_overloaded"
+        assert failure.retryable is True
+        assert get_request_openai_wire_commitment(request) is None
     finally:
         await peeked.aclose()
 

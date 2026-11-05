@@ -3129,6 +3129,20 @@ def _classify_passthrough_raw_http_error(
             ("upstream_transient_internal", "transient_upstream", True),
             reason="status_520_fallback",
         )
+    # Provider-attributed availability statuses are transient even when the
+    # body is an opaque/plain-text envelope that the Responses classifier does
+    # not recognize.  Keep local/proxy statuses terminal by requiring the
+    # private provider-returned marker, and preserve explicit auth/quota
+    # semantics above.
+    if (
+        getattr(exc, "_aawm_provider_returned", False) is True
+        and status_code in {500, 502, 503, 504, 529}
+        and classified[0] == "provider_terminal_error"
+    ):
+        return _finish(
+            ("upstream_transient_internal", "transient_upstream", True),
+            reason="provider_availability_unclassified_payload",
+        )
     # Some OpenAI capacity responses contain no body, or a provider-specific
     # shape that the shared Responses classifier cannot recognize. The
     # provider-returned marker is required so local/pre-egress 429s remain

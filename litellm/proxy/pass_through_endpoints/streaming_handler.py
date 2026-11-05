@@ -146,6 +146,81 @@ _RESPONSES_RESPONSE_ENVELOPE_FIELDS = {
     "moderation", "access_programs", "tool_usage",
 }
 _RESPONSES_ERROR_FIELDS = {"type", "code", "message", "param"}
+
+# Additive provider fields are safe only when they remain inert setup data.
+# Keep this scan deliberately small and bounded: known lifecycle semantics are
+# still validated below, while an unknown field carrying output/tool/effect
+# material must retain the replay veto.
+_RESPONSES_EFFECT_MARKER_FIELDS = frozenset(
+    {
+        "output",
+        "outputs",
+        "item",
+        "items",
+        "content",
+        "delta",
+        "arguments",
+        "tool",
+        "tools",
+        "tool_call",
+        "tool_calls",
+        "function_call",
+        "custom_tool_call",
+        "mcp_call",
+        "web_search_call",
+        "file_search_call",
+        "code_interpreter_call",
+        "computer_call",
+        "image_generation_call",
+        "shell_call",
+        "apply_patch_call",
+        "provider_execution",
+    }
+)
+
+def _responses_value_has_effect_marker(value: Any, *, depth: int = 0) -> bool:
+    """Return whether an additive field appears to carry effect data."""
+    if depth > 4:
+        return False
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            normalized_key = str(key).strip().lower()
+            if normalized_key in _RESPONSES_EFFECT_MARKER_FIELDS and nested not in (
+                None,
+                "",
+                [],
+                {},
+                False,
+                0,
+            ):
+                return True
+            if isinstance(nested, (Mapping, list, tuple)) and _responses_value_has_effect_marker(
+                nested, depth=depth + 1
+            ):
+                return True
+    elif isinstance(value, (list, tuple)):
+        return any(
+            _responses_value_has_effect_marker(item, depth=depth + 1)
+            for item in value
+        )
+    return False
+
+def _responses_unknown_fields_are_inert(
+    payload: Mapping[str, Any],
+    known_fields: set[str],
+    *,
+    rejection: Optional[Dict[str, str]],
+    path: str,
+) -> bool:
+    """Admit additive fields unless they carry an effect-shaped value."""
+    reject = PassThroughStreamingHandler._reject_responses_field
+    for key, value in payload.items():
+        if key in known_fields:
+            continue
+        if _responses_value_has_effect_marker(value):
+            return reject(rejection, f"{path}.{key}", "unsafe_event_shape")
+    return True
+
 # OPENAI-080: typed allowlist for replay-safe private event families.
 # Event names and nested semantic fields remain closed; response-envelope
 # metadata extensions are tolerated so provider additions do not block setup.
@@ -1510,9 +1585,13 @@ class PassThroughStreamingHandler:
             response_payload = payload.get("response")
             if not isinstance(response_payload, dict):
                 return reject(rejection, "$.response", "invalid_type")
+            lifecycle_fields = {
+                "type", "sequence_number", "response", "safety_buffering"
+            }
             if not PassThroughStreamingHandler._has_only_fields(
-                payload, {"type", "sequence_number", "response", "safety_buffering"},
-                rejection=rejection
+                payload, lifecycle_fields, rejection=rejection, allow_unknown=True
+            ) or not _responses_unknown_fields_are_inert(
+                payload, lifecycle_fields, rejection=rejection, path="$"
             ):
                 return False
             if not PassThroughStreamingHandler._has_safe_responses_metadata_extensions(
@@ -1522,6 +1601,9 @@ class PassThroughStreamingHandler:
             if not PassThroughStreamingHandler._has_only_fields(
                 response_payload, _RESPONSES_RESPONSE_ENVELOPE_FIELDS,
                 rejection=rejection, path="$.response", allow_unknown=True
+            ) or not _responses_unknown_fields_are_inert(
+                response_payload, _RESPONSES_RESPONSE_ENVELOPE_FIELDS,
+                rejection=rejection, path="$.response"
             ):
                 return False
             if not PassThroughStreamingHandler._is_nonempty_string(
@@ -1553,10 +1635,11 @@ class PassThroughStreamingHandler:
         if event_type == "response.metadata":
             # This event is setup-only.  Keep the event envelope bounded while
             # allowing arbitrary provider metadata values to pass through.
+            metadata_fields = {"type", "sequence_number", "metadata"}
             if not PassThroughStreamingHandler._has_only_fields(
-                payload,
-                {"type", "sequence_number", "metadata"},
-                rejection=rejection,
+                payload, metadata_fields, rejection=rejection, allow_unknown=True
+            ) or not _responses_unknown_fields_are_inert(
+                payload, metadata_fields, rejection=rejection, path="$"
             ):
                 return False
             return True
@@ -2134,10 +2217,15 @@ class PassThroughStreamingHandler:
                 direct_error
             )
 
+        failure_fields = {
+            "type", "sequence_number", "response", "safety_buffering"
+        }
         if event_type != "response.failed" or not (
             PassThroughStreamingHandler._has_only_fields(
-                payload, {"type", "sequence_number", "response", "safety_buffering"},
-                rejection=rejection
+                payload, failure_fields, rejection=rejection, allow_unknown=True
+            )
+            and _responses_unknown_fields_are_inert(
+                payload, failure_fields, rejection=rejection, path="$"
             )
         ):
             return False
@@ -2151,6 +2239,10 @@ class PassThroughStreamingHandler:
             or not PassThroughStreamingHandler._has_only_fields(
                 response_payload, _RESPONSES_RESPONSE_ENVELOPE_FIELDS,
                 rejection=rejection, path="$.response", allow_unknown=True
+            )
+            or not _responses_unknown_fields_are_inert(
+                response_payload, _RESPONSES_RESPONSE_ENVELOPE_FIELDS,
+                rejection=rejection, path="$.response"
             )
             or not PassThroughStreamingHandler._is_nonempty_string(
                 response_payload.get("id")
