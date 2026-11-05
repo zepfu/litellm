@@ -107,6 +107,10 @@ _RESPONSES_NON_SUBSTANTIVE_LIFECYCLE_EVENTS = frozenset(
     {
         "response.created",
         "response.in_progress",
+        # Providers may emit setup metadata before a terminal capacity
+        # failure.  Metadata carries no client-visible output or tool effect,
+        # so it must not commit the wire attempt and suppress capacity retry.
+        "response.metadata",
     }
 )
 _RESPONSES_PRE_COMMIT_FAILURE_EVENTS = frozenset({"response.failed", "error"})
@@ -1544,6 +1548,17 @@ class PassThroughStreamingHandler:
             model = response_payload.get("model")
             if model is not None and not isinstance(model, str):
                 return reject(rejection, "$.response.model", "invalid_type")
+            return True
+
+        if event_type == "response.metadata":
+            # This event is setup-only.  Keep the event envelope bounded while
+            # allowing arbitrary provider metadata values to pass through.
+            if not PassThroughStreamingHandler._has_only_fields(
+                payload,
+                {"type", "sequence_number", "metadata"},
+                rejection=rejection,
+            ):
+                return False
             return True
 
         if event_type == "response.output_item.added":

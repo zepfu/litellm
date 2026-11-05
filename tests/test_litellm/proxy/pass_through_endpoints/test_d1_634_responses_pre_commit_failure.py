@@ -5541,6 +5541,55 @@ async def test_exact_capacity_sse_codes_preserve_peek_exclusions_and_bytes(
 
 
 @pytest.mark.asyncio
+async def test_response_metadata_does_not_block_capacity_retry():
+    """Setup metadata must not commit a later provider capacity failure."""
+    response_id = "resp_metadata_capacity"
+    chunks = [
+        _response_event(
+            "response.created",
+            1,
+            response_id=response_id,
+            status="in_progress",
+        ),
+        _responses_event(
+            "response.metadata",
+            2,
+            metadata={"provider_request_id": "opaque"},
+        ),
+        _response_event(
+            "response.failed",
+            3,
+            response_id=response_id,
+            status="failed",
+            error={
+                "code": "server_is_overloaded",
+                "type": "server_error",
+                "message": "Selected model is at capacity.",
+            },
+        ),
+    ]
+    response = httpx.Response(
+        200,
+        stream=_ClosableAsyncByteStream(chunks),
+        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+    )
+
+    peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+        response,
+        openai_alpha_capacity_retry_enabled=True,
+    )
+    try:
+        assert failure is not None
+        assert failure.error_class == "server_overloaded"
+        assert failure.retryable is True
+        assert b"".join([chunk async for chunk in peeked.aiter_bytes()]) == b"".join(
+            chunks
+        )
+    finally:
+        await peeked.aclose()
+
+
+@pytest.mark.asyncio
 async def test_nonstream_alpha_openai_sse_substantive_bytes_survive_precommit_peek(
     monkeypatch,
 ):
@@ -8812,7 +8861,6 @@ async def test_transport_only_frames_preserve_capacity_recovery(monkeypatch, pre
         (b": private_frame_value\xff\n\n", "unknown_event", "$", "malformed_frame"),
         (b"id: private_frame_value\n\n", "unknown_event", "$.type", "missing_event_type"),
         (_sse("private_frame_value", {"type": "private_frame_value"}), "unknown_event", "$.type", "unsupported_event"),
-        (_sse("response.metadata", {"type": "response.metadata", "metadata": {"opaque": "private_frame_value"}}), "response.metadata", "$.type", "unsupported_event"),
     ],
 )
 async def test_unknown_commitment_diagnostics_preserve_replay_guard(
