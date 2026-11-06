@@ -13,11 +13,13 @@ from fastapi import HTTPException
 from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
     ProviderCallLedger,
+    ProviderCallLedgerExhausted,
     ensure_openai_wire_replay_allowed,
     is_openai_capacity_recovery_safe,
 )
 from litellm.proxy.pass_through_endpoints.streaming_handler import (
     PassThroughStreamingHandler,
+    ResponsesStreamPreCommitFailure,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry import (
     OpenAIAlphaCapacityRetryBudget,
@@ -288,3 +290,61 @@ async def test_hidden_retry_relaxes_unknown_semantics_for_typed_capacity_failure
     assert request.state._aawm_openai_responses_wire_commitment[
         "precommit_commitment_reason"
     ] == "provider_execution_possible"
+
+
+@pytest.mark.asyncio
+async def test_hidden_retry_preserves_capacity_after_ledger_exhaustion(monkeypatch):
+    """A local reservation denial must not hide the prior provider result."""
+
+    ledger = ProviderCallLedger(
+        provider="openai",
+        max_logical_provider_calls=3,
+        deadline_seconds=60,
+    )
+    context = {
+        "account_hash": "acct1",
+        "lane_key": "codex-oauth:account1",
+        "model": "gpt-6.1-sol",
+    }
+    attempts = 0
+    coordinator = OpenAIAlphaCapacityRetryCoordinator(
+        target_identity="https://api.openai.com/v1/responses",
+        budget=OpenAIAlphaCapacityRetryBudget(deadline_seconds=60),
+    )
+
+    async def operation():
+        nonlocal attempts
+        attempts += 1
+        ledger.reserve(
+            target="https://api.openai.com/v1/responses",
+            candidate_context=context,
+            prior_response_closed=True,
+        )
+        raise ResponsesStreamPreCommitFailure(
+            error_class="server_overloaded",
+            classification="transient_capacity",
+            retryable=True,
+            status_code=503,
+            provider_returned=True,
+            failure_origin="provider",
+        )
+
+    monkeypatch.setattr(
+        coordinator,
+        "sleep_with_wakeup",
+        AsyncMock(return_value="timer"),
+    )
+    with pytest.raises(ResponsesStreamPreCommitFailure) as raised:
+        await pte._execute_passthrough_pre_first_byte_with_hidden_retries(
+            kwargs={"litellm_params": {"metadata": {}}},
+            operation_name="test_capacity_ledger_handoff",
+            operation=operation,
+            caller_managed_hidden_retry=False,
+            openai_capacity_coordinator=coordinator,
+        )
+
+    assert attempts == 4
+    assert raised.value.error_class == "server_overloaded"
+    assert raised.value.provider_returned is True
+    assert not isinstance(raised.value, ProviderCallLedgerExhausted)
+    assert raised.value.aawm_capacity_retry_ledger_exhausted is True

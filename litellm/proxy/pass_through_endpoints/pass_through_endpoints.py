@@ -3791,6 +3791,55 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
             retry_progress["failed_attempt_seconds"] = float(
                 retry_progress.get("failed_attempt_seconds") or 0.0
             ) + max(0.0, time.monotonic() - operation_started)
+            # A provider-confirmed capacity result must remain the failure
+            # handed to alias routing when the next replacement reservation is
+            # denied by the request-wide ledger. The reservation denial is a
+            # local admission boundary, not a provider outcome; replacing the
+            # prior capacity exception with ProviderCallLedgerExhausted makes
+            # candidate/account rotation impossible and terminalizes the
+            # request before the normal failover planner runs.
+            if (
+                isinstance(exc, ProviderCallLedgerExhausted)
+                and last_capacity_exception is not None
+                and (
+                    getattr(last_capacity_exception, "_aawm_provider_returned", None)
+                    is True
+                    or getattr(last_capacity_exception, "provider_returned", None)
+                    is True
+                )
+            ):
+                prior_status_code, prior_failure_class, prior_classification = (
+                    _classify_passthrough_hidden_retry_failure(
+                        last_capacity_exception
+                    )
+                )
+                setattr(
+                    last_capacity_exception,
+                    "aawm_capacity_retry_ledger_exhausted",
+                    True,
+                )
+                ledger_snapshot = getattr(exc, "ledger_snapshot", None)
+                if isinstance(ledger_snapshot, Mapping):
+                    setattr(
+                        last_capacity_exception,
+                        "capacity_retry_ledger_snapshot",
+                        dict(ledger_snapshot),
+                    )
+                _record_passthrough_hidden_retry_metadata(
+                    kwargs,
+                    attempt_number=attempt_number,
+                    max_attempts=max_attempts,
+                    status_code=prior_status_code,
+                    failure_class=prior_failure_class,
+                    wait_seconds=0.0,
+                    final_outcome="failed_after_retry",
+                    failure_classification=prior_classification,
+                    request=request,
+                    logical_provider_call_start=logical_provider_call_start,
+                    reservation_rejected=True,
+                    immutable_openai_binding=immutable_openai_binding,
+                )
+                raise last_capacity_exception from exc
             (
                 status_code,
                 failure_class,
