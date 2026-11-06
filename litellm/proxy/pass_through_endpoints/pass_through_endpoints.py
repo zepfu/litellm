@@ -307,9 +307,12 @@ from .aawm_adapter_runtime.provider_call_ledger import (
     current_candidate_context,
     ensure_openai_wire_replay_allowed,
     get_or_create_openai_provider_call_ledger,
+    get_request_openai_wire_commitment,
     get_request_provider_call_ledger,
     get_request_provider_call_ledger_snapshot,
     get_responses_replay_commitment_reason,
+    is_openai_capacity_recovery_safe,
+    relax_openai_wire_replay_for_capacity,
     publish_reservation_metadata,
     publish_responses_replay_commitment,
     publish_wire_commitment_snapshot,
@@ -3939,14 +3942,84 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
             provider_returned = getattr(exc, "_aawm_provider_returned", None)
             if not isinstance(provider_returned, bool):
                 provider_returned = getattr(exc, "provider_returned", None)
+            capacity_retry_authorized = None
+            request_ledger = (
+                get_request_provider_call_ledger(request)
+                if request is not None
+                else None
+            )
+            if request_ledger is not None:
+                capacity_retry_authorized = bool(
+                    request_ledger.snapshot().get("capacity_retry_authorized")
+                    is True
+                )
+            error_payload = getattr(exc, "error_payload", None)
+            if not isinstance(error_payload, Mapping):
+                error_payload = None
+            event_type = getattr(exc, "error_type", None)
+            if not isinstance(event_type, str) or not event_type.strip():
+                event_type = (
+                    error_payload.get("type")
+                    if isinstance(error_payload, Mapping)
+                    else None
+                )
             provisional_capacity_retry = bool(
                 capacity_failure
                 and openai_capacity_coordinator is not None
-                and commitment_reason == "provider_execution_possible"
-                and provider_returned is True
+                and (
+                    request is None
+                    or provider_returned is True
+                )
                 and not getattr(exc, "aawm_call_ledger_exhausted", False)
                 and not getattr(exc, "aawm_openai_wire_replay_blocked", False)
+                and (
+                    request is None
+                    or is_openai_capacity_recovery_safe(
+                        get_request_openai_wire_commitment(request),
+                        provider_returned=provider_returned,
+                        capacity_retry_authorized=capacity_retry_authorized,
+                        status_code=(
+                            _extract_exception_status_code(exc)
+                            if status_code is None
+                            else status_code
+                        ),
+                        error_class=(
+                            raw_http_classification[0]
+                            if raw_http_classification is not None
+                            else failure_class
+                        ),
+                        error_payload=error_payload,
+                        event_type=event_type,
+                    )
+                )
             )
+            if provisional_capacity_retry and commitment_reason not in (
+                None,
+                "provider_execution_possible",
+            ):
+                # A typed response.failed envelope can prove that the
+                # provisional/unknown latch carried no output or tool effect.
+                # Normalize that one safe state before the next send so the
+                # final-send replay guard sees the same bounded capacity
+                # authorization as this retry owner.
+                if relax_openai_wire_replay_for_capacity(
+                    request,
+                    provider_returned=provider_returned,
+                    capacity_retry_authorized=capacity_retry_authorized,
+                    status_code=(
+                        _extract_exception_status_code(exc)
+                        if status_code is None
+                        else status_code
+                    ),
+                    error_class=(
+                        raw_http_classification[0]
+                        if raw_http_classification is not None
+                        else failure_class
+                    ),
+                    error_payload=error_payload,
+                    event_type=event_type,
+                ):
+                    commitment_reason = "provider_execution_possible"
             if commitment_reason is not None and not provisional_capacity_retry:
                 if openai_capacity_coordinator is not None:
                     openai_capacity_coordinator.record_terminal(

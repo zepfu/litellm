@@ -161,6 +161,27 @@ def test_unknown_response_field_does_not_block_empty_capacity_failure():
 async def test_hidden_retry_crosses_dispatch_commitment_for_provider_429(monkeypatch):
     request = _request_with_commitment("provider_execution_possible")
     request.is_disconnected = AsyncMock(return_value=False)
+    ledger = ProviderCallLedger(
+        provider="openai",
+        max_logical_provider_calls=3,
+        deadline_seconds=60,
+    )
+    request.state.aawm_openai_provider_call_ledger = ledger
+    context = {
+        "account_hash": "acct1",
+        "lane_key": "codex-oauth:account1",
+        "model": "gpt-6.1-sol",
+    }
+    ledger.reserve(
+        target="https://api.openai.com/v1/responses",
+        candidate_context=context,
+        prior_response_closed=True,
+    )
+    assert ledger.authorize_capacity_retry(
+        target="https://api.openai.com/v1/responses",
+        candidate_context=context,
+        deadline_at_monotonic=time.monotonic() + 60,
+    )
     attempts = 0
     coordinator = OpenAIAlphaCapacityRetryCoordinator(
         target_identity="https://api.openai.com/v1/responses",
@@ -192,3 +213,78 @@ async def test_hidden_retry_crosses_dispatch_commitment_for_provider_429(monkeyp
     )
     assert result == "recovered"
     assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_hidden_retry_relaxes_unknown_semantics_for_typed_capacity_failure(
+    monkeypatch,
+):
+    request = _request_with_commitment("unknown_semantics")
+    request.is_disconnected = AsyncMock(return_value=False)
+    ledger = ProviderCallLedger(
+        provider="openai",
+        max_logical_provider_calls=3,
+        deadline_seconds=60,
+    )
+    request.state.aawm_openai_provider_call_ledger = ledger
+    context = {
+        "account_hash": "acct1",
+        "lane_key": "codex-oauth:account1",
+        "model": "gpt-6.1-sol",
+    }
+    ledger.reserve(
+        target="https://api.openai.com/v1/responses",
+        candidate_context=context,
+        prior_response_closed=True,
+    )
+    assert ledger.authorize_capacity_retry(
+        target="https://api.openai.com/v1/responses",
+        candidate_context=context,
+        deadline_at_monotonic=time.monotonic() + 60,
+    )
+    attempts = 0
+    coordinator = OpenAIAlphaCapacityRetryCoordinator(
+        target_identity="https://api.openai.com/v1/responses",
+        budget=OpenAIAlphaCapacityRetryBudget(deadline_seconds=60),
+    )
+
+    async def operation():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise PassThroughStreamingHandler._build_responses_pre_commit_failure(
+                error_payload={
+                    "type": "response.failed",
+                    "response": {
+                        "id": "resp_capacity",
+                        "status": "failed",
+                        "output": [],
+                        "error": {
+                            "code": "server_overloaded",
+                            "message": "capacity",
+                        },
+                    },
+                },
+                event_type="response.failed",
+                openai_alpha_capacity_retry_enabled=True,
+            )
+        return "recovered"
+
+    monkeypatch.setattr(
+        coordinator,
+        "sleep_with_wakeup",
+        AsyncMock(return_value="timer"),
+    )
+    result = await pte._execute_passthrough_pre_first_byte_with_hidden_retries(
+        kwargs={"litellm_params": {"metadata": {}}},
+        operation_name="test_unknown_semantics_capacity_recovery",
+        operation=operation,
+        caller_managed_hidden_retry=False,
+        request=request,
+        openai_capacity_coordinator=coordinator,
+    )
+    assert result == "recovered"
+    assert attempts == 2
+    assert request.state._aawm_openai_responses_wire_commitment[
+        "precommit_commitment_reason"
+    ] == "provider_execution_possible"

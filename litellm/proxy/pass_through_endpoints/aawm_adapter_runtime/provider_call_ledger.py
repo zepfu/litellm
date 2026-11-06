@@ -749,7 +749,7 @@ def is_openai_capacity_recovery_safe(
     event_type: Optional[str] = None,
 ) -> bool:
     """Allow only a provider-confirmed, pre-commit capacity replacement send."""
-    if provider_returned is not True or capacity_retry_authorized is False:
+    if provider_returned is not True or capacity_retry_authorized is not True:
         return False
     normalized_status = (
         int(status_code)
@@ -827,6 +827,68 @@ def ensure_openai_wire_replay_allowed(
             commitment=commitment or {},
             ledger=ledger,
         )
+
+
+def relax_openai_wire_replay_for_capacity(
+    request: Request,
+    *,
+    provider_returned: Optional[bool],
+    capacity_retry_authorized: Optional[bool],
+    status_code: Optional[int] = None,
+    error_class: Optional[str] = None,
+    error_payload: Optional[Mapping[str, Any]] = None,
+    event_type: Optional[str] = None,
+) -> bool:
+    """Relax only a provisional replay latch after typed no-effect capacity.
+
+    The normal commitment publisher is monotonic.  This narrow transition is
+    the exception for a provider-confirmed, pre-first-byte capacity response:
+    the typed failure proves that no output or tool effect was delivered, and
+    the ledger's one-shot permit authorizes exactly one replacement send.
+    """
+
+    state = _request_state(request)
+    stored_commitment = (
+        getattr(state, _WIRE_COMMITMENT_STATE_KEY, None)
+        if state is not None
+        else None
+    )
+    commitment = (
+        _safe_wire_commitment(stored_commitment)
+        if isinstance(stored_commitment, Mapping)
+        else None
+    )
+    if not is_openai_capacity_recovery_safe(
+        commitment,
+        provider_returned=provider_returned,
+        capacity_retry_authorized=capacity_retry_authorized,
+        status_code=status_code,
+        error_class=error_class,
+        error_payload=error_payload,
+        event_type=event_type,
+    ):
+        return False
+    if not isinstance(stored_commitment, dict):
+        return True
+    reason = stored_commitment.get(_RESPONSES_REPLAY_LATCH_REASON_KEY)
+    if reason in {None, "provider_execution_possible"}:
+        return True
+    if reason != "unknown_semantics":
+        return False
+    stored_commitment[_RESPONSES_REPLAY_LATCH_REASON_KEY] = (
+        "provider_execution_possible"
+    )
+    stored_commitment[_RESPONSES_REPLAY_PUBLISHED_LATCH_REASON_KEY] = (
+        "provider_execution_possible"
+    )
+    stored_commitment[_RESPONSES_REPLAY_LATCH_EVENT_KEY] = (
+        _responses_replay_event_label(
+            event_type,
+            reason="provider_execution_possible",
+        )
+    )
+    stored_commitment["capacity_recovery_relaxed"] = True
+    return True
 
 
 def publish_wire_commitment_snapshot(
