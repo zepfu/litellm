@@ -147,80 +147,6 @@ _RESPONSES_RESPONSE_ENVELOPE_FIELDS = {
 }
 _RESPONSES_ERROR_FIELDS = {"type", "code", "message", "param"}
 
-# Additive provider fields are safe only when they remain inert setup data.
-# Keep this scan deliberately small and bounded: known lifecycle semantics are
-# still validated below, while an unknown field carrying output/tool/effect
-# material must retain the replay veto.
-_RESPONSES_EFFECT_MARKER_FIELDS = frozenset(
-    {
-        "output",
-        "outputs",
-        "item",
-        "items",
-        "content",
-        "delta",
-        "arguments",
-        "tool",
-        "tools",
-        "tool_call",
-        "tool_calls",
-        "function_call",
-        "custom_tool_call",
-        "mcp_call",
-        "web_search_call",
-        "file_search_call",
-        "code_interpreter_call",
-        "computer_call",
-        "image_generation_call",
-        "shell_call",
-        "apply_patch_call",
-        "provider_execution",
-    }
-)
-
-def _responses_value_has_effect_marker(value: Any, *, depth: int = 0) -> bool:
-    """Return whether an additive field appears to carry effect data."""
-    if depth > 4:
-        return False
-    if isinstance(value, Mapping):
-        for key, nested in value.items():
-            normalized_key = str(key).strip().lower()
-            if normalized_key in _RESPONSES_EFFECT_MARKER_FIELDS and nested not in (
-                None,
-                "",
-                [],
-                {},
-                False,
-                0,
-            ):
-                return True
-            if isinstance(nested, (Mapping, list, tuple)) and _responses_value_has_effect_marker(
-                nested, depth=depth + 1
-            ):
-                return True
-    elif isinstance(value, (list, tuple)):
-        return any(
-            _responses_value_has_effect_marker(item, depth=depth + 1)
-            for item in value
-        )
-    return False
-
-def _responses_unknown_fields_are_inert(
-    payload: Mapping[str, Any],
-    known_fields: set[str],
-    *,
-    rejection: Optional[Dict[str, str]],
-    path: str,
-) -> bool:
-    """Admit additive fields unless they carry an effect-shaped value."""
-    reject = PassThroughStreamingHandler._reject_responses_field
-    for key, value in payload.items():
-        if key in known_fields:
-            continue
-        if _responses_value_has_effect_marker(value):
-            return reject(rejection, f"{path}.{key}", "unsafe_event_shape")
-    return True
-
 # OPENAI-080: typed allowlist for replay-safe private event families.
 # Event names and nested semantic fields remain closed; response-envelope
 # metadata extensions are tolerated so provider additions do not block setup.
@@ -1332,18 +1258,17 @@ class PassThroughStreamingHandler:
         rejection: Optional[Dict[str, str]] = None, path: str = "$",
         required: bool = False, allow_unknown: bool = False,
     ) -> bool:
-        """Validate a known shape, optionally tolerating additive fields.
+        """Validate interpreted fields while tolerating provider extensions.
 
-        Responses providers may add metadata to an otherwise valid response
-        envelope.  Callers opt into that compatibility only for envelopes whose
-        extra fields cannot change the event's execution semantics.  Required
-        fields and the value checks made by callers remain enforced.
+        Responses payloads are open-world: unknown fields are forwarded and
+        ignored by this adapter.  Required fields and the value checks made by
+        callers remain enforced for fields that the adapter interprets.
         """
         reject = PassThroughStreamingHandler._reject_responses_field
         if not isinstance(value, dict):
             return reject(rejection, path, "invalid_type")
-        if not allow_unknown and not set(value).issubset(fields):
-            return reject(rejection, path + ".<unknown_field>", "unknown_field")
+        # ``allow_unknown`` remains in the signature for call-site
+        # compatibility; provider payloads are always open-world.
         if required:
             for key in fields:
                 if key not in value:
@@ -1378,7 +1303,7 @@ class PassThroughStreamingHandler:
         summary = item.get("summary", [])
         if not isinstance(summary, list) or not all(
             isinstance(part, dict)
-            and set(part) == {"type", "text"}
+            and {"type", "text"}.issubset(part)
             and part.get("type") == "summary_text"
             and isinstance(part.get("text"), str)
             for part in summary
@@ -1387,7 +1312,7 @@ class PassThroughStreamingHandler:
         content = item.get("content", [])
         if not isinstance(content, list) or not all(
             isinstance(part, dict)
-            and set(part) == {"type", "text"}
+            and {"type", "text"}.issubset(part)
             and part.get("type") == "reasoning_text"
             and isinstance(part.get("text"), str)
             for part in content
@@ -1591,8 +1516,8 @@ class PassThroughStreamingHandler:
     ) -> bool:
         """Return True for a known lifecycle event with safe semantics.
 
-        Event names and interpreted values remain validated.  Only additive
-        fields on the response envelope are ignored by the shape helper.
+        Event names and interpreted values remain validated; provider-owned
+        fields are opaque and never gate admission.
         """
         reject = PassThroughStreamingHandler._reject_responses_field
         if event_type is None or not isinstance(payload, dict):
@@ -1614,8 +1539,6 @@ class PassThroughStreamingHandler:
             }
             if not PassThroughStreamingHandler._has_only_fields(
                 payload, lifecycle_fields, rejection=rejection, allow_unknown=True
-            ) or not _responses_unknown_fields_are_inert(
-                payload, lifecycle_fields, rejection=rejection, path="$"
             ):
                 return False
             if not PassThroughStreamingHandler._has_safe_responses_metadata_extensions(
@@ -1625,9 +1548,6 @@ class PassThroughStreamingHandler:
             if not PassThroughStreamingHandler._has_only_fields(
                 response_payload, _RESPONSES_RESPONSE_ENVELOPE_FIELDS,
                 rejection=rejection, path="$.response", allow_unknown=True
-            ) or not _responses_unknown_fields_are_inert(
-                response_payload, _RESPONSES_RESPONSE_ENVELOPE_FIELDS,
-                rejection=rejection, path="$.response"
             ):
                 return False
             if not PassThroughStreamingHandler._is_nonempty_string(
@@ -1723,7 +1643,7 @@ class PassThroughStreamingHandler:
                 )
             return (
                 isinstance(part, dict)
-                and set(part) == {"type", "text"}
+                and {"type", "text"}.issubset(part)
                 and part.get("type") == "reasoning_text"
                 and isinstance(part.get("text"), str)
             )
@@ -1755,7 +1675,7 @@ class PassThroughStreamingHandler:
             part = payload.get("part")
             if (
                 not isinstance(part, dict)
-                or set(part) != {"type", "text"}
+                or not {"type", "text"}.issubset(part)
                 or part.get("type") != "summary_text"
                 or not isinstance(part.get("text"), str)
             ):
@@ -2214,12 +2134,21 @@ class PassThroughStreamingHandler:
         response_payload = payload.get("response")
         if not isinstance(response_payload, dict):
             return False
+        # Known response-envelope fields still establish the no-effect
+        # contract.  Only additive fields are opaque and ignored.
+        if (
+            not PassThroughStreamingHandler._is_nonempty_string(
+                response_payload.get("id")
+            )
+            or response_payload.get("status") != "failed"
+        ):
+            return False
         if "output" not in response_payload:
             # Some Responses providers omit output entirely for a
-            # pre-generation overload/rate-limit response.  Keep this
-            # admission narrow: the error must already classify as transient
-            # capacity and the envelope must not carry an effect marker.
-            return not _responses_value_has_effect_marker(response_payload)
+            # pre-generation overload/rate-limit response.  The error class
+            # and known response fields establish the retry contract; opaque
+            # provider extensions are not interpreted as execution effects.
+            return True
         output = response_payload.get("output")
         return isinstance(output, list) and not output
 

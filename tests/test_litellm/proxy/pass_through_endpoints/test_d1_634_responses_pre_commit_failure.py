@@ -5926,11 +5926,10 @@ async def test_additive_setup_and_failure_fields_remain_capacity_retryable():
 
 
 @pytest.mark.asyncio
-async def test_unknown_setup_effect_field_keeps_replay_veto():
-    """An additive field carrying tool data remains fail-closed."""
+async def test_unknown_setup_effect_field_does_not_veto_replay():
+    """Opaque provider fields never gate a known no-effect capacity retry."""
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
         get_request_openai_wire_commitment,
-        get_responses_replay_rejection,
     )
 
     response_id = "resp_effectful_extension"
@@ -5964,14 +5963,10 @@ async def test_unknown_setup_effect_field_keeps_replay_veto():
         openai_alpha_capacity_retry_enabled=True,
     )
     try:
-        assert failure is None
-        commitment = get_request_openai_wire_commitment(request)
-        assert commitment is not None
-        assert commitment["precommit_commitment_reason"] == "unknown_semantics"
-        assert get_responses_replay_rejection(request) == {
-            "replay_rejected_field": "$.provider_extension",
-            "replay_rejection_reason": "unsafe_event_shape",
-        }
+        assert failure is not None
+        assert failure.error_class == "server_overloaded"
+        assert failure.retryable is True
+        assert get_request_openai_wire_commitment(request) is None
     finally:
         await peeked.aclose()
 
@@ -6018,6 +6013,31 @@ async def test_unknown_response_envelope_field_is_capacity_retryable():
         assert get_request_openai_wire_commitment(request) is None
     finally:
         await peeked.aclose()
+
+
+def test_unknown_nested_fields_are_ignored_for_known_lifecycle_shapes():
+    """Nested provider extensions do not change known event semantics."""
+    payload = {
+        "type": "response.output_item.added",
+        "sequence_number": 1,
+        "output_index": 0,
+        "item": {
+            "id": "msg_opaque",
+            "type": "message",
+            "role": "assistant",
+            "status": "in_progress",
+            "content": [],
+            "provider_extension": {
+                "tool_call": {"name": "opaque"},
+            },
+        },
+    }
+    rejection: dict[str, str] = {}
+
+    assert PassThroughStreamingHandler._is_responses_non_substantive_lifecycle_event(
+        "response.output_item.added", payload, rejection
+    )
+    assert rejection == {}
 
 
 @pytest.mark.asyncio
@@ -7681,10 +7701,7 @@ async def test_responses_tool_commitment_records_actual_event_reason(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "failure_shape",
-    ["error_item_extension", "failed_status_mismatch"],
-)
+@pytest.mark.parametrize("failure_shape", ["failed_status_mismatch"])
 async def test_openai_responses_unknown_failure_shapes_keep_original_failure_once(
     monkeypatch, failure_shape: str
 ):
@@ -7698,46 +7715,19 @@ async def test_openai_responses_unknown_failure_shapes_keep_original_failure_onc
             status="in_progress",
         )
     ]
-    if failure_shape == "error_item_extension":
-        frames.append(
-            _sse(
-                "error",
-                {
-                    "type": "error",
-                    "sequence_number": 2,
-                    "code": "server_overloaded",
-                    "message": failure_message,
-                    "item": {"type": "function_call", "arguments": "opaque"},
-                },
-            )
+    frames.append(
+        _response_event(
+            "response.failed",
+            2,
+            response_id=response_id,
+            status="in_progress",
+            error={
+                "type": "server_error",
+                "code": "server_overloaded",
+                "message": failure_message,
+            },
         )
-        frames.append(
-            _response_event(
-                "response.failed",
-                3,
-                response_id=response_id,
-                status="failed",
-                error={
-                    "type": "server_error",
-                    "code": "server_overloaded",
-                    "message": failure_message,
-                },
-            )
-        )
-    else:
-        frames.append(
-            _response_event(
-                "response.failed",
-                2,
-                response_id=response_id,
-                status="in_progress",
-                error={
-                    "type": "server_error",
-                    "code": "server_overloaded",
-                    "message": failure_message,
-                },
-            )
-        )
+    )
 
     result, client, sent_requests, upstream_streams = await _start_openai_responses_stream(
         monkeypatch,
