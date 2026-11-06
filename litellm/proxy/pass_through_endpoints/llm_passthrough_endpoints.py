@@ -438,6 +438,7 @@ from .aawm_adapter_runtime.provider_call_ledger import (
     get_request_openai_wire_commitment,
     get_request_provider_call_ledger,
     get_request_provider_call_ledger_snapshot,
+    is_openai_capacity_recovery_safe,
     is_openai_wire_replay_prohibited,
 )
 
@@ -3630,10 +3631,40 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
         attempt_record=injected_attempt_record,
     )
     wire_commitment = get_request_openai_wire_commitment(request)
-    if is_openai_wire_replay_prohibited(
+    wire_replay_blocked = is_openai_wire_replay_prohibited(
         wire_commitment,
         ledger=get_request_provider_call_ledger(request),
-    ):
+    )
+    if wire_replay_blocked:
+        # The stream layer may have published a provisional/unknown latch
+        # before the direct route classified a provider-confirmed no-output
+        # capacity failure.  Re-open only that typed, pre-first-byte case;
+        # malformed/transport/effectful outcomes remain fail-closed.
+        error_payload = getattr(exc, "error_payload", None)
+        if not isinstance(error_payload, dict):
+            error_payload = None
+        ledger = get_request_provider_call_ledger(request)
+        capacity_retry_authorized = (
+            ledger is not None
+            and ledger.snapshot().get("capacity_retry_authorized") is True
+        )
+        event_type = (
+            error_payload.get("type")
+            if isinstance(error_payload, dict)
+            else None
+        )
+        wire_replay_blocked = not is_openai_capacity_recovery_safe(
+            wire_commitment,
+            provider_returned=provider_returned,
+            capacity_retry_authorized=capacity_retry_authorized,
+            status_code=_aawm_error_signals._extract_adapter_exception_status_code(
+                exc
+            ),
+            error_class=error_class,
+            error_payload=error_payload,
+            event_type=event_type,
+        )
+    if wire_replay_blocked:
         # Preserve the provider failure without resetting ownership or planning
         # a send that the native final-send replay guard must reject.
         retry_attempt_record["failover_decision"] = "terminal"

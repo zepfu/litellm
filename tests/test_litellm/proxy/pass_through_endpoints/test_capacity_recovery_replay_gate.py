@@ -81,6 +81,38 @@ def test_provider_429_without_capacity_authorization_stays_terminal():
     )
 
 
+def test_unknown_semantics_empty_response_capacity_can_recover():
+    commitment = {
+        "precommit_replay_committed": True,
+        "precommit_commitment_reason": "unknown_semantics",
+        "response_start_sent": False,
+        "first_body_sent": False,
+        "terminal_wire_committed": False,
+        "done_wire_committed": False,
+    }
+    error_payload = {
+        "type": "response.failed",
+        "response": {
+            "id": "resp_capacity_opaque",
+            "status": "failed",
+            "provider_extension": {"tool_call": {"name": "opaque"}},
+            "error": {
+                "code": "server_is_overloaded",
+                "message": "capacity",
+            },
+        },
+    }
+
+    assert is_openai_capacity_recovery_safe(
+        commitment,
+        provider_returned=True,
+        capacity_retry_authorized=True,
+        error_class="server_overloaded",
+        error_payload=error_payload,
+        event_type="response.failed",
+    )
+
+
 def test_unknown_response_field_does_not_block_empty_capacity_failure():
     created = {
         "type": "response.created",

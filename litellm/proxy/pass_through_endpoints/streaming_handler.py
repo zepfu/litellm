@@ -287,6 +287,20 @@ class ResponsesStreamPreCommitFailure(Exception):
                 "usage_limit_reached"
             )
         setattr(http_exception, "_aawm_provider_returned", self.provider_returned)
+        # Preserve the typed pre-commit outcome across the HTTPException
+        # boundary.  Direct Codex/account failover must be able to inspect the
+        # original provider envelope when deciding whether a replay latch can
+        # be relaxed; the sanitized ``detail`` is intentionally insufficient
+        # for that decision.
+        for attribute in (
+            "error_payload",
+            "error_class",
+            "classification",
+            "retryable",
+            "failure_origin",
+            "pre_commit_retry_exhausted",
+        ):
+            setattr(http_exception, attribute, getattr(self, attribute))
         if self.error_class == "openai_response_protection_unavailable":
             setattr(
                 http_exception,

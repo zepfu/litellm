@@ -562,6 +562,7 @@ async def test_peek_classifies_native_codex_recovery_errors_before_commit(
     http_exc = failure.as_http_exception()
     assert http_exc.status_code == expected_status_code
     assert getattr(http_exc, "_aawm_provider_returned", False) is True
+    assert getattr(http_exc, "error_payload", None) == failure.error_payload
     assert [chunk async for chunk in peeked.aiter_bytes()] == chunks
 
 

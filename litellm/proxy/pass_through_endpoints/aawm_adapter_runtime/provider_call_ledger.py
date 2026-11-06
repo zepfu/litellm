@@ -788,12 +788,23 @@ def is_openai_capacity_recovery_safe(
         if isinstance(error_payload, Mapping)
         else None
     )
+    if not isinstance(response_payload, Mapping):
+        return False
+    # A provider may omit ``output`` entirely on a pre-generation overload.
+    # The interpreted envelope still has to identify a failed response; opaque
+    # provider fields are deliberately ignored by this admission check.
+    if (
+        response_payload.get("status") != "failed"
+        or not isinstance(response_payload.get("id"), str)
+        or not response_payload.get("id")
+    ):
+        return False
     output = (
         response_payload.get("output")
         if isinstance(response_payload, Mapping)
         else None
     )
-    return isinstance(output, list) and not output
+    return output is None or (isinstance(output, list) and not output)
 
 
 def ensure_openai_wire_replay_allowed(
