@@ -47,6 +47,15 @@ def test_owner_preserves_unknown_provider_outcome_as_replay_veto():
     assert decision.reason == "provider_outcome_unknown"
 
 
+def test_owner_treats_unmarked_provider_outcome_as_replay_veto():
+    owner = CapacityRecoveryOwner()
+    decision = owner.observe(
+        _capacity_observation(provider_returned=None, alternate_route_available=True)
+    )
+    assert decision.action is CapacityRecoveryAction.REPLAY_VETO
+    assert decision.reason == "provider_outcome_unknown"
+
+
 def test_owner_allows_typed_omitted_output_capacity_failure():
     owner = CapacityRecoveryOwner()
     decision = owner.observe(

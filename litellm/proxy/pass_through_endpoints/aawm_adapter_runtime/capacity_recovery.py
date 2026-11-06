@@ -193,7 +193,7 @@ class CapacityRecoveryOwner:
             veto = None
         if observation.cancelled:
             action, reason = CapacityRecoveryAction.REPLAY_VETO, "cancelled"
-        elif observation.provider_returned is False:
+        elif observation.provider_returned is not True:
             action, reason = CapacityRecoveryAction.REPLAY_VETO, "provider_outcome_unknown"
         elif not observation.ledger_valid:
             action, reason = CapacityRecoveryAction.REPLAY_VETO, "invalid_ledger"
