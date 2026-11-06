@@ -6336,6 +6336,77 @@ async def handle_alias_route(  # noqa: PLR0915
                     in {408, 429, 500, 502, 503, 504, 529}
                 ):
                     attempt_record["provider_returned"] = True
+                capacity_recovery_decision = None
+                capacity_route_transition_decision = None
+                if (
+                    attempted_provider_call
+                    and error_class
+                    in _error_signals._RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES
+                ):
+                    # The local planner still carries provider-specific
+                    # cooldown policy, but it cannot decide whether a
+                    # capacity result is replay-safe.  Ask the request owner
+                    # before allowing same-account retry or account/candidate
+                    # rotation.  This also covers caller-managed hidden retry,
+                    # whose exception arrives here after observing the same
+                    # failure without consuming the route decision.
+                    capacity_recovery_decision = _observe_capacity_recovery(
+                        failure_exc,
+                        candidate=candidate,
+                        error_class=error_class,
+                        alternate_route_available=(
+                            not _provider_owned_continuation()
+                            and not has_previous_response_id
+                        ),
+                    )
+                    if capacity_recovery_decision.action in {
+                        CapacityRecoveryAction.REPLAY_VETO,
+                        CapacityRecoveryAction.BUDGET_EXHAUSTED,
+                        CapacityRecoveryAction.TERMINAL,
+                    }:
+                        # Do not let a local 429/5xx classifier reopen a
+                        # request whose owner has already established an
+                        # unknown outcome, invalid ledger, cancellation, or
+                        # exhausted request budget.  The terminal helper will
+                        # reuse this decision and emit the correct handoff or
+                        # veto metadata exactly once.
+                        _raise_terminal_alias_failure(
+                            failure_exc,
+                            preserve_upstream_failure=True,
+                        )
+                    if capacity_recovery_decision.action is CapacityRecoveryAction.REDISPATCH:
+                        # Redispatch is a caller handoff, never a local retry.
+                        # Let the terminal helper consume the acknowledged
+                        # owner decision and raise the established redispatch
+                        # exception with the original attempt evidence.
+                        _raise_terminal_alias_failure(
+                            failure_exc,
+                            preserve_upstream_failure=True,
+                        )
+                    if capacity_recovery_decision.action is CapacityRecoveryAction.ROUTE_TRANSITION:
+                        capacity_route_transition_decision = (
+                            capacity_recovery_decision
+                        )
+                        # Skip the local same-account wait.  The next action
+                        # must be an account/candidate transition under the
+                        # same request owner and ledger.
+                        prefer_account_failover = True
+                    elif capacity_recovery_decision.action is CapacityRecoveryAction.RETRY_SAME_ROUTE:
+                        # The retry branch below is the concrete consumer of
+                        # this decision.  It must not be left pending for the
+                        # stream finalizer to interpret as a terminal event.
+                        if not capacity_recovery_owner.decision_consumed(
+                            capacity_recovery_decision
+                        ):
+                            capacity_recovery_owner.consume_decision(
+                                capacity_recovery_decision,
+                                consumer="alias-same-route-retry",
+                            )
+                        if pre_commit_retry_plan["action"] != "retry_same_account":
+                            pre_commit_retry_plan = {
+                                **pre_commit_retry_plan,
+                                "action": "retry_same_account",
+                            }
                 prefer_account_failover = _prefer_codex_oauth_account_failover(
                     candidate=candidate,
                     selection=selection,
@@ -6345,6 +6416,17 @@ async def handle_alias_route(  # noqa: PLR0915
                         failure_exc
                     ),
                 )
+                if (
+                    capacity_recovery_decision is not None
+                    and capacity_recovery_decision.action
+                    is CapacityRecoveryAction.RETRY_SAME_ROUTE
+                ):
+                    # The request-scoped owner is authoritative: a local
+                    # quota/exhaustion hint must not turn its bounded
+                    # same-route retry into an account rotation.
+                    prefer_account_failover = False
+                elif capacity_route_transition_decision is not None:
+                    prefer_account_failover = True
                 provider_capacity_rotation_due = (
                     same_account_transient_attempts_by_slot.get(account_slot, 0)
                     >= _error_signals.RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS
@@ -6363,6 +6445,14 @@ async def handle_alias_route(  # noqa: PLR0915
                     and _is_codex_oauth_account_candidate is not None
                     and _is_codex_oauth_account_candidate(candidate)
                 )
+                if (
+                    capacity_recovery_decision is not None
+                    and capacity_recovery_decision.action
+                    is CapacityRecoveryAction.RETRY_SAME_ROUTE
+                ):
+                    provider_capacity_rotation_due = False
+                elif capacity_route_transition_decision is not None:
+                    provider_capacity_rotation_due = True
                 if provider_capacity_rotation_due:
                     # The bounded same-account retry has already been
                     # consumed. A fresh provider-confirmed no-effect failure
@@ -6612,6 +6702,11 @@ async def handle_alias_route(  # noqa: PLR0915
                     )
                 )
                 if account_failover_planned:
+                    if capacity_route_transition_decision is not None:
+                        capacity_recovery_owner.consume_decision(
+                            capacity_route_transition_decision,
+                            consumer="alias-account-transition",
+                        )
                     _carry_native_openai_responses_owner_snapshot(
                         durable_source_snapshot
                     )

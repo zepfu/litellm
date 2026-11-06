@@ -3728,6 +3728,55 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
         retry_attempt_record["wire_commitment"] = wire_commitment
         return None
 
+    if capacity_decision.action in {
+        CapacityRecoveryAction.REPLAY_VETO,
+        CapacityRecoveryAction.BUDGET_EXHAUSTED,
+        CapacityRecoveryAction.TERMINAL,
+    }:
+        # A local inventory planner must not reopen a request that the common
+        # owner has already closed for an unknown outcome, invalid ledger, or
+        # exhausted request-wide budget.  Returning None preserves the
+        # provider failure for the established outer error path.
+        retry_attempt_record["failover_decision"] = "terminal"
+        retry_attempt_record["terminal_reason"] = capacity_decision.reason
+        if not capacity_recovery_owner.decision_consumed(capacity_decision):
+            capacity_recovery_owner.consume_decision(
+                capacity_decision,
+                consumer="direct-oauth-terminal-owner-veto",
+            )
+        return None
+
+    if capacity_decision.action is CapacityRecoveryAction.REDISPATCH:
+        # A fresh, replay-safe request may be handed back to the caller for a
+        # new session/ledger.  This is the only direct path that may leave the
+        # current request without selecting another account locally.
+        capacity_recovery_owner.acknowledge_handoff(capacity_decision)
+        capacity_recovery_owner.consume_decision(
+            capacity_decision,
+            consumer="direct-oauth-redispatch",
+            handoff_acknowledged=True,
+        )
+        session_identity = selection.get("canonical_session_identity")
+        if not isinstance(session_identity, str) or not session_identity.strip():
+            session_identity = _sa.resolve_canonical_session_identity(
+                request,
+                request_body,
+            )
+        retry_attempt_record["failover_decision"] = "redispatch"
+        retry_attempt_record["terminal_reason"] = "redispatch_required"
+        _sa.raise_session_owner_redispatch_required(
+            session_identity=session_identity,
+            alias_model=selection.get("alias_model") or request_body.get("model"),
+            candidate=candidate if isinstance(candidate, dict) else None,
+            failure_phase="direct_openai_capacity_redispatch",
+            message=(
+                "Provider capacity exhausted this request's safe retry and "
+                "account lanes; redispatch with a fresh request ledger."
+            ),
+            request=request,
+            attempted_provider_call=attempted_provider_call,
+        )
+
     request_state = getattr(request, "state", None)
     retry_count = capacity_recovery_owner.retry_ordinal
 
