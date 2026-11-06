@@ -4055,6 +4055,7 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                             if request_ledger is not None
                             else None
                         ),
+                        observation_key=exc,
                     )
                 )
                 if isinstance(kwargs, dict):

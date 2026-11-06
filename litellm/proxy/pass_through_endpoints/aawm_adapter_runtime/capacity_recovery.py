@@ -64,6 +64,10 @@ class CapacityRecoveryObservation:
     error_payload: Optional[Mapping[str, Any]] = None
     event_type: Optional[str] = None
     ledger_snapshot: Optional[Mapping[str, Any]] = None
+    # The exception (or other request-local failure token) that represents
+    # this provider attempt.  Stream/failover layers can see the same object;
+    # observing it twice must not consume another owner ordinal.
+    observation_key: Any = None
 
 
 @dataclass(frozen=True)
@@ -105,6 +109,18 @@ class CapacityRecoveryOwner:
         self.retry_ordinal = 0
         self.last_decision: Optional[CapacityRecoveryDecision] = None
         self.root_recovery_id = uuid4().hex
+
+    @staticmethod
+    def _prior_observation(
+        observation: CapacityRecoveryObservation,
+    ) -> Optional[CapacityRecoveryDecision]:
+        key = observation.observation_key
+        if key is None:
+            return None
+        decision = getattr(key, "_aawm_capacity_recovery_decision", None)
+        if isinstance(decision, CapacityRecoveryDecision):
+            return decision
+        return None
 
     @property
     def remaining_seconds(self) -> float:
@@ -154,6 +170,10 @@ class CapacityRecoveryOwner:
 
     def observe(self, observation: CapacityRecoveryObservation) -> CapacityRecoveryDecision:
         """Return the only allowed next action for the observed attempt."""
+        prior_decision = self._prior_observation(observation)
+        if prior_decision is not None and prior_decision.root_recovery_id == self.root_recovery_id:
+            self.last_decision = prior_decision
+            return prior_decision
         capacity = self._is_capacity(observation)
         veto = self._wire_veto(observation)
         if (
@@ -189,6 +209,18 @@ class CapacityRecoveryOwner:
             )
         elif self.remaining_seconds <= 0.0:
             action, reason = CapacityRecoveryAction.BUDGET_EXHAUSTED, "deadline_exhausted"
+        elif self._ledger_has_no_ordinary_call(
+            observation,
+            capacity=capacity,
+        ):
+            # The request-wide ledger is authoritative.  A transition that
+            # still needs another send cannot be selected after its ordinary
+            # budget is gone.  A real caller-owned redispatch is still safe:
+            # it hands the child to a fresh request with a new ledger.
+            if observation.redispatch_available and not observation.continuation:
+                action, reason = CapacityRecoveryAction.REDISPATCH, "ledger_exhausted_redispatch"
+            else:
+                action, reason = CapacityRecoveryAction.BUDGET_EXHAUSTED, "logical_call_budget_exhausted"
         elif self.retry_ordinal < self.max_same_route_retries:
             self.retry_ordinal += 1
             action, reason = CapacityRecoveryAction.RETRY_SAME_ROUTE, "provider_capacity_precommit"
@@ -209,7 +241,30 @@ class CapacityRecoveryOwner:
             ledger_snapshot=observation.ledger_snapshot,
         )
         self.last_decision = decision
+        key = observation.observation_key
+        if key is not None:
+            try:
+                setattr(key, "_aawm_capacity_recovery_decision", decision)
+            except Exception:
+                pass
         return decision
+
+    @staticmethod
+    def _ledger_has_no_ordinary_call(
+        observation: CapacityRecoveryObservation,
+        *,
+        capacity: bool,
+    ) -> bool:
+        if not capacity or not isinstance(observation.ledger_snapshot, Mapping):
+            return False
+        remaining = observation.ledger_snapshot.get("remaining_logical_provider_calls")
+        if not isinstance(remaining, int) or isinstance(remaining, bool):
+            return False
+        # A capacity permit is a separate, tightly-bound one-use admission and
+        # may legally consume a send even when ordinary calls are exhausted.
+        if observation.ledger_snapshot.get("capacity_retry_authorized") is True:
+            return False
+        return remaining <= 0
 
 
 def get_or_create_capacity_recovery_owner(

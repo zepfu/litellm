@@ -3660,6 +3660,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             ),
             event_type=getattr(exc, "error_type", None),
             ledger_snapshot=get_request_provider_call_ledger_snapshot(request),
+            observation_key=exc,
         )
     )
     retry_attempt_record["capacity_recovery_decision"] = capacity_decision.to_metadata()

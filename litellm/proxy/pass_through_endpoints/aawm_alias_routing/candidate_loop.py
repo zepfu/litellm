@@ -1825,6 +1825,7 @@ async def handle_alias_route(  # noqa: PLR0915
                     if get_request_provider_call_ledger(request) is not None
                     else None
                 ),
+                observation_key=failure_exc,
             )
         )
         attempt = attempts[-1] if attempts else None

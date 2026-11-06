@@ -76,6 +76,51 @@ def test_owner_vetoes_continuation_and_invalid_ledger():
     assert invalid_ledger.action is CapacityRecoveryAction.REPLAY_VETO
 
 
+def test_owner_does_not_transition_after_ordinary_ledger_exhaustion():
+    owner = CapacityRecoveryOwner(max_same_route_retries=1)
+    decision = owner.observe(
+        _capacity_observation(
+            alternate_route_available=True,
+            redispatch_available=False,
+            ledger_snapshot={
+                "remaining_logical_provider_calls": 0,
+                "capacity_retry_authorized": False,
+            },
+        )
+    )
+    assert decision.action is CapacityRecoveryAction.BUDGET_EXHAUSTED
+    assert decision.reason == "logical_call_budget_exhausted"
+
+
+def test_owner_allows_caller_redispatch_after_ledger_exhaustion():
+    owner = CapacityRecoveryOwner(max_same_route_retries=1)
+    decision = owner.observe(
+        _capacity_observation(
+            alternate_route_available=True,
+            redispatch_available=True,
+            ledger_snapshot={
+                "remaining_logical_provider_calls": 0,
+                "capacity_retry_authorized": False,
+            },
+        )
+    )
+    assert decision.action is CapacityRecoveryAction.REDISPATCH
+
+
+def test_owner_observation_is_idempotent_for_same_failure_object():
+    owner = CapacityRecoveryOwner(max_same_route_retries=1)
+    failure = RuntimeError("provider capacity")
+    first = owner.observe(_capacity_observation(observation_key=failure))
+    second = owner.observe(
+        _capacity_observation(
+            observation_key=failure,
+            alternate_route_available=True,
+        )
+    )
+    assert second is first
+    assert owner.retry_ordinal == first.retry_ordinal
+
+
 def test_owner_is_request_scoped():
     request = SimpleNamespace(state=SimpleNamespace())
     first = get_or_create_capacity_recovery_owner(request)
