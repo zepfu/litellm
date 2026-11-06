@@ -44,6 +44,10 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_
     responses_emissions_from_chunk,
     responses_events_from_chunk,
 )
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.capacity_recovery import (
+    CapacityRecoveryObservation,
+    get_or_create_capacity_recovery_owner,
+)
 from litellm.proxy.pass_through_endpoints.success_handler import (
     PassThroughEndpointLogging,
 )
@@ -6482,6 +6486,119 @@ async def test_cancelled_without_terminal_keeps_reconciled_capacity_error():
     assert metadata["aawm_provider_terminal_event_type"] is None
     assert emitted[0]["event_type"] != "response.failed"
     assert emitted[0]["failure_origin"] == "provider"
+
+
+@pytest.mark.asyncio
+async def test_unconsumed_capacity_decision_does_not_suppress_terminal_audit():
+    request = MagicMock()
+    request.state = SimpleNamespace()
+    owner = get_or_create_capacity_recovery_owner(request)
+    decision = owner.observe(
+        CapacityRecoveryObservation(
+            provider_returned=True,
+            status_code=503,
+            error_class="server_overloaded",
+            retryable=True,
+            commitment={},
+        )
+    )
+    metadata = {
+        "aawm_capacity_recovery_decision": decision.to_metadata(),
+    }
+    kwargs = {"litellm_params": {"metadata": metadata}}
+    logging_obj = MagicMock()
+    logging_obj.async_failure_handler = AsyncMock()
+    emitted: list[dict[str, Any]] = []
+
+    def _capture_emit(context: dict[str, Any], **_kwargs: Any) -> bool:
+        emitted.append(dict(context))
+        return True
+
+    chunks = [chunk.decode("utf-8") for chunk in _failed_lifecycle_stream()]
+    with patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler._emit_aawm_terminal_error",
+        side_effect=_capture_emit,
+    ), patch(
+        "litellm.proxy.aawm_route_logging.record_aawm_route_rollup_failure"
+    ):
+        await PassThroughStreamingHandler._finalize_failed_responses_stream(
+            litellm_logging_obj=logging_obj,
+            kwargs=kwargs,
+            metadata=metadata,
+            all_chunks=chunks,
+            request_body={"model": "gpt-5.4"},
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+            terminal_event_type="response.failed",
+            terminal_payload={
+                "id": "resp_failed",
+                "status": "failed",
+                "output": [],
+                "error": {"code": "server_overloaded"},
+            },
+            handler_branch_state=["initial"],
+            operational_request=request,
+        )
+
+    assert emitted
+    assert metadata.get("aawm_capacity_terminal_suppressed") is not True
+
+
+@pytest.mark.asyncio
+async def test_consumed_capacity_decision_suppresses_terminal_audit():
+    request = MagicMock()
+    request.state = SimpleNamespace()
+    owner = get_or_create_capacity_recovery_owner(request)
+    decision = owner.observe(
+        CapacityRecoveryObservation(
+            provider_returned=True,
+            status_code=503,
+            error_class="server_overloaded",
+            retryable=True,
+            commitment={},
+        )
+    )
+    assert owner.consume_decision(decision, consumer="stream-retry")
+    metadata = {
+        "aawm_capacity_recovery_decision": decision.to_metadata(),
+    }
+    kwargs = {"litellm_params": {"metadata": metadata}}
+    logging_obj = MagicMock()
+    logging_obj.async_failure_handler = AsyncMock()
+    emitted: list[dict[str, Any]] = []
+
+    def _capture_emit(context: dict[str, Any], **_kwargs: Any) -> bool:
+        emitted.append(dict(context))
+        return True
+
+    chunks = [chunk.decode("utf-8") for chunk in _failed_lifecycle_stream()]
+    with patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler._emit_aawm_terminal_error",
+        side_effect=_capture_emit,
+    ), patch(
+        "litellm.proxy.aawm_route_logging.record_aawm_route_rollup_failure"
+    ):
+        await PassThroughStreamingHandler._finalize_failed_responses_stream(
+            litellm_logging_obj=logging_obj,
+            kwargs=kwargs,
+            metadata=metadata,
+            all_chunks=chunks,
+            request_body={"model": "gpt-5.4"},
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+            terminal_event_type="response.failed",
+            terminal_payload={
+                "id": "resp_failed",
+                "status": "failed",
+                "output": [],
+                "error": {"code": "server_overloaded"},
+            },
+            handler_branch_state=["initial"],
+            operational_request=request,
+        )
+
+    assert emitted == []
+    assert metadata["aawm_capacity_terminal_suppressed"] is True
 
 
 @pytest.mark.asyncio

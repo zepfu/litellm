@@ -61,6 +61,11 @@ class CapacityRecoveryObservation:
     ledger_valid: bool = True
     alternate_route_available: bool = False
     redispatch_available: bool = False
+    # Some callers arrive at the owner after their same-route retry slot has
+    # already been consumed (for example, selector exhaustion).  Keeping this
+    # fact in the observation prevents a caller-specific bypass from choosing
+    # redispatch while the owner still reports a same-route action.
+    same_route_retry_available: bool = True
     error_payload: Optional[Mapping[str, Any]] = None
     event_type: Optional[str] = None
     ledger_snapshot: Optional[Mapping[str, Any]] = None
@@ -227,7 +232,10 @@ class CapacityRecoveryOwner:
                 action, reason = CapacityRecoveryAction.REDISPATCH, "ledger_exhausted_redispatch"
             else:
                 action, reason = CapacityRecoveryAction.BUDGET_EXHAUSTED, "logical_call_budget_exhausted"
-        elif self.retry_ordinal < self.max_same_route_retries:
+        elif (
+            observation.same_route_retry_available
+            and self.retry_ordinal < self.max_same_route_retries
+        ):
             self.retry_ordinal += 1
             action, reason = CapacityRecoveryAction.RETRY_SAME_ROUTE, "provider_capacity_precommit"
         elif observation.alternate_route_available:

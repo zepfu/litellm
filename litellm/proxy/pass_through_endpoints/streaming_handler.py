@@ -6306,6 +6306,23 @@ class PassThroughStreamingHandler:
             "aawm_capacity_recovery_decision"
         )
         suppress_capacity_terminal = False
+        capacity_recovery_owner = None
+        consumed_capacity_decision = None
+        if operational_request is not None:
+            capacity_recovery_owner = get_or_create_capacity_recovery_owner(
+                operational_request
+            )
+            owner_decision = capacity_recovery_owner.last_decision
+            if (
+                isinstance(capacity_decision_metadata, dict)
+                and owner_decision is not None
+                and capacity_decision_metadata.get("decision_id")
+                == owner_decision.decision_id
+                and capacity_decision_metadata.get("root_recovery_id")
+                == owner_decision.root_recovery_id
+                and capacity_recovery_owner.decision_consumed(owner_decision)
+            ):
+                consumed_capacity_decision = owner_decision
         if (
             operational_request is not None
             and provider_authored
@@ -6353,7 +6370,10 @@ class PassThroughStreamingHandler:
             capacity_decision_metadata = decision.to_metadata()
             metadata["aawm_capacity_recovery_decision"] = capacity_decision_metadata
             annotate_capacity_recovery(operational_request, decision)
-        if isinstance(capacity_decision_metadata, dict):
+        if (
+            isinstance(capacity_decision_metadata, dict)
+            and consumed_capacity_decision is not None
+        ):
             suppress_capacity_terminal = capacity_decision_metadata.get("action") in {
                 CapacityRecoveryAction.RETRY_SAME_ROUTE.value,
                 CapacityRecoveryAction.ROUTE_TRANSITION.value,

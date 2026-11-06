@@ -1795,10 +1795,24 @@ async def handle_alias_route(  # noqa: PLR0915
         candidate: Optional[dict[str, Any]],
         error_class: Optional[str],
         alternate_route_available: bool,
+        same_route_retry_available: bool = True,
+        redispatch_available: Optional[bool] = None,
     ):
         provider_returned = getattr(failure_exc, "_aawm_provider_returned", None)
         if not isinstance(provider_returned, bool):
             provider_returned = getattr(failure_exc, "provider_returned", None)
+        if not isinstance(provider_returned, bool) and isinstance(candidate, dict):
+            candidate_provider_returned = candidate.get("provider_returned")
+            if isinstance(candidate_provider_returned, bool):
+                provider_returned = candidate_provider_returned
+        if (
+            not isinstance(provider_returned, bool)
+            and attempts
+            and isinstance(attempts[-1], dict)
+        ):
+            attempt_provider_returned = attempts[-1].get("provider_returned")
+            if isinstance(attempt_provider_returned, bool):
+                provider_returned = attempt_provider_returned
         status_code = _extract_adapter_exception_status_code(failure_exc)
         error_payload = getattr(failure_exc, "error_payload", None)
         if not isinstance(error_payload, Mapping):
@@ -1817,7 +1831,12 @@ async def handle_alias_route(  # noqa: PLR0915
                     failure_exc, "aawm_call_ledger_exhausted", False
                 ),
                 alternate_route_available=alternate_route_available,
-                redispatch_available=bool(callable(raise_redispatch_required_fn)),
+                redispatch_available=(
+                    bool(callable(raise_redispatch_required_fn))
+                    if redispatch_available is None
+                    else bool(redispatch_available)
+                ),
+                same_route_retry_available=same_route_retry_available,
                 error_payload=error_payload,
                 event_type=event_type,
                 ledger_snapshot=(
@@ -2699,19 +2718,37 @@ async def handle_alias_route(  # noqa: PLR0915
         # the OpenAI capacity-deadline path to its dedicated coordinator.
         transient_provider_exhaustion = False
         transient_provider_recovery_decision = None
+        provider_returned_by_transient_http = (
+            isinstance(last_attempt, dict)
+            and last_attempt.get("attempted_provider_call") is True
+            and last_attempt.get("provider_returned") is not True
+            and str(last_attempt.get("error_class") or "")
+            in _error_signals._RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES
+            and _extract_adapter_exception_status_code(exc)
+            in {429, 500, 502, 503, 504, 529}
+        )
         if (
             not capacity_retry_expired
             and callable(raise_redispatch_required_fn)
             and isinstance(last_attempt, dict)
             and last_attempt.get("attempted_provider_call") is True
-            and last_attempt.get("provider_returned") is True
+            and (
+                last_attempt.get("provider_returned") is True
+                or provider_returned_by_transient_http
+            )
             and str(last_attempt.get("error_class") or "")
             in _error_signals._RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES
             and not _provider_owned_continuation()
             and not getattr(exc, "aawm_openai_wire_replay_blocked", False)
             and not getattr(exc, "aawm_call_ledger_exhausted", False)
         ):
-            if getattr(exc, "_aawm_provider_returned", None) is not True:
+            if provider_returned_by_transient_http:
+                try:
+                    setattr(exc, "_aawm_provider_returned", True)
+                except Exception:
+                    pass
+                last_attempt["provider_returned"] = True
+            elif getattr(exc, "_aawm_provider_returned", None) is not True:
                 # The attempt record is the normalized adapter boundary.  A
                 # typed non-OpenAI response may have been stamped there even
                 # when the wrapper exception itself omitted the private flag.
@@ -2725,16 +2762,14 @@ async def handle_alias_route(  # noqa: PLR0915
                 candidate=candidate,
                 error_class=last_attempt.get("error_class"),
                 alternate_route_available=False,
+                same_route_retry_available=False,
             )
             transient_provider_recovery_decision = recovery_decision
-            transient_provider_exhaustion = is_codex_alias or (
-                recovery_decision.action
-                in {
-                    CapacityRecoveryAction.RETRY_SAME_ROUTE,
-                    CapacityRecoveryAction.ROUTE_TRANSITION,
-                    CapacityRecoveryAction.REDISPATCH,
-                }
-            )
+            transient_provider_exhaustion = recovery_decision.action in {
+                CapacityRecoveryAction.RETRY_SAME_ROUTE,
+                CapacityRecoveryAction.ROUTE_TRANSITION,
+                CapacityRecoveryAction.REDISPATCH,
+            }
         if transient_provider_exhaustion:
             if transient_provider_recovery_decision is not None:
                 capacity_recovery_owner.acknowledge_handoff(
@@ -3413,50 +3448,79 @@ async def handle_alias_route(  # noqa: PLR0915
                 else:
                     redispatch_candidate = None
                 if redispatch_candidate is not None:
-                    try:
-                        raise_redispatch_required_fn(
-                            candidate=redispatch_candidate,
-                            lane_key=redispatch_candidate.get("lane_key"),
-                            cooldown_seconds=float(
-                                redispatch_candidate.get("cooldown_seconds") or 0.0
-                            ),
-                            error_tokens=set(
-                                redispatch_candidate.get("error_tokens") or ()
-                            ),
-                            alias_model=alias_model,
-                            error_class=redispatch_candidate.get("error_class"),
-                            cooldown_scope=redispatch_candidate.get(
-                                "cooldown_scope"
-                            ),
-                            error_status_code=redispatch_candidate.get(
-                                "error_status_code"
-                            ),
-                            error_type=redispatch_candidate.get("error_type"),
-                            error_code=redispatch_candidate.get("error_code"),
-                            retry_after_seconds=redispatch_candidate.get(
-                                "retry_after_seconds"
-                            ),
-                            failure_phase=redispatch_candidate.get(
-                                "failure_phase"
-                            )
-                            or "alias_selection_cooling_down",
-                            attempted_provider_call=True,
-                            attempts=attempts,
-                            skipped_candidates=cooling_candidates,
+                    selection_recovery_decision = _observe_capacity_recovery(
+                        exc,
+                        candidate=redispatch_candidate,
+                        error_class=(
+                            redispatch_candidate.get("error_class")
+                            or "rate_limited"
+                        ),
+                        alternate_route_available=False,
+                        same_route_retry_available=False,
+                        redispatch_available=True,
+                    )
+                    if selection_recovery_decision.action is not CapacityRecoveryAction.REDISPATCH:
+                        # The selector supplied a provider-looking snapshot,
+                        # but the request owner vetoed the handoff (for
+                        # example, an unknown wire outcome, continuation, or
+                        # exhausted request ledger).  Fall through to the
+                        # normal terminal path instead of bypassing the owner.
+                        redispatch_candidate = None
+                    else:
+                        capacity_recovery_owner.acknowledge_handoff(
+                            selection_recovery_decision
                         )
-                    except HTTPException as redispatch_exc:
-                        _emit_validated_redispatch_terminal_event(
-                            exc=redispatch_exc,
-                            request=request,
-                            alias_family=alias_family,
-                            alias_model=alias_model,
-                            request_body=prepared_request_body,
-                            attempts=attempts,
-                            emit_pre_attempt_terminal_event=(
-                                _emit_auto_agent_alias_pre_attempt_terminal_event
-                            ),
-                        )
-                        raise
+                        if not capacity_recovery_owner.consume_decision(
+                            selection_recovery_decision,
+                            consumer="selector-boundary-redispatch",
+                            handoff_acknowledged=True,
+                        ):
+                            redispatch_candidate = None
+                        else:
+                            try:
+                                raise_redispatch_required_fn(
+                                    candidate=redispatch_candidate,
+                                    lane_key=redispatch_candidate.get("lane_key"),
+                                    cooldown_seconds=float(
+                                        redispatch_candidate.get("cooldown_seconds") or 0.0
+                                    ),
+                                    error_tokens=set(
+                                        redispatch_candidate.get("error_tokens") or ()
+                                    ),
+                                    alias_model=alias_model,
+                                    error_class=redispatch_candidate.get("error_class"),
+                                    cooldown_scope=redispatch_candidate.get(
+                                        "cooldown_scope"
+                                    ),
+                                    error_status_code=redispatch_candidate.get(
+                                        "error_status_code"
+                                    ),
+                                    error_type=redispatch_candidate.get("error_type"),
+                                    error_code=redispatch_candidate.get("error_code"),
+                                    retry_after_seconds=redispatch_candidate.get(
+                                        "retry_after_seconds"
+                                    ),
+                                    failure_phase=redispatch_candidate.get(
+                                        "failure_phase"
+                                    )
+                                    or "alias_selection_cooling_down",
+                                    attempted_provider_call=True,
+                                    attempts=attempts,
+                                    skipped_candidates=cooling_candidates,
+                                )
+                            except HTTPException as redispatch_exc:
+                                _emit_validated_redispatch_terminal_event(
+                                    exc=redispatch_exc,
+                                    request=request,
+                                    alias_family=alias_family,
+                                    alias_model=alias_model,
+                                    request_body=prepared_request_body,
+                                    attempts=attempts,
+                                    emit_pre_attempt_terminal_event=(
+                                        _emit_auto_agent_alias_pre_attempt_terminal_event
+                                    ),
+                                )
+                                raise
             if (
                 exc.status_code == status.HTTP_409_CONFLICT
                 and selection_error_code
