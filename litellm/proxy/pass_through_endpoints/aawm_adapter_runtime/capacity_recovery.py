@@ -26,6 +26,7 @@ class CapacityRecoveryAction(str, Enum):
 _CAPACITY_CLASSES = frozenset(
     {
         "rate_limited",
+        "too_many_requests",
         "server_overloaded",
         "upstream_overloaded",
         "capacity_exhausted",
@@ -73,6 +74,7 @@ class CapacityRecoveryObservation:
     # this provider attempt.  Stream/failover layers can see the same object;
     # observing it twice must not consume another owner ordinal.
     observation_key: Any = None
+    observation_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +88,7 @@ class CapacityRecoveryDecision:
     ledger_snapshot: Optional[Mapping[str, Any]] = None
     decision_id: str = ""
     handoff_required: bool = False
+    observation_id: Optional[str] = None
 
     def to_metadata(self) -> dict[str, Any]:
         return {
@@ -97,6 +100,7 @@ class CapacityRecoveryDecision:
             "root_recovery_id": self.root_recovery_id,
             "decision_id": self.decision_id,
             "handoff_required": self.handoff_required,
+            "observation_id": self.observation_id,
             "ledger_snapshot": dict(self.ledger_snapshot)
             if isinstance(self.ledger_snapshot, Mapping)
             else None,
@@ -120,6 +124,8 @@ class CapacityRecoveryOwner:
         self.root_recovery_id = uuid4().hex
         self._consumed_decision_ids: set[str] = set()
         self._acknowledged_handoff_ids: set[str] = set()
+        self._decisions_by_id: dict[str, CapacityRecoveryDecision] = {}
+        self._decisions_by_observation_id: dict[str, CapacityRecoveryDecision] = {}
 
     @staticmethod
     def _prior_observation(
@@ -179,12 +185,29 @@ class CapacityRecoveryOwner:
         output = response.get("output")
         return "output" not in response or (isinstance(output, list) and not output)
 
-    def observe(self, observation: CapacityRecoveryObservation) -> CapacityRecoveryDecision:
+    def observe(  # noqa: PLR0915
+        self, observation: CapacityRecoveryObservation
+    ) -> CapacityRecoveryDecision:
         """Return the only allowed next action for the observed attempt."""
         prior_decision = self._prior_observation(observation)
         if prior_decision is not None and prior_decision.root_recovery_id == self.root_recovery_id:
             self.last_decision = prior_decision
             return prior_decision
+        observation_id = observation.observation_id
+        key = observation.observation_key
+        if observation_id is None and key is not None:
+            observation_id = getattr(key, "_aawm_capacity_recovery_observation_id", None)
+            if not isinstance(observation_id, str) or not observation_id:
+                observation_id = f"{self.root_recovery_id}:observation:{id(key)}"
+                try:
+                    setattr(key, "_aawm_capacity_recovery_observation_id", observation_id)
+                except Exception:
+                    pass
+        if observation_id is not None:
+            prior_decision = self._decisions_by_observation_id.get(observation_id)
+            if prior_decision is not None:
+                self.last_decision = prior_decision
+                return prior_decision
         capacity = self._is_capacity(observation)
         veto = self._wire_veto(observation)
         if (
@@ -255,15 +278,33 @@ class CapacityRecoveryOwner:
             ledger_snapshot=observation.ledger_snapshot,
             decision_id=f"{self.root_recovery_id}:{self.retry_ordinal}:{uuid4().hex[:8]}",
             handoff_required=action is CapacityRecoveryAction.REDISPATCH,
+            observation_id=observation_id,
         )
         self.last_decision = decision
-        key = observation.observation_key
+        self._decisions_by_id[decision.decision_id] = decision
+        if observation_id is not None:
+            self._decisions_by_observation_id[observation_id] = decision
         if key is not None:
             try:
                 setattr(key, "_aawm_capacity_recovery_decision", decision)
             except Exception:
                 pass
         return decision
+
+    def decision_from_metadata(
+        self, metadata: Optional[Mapping[str, Any]]
+    ) -> Optional[CapacityRecoveryDecision]:
+        """Resolve a decision previously issued by this request owner."""
+
+        if not isinstance(metadata, Mapping):
+            return None
+        decision_id = metadata.get("decision_id")
+        root_recovery_id = metadata.get("root_recovery_id")
+        if not isinstance(decision_id, str) or not decision_id:
+            return None
+        if root_recovery_id != self.root_recovery_id:
+            return None
+        return self._decisions_by_id.get(decision_id)
 
     def acknowledge_handoff(self, decision: CapacityRecoveryDecision) -> bool:
         """Acknowledge a server-side redispatch selected by this owner.
@@ -334,10 +375,6 @@ class CapacityRecoveryOwner:
         remaining = observation.ledger_snapshot.get("remaining_logical_provider_calls")
         if not isinstance(remaining, int) or isinstance(remaining, bool):
             return False
-        # A capacity permit is a separate, tightly-bound one-use admission and
-        # may legally consume a send even when ordinary calls are exhausted.
-        if observation.ledger_snapshot.get("capacity_retry_authorized") is True:
-            return False
         return remaining <= 0
 
 
@@ -360,12 +397,10 @@ def get_or_create_capacity_recovery_owner(
             max_same_route_retries=max_same_route_retries,
         )
         setattr(state, "aawm_capacity_recovery_owner", owner)
-    elif max_same_route_retries > owner.max_same_route_retries:
-        owner.max_same_route_retries = int(max_same_route_retries)
-        owner.deadline_seconds = max(
-            owner.deadline_seconds,
-            max(0.0, float(deadline_seconds)),
-        )
+    # Owner policy is request-scoped and immutable after creation. Callers
+    # re-enter this helper at different boundaries (hidden retry, alias loop,
+    # and stream finalization); allowing later callers to widen the retry
+    # count or deadline made the hard request budget depend on call order.
     return owner
 
 

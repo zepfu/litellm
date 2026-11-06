@@ -6489,7 +6489,7 @@ async def test_cancelled_without_terminal_keeps_reconciled_capacity_error():
 
 
 @pytest.mark.asyncio
-async def test_unconsumed_capacity_decision_does_not_suppress_terminal_audit():
+async def test_stream_finalizer_consumes_recoverable_capacity_decision():
     request = MagicMock()
     request.state = SimpleNamespace()
     owner = get_or_create_capacity_recovery_owner(request)
@@ -6540,8 +6540,9 @@ async def test_unconsumed_capacity_decision_does_not_suppress_terminal_audit():
             operational_request=request,
         )
 
-    assert emitted
-    assert metadata.get("aawm_capacity_terminal_suppressed") is not True
+    assert emitted == []
+    assert metadata["aawm_capacity_terminal_suppressed"] is True
+    assert owner.decision_consumed(decision)
 
 
 @pytest.mark.asyncio
@@ -6803,6 +6804,37 @@ def test_stale_capacity_retry_permit_does_not_extend_exhausted_budget():
 
     assert raised.value.reason == "logical_call_cap_exhausted"
     assert ledger.snapshot()["capacity_retry_authorized"] is False
+    assert ledger.snapshot()["logical_provider_calls"] == 1
+
+
+def test_matching_capacity_retry_permit_does_not_bypass_hard_call_cap():
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        ProviderCallLedger,
+        ProviderCallLedgerExhausted,
+    )
+
+    ledger = ProviderCallLedger(provider="openai", max_logical_provider_calls=1)
+    context = {"model": "gpt-5.4", "account_hash": "acct1", "lane_key": "lane"}
+    ledger.reserve(
+        target="https://example.test/responses",
+        candidate_context=context,
+        prior_response_closed=True,
+    )
+    assert ledger.authorize_capacity_retry(
+        target="https://example.test/responses",
+        candidate_context=context,
+        deadline_at_monotonic=time.monotonic() + 60,
+    )
+
+    with pytest.raises(ProviderCallLedgerExhausted) as raised:
+        ledger.reserve(
+            target="https://example.test/responses",
+            candidate_context=context,
+            prior_response_closed=True,
+            allow_capacity_retry=True,
+        )
+
+    assert raised.value.reason == "logical_call_cap_exhausted"
     assert ledger.snapshot()["logical_provider_calls"] == 1
 
 

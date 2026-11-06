@@ -150,11 +150,39 @@ def test_owner_observation_is_idempotent_for_same_failure_object():
     assert owner.retry_ordinal == first.retry_ordinal
 
 
+def test_owner_observation_id_is_stable_across_wrapped_failures():
+    owner = CapacityRecoveryOwner(max_same_route_retries=1)
+    first = owner.observe(
+        _capacity_observation(observation_id="attempt-1")
+    )
+    second = owner.observe(
+        _capacity_observation(
+            observation_id="attempt-1", alternate_route_available=True
+        )
+    )
+    assert second is first
+    assert second.observation_id == "attempt-1"
+    assert owner.retry_ordinal == 1
+
+
 def test_owner_is_request_scoped():
     request = SimpleNamespace(state=SimpleNamespace())
     first = get_or_create_capacity_recovery_owner(request)
     second = get_or_create_capacity_recovery_owner(request)
     assert first is second
+
+
+def test_owner_policy_does_not_widen_on_reentry():
+    request = SimpleNamespace(state=SimpleNamespace())
+    owner = get_or_create_capacity_recovery_owner(
+        request, deadline_seconds=10, max_same_route_retries=1
+    )
+    same_owner = get_or_create_capacity_recovery_owner(
+        request, deadline_seconds=7200, max_same_route_retries=32
+    )
+    assert same_owner is owner
+    assert owner.deadline_seconds == 10
+    assert owner.max_same_route_retries == 1
 
 
 def test_non_ledger_capacity_handoff_clears_only_dispatch_latch():

@@ -519,10 +519,10 @@ class ProviderCallLedger:
                 self._capacity_retry_authorization = None
             else:
                 capacity_retry_authorized = True
-        if (
-            self._logical_provider_calls >= self.max_logical_provider_calls
-            and not capacity_retry_authorized
-        ):
+        # The request-wide provider-call cap is absolute. A capacity permit
+        # authorizes why the next send is safe; it never creates an extra
+        # send beyond the ledger budget.
+        if self._logical_provider_calls >= self.max_logical_provider_calls:
             raise ProviderCallLedgerExhausted(
                 ledger=self,
                 reason="logical_call_cap_exhausted",

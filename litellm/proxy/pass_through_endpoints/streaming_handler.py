@@ -181,6 +181,7 @@ RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS = 10.0
 RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS = 2
 _RESPONSES_TRANSIENT_CAPACITY_CLASSES = frozenset(
     {
+        "rate_limited",
         "server_overloaded",
         "upstream_overloaded",
         "capacity_exhausted",
@@ -6312,17 +6313,27 @@ class PassThroughStreamingHandler:
             capacity_recovery_owner = get_or_create_capacity_recovery_owner(
                 operational_request
             )
-            owner_decision = capacity_recovery_owner.last_decision
-            if (
-                isinstance(capacity_decision_metadata, dict)
-                and owner_decision is not None
-                and capacity_decision_metadata.get("decision_id")
-                == owner_decision.decision_id
-                and capacity_decision_metadata.get("root_recovery_id")
-                == owner_decision.root_recovery_id
-                and capacity_recovery_owner.decision_consumed(owner_decision)
-            ):
-                consumed_capacity_decision = owner_decision
+            owner_decision = capacity_recovery_owner.decision_from_metadata(
+                capacity_decision_metadata
+            )
+            if owner_decision is not None:
+                # Caller-managed alias/adapter retries can reach stream
+                # finalization before their outer planner consumes the owner
+                # decision. Finalization is the last gate before terminal
+                # emission, so consume the recoverable decision here and let
+                # the planner observe the same typed decision afterward.
+                if owner_decision.action in {
+                    CapacityRecoveryAction.RETRY_SAME_ROUTE,
+                    CapacityRecoveryAction.ROUTE_TRANSITION,
+                } and not capacity_recovery_owner.decision_consumed(
+                    owner_decision
+                ):
+                    capacity_recovery_owner.consume_decision(
+                        owner_decision,
+                        consumer="stream-finalizer-decision-gate",
+                    )
+                if capacity_recovery_owner.decision_consumed(owner_decision):
+                    consumed_capacity_decision = owner_decision
         if (
             operational_request is not None
             and provider_authored
@@ -6370,6 +6381,16 @@ class PassThroughStreamingHandler:
             capacity_decision_metadata = decision.to_metadata()
             metadata["aawm_capacity_recovery_decision"] = capacity_decision_metadata
             annotate_capacity_recovery(operational_request, decision)
+            if decision.action in {
+                CapacityRecoveryAction.RETRY_SAME_ROUTE,
+                CapacityRecoveryAction.ROUTE_TRANSITION,
+            }:
+                capacity_recovery_owner.consume_decision(
+                    decision,
+                    consumer="stream-finalizer-decision-gate",
+                )
+                if capacity_recovery_owner.decision_consumed(decision):
+                    consumed_capacity_decision = decision
         if (
             isinstance(capacity_decision_metadata, dict)
             and consumed_capacity_decision is not None
