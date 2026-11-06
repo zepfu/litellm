@@ -43,6 +43,7 @@ services:
     restart: unless-stopped
     # Durable log-gate switch. Recreate reloads this file; restart does not.
     env_file:
+      - .env.alpha-openrouter
       - compose.alpha.log-gates.env
     command:
       - /usr/bin/env
@@ -163,8 +164,6 @@ services:
       - NVIDIA_API_KEY=${NVIDIA_API_KEY:-${AAWM_NVIDIA_API_KEY:-}}
       - NVIDIA_NIM_API_BASE=${NVIDIA_NIM_API_BASE:-https://integrate.api.nvidia.com/v1}
       - NVIDIA_NIM_RERANK_API_BASE=${NVIDIA_NIM_RERANK_API_BASE:-https://ai.api.nvidia.com}
-      - AAWM_OPENROUTER_API_KEY=${AAWM_OPENROUTER_API_KEY:-}
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - OPENROUTER_API_BASE=${OPENROUTER_API_BASE:-https://openrouter.ai/api/v1}
       - ZAI_KEY=${ZAI_KEY:-}
       # COHERE-001: export only the canonical direct Cohere credential.
