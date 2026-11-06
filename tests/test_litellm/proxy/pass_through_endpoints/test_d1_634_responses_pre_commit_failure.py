@@ -5664,6 +5664,56 @@ async def test_response_metadata_does_not_block_capacity_retry():
 
 
 @pytest.mark.asyncio
+async def test_provider_metadata_shape_does_not_block_capacity_retry():
+    """Provider-owned metadata extensions stay outside replay commitment."""
+    response_id = "resp_metadata_provider_shape"
+    metadata = _sse(
+        "response.metadata",
+        {
+            "type": "response.metadata",
+            "sequence_number": 2,
+            "response_id": response_id,
+            "headers": {"x-openai-model": "gpt-6.1-sol"},
+            "metadata": {
+                "openai_chatgpt_moderation_metadata": {
+                    "content": {"presentation": "inline"},
+                }
+            },
+        },
+    )
+    failed = _response_event(
+        "response.failed",
+        3,
+        response_id=response_id,
+        status="failed",
+        error={
+            "code": "server_is_overloaded",
+            "type": "server_error",
+            "message": "Selected model is at capacity.",
+        },
+    )
+    response = httpx.Response(
+        200,
+        stream=_ClosableAsyncByteStream([metadata, failed]),
+        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+    )
+
+    peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+        response,
+        openai_alpha_capacity_retry_enabled=True,
+    )
+    try:
+        assert failure is not None
+        assert failure.error_class == "server_overloaded"
+        assert failure.retryable is True
+        assert b"".join([chunk async for chunk in peeked.aiter_bytes()]) == b"".join(
+            [metadata, failed]
+        )
+    finally:
+        await peeked.aclose()
+
+
+@pytest.mark.asyncio
 async def test_additive_setup_and_failure_fields_remain_capacity_retryable():
     """Inert provider extensions must not become replay commitments."""
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (

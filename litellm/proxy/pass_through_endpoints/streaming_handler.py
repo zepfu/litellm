@@ -1633,15 +1633,13 @@ class PassThroughStreamingHandler:
             return True
 
         if event_type == "response.metadata":
-            # This event is setup-only.  Keep the event envelope bounded while
-            # allowing arbitrary provider metadata values to pass through.
-            metadata_fields = {"type", "sequence_number", "metadata"}
-            if not PassThroughStreamingHandler._has_only_fields(
-                payload, metadata_fields, rejection=rejection, allow_unknown=True
-            ) or not _responses_unknown_fields_are_inert(
-                payload, metadata_fields, rejection=rejection, path="$"
-            ):
-                return False
+            # ``response.metadata`` is a provider setup event.  Codex uses
+            # several provider-owned shapes here (for example top-level
+            # headers/response_id and moderation metadata); none of those
+            # fields deliver model output or execute a tool.  Treat the event
+            # as lifecycle data so a later no-output capacity failure can use
+            # the normal pre-commit retry path.  The event remains subject to
+            # the pipeline's existing framing, JSON, byte, and event bounds.
             return True
 
         if event_type == "response.output_item.added":
