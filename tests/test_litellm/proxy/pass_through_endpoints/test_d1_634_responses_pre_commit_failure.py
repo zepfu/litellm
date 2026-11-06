@@ -9519,7 +9519,8 @@ async def test_transport_frames_retain_admission_bounds(limit):
 
 
 @pytest.mark.asyncio
-async def test_alpha_retries_response_failed_capacity_without_output():
+@pytest.mark.parametrize("error_code", ["server_overloaded", "rate_limit_exceeded"])
+async def test_alpha_retries_response_failed_capacity_without_output(error_code):
     """Omitted output on a provider overload must not terminate the turn."""
     first_stream = _ClosableAsyncByteStream(
         [
@@ -9532,7 +9533,7 @@ async def test_alpha_retries_response_failed_capacity_without_output():
                     "status": "failed",
                     "error": {
                         "type": "service_unavailable_error",
-                        "code": "server_is_overloaded",
+                        "code": error_code,
                         "message": "Try again.",
                     },
                 },
