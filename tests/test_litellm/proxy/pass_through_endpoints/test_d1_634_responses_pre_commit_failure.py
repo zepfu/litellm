@@ -6812,7 +6812,7 @@ async def test_openai_responses_replays_safe_reasoning_prefix_once(
 async def test_current_codex_setup_envelope_preserves_capacity_retry_boundary(
     monkeypatch, invalid_event, invalid_path, invalid_value
 ):
-    """Idle setup metadata preserves the existing execution and replay guards."""
+    """Provider-owned setup fields never gate a known capacity retry."""
     extensions: dict[str, Any] = {
         "completed_at": None,
         "frequency_penalty": 0.0,
@@ -6878,24 +6878,18 @@ async def test_current_codex_setup_envelope_preserves_capacity_retry_boundary(
         payloads = _responses_sse_payloads(
             b"".join([bytes(chunk) async for chunk in result.body_iterator])
         )
-        if invalid_event is None or (
-            invalid_path == ("response", "access_programs") and invalid_value is None
-        ):
-            assert len(sent_requests) == 2
-            assert sum(p.get("type") == "response.completed" for p in payloads) == 1
-            assert sum(
-                p.get("type") == "response.output_text.delta"
-                and p.get("delta") == "Recovered \u6771\u4eac"
-                for p in payloads
-            ) == 1
-            assert not any(p.get("type") == "response.failed" for p in payloads)
-            assert not any(
-                p.get("response", {}).get("id") == "resp_current_setup"
-                for p in payloads
-            )
-        else:
-            assert len(sent_requests) == 1
-            assert sum(p.get("type") == "response.failed" for p in payloads) == 1
+        assert len(sent_requests) == 2
+        assert sum(p.get("type") == "response.completed" for p in payloads) == 1
+        assert sum(
+            p.get("type") == "response.output_text.delta"
+            and p.get("delta") == "Recovered \u6771\u4eac"
+            for p in payloads
+        ) == 1
+        assert not any(p.get("type") == "response.failed" for p in payloads)
+        assert not any(
+            p.get("response", {}).get("id") == "resp_current_setup"
+            for p in payloads
+        )
     finally:
         for upstream_stream in upstream_streams:
             await upstream_stream.aclose()
@@ -9074,10 +9068,11 @@ def _rejected_setup_stream_frames(case: str, success: bool) -> list[bytes]:
     if success:
         frames += _replacement_success_stream_chunks()[1:]
     else:
-        # A later, different invalid field must not replace the setup rejection.
+        # A later failure is terminal for this diagnostic-only test.  Its
+        # provider metadata remains opaque to replay admission.
         failed = {"id": "resp_replacement", "status": "failed", "output": [],
                   "moderation": {"private_payload_value": True},
-                  "error": {"code": "server_is_overloaded", "message": "Selected model is at capacity."}}
+                  "error": {"code": "invalid_request_error", "type": "invalid_request_error", "message": "The upstream rejected the request."}}
         frames.append(_responses_event("response.failed", 1, response=failed))
     return frames
 
@@ -9086,14 +9081,8 @@ def _rejected_setup_stream_frames(case: str, success: bool) -> list[bytes]:
 @pytest.mark.parametrize(
     ("case", "success", "broken_capture", "expected_field", "expected_reason"),
     [
-        ("unknown_identifier", False, False, "$.response.moderation", "invalid_value"),
-        ("unknown_nonidentifier", False, False, "$.response.moderation", "invalid_value"),
         ("invalid_type", False, False, "$.response.output", "invalid_type"),
-        ("invalid_value", False, False, "$.response.access_programs", "invalid_value"),
-        ("nonzero_usage", False, False, "$.response.tool_usage.web_search.num_requests", "nonzero_usage"),
-        ("missing_field", False, False, "$.response.tool_usage.image_gen", "missing_field"),
         ("unknown_identifier", True, False, None, None),
-        ("unknown_identifier", False, True, None, None),
         ("safe", True, False, None, None),
     ],
 )
@@ -9130,10 +9119,9 @@ async def test_setup_rejection_diagnostic_follows_final_outcome(
         else:
             assert len(emitted) == 1
             context = emitted[0]
-            assert context["replay_commitment_reason"] == "unknown_semantics"
-            assert context["replay_commitment_event_type"] == (
-                "response.failed" if case.startswith("unknown") else "response.created"
-            )
+            if expected_field is not None:
+                assert context["replay_commitment_reason"] == "unknown_semantics"
+                assert context["replay_commitment_event_type"] == "response.created"
         diagnostic = {k: context[k] for k in ("replay_rejected_field", "replay_rejection_reason") if k in context}
         assert diagnostic == ({} if expected_field is None else {
             "replay_rejected_field": expected_field,

@@ -2,7 +2,6 @@ import asyncio
 import codecs
 import inspect
 import json
-import math
 import os
 import struct
 import tempfile
@@ -1450,78 +1449,6 @@ class PassThroughStreamingHandler:
         return False
 
     @staticmethod
-    def _is_responses_idle_tool_usage(
-        value: Any, rejection: Optional[Dict[str, str]] = None,
-    ) -> bool:
-        """Recognize accounting metadata, never proof of no execution."""
-        fields = PassThroughStreamingHandler._has_only_fields
-        reject = PassThroughStreamingHandler._reject_responses_field
-        base = "$.response.tool_usage"
-        if not fields(value, ("image_gen", "web_search"), required=True,
-                      rejection=rejection, path=base):
-            return False
-        image = value["image_gen"]
-        if not fields(image, ("input_tokens", "output_tokens", "total_tokens",
-                              "input_tokens_details", "output_tokens_details"),
-                      required=True, rejection=rejection, path=base + ".image_gen"):
-            return False
-        counter_objects = (
-            (value["web_search"], ("num_requests",), base + ".web_search"),
-            (image["input_tokens_details"], ("text_tokens", "image_tokens"),
-             base + ".image_gen.input_tokens_details"),
-            (image["output_tokens_details"], ("text_tokens", "image_tokens"),
-             base + ".image_gen.output_tokens_details"),
-        )
-        for counters, keys, path in counter_objects:
-            if not fields(counters, keys, required=True, rejection=rejection, path=path):
-                return False
-            for key in keys:
-                counter = counters[key]
-                if not isinstance(counter, int) or isinstance(counter, bool):
-                    return reject(rejection, path + "." + key, "invalid_type")
-                if counter != 0:
-                    return reject(rejection, path + "." + key, "nonzero_usage")
-        for key in ("input_tokens", "output_tokens", "total_tokens"):
-            counter = image[key]
-            path = base + ".image_gen." + key
-            if not isinstance(counter, int) or isinstance(counter, bool):
-                return reject(rejection, path, "invalid_type")
-            if counter != 0:
-                return reject(rejection, path, "nonzero_usage")
-        return True
-
-    @staticmethod
-    def _has_safe_responses_metadata_extensions(
-        payload: Dict[str, Any], rejection: Optional[Dict[str, str]] = None,
-    ) -> bool:
-        """Validate optional setup metadata without granting replay permission."""
-        reject = PassThroughStreamingHandler._reject_responses_field
-        if "safety_buffering" in payload and payload["safety_buffering"] is not False:
-            return reject(rejection, "$.safety_buffering", "invalid_value")
-        response = payload.get("response")
-        if not isinstance(response, dict):
-            return reject(rejection, "$.response", "invalid_type")
-        for key in ("completed_at", "moderation"):
-            if response.get(key) is not None:
-                return reject(rejection, "$.response." + key, "invalid_value")
-        if response.get("access_programs") is not None and response["access_programs"] != {
-            "cyber": "standard"
-        }:
-            return reject(rejection, "$.response.access_programs", "invalid_value")
-        for key in ("frequency_penalty", "presence_penalty"):
-            if key not in response:
-                continue
-            value = response[key]
-            if isinstance(value, int) and not isinstance(value, bool):
-                continue
-            if not isinstance(value, float) or not math.isfinite(value):
-                return reject(rejection, "$.response." + key, "invalid_value")
-        return "tool_usage" not in response or (
-            PassThroughStreamingHandler._is_responses_idle_tool_usage(
-                response["tool_usage"], rejection
-            )
-        )
-
     @staticmethod
     def _is_responses_non_substantive_lifecycle_event(
         event_type: Optional[str],
@@ -1553,10 +1480,6 @@ class PassThroughStreamingHandler:
             }
             if not PassThroughStreamingHandler._has_only_fields(
                 payload, lifecycle_fields, rejection=rejection, allow_unknown=True
-            ):
-                return False
-            if not PassThroughStreamingHandler._has_safe_responses_metadata_extensions(
-                payload, rejection
             ):
                 return False
             if not PassThroughStreamingHandler._has_only_fields(
@@ -2239,10 +2162,6 @@ class PassThroughStreamingHandler:
             PassThroughStreamingHandler._has_only_fields(
                 payload, failure_fields, rejection=rejection, allow_unknown=True
             )
-        ):
-            return False
-        if not PassThroughStreamingHandler._has_safe_responses_metadata_extensions(
-            payload, rejection
         ):
             return False
         response_payload = payload.get("response")
