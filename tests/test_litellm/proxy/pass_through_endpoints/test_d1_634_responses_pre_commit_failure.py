@@ -1915,6 +1915,78 @@ def test_response_failed_capacity_without_output_is_replay_safe():
     )
 
 
+def test_response_failed_capacity_ignores_provider_additive_fields():
+    """Provider metadata must not turn a no-output overload into a terminal."""
+    payload = {
+        "type": "response.failed",
+        "sequence_number": 1,
+        "provider_metadata": {"request_id": "req_123", "retry_after": "1"},
+        "response": {
+            "id": "resp_overloaded_metadata",
+            "object": "response",
+            "status": "failed",
+            "provider_details": {"region": "alpha"},
+            "error": {
+                "type": "service_unavailable_error",
+                "code": "server_is_overloaded",
+                "message": "Try again.",
+                "request_id": "req_123",
+            },
+        },
+    }
+    rejection: dict[str, str] = {}
+    event = ParsedResponsesEvent(
+        sequence_number=1,
+        event_type="response.failed",
+        payload=payload,
+        is_done_marker=False,
+        is_malformed=False,
+        byte_count=0,
+        observed_at=datetime.now(timezone.utc),
+    )
+
+    decision = PassThroughStreamingHandler._inspect_responses_events(
+        event, rejection
+    )
+
+    assert decision[0] == "failed"
+    assert decision[3] is None
+    assert rejection == {}
+
+
+def test_error_capacity_ignores_provider_additive_fields():
+    """The generic Responses error event may carry provider diagnostics."""
+    payload = {
+        "type": "error",
+        "sequence_number": 1,
+        "request_id": "req_456",
+        "error": {
+            "type": "service_unavailable_error",
+            "code": "server_is_overloaded",
+            "message": "Try again.",
+            "retry_after": "1",
+        },
+    }
+    rejection: dict[str, str] = {}
+    event = ParsedResponsesEvent(
+        sequence_number=1,
+        event_type="error",
+        payload=payload,
+        is_done_marker=False,
+        is_malformed=False,
+        byte_count=0,
+        observed_at=datetime.now(timezone.utc),
+    )
+
+    decision = PassThroughStreamingHandler._inspect_responses_events(
+        event, rejection
+    )
+
+    assert decision[0] == "failed"
+    assert decision[3] is None
+    assert rejection == {}
+
+
 def test_response_failed_without_output_unknown_error_remains_terminal():
     payload = {
         "type": "response.failed",

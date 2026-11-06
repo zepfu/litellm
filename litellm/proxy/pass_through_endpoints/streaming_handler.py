@@ -2228,15 +2228,17 @@ class PassThroughStreamingHandler:
         if (
             not isinstance(error_payload, dict)
             or not error_payload
-            or not PassThroughStreamingHandler._has_only_fields(
-                error_payload, _RESPONSES_ERROR_FIELDS
-            )
-            or not isinstance(error_payload.get("message"), str)
         ):
             return False
+        # Upstream error objects are provider payloads.  Keep validating the
+        # small set of fields we interpret, but do not reject additive fields
+        # that the provider may legitimately attach (request IDs, diagnostics,
+        # retry metadata, and similar context).
         for field in _RESPONSES_ERROR_FIELDS:
             value = error_payload.get(field)
             if field == "message":
+                if value is not None and not isinstance(value, str):
+                    return False
                 continue
             if value is None:
                 continue
@@ -2266,6 +2268,7 @@ class PassThroughStreamingHandler:
             if not PassThroughStreamingHandler._has_only_fields(
                 payload,
                 {"type", "sequence_number", "error", "code", "message", "param"},
+                allow_unknown=True,
             ):
                 return False
             nested_error = payload.get("error")
@@ -2293,9 +2296,6 @@ class PassThroughStreamingHandler:
             PassThroughStreamingHandler._has_only_fields(
                 payload, failure_fields, rejection=rejection, allow_unknown=True
             )
-            and _responses_unknown_fields_are_inert(
-                payload, failure_fields, rejection=rejection, path="$"
-            )
         ):
             return False
         if not PassThroughStreamingHandler._has_safe_responses_metadata_extensions(
@@ -2313,10 +2313,6 @@ class PassThroughStreamingHandler:
             or not PassThroughStreamingHandler._has_only_fields(
                 response_payload, _RESPONSES_RESPONSE_ENVELOPE_FIELDS,
                 rejection=rejection, path="$.response", allow_unknown=True
-            )
-            or not _responses_unknown_fields_are_inert(
-                response_payload, _RESPONSES_RESPONSE_ENVELOPE_FIELDS,
-                rejection=rejection, path="$.response"
             )
             or not PassThroughStreamingHandler._is_nonempty_string(
                 response_payload.get("id")
