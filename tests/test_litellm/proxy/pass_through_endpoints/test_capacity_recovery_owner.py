@@ -77,6 +77,17 @@ def test_owner_allows_typed_omitted_output_capacity_failure():
     assert decision.action is CapacityRecoveryAction.RETRY_SAME_ROUTE
 
 
+def test_owner_normalizes_provider_neutral_rate_limit_class():
+    owner = CapacityRecoveryOwner()
+    decision = owner.observe(
+        _capacity_observation(
+            status_code=None,
+            error_class="too_many_requests",
+        )
+    )
+    assert decision.action is CapacityRecoveryAction.RETRY_SAME_ROUTE
+
+
 def test_owner_vetoes_continuation_and_invalid_ledger():
     owner = CapacityRecoveryOwner()
     continuation = owner.observe(_capacity_observation(continuation=True))
