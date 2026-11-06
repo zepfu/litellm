@@ -26866,10 +26866,47 @@
     },
     "openrouter/~deepseek/deepseek-flash-latest": {
         "input_cost_per_token": 6e-09,
+        "cache_read_input_token_cost": 5e-09,
+        "input_cost_per_token_cache_hit": 5e-09,
         "litellm_provider": "openrouter",
         "max_input_tokens": 1048576,
+        "max_output_tokens": 943718,
+        "max_tokens": 943718,
         "mode": "chat",
         "output_cost_per_token": 5e-07,
+        "provider_specific_entry": {
+            "openrouter": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "priced",
+                    "kind": "moving_latest_alias_snapshot",
+                    "billing_mode": "openrouter_payg",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "openrouter",
+                        "model": "openrouter/~deepseek/deepseek-flash-latest"
+                    },
+                    "cache_mode": "provider_cache_read",
+                    "equivalence_status": "exact",
+                    "equivalence_evidence": "Rates are the OpenRouter model-catalog snapshot for this moving latest alias; the alias may resolve to a newer served model and must be reverified when OpenRouter changes it.",
+                    "rates": {
+                        "input_per_million": 0.006,
+                        "cache_read_per_million": 0.005,
+                        "output_per_million": 0.5
+                    },
+                    "source": {
+                        "kind": "provider_catalog",
+                        "label": "OpenRouter DeepSeek Flash latest alias",
+                        "urls": [
+                            "https://openrouter.ai/~deepseek/deepseek-flash-latest"
+                        ],
+                        "version": "2026-11-06",
+                        "verified_on": "2026-11-06"
+                    }
+                }
+            }
+        },
         "source": "https://openrouter.ai/~deepseek/deepseek-flash-latest",
         "supports_function_calling": true,
         "supports_prompt_caching": true,
@@ -26880,10 +26917,47 @@
     },
     "openrouter/~deepseek/deepseek-pro-latest": {
         "input_cost_per_token": 9.99e-08,
+        "cache_read_input_token_cost": 9.99e-08,
+        "input_cost_per_token_cache_hit": 9.99e-08,
         "litellm_provider": "openrouter",
         "max_input_tokens": 1048576,
+        "max_output_tokens": 393216,
+        "max_tokens": 393216,
         "mode": "chat",
         "output_cost_per_token": 8e-06,
+        "provider_specific_entry": {
+            "openrouter": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "priced",
+                    "kind": "moving_latest_alias_snapshot",
+                    "billing_mode": "openrouter_payg",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "openrouter",
+                        "model": "openrouter/~deepseek/deepseek-pro-latest"
+                    },
+                    "cache_mode": "provider_cache_read",
+                    "equivalence_status": "exact",
+                    "equivalence_evidence": "Rates are the OpenRouter model-catalog snapshot for this moving latest alias; the alias may resolve to a newer served model and must be reverified when OpenRouter changes it.",
+                    "rates": {
+                        "input_per_million": 0.0999,
+                        "cache_read_per_million": 0.0999,
+                        "output_per_million": 8.0
+                    },
+                    "source": {
+                        "kind": "provider_catalog",
+                        "label": "OpenRouter DeepSeek Pro latest alias",
+                        "urls": [
+                            "https://openrouter.ai/~deepseek/deepseek-pro-latest"
+                        ],
+                        "version": "2026-11-06",
+                        "verified_on": "2026-11-06"
+                    }
+                }
+            }
+        },
         "source": "https://openrouter.ai/~deepseek/deepseek-pro-latest",
         "supports_function_calling": true,
         "supports_prompt_caching": true,
