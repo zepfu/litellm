@@ -79,6 +79,8 @@ class CapacityRecoveryDecision:
     capacity: bool
     root_recovery_id: str
     ledger_snapshot: Optional[Mapping[str, Any]] = None
+    decision_id: str = ""
+    handoff_required: bool = False
 
     def to_metadata(self) -> dict[str, Any]:
         return {
@@ -88,6 +90,8 @@ class CapacityRecoveryDecision:
             "provider_returned": self.provider_returned,
             "capacity": self.capacity,
             "root_recovery_id": self.root_recovery_id,
+            "decision_id": self.decision_id,
+            "handoff_required": self.handoff_required,
             "ledger_snapshot": dict(self.ledger_snapshot)
             if isinstance(self.ledger_snapshot, Mapping)
             else None,
@@ -109,6 +113,8 @@ class CapacityRecoveryOwner:
         self.retry_ordinal = 0
         self.last_decision: Optional[CapacityRecoveryDecision] = None
         self.root_recovery_id = uuid4().hex
+        self._consumed_decision_ids: set[str] = set()
+        self._acknowledged_handoff_ids: set[str] = set()
 
     @staticmethod
     def _prior_observation(
@@ -239,6 +245,8 @@ class CapacityRecoveryOwner:
             capacity=capacity,
             root_recovery_id=self.root_recovery_id,
             ledger_snapshot=observation.ledger_snapshot,
+            decision_id=f"{self.root_recovery_id}:{self.retry_ordinal}:{uuid4().hex[:8]}",
+            handoff_required=action is CapacityRecoveryAction.REDISPATCH,
         )
         self.last_decision = decision
         key = observation.observation_key
@@ -248,6 +256,64 @@ class CapacityRecoveryOwner:
             except Exception:
                 pass
         return decision
+
+    def acknowledge_handoff(self, decision: CapacityRecoveryDecision) -> bool:
+        """Acknowledge a server-side redispatch selected by this owner.
+
+        Redispatch is a handoff, not a terminal result.  The caller must
+        acknowledge the handoff before the decision can be consumed; repeated
+        acknowledgements are idempotent and cannot create another send.
+        """
+
+        if (
+            decision.root_recovery_id != self.root_recovery_id
+            or decision.action is not CapacityRecoveryAction.REDISPATCH
+            or not decision.decision_id
+        ):
+            return False
+        self._acknowledged_handoff_ids.add(decision.decision_id)
+        return True
+
+    def consume_decision(
+        self,
+        decision: CapacityRecoveryDecision,
+        *,
+        consumer: str,
+        handoff_acknowledged: bool = False,
+    ) -> bool:
+        """Consume one owner decision at a concrete route/handoff boundary.
+
+        A decision can be consumed once.  Redispatch additionally requires an
+        acknowledgement from the server-side handoff consumer; otherwise the
+        request remains pending and must not be terminalized as if the handoff
+        succeeded.
+        """
+
+        _ = consumer
+        if decision.root_recovery_id != self.root_recovery_id:
+            return False
+        decision_id = decision.decision_id
+        if not decision_id or decision_id in self._consumed_decision_ids:
+            return False
+        if decision.action is CapacityRecoveryAction.REDISPATCH:
+            if handoff_acknowledged:
+                self.acknowledge_handoff(decision)
+            if decision_id not in self._acknowledged_handoff_ids:
+                return False
+        self._consumed_decision_ids.add(decision_id)
+        return True
+
+    def decision_consumed(self, decision: CapacityRecoveryDecision) -> bool:
+        return bool(
+            decision.root_recovery_id == self.root_recovery_id
+            and decision.decision_id in self._consumed_decision_ids
+        )
+
+    def handoff_acknowledged(self, decision: CapacityRecoveryDecision) -> bool:
+        return bool(
+            decision.root_recovery_id == self.root_recovery_id
+            and decision.decision_id in self._acknowledged_handoff_ids
+        )
 
     @staticmethod
     def _ledger_has_no_ordinary_call(

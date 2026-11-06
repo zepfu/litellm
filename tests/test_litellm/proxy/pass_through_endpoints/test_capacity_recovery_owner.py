@@ -116,6 +116,26 @@ def test_owner_allows_caller_redispatch_after_ledger_exhaustion():
     assert decision.action is CapacityRecoveryAction.REDISPATCH
 
 
+def test_owner_requires_handoff_acknowledgement_before_consumption():
+    owner = CapacityRecoveryOwner(max_same_route_retries=0)
+    decision = owner.observe(
+        _capacity_observation(
+            alternate_route_available=False,
+            redispatch_available=True,
+        )
+    )
+    assert decision.action is CapacityRecoveryAction.REDISPATCH
+    assert not owner.consume_decision(decision, consumer="alias-loop")
+    assert owner.acknowledge_handoff(decision)
+    assert owner.consume_decision(decision, consumer="alias-loop")
+    assert owner.decision_consumed(decision)
+    assert not owner.consume_decision(
+        decision,
+        consumer="alias-loop",
+        handoff_acknowledged=True,
+    )
+
+
 def test_owner_observation_is_idempotent_for_same_failure_object():
     owner = CapacityRecoveryOwner(max_same_route_retries=1)
     failure = RuntimeError("provider capacity")

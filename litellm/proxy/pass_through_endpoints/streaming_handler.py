@@ -90,6 +90,13 @@ from .aawm_adapter_runtime.provider_call_ledger import (
     get_responses_replay_commitment_reason,
     publish_responses_replay_commitment,
     responses_effective_provider_tools_allowed,
+    get_request_provider_call_ledger,
+)
+from .aawm_adapter_runtime.capacity_recovery import (
+    CapacityRecoveryAction,
+    CapacityRecoveryObservation,
+    annotate_capacity_recovery,
+    get_or_create_capacity_recovery_owner,
 )
 from .success_handler import PassThroughEndpointLogging
 
@@ -6295,8 +6302,66 @@ class PassThroughStreamingHandler:
         error_code = None
         if isinstance(error_payload, dict):
             error_code = error_payload.get("code") or error_payload.get("type")
-        _emit_aawm_terminal_error(
-            {
+        capacity_decision_metadata = metadata.get(
+            "aawm_capacity_recovery_decision"
+        )
+        suppress_capacity_terminal = False
+        if (
+            operational_request is not None
+            and provider_authored
+            and retryable
+            and error_class in _RESPONSES_TRANSIENT_CAPACITY_CLASSES
+            and not delivered_disposition
+            and not isinstance(capacity_decision_metadata, dict)
+        ):
+            owner = get_or_create_capacity_recovery_owner(operational_request)
+            ledger = get_request_provider_call_ledger(operational_request)
+            status_code = metadata.get("upstream_status_code")
+            if not isinstance(status_code, int) and isinstance(error_payload, dict):
+                payload_status = error_payload.get("status_code")
+                status_code = payload_status if isinstance(payload_status, int) else None
+            decision = owner.observe(
+                CapacityRecoveryObservation(
+                    provider_returned=True,
+                    status_code=status_code,
+                    error_class=error_class,
+                    retryable=True,
+                    commitment=get_request_openai_wire_commitment(
+                        operational_request
+                    ),
+                    continuation=bool(
+                        request_body.get("previous_response_id")
+                        if isinstance(request_body, dict)
+                        else False
+                    ),
+                    cancelled=False,
+                    ledger_valid=True,
+                    alternate_route_available=bool(
+                        metadata.get("aawm_capacity_alternate_route_available")
+                    ),
+                    redispatch_available=bool(
+                        metadata.get("redispatch_required") is True
+                    ),
+                    error_payload=(
+                        error_payload if isinstance(error_payload, Mapping) else None
+                    ),
+                    event_type=terminal_event_type,
+                    ledger_snapshot=ledger.snapshot() if ledger is not None else None,
+                    observation_key=failure_exc,
+                )
+            )
+            capacity_decision_metadata = decision.to_metadata()
+            metadata["aawm_capacity_recovery_decision"] = capacity_decision_metadata
+            annotate_capacity_recovery(operational_request, decision)
+        if isinstance(capacity_decision_metadata, dict):
+            suppress_capacity_terminal = capacity_decision_metadata.get("action") in {
+                CapacityRecoveryAction.RETRY_SAME_ROUTE.value,
+                CapacityRecoveryAction.ROUTE_TRANSITION.value,
+                CapacityRecoveryAction.REDISPATCH.value,
+            }
+            if suppress_capacity_terminal:
+                metadata["aawm_capacity_terminal_suppressed"] = True
+        terminal_event = {
                 "event_type": (
                     policy_failure_kind
                     or policy_failure_code
@@ -6376,9 +6441,9 @@ class PassThroughStreamingHandler:
                     or metadata.get("request_id")
                     or metadata.get("trace_id")
                 ),
-            },
-            marker=metadata,
-        )
+            }
+        if not suppress_capacity_terminal:
+            _emit_aawm_terminal_error(terminal_event, marker=metadata)
         if delivered_disposition:
             annotate_delivered_wire_failure(
                 failure_exc,

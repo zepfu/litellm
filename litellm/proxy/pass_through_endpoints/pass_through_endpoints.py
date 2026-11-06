@@ -3611,16 +3611,83 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
     ] = None,
     capacity_recovery_owner: Optional[Any] = None,
 ) -> Any:
+    if capacity_recovery_owner is None and request is not None:
+        capacity_recovery_owner = get_or_create_capacity_recovery_owner(
+            request,
+            deadline_seconds=(
+                openai_capacity_coordinator.deadline_seconds
+                if openai_capacity_coordinator is not None
+                else _get_passthrough_hidden_retry_budget_seconds()
+            ),
+            max_same_route_retries=(
+                32 if openai_capacity_coordinator is not None else 1
+            ),
+        )
+
+    async def _observe_caller_managed_failure(exc: Exception) -> None:
+        """Keep alias-owned retries on the same request-scoped owner."""
+
+        if capacity_recovery_owner is None:
+            return
+        status_code = _extract_exception_status_code(exc)
+        failure_class, _failure_classification, retryable = (
+            _classify_passthrough_hidden_retry_failure(exc)
+        )
+        error_payload = getattr(exc, "error_payload", None)
+        if not isinstance(error_payload, Mapping):
+            error_payload = None
+        provider_returned = getattr(exc, "_aawm_provider_returned", None)
+        if not isinstance(provider_returned, bool):
+            provider_returned = getattr(exc, "provider_returned", None)
+        capacity = (
+            str(failure_class or "").strip().lower()
+            in _RESPONSES_TRANSIENT_CAPACITY_CLASSES
+            or status_code in {429, 529}
+        )
+        if not capacity:
+            return
+        ledger = get_request_provider_call_ledger(request) if request is not None else None
+        decision = capacity_recovery_owner.observe(
+            CapacityRecoveryObservation(
+                provider_returned=provider_returned,
+                status_code=status_code,
+                error_class=failure_class,
+                retryable=bool(retryable),
+                commitment=(
+                    get_request_openai_wire_commitment(request)
+                    if request is not None
+                    else None
+                ),
+                continuation=False,
+                cancelled=False,
+                ledger_valid=not getattr(exc, "aawm_call_ledger_exhausted", False),
+                error_payload=error_payload,
+                event_type=getattr(exc, "error_type", None),
+                ledger_snapshot=ledger.snapshot() if ledger is not None else None,
+                observation_key=exc,
+            )
+        )
+        if isinstance(kwargs, dict):
+            _ensure_passthrough_metadata(kwargs)[
+                "aawm_capacity_recovery_decision"
+            ] = decision.to_metadata()
+        if request is not None:
+            annotate_capacity_recovery(request, decision)
+
     if caller_managed_hidden_retry:
         # The alias loop owns retries here and must preserve this operation's
         # failure while checking the request-scoped wire commitment.
-        if openai_capacity_coordinator is not None:
-            return await _await_passthrough_pre_first_byte_operation(
-                operation,
-                timeout_seconds=openai_capacity_coordinator.remaining_seconds,
-                operation_name=operation_name,
-            )
-        return await operation()
+        try:
+            if openai_capacity_coordinator is not None:
+                return await _await_passthrough_pre_first_byte_operation(
+                    operation,
+                    timeout_seconds=openai_capacity_coordinator.remaining_seconds,
+                    operation_name=operation_name,
+                )
+            return await operation()
+        except Exception as exc:
+            await _observe_caller_managed_failure(exc)
+            raise
 
     max_attempts = (
         0
@@ -3841,6 +3908,40 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         "capacity_retry_ledger_snapshot",
                         dict(ledger_snapshot),
                     )
+                if capacity_recovery_owner is not None:
+                    ledger_decision = capacity_recovery_owner.observe(
+                        CapacityRecoveryObservation(
+                            provider_returned=True,
+                            status_code=prior_status_code,
+                            error_class=prior_failure_class,
+                            retryable=False,
+                            commitment=(
+                                get_request_openai_wire_commitment(request)
+                                if request is not None
+                                else None
+                            ),
+                            ledger_valid=False,
+                            error_payload=getattr(
+                                last_capacity_exception,
+                                "error_payload",
+                                None,
+                            ),
+                            event_type=prior_classification,
+                            ledger_snapshot=(
+                                dict(ledger_snapshot)
+                                if isinstance(ledger_snapshot, Mapping)
+                                else None
+                            ),
+                            observation_key=exc,
+                        )
+                    )
+                    setattr(
+                        last_capacity_exception,
+                        "aawm_capacity_recovery_decision",
+                        ledger_decision.to_metadata(),
+                    )
+                    if request is not None:
+                        annotate_capacity_recovery(request, ledger_decision)
                 _record_passthrough_hidden_retry_metadata(
                     kwargs,
                     attempt_number=attempt_number,
@@ -4073,6 +4174,10 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     should_retry = False
                 elif recovery_decision.action == CapacityRecoveryAction.RETRY_SAME_ROUTE:
                     should_retry = True
+                    capacity_recovery_owner.consume_decision(
+                        recovery_decision,
+                        consumer="hidden-pre-first-byte",
+                    )
                     if request is not None and provider_returned is True:
                         authorize_capacity_recovery_replay(
                             request,
@@ -4081,6 +4186,16 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                                 and event_type == "response.failed"
                             ),
                         )
+                elif recovery_decision.action in {
+                    CapacityRecoveryAction.ROUTE_TRANSITION,
+                    CapacityRecoveryAction.REDISPATCH,
+                }:
+                    # The hidden helper owns only same-route sends.  Return
+                    # the provider failure to the outer route/candidate
+                    # planner so it can select the next account or consume a
+                    # server-side handoff under the same owner.
+                    capacity_failure = False
+                    should_retry = False
             capacity_retry_authorized = None
             if request_ledger is not None:
                 capacity_retry_authorized = bool(

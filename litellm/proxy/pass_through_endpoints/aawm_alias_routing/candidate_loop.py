@@ -2697,9 +2697,10 @@ async def handle_alias_route(  # noqa: PLR0915
         # caller must redispatch the child so selection can run again.  Keep
         # replay/auth/semantic failures on the terminal path below, and leave
         # the OpenAI capacity-deadline path to its dedicated coordinator.
-        transient_provider_exhaustion = (
+        transient_provider_exhaustion = False
+        transient_provider_recovery_decision = None
+        if (
             not capacity_retry_expired
-            and is_codex_alias
             and callable(raise_redispatch_required_fn)
             and isinstance(last_attempt, dict)
             and last_attempt.get("attempted_provider_call") is True
@@ -2709,8 +2710,41 @@ async def handle_alias_route(  # noqa: PLR0915
             and not _provider_owned_continuation()
             and not getattr(exc, "aawm_openai_wire_replay_blocked", False)
             and not getattr(exc, "aawm_call_ledger_exhausted", False)
-        )
+        ):
+            if getattr(exc, "_aawm_provider_returned", None) is not True:
+                # The attempt record is the normalized adapter boundary.  A
+                # typed non-OpenAI response may have been stamped there even
+                # when the wrapper exception itself omitted the private flag.
+                if last_attempt.get("provider_returned") is True:
+                    try:
+                        setattr(exc, "_aawm_provider_returned", True)
+                    except Exception:
+                        pass
+            recovery_decision = _observe_capacity_recovery(
+                exc,
+                candidate=candidate,
+                error_class=last_attempt.get("error_class"),
+                alternate_route_available=False,
+            )
+            transient_provider_recovery_decision = recovery_decision
+            transient_provider_exhaustion = is_codex_alias or (
+                recovery_decision.action
+                in {
+                    CapacityRecoveryAction.RETRY_SAME_ROUTE,
+                    CapacityRecoveryAction.ROUTE_TRANSITION,
+                    CapacityRecoveryAction.REDISPATCH,
+                }
+            )
         if transient_provider_exhaustion:
+            if transient_provider_recovery_decision is not None:
+                capacity_recovery_owner.acknowledge_handoff(
+                    transient_provider_recovery_decision
+                )
+                capacity_recovery_owner.consume_decision(
+                    transient_provider_recovery_decision,
+                    consumer="alias-redispatch",
+                    handoff_acknowledged=True,
+                )
             try:
                 raise_redispatch_required_fn(
                     candidate=candidate,

@@ -3750,6 +3750,10 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
         and current_auth is not None
     ):
         if capacity_decision.action == CapacityRecoveryAction.RETRY_SAME_ROUTE:
+            capacity_recovery_owner.consume_decision(
+                capacity_decision,
+                consumer="direct-oauth-same-route",
+            )
             if request_state is not None:
                 setattr(
                     request_state,
@@ -4046,9 +4050,19 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             True,
         )
     if retry_planned:
+        if capacity_decision.action is not CapacityRecoveryAction.REDISPATCH:
+            capacity_recovery_owner.consume_decision(
+                capacity_decision,
+                consumer="direct-oauth-route-transition",
+            )
         retry_attempt_record["failover_decision"] = "move_account"
         retry_attempt_record["terminal_reason"] = "success"
     else:
+        if capacity_decision.action is not CapacityRecoveryAction.REDISPATCH:
+            capacity_recovery_owner.consume_decision(
+                capacity_decision,
+                consumer="direct-oauth-terminal",
+            )
         retry_attempt_record["failover_decision"] = "terminal"
         retry_attempt_record["terminal_reason"] = (
             retry_attempt_record.get("account_failover_rejection_reason")
