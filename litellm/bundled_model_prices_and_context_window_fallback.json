@@ -26891,9 +26891,9 @@
                     "equivalence_status": "exact",
                     "equivalence_evidence": "Rates are the OpenRouter model-catalog snapshot for this moving latest alias; the alias may resolve to a newer served model and must be reverified when OpenRouter changes it.",
                     "rates": {
-                        "input_per_million": 0.006,
-                        "cache_read_per_million": 0.005,
-                        "output_per_million": 0.5
+                        "input_usd_per_million_tokens": 0.006,
+                        "cache_read_usd_per_million_tokens": 0.005,
+                        "output_usd_per_million_tokens": 0.5
                     },
                     "source": {
                         "kind": "provider_catalog",
@@ -26942,9 +26942,9 @@
                     "equivalence_status": "exact",
                     "equivalence_evidence": "Rates are the OpenRouter model-catalog snapshot for this moving latest alias; the alias may resolve to a newer served model and must be reverified when OpenRouter changes it.",
                     "rates": {
-                        "input_per_million": 0.0999,
-                        "cache_read_per_million": 0.0999,
-                        "output_per_million": 8.0
+                        "input_usd_per_million_tokens": 0.0999,
+                        "cache_read_usd_per_million_tokens": 0.0999,
+                        "output_usd_per_million_tokens": 8.0
                     },
                     "source": {
                         "kind": "provider_catalog",
