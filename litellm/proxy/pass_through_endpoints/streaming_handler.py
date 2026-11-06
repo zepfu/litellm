@@ -834,18 +834,11 @@ class _ResponsesPreCommitSSEParser:
             ):
                 self._response_id = response_id
             if event_type == "response.failed":
-                output = response.get("output")
-                if not isinstance(output, list):
-                    return False
-                for output_index, item in enumerate(output):
-                    known_item = self._output_items.get(output_index)
-                    if known_item is not None and (
-                        not isinstance(item, dict)
-                        or (item.get("id"), item.get("type")) != known_item
-                    ):
-                        return False
-                    if known_item is None and self._output_items:
-                        return False
+                return PassThroughStreamingHandler._validate_failed_response_association(
+                    response,
+                    payload,
+                    output_items=self._output_items,
+                )
             return True
 
         if event_type not in {
@@ -1174,6 +1167,37 @@ class PassThroughStreamingHandler:
             if _strip_chunk_line(raw_line) == "data: [DONE]":
                 return True
         return False
+
+    @staticmethod
+    def _validate_failed_response_association(
+        response: Dict[str, Any],
+        payload: Dict[str, Any],
+        *,
+        output_items: Dict[int, tuple[str, str]],
+    ) -> bool:
+        output = response.get("output")
+        if "output" not in response:
+            # A pre-generation capacity failure may omit the output snapshot.
+            # Once an output item has been observed, the parser stops before
+            # this terminal; keep the explicit guard for complete batches.
+            return (
+                not output_items
+                and PassThroughStreamingHandler._is_no_effect_capacity_failure_payload(
+                    payload
+                )
+            )
+        if not isinstance(output, list):
+            return False
+        for output_index, item in enumerate(output):
+            known_item = output_items.get(output_index)
+            if known_item is not None and (
+                not isinstance(item, dict)
+                or (item.get("id"), item.get("type")) != known_item
+            ):
+                return False
+            if known_item is None and output_items:
+                return False
+        return True
 
     @staticmethod
     def _split_trailing_done_chunk(chunk: bytes) -> tuple[bytes, bytes]:
@@ -2128,6 +2152,19 @@ class PassThroughStreamingHandler:
                 if event_type == "response.failed"
                 else None
             )
+        # A provider can omit the output snapshot when it rejects the request
+        # before generation.  An explicit no-effect capacity error is safe to
+        # classify from its error envelope; the omission alone does not prove
+        # that output or a tool effect was delivered.
+        if "output" not in response_payload:
+            if (
+                event_type == "response.failed"
+                and PassThroughStreamingHandler._is_no_effect_capacity_failure_payload(
+                    payload
+                )
+            ):
+                return None
+            return "unknown_semantics"
         output = response_payload.get("output")
         if not isinstance(output, list):
             return "unknown_semantics"
@@ -2177,6 +2214,12 @@ class PassThroughStreamingHandler:
         response_payload = payload.get("response")
         if not isinstance(response_payload, dict):
             return False
+        if "output" not in response_payload:
+            # Some Responses providers omit output entirely for a
+            # pre-generation overload/rate-limit response.  Keep this
+            # admission narrow: the error must already classify as transient
+            # capacity and the envelope must not carry an effect marker.
+            return not _responses_value_has_effect_marker(response_payload)
         output = response_payload.get("output")
         return isinstance(output, list) and not output
 
@@ -2260,6 +2303,11 @@ class PassThroughStreamingHandler:
         ):
             return False
         response_payload = payload.get("response")
+        response_output = (
+            response_payload.get("output")
+            if isinstance(response_payload, dict)
+            else None
+        )
         if (
             not isinstance(response_payload, dict)
             or not PassThroughStreamingHandler._has_only_fields(
@@ -2274,7 +2322,16 @@ class PassThroughStreamingHandler:
                 response_payload.get("id")
             )
             or response_payload.get("status") != "failed"
-            or not isinstance(response_payload.get("output"), list)
+            or (
+                response_output is not None
+                and not isinstance(response_output, list)
+            )
+            or (
+                response_output is None
+                and not PassThroughStreamingHandler._is_no_effect_capacity_failure_payload(
+                    payload
+                )
+            )
         ):
             return False
         if response_payload.get("object") not in (None, "response"):
@@ -2412,6 +2469,7 @@ class PassThroughStreamingHandler:
         if (
             event_type == "response.failed"
             and commitment_reason == "unknown_semantics"
+            and not rejection
             and PassThroughStreamingHandler._is_no_effect_capacity_failure_payload(
                 payload
             )
@@ -2782,6 +2840,7 @@ class PassThroughStreamingHandler:
                     )
                     no_effect_capacity_failure = (
                         failure.provider_returned
+                        and not parser.commitment_rejection
                         and PassThroughStreamingHandler._is_no_effect_capacity_failure_payload(
                             error_payload
                         )
@@ -2873,6 +2932,7 @@ class PassThroughStreamingHandler:
                     )
                     no_effect_capacity_failure = (
                         failure.provider_returned
+                        and not parser.commitment_rejection
                         and PassThroughStreamingHandler._is_no_effect_capacity_failure_payload(
                             error_payload
                         )
@@ -2930,6 +2990,7 @@ class PassThroughStreamingHandler:
                 )
                 no_effect_capacity_failure = (
                     failure.provider_returned
+                    and not parser.commitment_rejection
                     and PassThroughStreamingHandler._is_no_effect_capacity_failure_payload(
                         error_payload
                     )

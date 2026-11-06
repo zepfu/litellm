@@ -6,7 +6,7 @@ import asyncio
 import copy
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
@@ -38,6 +38,7 @@ from litellm.proxy.pass_through_endpoints.streaming_handler import (
     ResponsesStreamPreCommitFailure,
 )
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+    ParsedResponsesEvent,
     ResponsesBoundFailure,
     ResponsesEventPipeline,
     responses_emissions_from_chunk,
@@ -1873,6 +1874,83 @@ def test_reconcile_error_and_response_failed_without_duplicate_payload():
     assert error_class == "server_overloaded"
     assert classification == "transient_capacity"
     assert retryable is True
+
+
+def test_response_failed_capacity_without_output_is_replay_safe():
+    """A pre-generation overload may omit the response output snapshot."""
+    payload = {
+        "type": "response.failed",
+        "sequence_number": 1,
+        "response": {
+            "id": "resp_overloaded",
+            "object": "response",
+            "status": "failed",
+            "error": {
+                "type": "service_unavailable_error",
+                "code": "server_is_overloaded",
+                "message": "Try again.",
+            },
+        },
+    }
+    rejection: dict[str, str] = {}
+    event = ParsedResponsesEvent(
+        sequence_number=1,
+        event_type="response.failed",
+        payload=payload,
+        is_done_marker=False,
+        is_malformed=False,
+        byte_count=0,
+        observed_at=datetime.now(timezone.utc),
+    )
+
+    decision = PassThroughStreamingHandler._inspect_responses_events(
+        event, rejection
+    )
+
+    assert decision[0] == "failed"
+    assert decision[3] is None
+    assert rejection == {}
+    assert PassThroughStreamingHandler._is_no_effect_capacity_failure_payload(
+        payload
+    )
+
+
+def test_response_failed_without_output_unknown_error_remains_terminal():
+    payload = {
+        "type": "response.failed",
+        "sequence_number": 1,
+        "response": {
+            "id": "resp_unknown",
+            "object": "response",
+            "status": "failed",
+            "error": {
+                "type": "server_error",
+                "code": "unknown_failure",
+                "message": "The upstream failed.",
+            },
+        },
+    }
+    rejection: dict[str, str] = {}
+    event = ParsedResponsesEvent(
+        sequence_number=1,
+        event_type="response.failed",
+        payload=payload,
+        is_done_marker=False,
+        is_malformed=False,
+        byte_count=0,
+        observed_at=datetime.now(timezone.utc),
+    )
+
+    decision = PassThroughStreamingHandler._inspect_responses_events(
+        event, rejection
+    )
+
+    assert decision[0] == "failed"
+    assert decision[3] == "unknown_semantics"
+    assert rejection == {"path": "$", "reason": "unsafe_event_shape"}
+    assert not PassThroughStreamingHandler._is_no_effect_capacity_failure_payload(
+        payload
+    )
 
 
 def test_inspect_pre_commit_chunks_does_not_raise_on_truncated_utf8_tail():
@@ -9438,3 +9516,46 @@ async def test_transport_frames_retain_admission_bounds(limit):
         await peeked.aclose()
         await response.aclose()
         await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_alpha_retries_response_failed_capacity_without_output():
+    """Omitted output on a provider overload must not terminate the turn."""
+    first_stream = _ClosableAsyncByteStream(
+        [
+            _responses_event(
+                "response.failed",
+                1,
+                response={
+                    "id": "resp_overloaded",
+                    "object": "response",
+                    "status": "failed",
+                    "error": {
+                        "type": "service_unavailable_error",
+                        "code": "server_is_overloaded",
+                        "message": "Try again.",
+                    },
+                },
+            )
+        ]
+    )
+    monkeypatch = pytest.MonkeyPatch()
+    result, client, sent_requests, upstream_streams = await _start_openai_responses_stream(
+        monkeypatch,
+        [first_stream, _ClosableAsyncByteStream(_replacement_success_stream_chunks())],
+    )
+    try:
+        assert not isinstance(result, BaseException)
+        assert len(sent_requests) == 2
+        rendered = b"".join([bytes(chunk) async for chunk in result.body_iterator])
+        assert b"Recovered \xe6\x9d\xb1\xe4\xba\xac" in rendered
+        assert b"response.failed" not in rendered
+    finally:
+        for upstream_stream in upstream_streams:
+            await upstream_stream.aclose()
+        if not isinstance(result, BaseException):
+            close_iterator = getattr(result.body_iterator, "aclose", None)
+            if callable(close_iterator):
+                await close_iterator()
+        await client.aclose()
+        monkeypatch.undo()
