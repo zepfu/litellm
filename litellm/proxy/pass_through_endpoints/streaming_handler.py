@@ -91,6 +91,11 @@ from .aawm_adapter_runtime.provider_call_ledger import (
     publish_responses_replay_commitment,
     responses_effective_provider_tools_allowed,
 )
+from .aawm_adapter_runtime.capacity_recovery import (
+    CapacityRecoveryObservation,
+    annotate_capacity_recovery,
+    get_or_create_capacity_recovery_owner,
+)
 from .success_handler import PassThroughEndpointLogging
 
 
@@ -6251,6 +6256,37 @@ class PassThroughStreamingHandler:
             provider_returned=provider_authored,
             failure_origin=metadata["aawm_failure_origin"],
         )
+        if operational_request is not None:
+            recovery_owner = get_or_create_capacity_recovery_owner(
+                operational_request
+            )
+            recovery_decision = recovery_owner.observe(
+                CapacityRecoveryObservation(
+                    provider_returned=provider_authored,
+                    status_code=(
+                        int(metadata["upstream_status_code"])
+                        if isinstance(metadata.get("upstream_status_code"), int)
+                        else None
+                    ),
+                    error_class=error_class,
+                    retryable=retryable,
+                    commitment=get_request_openai_wire_commitment(
+                        operational_request
+                    ),
+                    continuation=bool(
+                        request_body.get("previous_response_id")
+                    ),
+                    cancelled=delivered_disposition
+                    in {"cancelled", "disconnected"},
+                    ledger_valid=True,
+                    alternate_route_available=False,
+                    redispatch_available=False,
+                )
+            )
+            metadata["aawm_capacity_recovery_decision"] = (
+                recovery_decision.to_metadata()
+            )
+            annotate_capacity_recovery(operational_request, recovery_decision)
         if policy_failure_kind:
             setattr(failure_exc, "policy_failure_kind", policy_failure_kind)
         if policy_failure_code:

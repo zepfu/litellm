@@ -67,6 +67,7 @@ from litellm.llms.xai.managed_send_counter import (
     get_or_create_managed_xai_actual_send_counter,
 )
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+    authorize_capacity_recovery_replay,
     ProviderCallLedgerExhausted,
     ProviderCallReplayBlocked,
     bind_openai_candidate_context,
@@ -74,6 +75,12 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_led
     get_request_openai_wire_commitment,
     is_openai_capacity_recovery_safe,
     is_openai_wire_replay_prohibited,
+)
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.capacity_recovery import (
+    CapacityRecoveryAction,
+    CapacityRecoveryObservation,
+    annotate_capacity_recovery,
+    get_or_create_capacity_recovery_owner,
 )
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.deferred_success import (
     finalize_deferred_success,
@@ -1782,6 +1789,66 @@ async def handle_alias_route(  # noqa: PLR0915
             **classifier_kwargs,
         )
 
+    def _observe_capacity_recovery(
+        failure_exc: Exception,
+        *,
+        candidate: Optional[dict[str, Any]],
+        error_class: Optional[str],
+        alternate_route_available: bool,
+    ):
+        provider_returned = getattr(failure_exc, "_aawm_provider_returned", None)
+        if not isinstance(provider_returned, bool):
+            provider_returned = getattr(failure_exc, "provider_returned", None)
+        status_code = _extract_adapter_exception_status_code(failure_exc)
+        error_payload = getattr(failure_exc, "error_payload", None)
+        if not isinstance(error_payload, Mapping):
+            error_payload = None
+        event_type = getattr(failure_exc, "error_type", None)
+        decision = capacity_recovery_owner.observe(
+            CapacityRecoveryObservation(
+                provider_returned=provider_returned,
+                status_code=status_code,
+                error_class=error_class,
+                retryable=bool(getattr(failure_exc, "retryable", False)),
+                commitment=get_request_openai_wire_commitment(request),
+                continuation=_provider_owned_continuation(),
+                cancelled=False,
+                ledger_valid=not getattr(
+                    failure_exc, "aawm_call_ledger_exhausted", False
+                ),
+                alternate_route_available=alternate_route_available,
+                redispatch_available=bool(callable(raise_redispatch_required_fn)),
+                error_payload=error_payload,
+                event_type=event_type,
+                ledger_snapshot=(
+                    get_request_provider_call_ledger(request).snapshot()
+                    if get_request_provider_call_ledger(request) is not None
+                    else None
+                ),
+            )
+        )
+        attempt = attempts[-1] if attempts else None
+        if isinstance(attempt, dict):
+            attempt["capacity_recovery_decision"] = decision.to_metadata()
+        annotate_capacity_recovery(request, decision)
+        if (
+            provider_returned is True
+            and decision.action
+            in {
+                CapacityRecoveryAction.RETRY_SAME_ROUTE,
+                CapacityRecoveryAction.ROUTE_TRANSITION,
+                CapacityRecoveryAction.REDISPATCH,
+            }
+        ):
+            authorize_capacity_recovery_replay(
+                request,
+                allow_unknown_semantics=(
+                    isinstance(error_payload, Mapping)
+                    and event_type == "response.failed"
+                ),
+            )
+        return decision
+
     replay_safety = (
         _session_affinity_mod().classify_session_owner_replay_safety_body(
             prepared_request_body
@@ -1799,6 +1866,7 @@ async def handle_alias_route(  # noqa: PLR0915
     attempts: list[dict[str, Any]] = []
     request_outcome = _attempt_records._auto_agent_alias_request_outcome_state(request)
     request_outcome["attempts"] = attempts
+    capacity_recovery_owner = get_or_create_capacity_recovery_owner(request)
     last_retryable_exc: Optional[Exception] = None
     last_capacity_failure_exc: Optional[Exception] = None
     last_capacity_failure_class: Optional[str] = None
@@ -5143,6 +5211,21 @@ async def handle_alias_route(  # noqa: PLR0915
                     # terminalizes the request before this relaxation can take
                     # effect.
                     if wire_replay_prohibited:
+                        recovery_decision = _observe_capacity_recovery(
+                            probe_failure_exc,
+                            candidate=candidate,
+                            error_class=early_pre_commit_error_class,
+                            alternate_route_available=(
+                                not _provider_owned_continuation()
+                                and not has_previous_response_id
+                            ),
+                        )
+                        if recovery_decision.action in {
+                            CapacityRecoveryAction.RETRY_SAME_ROUTE,
+                            CapacityRecoveryAction.ROUTE_TRANSITION,
+                            CapacityRecoveryAction.REDISPATCH,
+                        }:
+                            wire_replay_prohibited = False
                         provider_returned = getattr(
                             probe_failure_exc,
                             "_aawm_provider_returned",
@@ -5790,6 +5873,21 @@ async def handle_alias_route(  # noqa: PLR0915
                         error_code=attempt_record.get("error_code"),
                     )
                 if wire_replay_prohibited:
+                    recovery_decision = _observe_capacity_recovery(
+                        failure_exc,
+                        candidate=candidate,
+                        error_class=error_class,
+                        alternate_route_available=(
+                            not _provider_owned_continuation()
+                            and not has_previous_response_id
+                        ),
+                    )
+                    if recovery_decision.action in {
+                        CapacityRecoveryAction.RETRY_SAME_ROUTE,
+                        CapacityRecoveryAction.ROUTE_TRANSITION,
+                        CapacityRecoveryAction.REDISPATCH,
+                    }:
+                        wire_replay_prohibited = False
                     provider_returned = getattr(
                         failure_exc, "_aawm_provider_returned", None
                     )
@@ -6234,9 +6332,29 @@ async def handle_alias_route(  # noqa: PLR0915
                     )
                     attempt_record["attempted_provider_call"] = False
                     continue
+                owner_forced_transition = False
+                if (
+                    pre_commit_retry_plan["action"] == "pre_stream_unavailable"
+                    and error_class in _error_signals._RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES
+                ):
+                    recovery_decision = _observe_capacity_recovery(
+                        failure_exc,
+                        candidate=candidate,
+                        error_class=error_class,
+                        alternate_route_available=(
+                            not _provider_owned_continuation()
+                            and not has_previous_response_id
+                        ),
+                    )
+                    owner_forced_transition = recovery_decision.action in {
+                        CapacityRecoveryAction.RETRY_SAME_ROUTE,
+                        CapacityRecoveryAction.ROUTE_TRANSITION,
+                        CapacityRecoveryAction.REDISPATCH,
+                    }
                 if (
                     not prefer_account_failover
                     and pre_commit_retry_plan["action"] == "pre_stream_unavailable"
+                    and not owner_forced_transition
                 ):
                     attempt_record["pre_commit_retry"] = {
                         "action": pre_commit_retry_plan["action"],

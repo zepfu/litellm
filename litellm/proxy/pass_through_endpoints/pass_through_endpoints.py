@@ -125,6 +125,12 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_generated_s
     CODEX_SEND_MESSAGE_OUTPUT_GATE_ATTR,
     build_codex_send_message_output_gate,
 )
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.capacity_recovery import (
+    CapacityRecoveryAction,
+    CapacityRecoveryObservation,
+    annotate_capacity_recovery,
+    get_or_create_capacity_recovery_owner,
+)
 from litellm.responses.function_name_sanitization import (
     ResponsesFunctionNameRewrite,
     restore_function_names_in_responses_body,
@@ -301,6 +307,7 @@ from litellm.llms.xai.managed_send_counter import (
     record_managed_xai_actual_send,
 )
 from .aawm_adapter_runtime.provider_call_ledger import (
+    authorize_capacity_recovery_replay,
     ProviderCallLedgerExhausted,
     ProviderCallReplayBlocked,
     close_active_upstream_response,
@@ -3602,6 +3609,7 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
     openai_capacity_coordinator: Optional[
         OpenAIAlphaCapacityRetryCoordinator
     ] = None,
+    capacity_recovery_owner: Optional[Any] = None,
 ) -> Any:
     if caller_managed_hidden_retry:
         # The alias loop owns retries here and must preserve this operation's
@@ -3639,6 +3647,14 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
         _ensure_passthrough_metadata(kwargs)[
             "_aawm_openai_retry_progress"
         ] = retry_progress
+    if capacity_recovery_owner is None and request is not None:
+        capacity_recovery_owner = get_or_create_capacity_recovery_owner(
+            request,
+            deadline_seconds=budget_seconds if budget_seconds > 0 else 7200.0,
+            max_same_route_retries=(
+                32 if openai_capacity_coordinator is not None else 1
+            ),
+        )
 
     def _note_retry_reason(class_name: str, classification_name: Optional[str]) -> None:
         label = _openai_retry_reason_label(class_name, classification_name)
@@ -3991,17 +4007,6 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
             provider_returned = getattr(exc, "_aawm_provider_returned", None)
             if not isinstance(provider_returned, bool):
                 provider_returned = getattr(exc, "provider_returned", None)
-            capacity_retry_authorized = None
-            request_ledger = (
-                get_request_provider_call_ledger(request)
-                if request is not None
-                else None
-            )
-            if request_ledger is not None:
-                capacity_retry_authorized = bool(
-                    request_ledger.snapshot().get("capacity_retry_authorized")
-                    is True
-                )
             error_payload = getattr(exc, "error_payload", None)
             if not isinstance(error_payload, Mapping):
                 error_payload = None
@@ -4011,6 +4016,75 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     error_payload.get("type")
                     if isinstance(error_payload, Mapping)
                     else None
+                )
+            request_ledger = (
+                get_request_provider_call_ledger(request)
+                if request is not None
+                else None
+            )
+            recovery_decision = None
+            if capacity_failure and capacity_recovery_owner is not None:
+                recovery_decision = capacity_recovery_owner.observe(
+                    CapacityRecoveryObservation(
+                        provider_returned=provider_returned,
+                        status_code=(
+                            _extract_exception_status_code(exc)
+                            if status_code is None
+                            else status_code
+                        ),
+                        error_class=(
+                            raw_http_classification[0]
+                            if raw_http_classification is not None
+                            else failure_class
+                        ),
+                        retryable=True,
+                        commitment=(
+                            get_request_openai_wire_commitment(request)
+                            if request is not None
+                            else None
+                        ),
+                        continuation=False,
+                        cancelled=False,
+                        ledger_valid=not getattr(
+                            exc, "aawm_call_ledger_exhausted", False
+                        ),
+                        error_payload=error_payload,
+                        event_type=event_type,
+                        ledger_snapshot=(
+                            request_ledger.snapshot()
+                            if request_ledger is not None
+                            else None
+                        ),
+                    )
+                )
+                if isinstance(kwargs, dict):
+                    _ensure_passthrough_metadata(kwargs)[
+                        "aawm_capacity_recovery_decision"
+                    ] = recovery_decision.to_metadata()
+                if request is not None:
+                    annotate_capacity_recovery(request, recovery_decision)
+                if recovery_decision.action in {
+                    CapacityRecoveryAction.REPLAY_VETO,
+                    CapacityRecoveryAction.BUDGET_EXHAUSTED,
+                    CapacityRecoveryAction.TERMINAL,
+                }:
+                    capacity_failure = False
+                    should_retry = False
+                elif recovery_decision.action == CapacityRecoveryAction.RETRY_SAME_ROUTE:
+                    should_retry = True
+                    if request is not None and provider_returned is True:
+                        authorize_capacity_recovery_replay(
+                            request,
+                            allow_unknown_semantics=(
+                                isinstance(error_payload, Mapping)
+                                and event_type == "response.failed"
+                            ),
+                        )
+            capacity_retry_authorized = None
+            if request_ledger is not None:
+                capacity_retry_authorized = bool(
+                    request_ledger.snapshot().get("capacity_retry_authorized")
+                    is True
                 )
             provisional_capacity_retry = bool(
                 capacity_failure

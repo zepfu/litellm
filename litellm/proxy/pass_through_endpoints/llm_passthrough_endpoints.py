@@ -435,11 +435,18 @@ from .aawm_alias_routing import candidate_loop as _aawm_alias_candidate_loop
 from .aawm_alias_routing import durable as _aawm_alias_durable
 from .aawm_alias_routing import dev_fault_plan as _aawm_dev_fault_plan
 from .aawm_adapter_runtime.provider_call_ledger import (
+    authorize_capacity_recovery_replay,
     get_request_openai_wire_commitment,
     get_request_provider_call_ledger,
     get_request_provider_call_ledger_snapshot,
     is_openai_capacity_recovery_safe,
     is_openai_wire_replay_prohibited,
+)
+from .aawm_adapter_runtime.capacity_recovery import (
+    CapacityRecoveryAction,
+    CapacityRecoveryObservation,
+    annotate_capacity_recovery,
+    get_or_create_capacity_recovery_owner,
 )
 
 # Wave 4 pure-leaf extraction imports
@@ -3610,6 +3617,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
     account_failover_replay_safe = (
         _sa.is_replay_safe_session_owner_redispatch_body(request_body)
     )
+    capacity_recovery_owner = get_or_create_capacity_recovery_owner(request)
     retry_attempt_record["replay_safety"] = (
         "replay_safe" if account_failover_replay_safe else "replay_unsafe"
     )
@@ -3631,10 +3639,57 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
         attempt_record=injected_attempt_record,
     )
     wire_commitment = get_request_openai_wire_commitment(request)
+    capacity_decision = capacity_recovery_owner.observe(
+        CapacityRecoveryObservation(
+            provider_returned=provider_returned,
+            status_code=_aawm_error_signals._extract_adapter_exception_status_code(exc),
+            error_class=error_class,
+            retryable=bool(getattr(exc, "retryable", False)),
+            commitment=wire_commitment,
+            continuation=has_continuation_state
+            or bool(request_body.get("previous_response_id")),
+            ledger_valid=not getattr(exc, "aawm_call_ledger_exhausted", False),
+            alternate_route_available=bool(
+                current_auth is not None and account_failover_replay_safe
+            ),
+            redispatch_available=bool(account_failover_replay_safe),
+            error_payload=(
+                getattr(exc, "error_payload", None)
+                if isinstance(getattr(exc, "error_payload", None), dict)
+                else None
+            ),
+            event_type=getattr(exc, "error_type", None),
+            ledger_snapshot=get_request_provider_call_ledger_snapshot(request),
+        )
+    )
+    retry_attempt_record["capacity_recovery_decision"] = capacity_decision.to_metadata()
+    annotate_capacity_recovery(request, capacity_decision)
+    if (
+        provider_returned is True
+        and capacity_decision.action
+        in {
+            CapacityRecoveryAction.RETRY_SAME_ROUTE,
+            CapacityRecoveryAction.ROUTE_TRANSITION,
+            CapacityRecoveryAction.REDISPATCH,
+        }
+    ):
+        authorize_capacity_recovery_replay(
+            request,
+            allow_unknown_semantics=(
+                isinstance(getattr(exc, "error_payload", None), dict)
+                and getattr(exc, "error_type", None) == "response.failed"
+            ),
+        )
     wire_replay_blocked = is_openai_wire_replay_prohibited(
         wire_commitment,
         ledger=get_request_provider_call_ledger(request),
     )
+    if wire_replay_blocked and capacity_decision.action in {
+        CapacityRecoveryAction.RETRY_SAME_ROUTE,
+        CapacityRecoveryAction.ROUTE_TRANSITION,
+        CapacityRecoveryAction.REDISPATCH,
+    }:
+        wire_replay_blocked = False
     if wire_replay_blocked:
         # The stream layer may have published a provisional/unknown latch
         # before the direct route classified a provider-confirmed no-output
@@ -3673,11 +3728,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
         return None
 
     request_state = getattr(request, "state", None)
-    retry_count = (
-        int(getattr(request_state, "_aawm_direct_codex_capacity_retries", 0))
-        if request_state is not None
-        else 0
-    )
+    retry_count = capacity_recovery_owner.retry_ordinal
 
     # A provider-returned transient capacity response is a known no-effect
     # pre-commit outcome. Direct Codex OAuth traffic bypasses the candidate
@@ -3697,12 +3748,12 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
         and provider_returned
         and current_auth is not None
     ):
-        if retry_count < 1:
+        if capacity_decision.action == CapacityRecoveryAction.RETRY_SAME_ROUTE:
             if request_state is not None:
                 setattr(
                     request_state,
                     "_aawm_direct_codex_capacity_retries",
-                    retry_count + 1,
+                    retry_count,
                 )
             retry_attempt_record["failover_decision"] = "retry_same_account"
             retry_attempt_record["terminal_reason"] = "success"

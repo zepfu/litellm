@@ -656,6 +656,7 @@ def _safe_wire_commitment(
             "done_wire_committed",
             "finalization_started",
             "finalized",
+            "capacity_recovery_authorized",
             _RESPONSES_REPLAY_LATCH_REASON_KEY,
             _RESPONSES_REPLAY_LATCH_EVENT_KEY,
         )
@@ -733,9 +734,42 @@ def is_openai_wire_replay_prohibited(
                 )
             except Exception:
                 capacity_retry_permitted = False
+        if (
+            commitment.get("capacity_recovery_authorized") is True
+            and ledger is None
+        ):
+            capacity_retry_permitted = True
         if not capacity_retry_permitted:
             return True
     return commitment.get("disposition") in _WIRE_REPLAY_BLOCKING_DISPOSITIONS
+
+
+def authorize_capacity_recovery_replay(
+    request: Request,
+    *,
+    allow_unknown_semantics: bool = False,
+) -> None:
+    """Record a provider-confirmed no-effect capacity handoff for non-ledger routes."""
+
+    state = _request_state(request)
+    commitment = getattr(state, _WIRE_COMMITMENT_STATE_KEY, None) if state else None
+    if not isinstance(commitment, dict):
+        return
+    if any(
+        commitment.get(flag) is True
+        for flag in ("response_start_sent", "first_body_sent", "terminal_wire_committed", "done_wire_committed")
+    ):
+        return
+    reason = commitment.get(_RESPONSES_REPLAY_LATCH_REASON_KEY)
+    if reason not in {None, "provider_execution_possible"} and not (
+        allow_unknown_semantics and reason == "unknown_semantics"
+    ):
+        return
+    if allow_unknown_semantics and reason == "unknown_semantics":
+        commitment[_RESPONSES_REPLAY_LATCH_REASON_KEY] = (
+            "provider_execution_possible"
+        )
+    commitment["capacity_recovery_authorized"] = True
 
 
 def is_openai_capacity_recovery_safe(
@@ -1277,6 +1311,7 @@ __all__ = [
     "ProviderCallLedgerExhausted",
     "ProviderCallReplayBlocked",
     "ProviderCallReservation",
+    "authorize_capacity_recovery_replay",
     "bind_openai_candidate_context",
     "clear_active_upstream_response",
     "close_active_upstream_response",
