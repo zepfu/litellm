@@ -1449,7 +1449,6 @@ class PassThroughStreamingHandler:
         return False
 
     @staticmethod
-    @staticmethod
     def _is_responses_non_substantive_lifecycle_event(
         event_type: Optional[str],
         payload: Optional[Dict[str, Any]] = None,
