@@ -771,6 +771,10 @@ async def _responses_sse_from_iterator(  # noqa: PLR0915
         yield "data: [DONE]\n\n"
     except Exception as stream_exc:
         if not has_emitted:
+            if on_stream_error is not None:
+                # Alias streams use this hook to preserve provider attribution;
+                # the original exception still reaches candidate retry logic.
+                on_stream_error(stream_exc)
             raise
         if on_stream_error is not None:
             terminal_event = on_stream_error(stream_exc)

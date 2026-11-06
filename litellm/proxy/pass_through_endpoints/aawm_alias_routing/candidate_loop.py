@@ -6120,6 +6120,25 @@ async def handle_alias_route(  # noqa: PLR0915
                         and capacity_retry_coordinator is not None
                     ),
                 )
+                # Non-OpenAI adapters often surface typed 429/5xx exceptions
+                # without LiteLLM's private provider-return marker.  Mark a
+                # structured transient response before retry, rotation, or
+                # redispatch decisions consume this attempt. Transport and
+                # unknown failures remain unmarked.
+                if (
+                    attempt_record.get("attempted_provider_call") is True
+                    and attempt_record.get("provider_returned") is not True
+                    and str(candidate.get("provider") or "").strip().lower()
+                    not in {"", "openai"}
+                    and error_class
+                    in _error_signals._RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES
+                    and (
+                        attempt_record.get("error_status_code")
+                        or _extract_adapter_exception_status_code(failure_exc)
+                    )
+                    in {408, 429, 500, 502, 503, 504, 529}
+                ):
+                    attempt_record["provider_returned"] = True
                 prefer_account_failover = _prefer_codex_oauth_account_failover(
                     candidate=candidate,
                     selection=selection,
@@ -6285,24 +6304,6 @@ async def handle_alias_route(  # noqa: PLR0915
                     candidate=candidate,
                     kimi_failure_metadata=kimi_failure_metadata,
                 )
-                # Non-OpenAI adapters often surface their own typed 429/5xx
-                # exception without LiteLLM's private provider-return marker.
-                # Once the candidate loop has proven that a provider call was
-                # attempted, a structured transient HTTP response is still a
-                # provider-returned no-effect result and is eligible for the
-                # existing redispatch path. Transport/unknown failures remain
-                # unmarked and therefore replay-prohibited.
-                if (
-                    attempt_record.get("attempted_provider_call") is True
-                    and attempt_record.get("provider_returned") is not True
-                    and str(candidate.get("provider") or "").strip().lower()
-                    not in {"", "openai"}
-                    and error_class
-                    in _error_signals._RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES
-                    and attempt_record.get("error_status_code")
-                    in {408, 429, 500, 502, 503, 504, 529}
-                ):
-                    attempt_record["provider_returned"] = True
                 if xai_no_io_selection_skip_reason is not None:
                     _account_xai_no_io_selection(
                         attempt_record=attempt_record,

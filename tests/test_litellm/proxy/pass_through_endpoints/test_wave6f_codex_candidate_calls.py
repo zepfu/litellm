@@ -57,6 +57,7 @@ EXPECTED_PUBLIC_SYMBOLS = frozenset(
         "_opencode_zen_direct_safe_retry_after",
         "_maybe_raise_opencode_zen_direct_rate_limit",
         "_opencode_zen_direct_stream_terminal_error",
+        "_opencode_zen_alias_stream_error",
         "_OPENCODE_ZEN_DIRECT_429_ERROR_CLASSES",
         "_OPENCODE_ZEN_DIRECT_RETRY_AFTER_CEILING_SECONDS",
         "_OPENCODE_ZEN_DIRECT_PEEK_MAX_BYTES",
@@ -86,7 +87,7 @@ class TestSymbolInventory:
                 callable(getattr(codex_candidate_calls, name))
                 for name in codex_candidate_calls._HOST_FUNCTION_NAMES
             )
-            == 29
+                == 30
         )
 
 

@@ -40,6 +40,13 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import session_affinity
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import snapshot_select
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import error_signals
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.failure_vocabulary import (
+    ZenFailure,
+)
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+    codex_candidate_calls,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
     DEFAULT_CONFIG_DIR,
     compile_directory,
@@ -70,6 +77,55 @@ PACKAGE_DIR = Path(package.__file__).resolve().parent
 GOD_PATH = Path(lpe.__file__).resolve()
 CANDIDATE_LOOP_PATH = PACKAGE_DIR / "candidate_loop.py"
 INTERFACES_PATH = PACKAGE_DIR / "interfaces.py"
+
+
+def test_opencode_zen_cached_alias_failure_classifies_without_candidate() -> None:
+    """A translated alias 429 keeps its typed provider classification."""
+    exc = RuntimeError("sanitized provider failure")
+    exc._aawm_zen_failure = ZenFailure(
+        class_name="capacity",
+        origin="upstream",
+        route="alias",
+        status_code=429,
+        public_status_code=429,
+        scope="account",
+        retryable=True,
+        fallback=True,
+        error_class="capacity_exhausted",
+        cooldown_seconds=30.0,
+        retry_after_seconds=None,
+        reset_after_seconds=None,
+        public_detail="OpenCode Zen capacity is temporarily unavailable.",
+    )
+
+    assert (
+        error_signals._classify_codex_auto_agent_retryable_exhaustion(exc)
+        == "capacity_exhausted"
+    )
+
+
+def test_opencode_zen_alias_stream_callback_preserves_provider_failure() -> None:
+    """The rebound stream callback records a typed alias provider 429."""
+    exc = HTTPException(
+        status_code=429,
+        detail={
+            "error": {
+                "type": "FreeUsageLimitError",
+                "message": "Free usage limit reached",
+            }
+        },
+    )
+
+    callback = getattr(lpe, "_opencode_zen_alias_stream_error")
+    assert callback is getattr(
+        codex_candidate_calls, "_opencode_zen_alias_stream_error"
+    )
+    assert callback(exc) is None
+    failure = getattr(exc, "_aawm_zen_failure")
+    assert isinstance(failure, ZenFailure)
+    assert failure.route == "alias"
+    assert failure.origin == "upstream"
+    assert failure.public_status_code == 429
 
 
 class _StructuredWeeklyExhaustion(Exception):
@@ -503,7 +559,6 @@ async def test_candidate_loop_provider_429_exhaustion_redispatches_without_killi
         },
     )
     provider_error.error_class = "rate_limited"
-    provider_error._aawm_provider_returned = True
     terminal_events: list[dict[str, Any]] = []
     no_candidate_events: list[dict[str, Any]] = []
     redispatch_calls: list[dict[str, Any]] = []

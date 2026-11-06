@@ -2498,6 +2498,7 @@ _HOST_FUNCTION_NAMES = (
     # D1-574 OpenCode direct 429
     "_maybe_raise_opencode_zen_direct_rate_limit",
     "_opencode_zen_direct_stream_terminal_error",
+    "_opencode_zen_alias_stream_error",
     "_OPENCODE_ZEN_DIRECT_PEEK_MAX_BYTES",
     # CFG-004 encrypted reasoning detection
     "_is_fernet_encrypted_token",
@@ -11066,14 +11067,18 @@ _OPENCODE_ZEN_DIRECT_PEEK_MAX_BYTES = 65536
 
 def _maybe_raise_opencode_zen_direct_rate_limit(exc: Exception) -> None:
     """Deliver the shared typed Zen outcome without exposing provider detail."""
-    from ..providers.opencode_zen.runtime import _raise_opencode_zen_failure
+    from litellm.proxy.pass_through_endpoints.providers.opencode_zen.runtime import (
+        _raise_opencode_zen_failure,
+    )
 
     _raise_opencode_zen_failure(exc)
 
 
 def _opencode_zen_direct_stream_terminal_error(exc: Exception) -> Optional[str]:
     """Render the same secret-free outcome after response headers commit."""
-    from ..providers.opencode_zen.runtime import _extract_opencode_zen_failure
+    from litellm.proxy.pass_through_endpoints.providers.opencode_zen.runtime import (
+        _extract_opencode_zen_failure,
+    )
 
     failure = _extract_opencode_zen_failure(exc)
     payload = {
@@ -11088,6 +11093,25 @@ def _opencode_zen_direct_stream_terminal_error(exc: Exception) -> Optional[str]:
         },
     }
     return "event: response.failed\ndata: " + json.dumps(payload, separators=(",", ":")) + "\n\n"
+
+
+def _opencode_zen_alias_stream_error(exc: Exception) -> Optional[str]:
+    """Preserve provider attribution while alias streams reach retry logic."""
+    setattr(exc, "attempted_provider_call", True)
+    setattr(exc, "_aawm_provider_returned", True)
+    from litellm.proxy.pass_through_endpoints.providers.opencode_zen.runtime import (
+        _extract_opencode_zen_failure,
+    )
+
+    failure = _extract_opencode_zen_failure(
+        exc,
+        use_alias_candidate_probe=True,
+    )
+    try:
+        setattr(exc, "_aawm_zen_failure", failure)
+    except (AttributeError, TypeError):
+        pass
+    return None
 
 
 def _consume_opencode_zen_tools_mode_header(
@@ -11426,7 +11450,9 @@ async def _handle_codex_opencode_zen_adapter_route(
             is_known_free_direct=is_known_free_direct,
         )
     except Exception as exc:
-        from ..providers.opencode_zen.runtime import _raise_opencode_zen_failure
+        from litellm.proxy.pass_through_endpoints.providers.opencode_zen.runtime import (
+            _raise_opencode_zen_failure,
+        )
 
         _raise_opencode_zen_failure(
             exc, use_alias_candidate_probe=use_alias_candidate_probe,
@@ -11460,7 +11486,7 @@ async def _handle_codex_opencode_zen_adapter_route(
                     adapter_label="OpenCode Zen",
                 ),
                 on_stream_error=(
-                    None
+                    _opencode_zen_alias_stream_error
                     if use_alias_candidate_probe
                     else _opencode_zen_direct_stream_terminal_error
                 ),

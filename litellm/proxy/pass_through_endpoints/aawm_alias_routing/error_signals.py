@@ -2426,6 +2426,20 @@ def _opencode_zen_alias_failure(
     attempted_provider_call: bool = True,
 ) -> Optional[ZenFailure]:
     """Return provider-attributed Zen policy. Skip origin=unknown wrappers."""
+    # The provider runtime attaches a typed, provider-attributed failure when
+    # it translates a Zen response for an alias candidate.  Later retry and
+    # terminalization paths can receive that translated exception without the
+    # candidate object (for example, after a streaming wrapper has yielded the
+    # exception).  Preserve the trusted classification in that case; do not
+    # infer Zen provenance from an untyped 429 or from exception text.
+    cached = getattr(exc, "_aawm_zen_failure", None)
+    if (
+        isinstance(cached, ZenFailure)
+        and cached.route == "alias"
+        and cached.origin == "upstream"
+        and attempted_provider_call
+    ):
+        return cached
     if not _is_opencode_zen_candidate(candidate):
         return None
     failure = classify_opencode_zen_failure(
