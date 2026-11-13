@@ -356,3 +356,5 @@ general_settings:
 environment_variables:
   LITELLM_KIMI_NATIVE_CONTRACT_PATH: "/run/aawm/kimi-descriptor/native-contract.json"
   LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED: "true"
+  AAWM_CAPTURE_RESPONSES_FAILURE_EVIDENCE: "1"
+  AAWM_CAPTURE_RESPONSES_FAILURE_EVIDENCE_DIR: "/app/.analysis/runtime/litellm-alpha/responses_failure_evidence"
