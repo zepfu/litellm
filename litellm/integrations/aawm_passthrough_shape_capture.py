@@ -440,6 +440,18 @@ def capture_responses_failure_evidence(  # noqa: PLR0915
                 value = getattr(state, key, None)
                 if value is not None and key not in safe_metadata:
                     safe_metadata[key] = _bounded_capture_value(value, limit=256)
+            if "litellm_call_id" not in safe_metadata:
+                value = getattr(state, "aawm_alias_request_litellm_call_id", None)
+                if value is not None:
+                    safe_metadata["litellm_call_id"] = _bounded_capture_value(
+                        value, limit=256
+                    )
+            if "session_id" not in safe_metadata:
+                value = getattr(state, "codex_session_id", None)
+                if value is not None:
+                    safe_metadata["session_id"] = _bounded_capture_value(
+                        value, limit=256
+                    )
             candidate = getattr(state, "aawm_openai_candidate_context", None)
             if isinstance(candidate, Mapping):
                 safe_metadata["selected_candidate"] = {
@@ -475,7 +487,11 @@ def capture_responses_failure_evidence(  # noqa: PLR0915
                     getattr(failure, "classification", None), limit=128
                 ),
                 "retryable": getattr(failure, "retryable", None),
-                "error_code": _bounded_capture_value(getattr(failure, "error_code", None), limit=256),
+                "error_code": _bounded_capture_value(
+                    getattr(failure, "error_code", None)
+                    or getattr(failure, "code", None),
+                    limit=256,
+                ),
                 "error_type": _bounded_capture_value(getattr(failure, "error_type", None), limit=128),
                 "status_code": getattr(failure, "status_code", None),
                 "provider_returned": getattr(failure, "provider_returned", None),
