@@ -70,6 +70,7 @@ from litellm._uuid import uuid
 from litellm.constants import MAXIMUM_TRACEBACK_LINES_TO_LOG, PASS_THROUGH_HEADER_PREFIX
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.aawm_passthrough_shape_capture import (
+    capture_responses_failure_evidence,
     capture_passthrough_shape,
 )
 
@@ -317,6 +318,7 @@ from .aawm_adapter_runtime.provider_call_ledger import (
     get_request_openai_wire_commitment,
     get_request_provider_call_ledger,
     get_request_provider_call_ledger_snapshot,
+    get_responses_first_semantic_commitment,
     get_responses_replay_commitment_reason,
     is_openai_capacity_recovery_safe,
     relax_openai_wire_replay_for_capacity,
@@ -11245,6 +11247,27 @@ async def pass_through_request(  # noqa: PLR0915
                     error_content,
                 )
                 _authorize_openai_capacity_retry(provider_exception, e.response)
+                if is_native_openai_responses_route:
+                    diagnostic = {
+                        "first_semantic_commitment": get_responses_first_semantic_commitment(
+                            request
+                        ),
+                        "event_prefix": [],
+                    }
+                    capture_responses_failure_evidence(
+                        failure=provider_exception,
+                        request=request,
+                        metadata={
+                            "litellm_call_id": litellm_call_id,
+                            "model": (
+                                provider_bound_body.get("model")
+                                if isinstance(provider_bound_body, dict)
+                                else None
+                            ),
+                            "provider": custom_llm_provider or endpoint_type.value,
+                        },
+                        diagnostic=diagnostic,
+                    )
                 raise provider_exception from e
             def _prepare_stream_pre_first_byte_json_headers() -> Any:
                 stream_headers, removed_content_type = (
@@ -11360,6 +11383,19 @@ async def pass_through_request(  # noqa: PLR0915
                                     pre_commit_failure,
                                     retired_response,
                                 )
+                            capture_responses_failure_evidence(
+                                failure=pre_commit_failure,
+                                request=request,
+                                metadata={
+                                    "litellm_call_id": litellm_call_id,
+                                    "model": (
+                                        provider_bound_body.get("model")
+                                        if isinstance(provider_bound_body, dict)
+                                        else None
+                                    ),
+                                },
+                                diagnostic=pre_commit_failure.responses_diagnostic,
+                            )
                             raise pre_commit_failure
                     ensure_precommit_send_active()
                     return response, req
@@ -11913,6 +11949,19 @@ async def pass_through_request(  # noqa: PLR0915
                                     pre_commit_failure,
                                     retired_response,
                                 )
+                            capture_responses_failure_evidence(
+                                failure=pre_commit_failure,
+                                request=request,
+                                metadata={
+                                    "litellm_call_id": litellm_call_id,
+                                    "model": (
+                                        provider_bound_body.get("model")
+                                        if isinstance(provider_bound_body, dict)
+                                        else None
+                                    ),
+                                },
+                                diagnostic=pre_commit_failure.responses_diagnostic,
+                            )
                             raise pre_commit_failure
                     if (
                         is_native_openai_responses_route
