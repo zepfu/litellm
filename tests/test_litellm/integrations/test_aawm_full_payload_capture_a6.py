@@ -84,6 +84,8 @@ def test_responses_failure_capture_is_opt_in_and_private(tmp_path: Path, monkeyp
 
     request = SimpleNamespace(
         state=SimpleNamespace(
+            aawm_alias_request_litellm_call_id="call-state-fallback",
+            codex_session_id="session-state-fallback",
             _aawm_openai_responses_wire_commitment={
                 "precommit_replay_committed": True,
                 "precommit_commitment_reason": "provider_execution_possible",
@@ -128,8 +130,6 @@ def test_responses_failure_capture_is_opt_in_and_private(tmp_path: Path, monkeyp
         failure=failure,
         request=request,
         metadata={
-            "litellm_call_id": "call-123",
-            "session_id": "session-456",
             "prompt": "DO NOT STORE",
         },
         diagnostic={
@@ -155,8 +155,8 @@ def test_responses_failure_capture_is_opt_in_and_private(tmp_path: Path, monkeyp
         "item_types": ["function_call", "message"],
     }
     assert artifact["correlation"] == {
-        "litellm_call_id": "call-123",
-        "session_id": "session-456",
+        "litellm_call_id": "call-state-fallback",
+        "session_id": "session-state-fallback",
     }
     assert artifact["replay_commitment"]["first_semantic_commitment"] == {
         "reason": "assistant_output",

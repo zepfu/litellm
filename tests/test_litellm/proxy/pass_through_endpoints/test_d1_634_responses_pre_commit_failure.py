@@ -6028,6 +6028,236 @@ async def test_responses_failure_diagnostic_prefix_is_bounded_and_wire_unchanged
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", ["success", "provider_failure", "clean_eof", "size_limit"])
+async def test_capture_enabled_committed_stream_paths_are_fail_open(  # noqa: PLR0915
+    monkeypatch, tmp_path, scenario
+):
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        get_responses_first_semantic_commitment,
+        publish_responses_replay_commitment,
+    )
+
+    monkeypatch.setenv("AAWM_CAPTURE_RESPONSES_FAILURE_EVIDENCE", "1")
+    monkeypatch.setenv(
+        "AAWM_CAPTURE_RESPONSES_FAILURE_EVIDENCE_DIR", str(tmp_path / "capture")
+    )
+    if scenario == "size_limit":
+        monkeypatch.setenv("AAWM_RESPONSES_MAX_EVENT_BYTES", "400")
+    else:
+        monkeypatch.delenv("AAWM_RESPONSES_MAX_EVENT_BYTES", raising=False)
+
+    call_id = f"capture-probe-{scenario}"
+    session_id = f"synthetic-session-{scenario}"
+    body = {"model": "gpt-5.4", "stream": True, "input": "PRIVATE_REQUEST_MARKER"}
+    request = _responses_request(body)
+    request.state.codex_session_id = session_id
+    request.state._aawm_openai_responses_wire_commitment = {}
+    publish_responses_replay_commitment(
+        request,
+        reason="provider_execution_possible",
+        event_type="provider_dispatch",
+    )
+
+    response_id = f"resp_capture_{scenario}"
+    chunks = [
+        _response_event(
+            "response.created", 1, response_id=response_id, status="in_progress"
+        ),
+        _responses_event(
+            "response.output_text.delta",
+            2,
+            item_id="msg_capture",
+            output_index=0,
+            content_index=0,
+            delta="PRIVATE_OUTPUT_MARKER",
+        ),
+    ]
+    if scenario == "success":
+        chunks.append(
+            _response_event(
+                "response.completed",
+                3,
+                response_id=response_id,
+                status="completed",
+                output=[
+                    {
+                        "id": "msg_capture",
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "PRIVATE_OUTPUT_MARKER",
+                                "annotations": [],
+                            }
+                        ],
+                    }
+                ],
+            )
+        )
+    elif scenario == "provider_failure":
+        chunks.append(
+            _response_event(
+                "response.failed",
+                3,
+                response_id=response_id,
+                status="failed",
+                output=[
+                    {
+                        "id": "msg_capture",
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "PRIVATE_OUTPUT_MARKER",
+                            }
+                        ],
+                    },
+                    {
+                        "id": "fc_capture",
+                        "type": "function_call",
+                        "arguments": "PRIVATE_TOOL_ARGUMENT_MARKER",
+                    },
+                ],
+                error={
+                    "type": "server_error",
+                    "code": "server_is_overloaded",
+                    "message": "Synthetic capacity failure.",
+                },
+            )
+        )
+    elif scenario == "size_limit":
+        chunks.append(
+            _responses_event(
+                "response.output_text.delta",
+                3,
+                item_id="msg_capture",
+                output_index=0,
+                content_index=0,
+                delta="x" * 1000,
+            )
+        )
+
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        stream=_ClosableAsyncByteStream(chunks),
+        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+    )
+    prefixed, peek_failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+        response,
+        request=request,
+        provider_bound_body=body,
+    )
+    assert peek_failure is None
+    first_semantic = get_responses_first_semantic_commitment(request)
+    assert first_semantic == {
+        "reason": "assistant_output",
+        "event_type": "response.output_text.delta",
+    }
+
+    success_handler_kwargs = {
+        "litellm_call_id": call_id,
+        "litellm_params": {
+            "metadata": {
+                "provider": "openai",
+                "model": "gpt-5.4",
+                "route_family": "codex_responses",
+            }
+        },
+        "standard_logging_object": {"metadata": {}, "request_tags": []},
+    }
+    logging_obj = MagicMock()
+    logging_obj.model_call_details = {}
+    logging_obj.async_success_handler = AsyncMock()
+    logging_obj.async_failure_handler = AsyncMock()
+    logging_obj._update_completion_start_time = MagicMock()
+    logging_obj._should_run_sync_callbacks_for_async_calls.return_value = False
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    with patch.object(
+        PassThroughStreamingHandler,
+        "_route_streaming_logging_to_handler",
+        new=_noop,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.record_aawm_route_rollup_turn"
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.record_aawm_route_rollup"
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.record_aawm_route_rollup_failure"
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.emit_aawm_route_status_event"
+    ):
+        emitted = [
+            chunk
+            async for chunk in PassThroughStreamingHandler.chunk_processor(
+                response=prefixed,
+                request_body=body,
+                litellm_logging_obj=logging_obj,
+                endpoint_type=EndpointType.OPENAI,
+                start_time=datetime.now(),
+                passthrough_success_handler_obj=MagicMock(
+                    spec=PassThroughEndpointLogging
+                ),
+                url_route="https://api.openai.com/v1/responses",
+                custom_llm_provider="openai",
+                success_handler_kwargs=success_handler_kwargs,
+                operational_request=request,
+            )
+        ]
+        await asyncio.sleep(0)
+
+    wire = b"".join(emitted)
+    assert b"PRIVATE_OUTPUT_MARKER" in wire
+    artifacts = list((tmp_path / "capture").glob("*_responses_failure.json"))
+    if scenario == "success":
+        assert not artifacts
+        assert logging_obj.async_success_handler.await_count == 0
+    else:
+        assert len(artifacts) == 1
+        artifact = json.loads(artifacts[0].read_text(encoding="utf-8"))
+        assert artifact["correlation"]["litellm_call_id"] == call_id
+        assert artifact["correlation"]["session_id"] == session_id
+        assert artifact["replay_commitment"]["first_semantic_commitment"] == (
+            first_semantic
+        )
+        assert artifact["replay_commitment"]["precommit_commitment_event_type"] == (
+            "provider_dispatch"
+        )
+        assert len(artifacts[0].read_bytes()) <= 64 * 1024
+        if scenario == "provider_failure":
+            assert wire.count(b"event: response.failed") == 1
+            assert b'"code":"server_is_overloaded"' in wire
+            assert (
+                artifact["failure"]["terminal_envelope"]["response"]["error"]["code"]
+                == "server_is_overloaded"
+            )
+            event_types = [
+                event.get("event_type")
+                for event in artifact["diagnostic"]["event_prefix"]
+            ]
+            assert "response.output_text.delta" in event_types
+            assert "response.failed" in event_types
+        elif scenario == "clean_eof":
+            assert b"event: response.incomplete" in wire
+            assert artifact["failure"]["error_class"] == "stream_incomplete"
+        else:
+            assert artifact["failure"]["error_code"] == (
+                "openai_responses_stream_event_too_large"
+            )
+        content = artifacts[0].read_bytes()
+        for private_marker in (
+            "PRIVATE_REQUEST_MARKER",
+            "PRIVATE_OUTPUT_MARKER",
+            "PRIVATE_TOOL_ARGUMENT_MARKER",
+        ):
+            assert private_marker.encode() not in content
+
+
+@pytest.mark.asyncio
 async def test_unknown_setup_effect_field_does_not_veto_replay():
     """Opaque provider fields never gate a known no-effect capacity retry."""
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (

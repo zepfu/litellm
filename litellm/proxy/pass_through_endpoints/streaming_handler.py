@@ -724,7 +724,9 @@ class _ResponsesPreCommitSSEParser:
             )
             response = payload.get("response")
             output = response.get("output") if isinstance(response, dict) else None
-            event_label = _responses_replay_event_label(event_type)
+            event_label = _responses_replay_event_label(
+                event_type or parsed_event.event_type
+            )
             event_record = {
                 "event_type": event_label,
                 "sequence_number": payload.get("sequence_number"),
@@ -3638,6 +3640,7 @@ class PassThroughStreamingHandler:
             )
             responses_terminal_seen = False
             responses_substantive_seen = False
+            failure_evidence_captured = False
             held_responses_done_suffix = b""
             eof_responses_events: List[ParsedResponsesEvent] = []
             responses_sse_event_buffer = b""
@@ -3674,6 +3677,48 @@ class PassThroughStreamingHandler:
                 custom_llm_provider=custom_llm_provider,
                 operational_request=operational_request,
             )
+
+            def _capture_failure_evidence(
+                failure: Any,
+                *,
+                event_prefix: Optional[List[Dict[str, Any]]] = None,
+            ) -> None:
+                nonlocal failure_evidence_captured
+                if failure_evidence_captured:
+                    return
+                if not capture_diagnostics or operational_request is None:
+                    return
+                try:
+                    capture_metadata = dict(metadata)
+                    if isinstance(success_handler_kwargs, dict):
+                        call_id = success_handler_kwargs.get("litellm_call_id")
+                        if call_id is not None:
+                            capture_metadata.setdefault("litellm_call_id", call_id)
+                    capture_responses_failure_evidence(
+                        failure=failure,
+                        request=operational_request,
+                        metadata=capture_metadata,
+                        diagnostic={
+                            "first_semantic_commitment": (
+                                get_responses_first_semantic_commitment(
+                                    operational_request
+                                )
+                            ),
+                            "event_prefix": (
+                                diagnostic_event_prefix
+                                if event_prefix is None
+                                else event_prefix
+                            ),
+                            "tracker": metadata.get(
+                                "aawm_stream_tracker_state", {}
+                            ),
+                        },
+                    )
+                    failure_evidence_captured = True
+                except Exception:
+                    # Evidence capture is observational and must not affect delivery.
+                    return
+
             metadata["aawm_stream_raw_bytes_buffered"] = buffer_raw_bytes
             transfer_identity = extract_transfer_identity(
                 request_body=request_body if isinstance(request_body, dict) else None,
@@ -3755,15 +3800,22 @@ class PassThroughStreamingHandler:
             def _consume_responses_event(
                 parsed_event: ParsedResponsesEvent,
             ) -> Optional[ResponsesStreamPreCommitFailure]:
+                nonlocal failure_evidence_captured
                 nonlocal responses_terminal_seen, responses_substantive_seen
                 nonlocal responses_tracking_finalized
                 if responses_sse_tracker is None:
                     return None
                 if capture_diagnostics:
-                    diagnostic_parser._record_event(parsed_event)
-                    diagnostic_event_prefix[:] = (
-                        diagnostic_parser.diagnostic_event_prefix
-                    )
+                    try:
+                        # _consume_event accepts a ParsedResponsesEvent and updates
+                        # only this diagnostic parser's bounded summary.
+                        diagnostic_parser._consume_event(parsed_event)
+                        diagnostic_event_prefix[:] = (
+                            diagnostic_parser.diagnostic_event_prefix
+                        )
+                    except Exception:
+                        # A diagnostic parser failure cannot change stream handling.
+                        pass
                 if parsed_event.is_malformed:
                     OpenAIPassthroughLoggingHandler._mark_responses_sse_parse_ambiguity(
                         responses_sse_tracker
@@ -3806,6 +3858,11 @@ class PassThroughStreamingHandler:
                             event_type=parsed_event.event_type,
                         )
                     )
+                    if (
+                        parsed_event.event_type == "response.failed"
+                        and not failure_evidence_captured
+                    ):
+                        _capture_failure_evidence(candidate_failure)
                     if (
                         candidate_failure.error_class
                         in _RESPONSES_STREAM_REDISPATCH_CLASSES
@@ -4043,17 +4100,7 @@ class PassThroughStreamingHandler:
                 failure_context = _build_postcommit_responses_failure_context(
                     failure
                 )
-                failure.responses_diagnostic = {
-                    "first_semantic_commitment": get_responses_first_semantic_commitment(operational_request),
-                    "event_prefix": diagnostic_event_prefix,
-                    "tracker": metadata.get("aawm_stream_tracker_state", {}),
-                }
-                capture_responses_failure_evidence(
-                    failure=failure,
-                    request=operational_request,
-                    metadata=metadata,
-                    diagnostic=failure.responses_diagnostic,
-                )
+                _capture_failure_evidence(failure)
                 if isinstance(error_log_context, dict):
                     error_log_context.update(failure_context)
                 metadata.update(failure_context)
@@ -4363,6 +4410,7 @@ class PassThroughStreamingHandler:
                         raise recovery_failure
 
                     if limit_exception is not None:
+                        _capture_failure_evidence(limit_exception)
                         responses_sse_event_buffer = b""
                         held_responses_done_suffix = b""
                         if responses_sse_tracker is not None:
@@ -4600,6 +4648,22 @@ class PassThroughStreamingHandler:
                         yield eof_chunk
                     synthetic_terminal = _classify_responses_tracking()
                     if synthetic_terminal is not None:
+                        if synthetic_terminal.get("type") == "response.incomplete":
+                            synthetic_failure = ResponsesStreamPreCommitFailure(
+                                error_class="stream_incomplete",
+                                classification="upstream_stream_incomplete",
+                                retryable=False,
+                                error_code="upstream_stream_incomplete",
+                                error_type="invalid_response",
+                                message=str(
+                                    synthetic_terminal.get("response", {})
+                                    .get("incomplete_details", {})
+                                    .get("reason", "upstream_stream_incomplete")
+                                ),
+                                status_code=502,
+                                error_payload=synthetic_terminal,
+                            )
+                            _capture_failure_evidence(synthetic_failure)
                         event_type = synthetic_terminal["type"]
                         terminal_chunks = [
                             (
@@ -4791,19 +4855,7 @@ class PassThroughStreamingHandler:
                 )
             )
             if locals().get("is_fork_owned_responses_stream") is True:
-                failure_diagnostic = {
-                    "first_semantic_commitment": get_responses_first_semantic_commitment(
-                        operational_request
-                    ),
-                    "event_prefix": diagnostic_event_prefix,
-                    "tracker": metadata.get("aawm_stream_tracker_state", {}),
-                }
-                capture_responses_failure_evidence(
-                    failure=e,
-                    request=operational_request,
-                    metadata=metadata,
-                    diagnostic=failure_diagnostic,
-                )
+                _capture_failure_evidence(e)
             if isinstance(e, ResponsesBoundFailure):
                 bound_failure = e
                 failure_kind = (
