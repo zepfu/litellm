@@ -83,9 +83,14 @@ def test_responses_failure_capture_is_opt_in_and_private(tmp_path: Path, monkeyp
     monkeypatch.setenv(capture._RESPONSES_FAILURE_CAPTURE_DIR_ENV, str(output_dir))
 
     request = SimpleNamespace(
+        scope={
+            "parsed_body": (
+                ("session_id",),
+                {"session_id": "session-request-identity"},
+            )
+        },
         state=SimpleNamespace(
             aawm_alias_request_litellm_call_id="call-state-fallback",
-            codex_session_id="session-state-fallback",
             _aawm_openai_responses_wire_commitment={
                 "precommit_replay_committed": True,
                 "precommit_commitment_reason": "provider_execution_possible",
@@ -130,6 +135,7 @@ def test_responses_failure_capture_is_opt_in_and_private(tmp_path: Path, monkeyp
         failure=failure,
         request=request,
         metadata={
+            "codex_session_id": "session-metadata-carrier",
             "prompt": "DO NOT STORE",
         },
         diagnostic={
@@ -156,7 +162,7 @@ def test_responses_failure_capture_is_opt_in_and_private(tmp_path: Path, monkeyp
     }
     assert artifact["correlation"] == {
         "litellm_call_id": "call-state-fallback",
-        "session_id": "session-state-fallback",
+        "session_id": "session-metadata-carrier",
     }
     assert artifact["replay_commitment"]["first_semantic_commitment"] == {
         "reason": "assistant_output",
@@ -165,6 +171,18 @@ def test_responses_failure_capture_is_opt_in_and_private(tmp_path: Path, monkeyp
     assert path.stat().st_size <= capture._RESPONSES_FAILURE_MAX_BYTES
     assert "DO NOT STORE" not in text
     assert "input" not in artifact["failure"]["terminal_envelope"]
+    reduced_metadata_path = capture.capture_responses_failure_evidence(
+        failure=failure,
+        request=request,
+        metadata={},
+    )
+    assert reduced_metadata_path is not None
+    reduced_metadata_artifact = json.loads(
+        Path(reduced_metadata_path).read_text(encoding="utf-8")
+    )
+    assert reduced_metadata_artifact["correlation"]["session_id"] == (
+        "session-request-identity"
+    )
     for _ in range(capture._RESPONSES_FAILURE_MAX_FILES):
         capture.capture_responses_failure_evidence(
             failure=failure,

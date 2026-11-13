@@ -6050,7 +6050,6 @@ async def test_capture_enabled_committed_stream_paths_are_fail_open(  # noqa: PL
     session_id = f"synthetic-session-{scenario}"
     body = {"model": "gpt-5.4", "stream": True, "input": "PRIVATE_REQUEST_MARKER"}
     request = _responses_request(body)
-    request.state.codex_session_id = session_id
     request.state._aawm_openai_responses_wire_commitment = {}
     publish_responses_replay_commitment(
         request,
@@ -6164,6 +6163,7 @@ async def test_capture_enabled_committed_stream_paths_are_fail_open(  # noqa: PL
                 "provider": "openai",
                 "model": "gpt-5.4",
                 "route_family": "codex_responses",
+                "codex_session_id": session_id,
             }
         },
         "standard_logging_object": {"metadata": {}, "request_tags": []},

@@ -432,6 +432,11 @@ def capture_responses_failure_evidence(  # noqa: PLR0915
             value = (metadata or {}).get(key)
             if value is not None:
                 safe_metadata[key] = _bounded_capture_value(value, limit=256)
+        metadata_session_identity = (metadata or {}).get("codex_session_id")
+        if "session_id" not in safe_metadata and metadata_session_identity is not None:
+            safe_metadata["session_id"] = _bounded_capture_value(
+                metadata_session_identity, limit=256
+            )
         if state is not None:
             for key in (
                 "litellm_call_id", "request_id", "trace_id", "session_id",
@@ -446,12 +451,6 @@ def capture_responses_failure_evidence(  # noqa: PLR0915
                     safe_metadata["litellm_call_id"] = _bounded_capture_value(
                         value, limit=256
                     )
-            if "session_id" not in safe_metadata:
-                value = getattr(state, "codex_session_id", None)
-                if value is not None:
-                    safe_metadata["session_id"] = _bounded_capture_value(
-                        value, limit=256
-                    )
             candidate = getattr(state, "aawm_openai_candidate_context", None)
             if isinstance(candidate, Mapping):
                 safe_metadata["selected_candidate"] = {
@@ -462,6 +461,25 @@ def capture_responses_failure_evidence(  # noqa: PLR0915
                     )
                     if candidate.get(key) is not None
                 }
+        if "session_id" not in safe_metadata and request is not None:
+            try:
+                from litellm.proxy.common_utils.http_parsing_utils import (
+                    _safe_get_request_parsed_body,
+                )
+                from litellm.proxy.pass_through_endpoints.aawm_alias_routing.session_affinity import (
+                    resolve_canonical_session_identity,
+                )
+
+                session_identity = resolve_canonical_session_identity(
+                    request,
+                    _safe_get_request_parsed_body(request),
+                )
+                if session_identity is not None:
+                    safe_metadata["session_id"] = _bounded_capture_value(
+                        session_identity, limit=256
+                    )
+            except Exception:
+                pass
         for key, env_name in (
             ("runtime_revision", "AAWM_RUNTIME_REVISION"),
             ("config_epoch_tag", "AAWM_CONFIG_EPOCH_TAG"),
