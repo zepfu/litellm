@@ -164,6 +164,7 @@ class OpenAIResponsesWireTrace:
             "precommit_replay_committed",
             "precommit_commitment_reason",
             "precommit_commitment_event_type",
+            "precommit_first_semantic_commitment",
         ):
             if key in existing_commitment:
                 commitment_snapshot[key] = existing_commitment[key]

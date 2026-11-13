@@ -7850,6 +7850,45 @@ async def test_openai_responses_replay_commitment_survives_wire_snapshots():
     ] == commitment
 
 
+def test_first_semantic_commitment_survives_wire_publication():
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+        OpenAIResponsesWireTrace,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        get_or_create_openai_provider_call_ledger,
+        get_request_openai_wire_commitment,
+        get_responses_first_semantic_commitment,
+        record_responses_first_semantic_commitment,
+    )
+
+    request = MagicMock(spec=Request)
+    request.state = SimpleNamespace()
+    get_or_create_openai_provider_call_ledger(
+        request,
+        custom_llm_provider="openai",
+        target="https://api.openai.com/v1/responses",
+    )
+    trace = OpenAIResponsesWireTrace(_request=request)
+    trace.publish_request_commitment()
+    record_responses_first_semantic_commitment(
+        request,
+        reason="assistant_output",
+        event_type="response.output_text.delta",
+    )
+
+    trace.record_response_start_delivery()
+    expected = {
+        "reason": "assistant_output",
+        "event_type": "response.output_text.delta",
+    }
+    assert get_responses_first_semantic_commitment(request) == expected
+
+    trace.record_body_delivery(b"data: {}\n\n")
+    assert get_responses_first_semantic_commitment(request) == expected
+    commitment = get_request_openai_wire_commitment(request)
+    assert commitment["precommit_first_semantic_commitment"] == expected
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("event_type", "completion_payload"),
