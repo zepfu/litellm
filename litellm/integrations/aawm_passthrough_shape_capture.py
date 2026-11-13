@@ -54,6 +54,19 @@ _DIAGNOSTIC_ENV_NAME_ENV = "AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_ENVIRONMENT"
 _DEFAULT_CAPTURE_DIR = Path("/tmp/captures/pass_through_shapes")
 _DEFAULT_FULL_PAYLOAD_CAPTURE_DIR = Path("/tmp/captures/pass_through_full_payloads")
 _DEFAULT_DIAGNOSTIC_CAPTURE_DIR = Path("/tmp/captures/diagnostic_payloads")
+_RESPONSES_FAILURE_CAPTURE_ENV = "AAWM_CAPTURE_RESPONSES_FAILURE_EVIDENCE"
+_RESPONSES_FAILURE_CAPTURE_DIR_ENV = "AAWM_CAPTURE_RESPONSES_FAILURE_EVIDENCE_DIR"
+_RESPONSES_FAILURE_CAPTURE_CONTROL_ENV = (
+    "AAWM_CAPTURE_RESPONSES_FAILURE_EVIDENCE_CONTROL_FILE"
+)
+_DEFAULT_RESPONSES_FAILURE_CAPTURE_DIR = Path(
+    "/tmp/captures/responses_failure_evidence"
+)
+_DEFAULT_RESPONSES_FAILURE_CAPTURE_CONTROL = Path(
+    "/tmp/captures/responses_failure_evidence.enabled"
+)
+_RESPONSES_FAILURE_MAX_BYTES = 64 * 1024
+_RESPONSES_FAILURE_MAX_FILES = 32
 _DEFAULT_FULL_PAYLOAD_CONTROL_FILE = Path(
     "/tmp/captures/pass_through_full_payloads.enabled"
 )
@@ -236,6 +249,330 @@ def passthrough_full_payload_capture_enabled() -> bool:
         return _is_truthy(control_file.read_text(encoding="utf-8"))
     except Exception:
         return False
+
+
+def responses_failure_evidence_capture_enabled() -> bool:
+    if _is_truthy(os.environ.get(_RESPONSES_FAILURE_CAPTURE_ENV, "")):
+        return True
+    control_file = Path(
+        os.environ.get(
+            _RESPONSES_FAILURE_CAPTURE_CONTROL_ENV,
+            str(_DEFAULT_RESPONSES_FAILURE_CAPTURE_CONTROL),
+        )
+    )
+    try:
+        return _control_file_is_trusted(control_file) and _is_truthy(
+            control_file.read_text(encoding="utf-8")
+        )
+    except Exception:
+        return False
+
+
+def _responses_failure_capture_dir() -> Path:
+    configured = os.environ.get(_RESPONSES_FAILURE_CAPTURE_DIR_ENV)
+    return Path(configured) if configured else _DEFAULT_RESPONSES_FAILURE_CAPTURE_DIR
+
+
+def _bounded_capture_value(value: Any, *, limit: int = 2048) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key)[:80]: _bounded_capture_value(child, limit=limit)
+            for key, child in list(value.items())[:32]
+            if str(key).lower() not in {
+                "input", "prompt", "instructions", "authorization", "headers",
+                "cookie", "api_key", "token", "secret", "text", "content",
+                "arguments", "tool_arguments", "user_text", "output",
+            }
+        }
+    if isinstance(value, (list, tuple)):
+        return [_bounded_capture_value(child, limit=limit) for child in value[:16]]
+    if isinstance(value, str):
+        text = value[:limit]
+        for pattern in _SECRET_PATTERNS:
+            text = pattern.sub("[REDACTED]", text)
+        return text
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return None
+
+
+def _sanitize_responses_failure_diagnostic(
+    value: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    result: Dict[str, Any] = {}
+    semantic = value.get("first_semantic_commitment")
+    if isinstance(semantic, Mapping):
+        result["first_semantic_commitment"] = {
+            key: semantic[key]
+            for key in ("reason", "event_type", "event_type_sha256")
+            if isinstance(semantic.get(key), str)
+        }
+    rejection = value.get("replay_rejection")
+    if isinstance(rejection, Mapping):
+        result["replay_rejection"] = {
+            key: rejection[key]
+            for key in ("replay_rejected_field", "replay_rejection_reason")
+            if isinstance(rejection.get(key), str)
+        }
+    event_prefix = value.get("event_prefix")
+    if isinstance(event_prefix, list):
+        safe_events = []
+        for event in event_prefix[:8]:
+            if not isinstance(event, Mapping):
+                continue
+            safe_event = {}
+            for key in (
+                "event_type", "event_type_sha256", "sequence_number", "decision",
+                "commitment_reason", "response_status", "response_id", "malformed",
+            ):
+                field = event.get(key)
+                if isinstance(field, (str, bool, int)) and not isinstance(field, float):
+                    safe_event[key] = _bounded_capture_value(field, limit=256)
+            keys = event.get("payload_keys")
+            if isinstance(keys, list):
+                safe_event["payload_keys"] = [
+                    _bounded_capture_value(key, limit=64)
+                    for key in keys[:32]
+                    if isinstance(key, str)
+                ]
+            item_types = event.get("output_item_types")
+            if isinstance(item_types, list):
+                safe_event["output_item_types"] = [
+                    _bounded_capture_value(item, limit=128)
+                    for item in item_types[:16]
+                    if isinstance(item, str)
+                ]
+            safe_events.append(safe_event)
+        result["event_prefix"] = safe_events
+    tracker = value.get("tracker")
+    if isinstance(tracker, Mapping):
+        result["tracker"] = {
+            key: _bounded_capture_value(tracker[key], limit=256)
+            for key in (
+                "responses_stream_events_seen",
+                "responses_stream_event_types_omitted",
+                "responses_stream_parse_ambiguity",
+                "responses_stream_sequence_ambiguity",
+                "responses_stream_unsupported_event_types",
+            )
+            if key in tracker
+        }
+    return result
+
+
+def capture_responses_failure_evidence(  # noqa: PLR0915
+    *,
+    failure: Any,
+    request: Any,
+    metadata: Optional[Mapping[str, Any]],
+    diagnostic: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
+    """Persist a private, bounded failure-only Responses replay diagnostic."""
+    if not responses_failure_evidence_capture_enabled():
+        return None
+    try:
+        state = getattr(request, "state", None)
+        raw_commitment = getattr(state, "_aawm_openai_responses_wire_commitment", {})
+        commitment = {}
+        if isinstance(raw_commitment, Mapping):
+            for key in (
+                "precommit_replay_committed", "precommit_commitment_reason",
+                "precommit_commitment_event_type", "capacity_recovery_authorized",
+                "response_start_sent", "first_body_sent", "terminal_wire_committed",
+                "done_wire_committed", "disposition",
+            ):
+                value = raw_commitment.get(key)
+                if isinstance(value, (str, bool, int)) or value is None:
+                    commitment[key] = _bounded_capture_value(value, limit=128)
+            semantic = raw_commitment.get("precommit_first_semantic_commitment")
+            if isinstance(semantic, Mapping):
+                commitment["first_semantic_commitment"] = {
+                    key: semantic.get(key)
+                    for key in ("reason", "event_type", "event_type_sha256")
+                    if isinstance(semantic.get(key), str)
+                }
+        ledger = getattr(state, "aawm_openai_provider_call_ledger", None)
+        ledger_raw = ledger.snapshot() if callable(getattr(ledger, "snapshot", None)) else None
+        ledger_snapshot = {}
+        if isinstance(ledger_raw, Mapping):
+            for key in (
+                "max_logical_provider_calls", "logical_provider_calls",
+                "remaining_logical_provider_calls", "capacity_retry_authorized",
+                "next_attempt_ordinal", "transport_connection_failures",
+            ):
+                value = ledger_raw.get(key)
+                if isinstance(value, (int, bool)) and not isinstance(value, float):
+                    ledger_snapshot[key] = value
+            reservations = ledger_raw.get("reservations")
+            if isinstance(reservations, list):
+                ledger_snapshot["reservations"] = [
+                    {
+                        key: _bounded_capture_value(call.get(key), limit=128)
+                        for key in (
+                            "ordinal", "provider", "model", "route_family",
+                            "status_code", "error_class", "outcome",
+                        )
+                        if isinstance(call, Mapping) and call.get(key) is not None
+                    }
+                    for call in reservations[:8]
+                    if isinstance(call, Mapping)
+                ]
+            if isinstance(ledger_raw.get("request_fingerprint"), str):
+                ledger_snapshot["request_fingerprint"] = ledger_raw[
+                    "request_fingerprint"
+                ][:64]
+        safe_metadata = {}
+        for key in (
+            "trace_id", "litellm_call_id", "request_id", "session_id",
+            "canonical_session_identity", "route_family", "provider",
+            "model", "model_alias", "runtime_revision", "config_epoch_tag",
+        ):
+            value = (metadata or {}).get(key)
+            if value is not None:
+                safe_metadata[key] = _bounded_capture_value(value, limit=256)
+        if state is not None:
+            for key in (
+                "litellm_call_id", "request_id", "trace_id", "session_id",
+                "canonical_session_identity",
+            ):
+                value = getattr(state, key, None)
+                if value is not None and key not in safe_metadata:
+                    safe_metadata[key] = _bounded_capture_value(value, limit=256)
+            candidate = getattr(state, "aawm_openai_candidate_context", None)
+            if isinstance(candidate, Mapping):
+                safe_metadata["selected_candidate"] = {
+                    key: _bounded_capture_value(candidate.get(key), limit=128)
+                    for key in (
+                        "provider", "model", "route_family", "config_epoch_tag",
+                        "account_hash",
+                    )
+                    if candidate.get(key) is not None
+                }
+        for key, env_name in (
+            ("runtime_revision", "AAWM_RUNTIME_REVISION"),
+            ("config_epoch_tag", "AAWM_CONFIG_EPOCH_TAG"),
+        ):
+            if key not in safe_metadata and os.environ.get(env_name):
+                safe_metadata[key] = _bounded_capture_value(
+                    os.environ[env_name], limit=128
+                )
+        artifact = {
+            "captured_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "capture_kind": "aawm_responses_failure_evidence",
+            "schema_version": 1,
+            "correlation": safe_metadata,
+            "replay_commitment": commitment,
+            "provider_call_ledger": ledger_snapshot,
+            "failure": {
+                "error_class": _bounded_capture_value(
+                    getattr(failure, "error_class", None)
+                    or type(failure).__name__,
+                    limit=128,
+                ),
+                "classification": _bounded_capture_value(
+                    getattr(failure, "classification", None), limit=128
+                ),
+                "retryable": getattr(failure, "retryable", None),
+                "error_code": _bounded_capture_value(getattr(failure, "error_code", None), limit=256),
+                "error_type": _bounded_capture_value(getattr(failure, "error_type", None), limit=128),
+                "status_code": getattr(failure, "status_code", None),
+                "provider_returned": getattr(failure, "provider_returned", None),
+                "failure_origin": _bounded_capture_value(getattr(failure, "failure_origin", None), limit=128),
+                "pre_commit_retry_exhausted": getattr(failure, "pre_commit_retry_exhausted", None),
+                "message_sha256": hashlib.sha256(
+                    str(getattr(failure, "message", "")).encode("utf-8")
+                ).hexdigest(),
+                "terminal_envelope": _responses_terminal_error_envelope(
+                    getattr(failure, "error_payload", None)
+                ),
+            },
+            "diagnostic": _sanitize_responses_failure_diagnostic(diagnostic),
+        }
+        serialized = _serialize_full_payload_json(artifact)
+        encoded = serialized.encode("utf-8")
+        if len(encoded) > _RESPONSES_FAILURE_MAX_BYTES:
+            artifact["diagnostic"] = {"truncated": True}
+            artifact["failure"]["terminal_envelope"] = None
+            artifact["provider_call_ledger"] = None
+            serialized = _serialize_full_payload_json(artifact)
+            encoded = serialized.encode("utf-8")
+        if len(encoded) > _RESPONSES_FAILURE_MAX_BYTES:
+            return None
+        capture_dir = _responses_failure_capture_dir()
+        _ensure_private_dir(capture_dir)
+        path = capture_dir / (
+            f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}_"
+            f"{_next_counter():04d}_responses_failure.json"
+        )
+        _atomic_write_private_json(path, artifact)
+        files = sorted(capture_dir.glob("*_responses_failure.json"))
+        for old_path in files[:-_RESPONSES_FAILURE_MAX_FILES]:
+            old_path.unlink(missing_ok=True)
+        return str(path)
+    except Exception as exc:
+        verbose_proxy_logger.warning(
+            "AawmResponsesFailureEvidenceCapture: capture failed: %s", exc
+        )
+        return None
+
+
+def _responses_terminal_error_envelope(value: Any) -> Optional[Dict[str, Any]]:
+    """Keep only causal protocol fields; never persist output content or arguments."""
+    if not isinstance(value, Mapping):
+        return None
+    result: Dict[str, Any] = {}
+    event_type = value.get("type")
+    if isinstance(event_type, str):
+        result["type"] = event_type[:128]
+    sequence_number = value.get("sequence_number")
+    if isinstance(sequence_number, int) and not isinstance(sequence_number, bool):
+        result["sequence_number"] = sequence_number
+    for error_key in ("error",):
+        error = value.get(error_key)
+        if isinstance(error, Mapping):
+            result[error_key] = _responses_error_fields(error)
+    direct_error = {
+        key: value[key] for key in ("code", "message", "param") if key in value
+    }
+    if direct_error:
+        result["error"] = _responses_error_fields(direct_error)
+    response = value.get("response")
+    if isinstance(response, Mapping):
+        safe_response: Dict[str, Any] = {}
+        for key in ("id", "status", "object"):
+            item = response.get(key)
+            if isinstance(item, str):
+                safe_response[key] = item[:256]
+        if isinstance(response.get("error"), Mapping):
+            safe_response["error"] = _responses_error_fields(response["error"])
+        output = response.get("output")
+        if isinstance(output, list):
+            safe_response["output"] = {
+                "item_count": len(output),
+                "item_types": [
+                    item.get("type")[:128]
+                    for item in output[:16]
+                    if isinstance(item, Mapping) and isinstance(item.get("type"), str)
+                ],
+            }
+        result["response"] = safe_response
+    return result
+
+
+def _responses_error_fields(value: Mapping[str, Any]) -> Dict[str, Any]:
+    safe: Dict[str, Any] = {}
+    for key in ("type", "code", "param"):
+        field = value.get(key)
+        if isinstance(field, str):
+            safe[key] = _bounded_capture_value(field, limit=256)
+    message = value.get("message")
+    if isinstance(message, str):
+        safe["message_sha256"] = hashlib.sha256(
+            message[:512].encode("utf-8")
+        ).hexdigest()
+    return safe
 
 
 def _split_scope_values(value: str) -> List[str]:

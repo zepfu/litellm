@@ -7,6 +7,7 @@ import copy
 import json
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
@@ -5931,6 +5932,102 @@ async def test_additive_setup_and_failure_fields_remain_capacity_retryable():
 
 
 @pytest.mark.asyncio
+async def test_responses_failure_diagnostic_prefix_is_bounded_and_wire_unchanged(
+    monkeypatch, tmp_path
+):
+    from litellm.integrations.aawm_passthrough_shape_capture import (
+        capture_responses_failure_evidence,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        record_responses_first_semantic_commitment,
+    )
+
+    monkeypatch.setenv("AAWM_CAPTURE_RESPONSES_FAILURE_EVIDENCE", "1")
+    monkeypatch.setenv(
+        "AAWM_CAPTURE_RESPONSES_FAILURE_EVIDENCE_DIR", str(tmp_path / "capture")
+    )
+    response_id = "resp_evidence_prefix"
+    chunks = [
+        _response_event(
+            "response.created",
+            1,
+            response_id=response_id,
+            status="in_progress",
+        )
+    ]
+    chunks.extend(
+        _responses_event(
+            "response.metadata",
+            sequence,
+            metadata={"provider_request_id": "not-user-content"},
+        )
+        for sequence in range(2, 11)
+    )
+    terminal = _response_event(
+        "response.failed",
+        11,
+        response_id=response_id,
+        status="failed",
+        error={
+            "code": "server_overloaded",
+            "type": "server_error",
+            "message": "Selected model is at capacity.",
+        },
+    )
+    chunks.append(terminal)
+    request = _responses_request({"model": "gpt-5.4"})
+    request.state.litellm_call_id = "call-evidence-prefix"
+    request.state._aawm_openai_responses_wire_commitment = {
+        "precommit_replay_committed": True,
+        "precommit_commitment_reason": "provider_execution_possible",
+        "precommit_commitment_event_type": "provider_dispatch",
+    }
+    response = httpx.Response(
+        200,
+        stream=_ClosableAsyncByteStream(chunks),
+        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+    )
+
+    prefixed, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+        response,
+        request=request,
+        provider_bound_body={"model": "gpt-5.4", "tools": []},
+        openai_alpha_capacity_retry_enabled=True,
+    )
+    try:
+        assert failure is not None
+        assert failure.error_class == "server_overloaded"
+        assert failure.error_payload["response"]["error"]["code"] == "server_overloaded"
+        assert len(failure.responses_diagnostic["event_prefix"]) == 8
+        record_responses_first_semantic_commitment(
+            request,
+            reason="assistant_output",
+            event_type="response.output_text.delta",
+        )
+        path_value = capture_responses_failure_evidence(
+            failure=failure,
+            request=request,
+            metadata={"litellm_call_id": "call-evidence-prefix"},
+            diagnostic=failure.responses_diagnostic,
+        )
+        assert path_value is not None
+        artifact = json.loads(Path(path_value).read_text(encoding="utf-8"))
+        assert artifact["correlation"]["litellm_call_id"] == "call-evidence-prefix"
+        assert artifact["replay_commitment"]["first_semantic_commitment"] == {
+            "reason": "assistant_output",
+            "event_type": "response.output_text.delta",
+        }
+        assert artifact["failure"]["terminal_envelope"]["response"]["error"]["code"] == (
+            "server_overloaded"
+        )
+        assert b"".join([chunk async for chunk in prefixed.aiter_bytes()]) == b"".join(
+            chunks
+        )
+    finally:
+        await prefixed.aclose()
+
+
+@pytest.mark.asyncio
 async def test_unknown_setup_effect_field_does_not_veto_replay():
     """Opaque provider fields never gate a known no-effect capacity retry."""
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
@@ -9641,19 +9738,45 @@ async def test_unconfirmed_capacity_failure_keeps_provisional_commitment_termina
         side_effect=run_operation,
     ), pytest.raises(ResponsesStreamPreCommitFailure) as raised:
         await _execute_passthrough_pre_first_byte_with_hidden_retries(
-                kwargs={},
-                operation=operation,
-                operation_name="stream_pre_first_byte",
-                caller_managed_hidden_retry=False,
-                request=request,
-                url=httpx.URL("https://api.openai.com/v1/responses"),
-                custom_llm_provider="openai",
-                openai_capacity_coordinator=coordinator,
-            )
-
+            kwargs={},
+            operation=operation,
+            operation_name="stream_pre_first_byte",
+            caller_managed_hidden_retry=False,
+            request=request,
+            url=httpx.URL("https://api.openai.com/v1/responses"),
+            custom_llm_provider="openai",
+            openai_capacity_coordinator=coordinator,
+        )
     assert raised.value is failure
     assert calls == 1
 
+
+def test_first_semantic_commitment_survives_dispatch_latch_separately():
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        get_request_openai_wire_commitment,
+        get_responses_first_semantic_commitment,
+        publish_responses_replay_commitment,
+        record_responses_first_semantic_commitment,
+    )
+
+    request = _responses_request({"model": "gpt-5.4"})
+    publish_responses_replay_commitment(
+        request,
+        reason="provider_execution_possible",
+    )
+    record_responses_first_semantic_commitment(
+        request,
+        reason="assistant_output",
+        event_type="response.output_text.delta",
+    )
+
+    commitment = get_request_openai_wire_commitment(request)
+    assert commitment["precommit_commitment_reason"] == "provider_execution_possible"
+    assert commitment["precommit_commitment_event_type"] == "provider_dispatch"
+    assert get_responses_first_semantic_commitment(request) == {
+        "reason": "assistant_output",
+        "event_type": "response.output_text.delta",
+    }
 
 def test_adopted_event_without_payload_cannot_claim_transport_exemption():
     event = ResponsesEventPipeline().adopt_event(None, wire_event=b": keepalive\n\n")

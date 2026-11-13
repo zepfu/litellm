@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import stat
+from types import SimpleNamespace
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
@@ -68,6 +69,120 @@ def test_env_flag_enables_without_control_file(monkeypatch) -> None:
     monkeypatch.setenv(capture._FULL_PAYLOAD_ENV_FLAG, "1")
     monkeypatch.delenv(capture._FULL_PAYLOAD_CONTROL_FILE_ENV, raising=False)
     assert capture.passthrough_full_payload_capture_enabled() is True
+
+
+def test_responses_failure_capture_is_opt_in_and_private(tmp_path: Path, monkeypatch) -> None:
+    control_parent = tmp_path / "control"
+    control_parent.mkdir(mode=0o700)
+    control = control_parent / "enabled"
+    control.write_text("1", encoding="utf-8")
+    control.chmod(0o600)
+    output_dir = tmp_path / "evidence"
+    monkeypatch.delenv(capture._RESPONSES_FAILURE_CAPTURE_ENV, raising=False)
+    monkeypatch.setenv(capture._RESPONSES_FAILURE_CAPTURE_CONTROL_ENV, str(control))
+    monkeypatch.setenv(capture._RESPONSES_FAILURE_CAPTURE_DIR_ENV, str(output_dir))
+
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            _aawm_openai_responses_wire_commitment={
+                "precommit_replay_committed": True,
+                "precommit_commitment_reason": "provider_execution_possible",
+                "precommit_first_semantic_commitment": {
+                    "reason": "assistant_output",
+                    "event_type": "response.output_text.delta",
+                },
+            }
+        )
+    )
+    failure = SimpleNamespace(
+        error_class="server_overloaded",
+        classification="transient_capacity",
+        retryable=True,
+        error_code="server_overloaded",
+        error_type="server_error",
+        status_code=529,
+        provider_returned=True,
+        failure_origin=None,
+        pre_commit_retry_exhausted=False,
+        message="server overloaded",
+        error_payload={
+            "type": "response.failed",
+            "sequence_number": 8,
+            "response": {
+                "id": "resp-123",
+                "status": "failed",
+                "error": {
+                    "type": "server_error",
+                    "code": "server_overloaded",
+                    "message": "server overloaded",
+                },
+                "output": [
+                    {"type": "function_call", "arguments": "DO NOT STORE"},
+                    {"type": "message", "content": "DO NOT STORE"},
+                ],
+            },
+            "input": "DO NOT STORE",
+        },
+    )
+    path_value = capture.capture_responses_failure_evidence(
+        failure=failure,
+        request=request,
+        metadata={
+            "litellm_call_id": "call-123",
+            "session_id": "session-456",
+            "prompt": "DO NOT STORE",
+        },
+        diagnostic={
+            "first_semantic_commitment": {
+                "reason": "assistant_output",
+                "event_type": "response.output_text.delta",
+            },
+            "event_prefix": [
+                {"event_type": "response.output_text.delta", "sequence_number": 3}
+            ],
+            "tool_arguments": "DO NOT STORE",
+        },
+    )
+    assert path_value is not None
+    path = Path(path_value)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(output_dir.stat().st_mode) == 0o700
+    text = path.read_text(encoding="utf-8")
+    artifact = json.loads(text)
+    assert artifact["failure"]["terminal_envelope"]["response"]["id"] == "resp-123"
+    assert artifact["failure"]["terminal_envelope"]["response"]["output"] == {
+        "item_count": 2,
+        "item_types": ["function_call", "message"],
+    }
+    assert artifact["correlation"] == {
+        "litellm_call_id": "call-123",
+        "session_id": "session-456",
+    }
+    assert artifact["replay_commitment"]["first_semantic_commitment"] == {
+        "reason": "assistant_output",
+        "event_type": "response.output_text.delta",
+    }
+    assert path.stat().st_size <= capture._RESPONSES_FAILURE_MAX_BYTES
+    assert "DO NOT STORE" not in text
+    assert "input" not in artifact["failure"]["terminal_envelope"]
+    for _ in range(capture._RESPONSES_FAILURE_MAX_FILES):
+        capture.capture_responses_failure_evidence(
+            failure=failure,
+            request=request,
+            metadata={},
+        )
+    assert len(list(output_dir.glob("*_responses_failure.json"))) == (
+        capture._RESPONSES_FAILURE_MAX_FILES
+    )
+
+
+def test_responses_failure_capture_is_disabled_by_default(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv(capture._RESPONSES_FAILURE_CAPTURE_ENV, raising=False)
+    monkeypatch.setenv(
+        capture._RESPONSES_FAILURE_CAPTURE_CONTROL_ENV,
+        str(tmp_path / "missing-control"),
+    )
+    assert capture.responses_failure_evidence_capture_enabled() is False
 
 
 def test_write_full_payload_artifact_is_mode_0600(tmp_path: Path, monkeypatch) -> None:

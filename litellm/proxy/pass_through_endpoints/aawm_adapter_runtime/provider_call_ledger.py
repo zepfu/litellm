@@ -51,6 +51,7 @@ _RESPONSES_REPLAY_COMMITMENT_REASONS = frozenset({
 
 _RESPONSES_REPLAY_LATCH_REASON_KEY = "precommit_commitment_reason"
 _RESPONSES_REPLAY_LATCH_EVENT_KEY = "precommit_commitment_event_type"
+_RESPONSES_REPLAY_FIRST_SEMANTIC_KEY = "precommit_first_semantic_commitment"
 _RESPONSES_REPLAY_PUBLISHED_LATCH_REASON_KEY = (
     "precommit_published_replay_reason"
 )
@@ -58,6 +59,7 @@ _RESPONSES_REPLAY_EVENT_LABELS = frozenset(
     {
         "[DONE]",
         "error",
+        "provider_dispatch",
         "response.created",
         "response.in_progress",
         "response.completed",
@@ -659,6 +661,7 @@ def _safe_wire_commitment(
             "capacity_recovery_authorized",
             _RESPONSES_REPLAY_LATCH_REASON_KEY,
             _RESPONSES_REPLAY_LATCH_EVENT_KEY,
+            _RESPONSES_REPLAY_FIRST_SEMANTIC_KEY,
         )
         if key in commitment
     }
@@ -683,6 +686,25 @@ def _safe_wire_commitment(
                 reason=reason if isinstance(reason, str) else None,
             )
         )
+    semantic = safe_commitment.get(_RESPONSES_REPLAY_FIRST_SEMANTIC_KEY)
+    if isinstance(semantic, Mapping):
+        event_type = semantic.get("event_type")
+        safe_semantic = {
+            "reason": semantic.get("reason")
+            if semantic.get("reason") in _RESPONSES_REPLAY_COMMITMENT_REASONS
+            else "unknown_semantics",
+            "event_type": _responses_replay_event_label(
+                event_type
+                if isinstance(event_type, str)
+                else None
+            ),
+        }
+        event_hash = semantic.get("event_type_sha256")
+        if isinstance(event_hash, str) and len(event_hash) == 64:
+            safe_semantic["event_type_sha256"] = event_hash
+        safe_commitment[_RESPONSES_REPLAY_FIRST_SEMANTIC_KEY] = safe_semantic
+    else:
+        safe_commitment.pop(_RESPONSES_REPLAY_FIRST_SEMANTIC_KEY, None)
     return safe_commitment
 
 
@@ -1148,8 +1170,6 @@ def publish_responses_replay_commitment(
     commitment[_RESPONSES_REPLAY_LATCH_EVENT_KEY] = (
         _responses_replay_event_label(event_type, reason=reason)
     )
-
-
 def get_responses_replay_commitment_reason(
     request: Request,
 ) -> Optional[str]:
@@ -1165,6 +1185,53 @@ def get_responses_replay_commitment_reason(
         return None
     reason = commitment.get(_RESPONSES_REPLAY_LATCH_REASON_KEY)
     return reason if isinstance(reason, str) else None
+
+
+def get_responses_first_semantic_commitment(request: Any) -> Optional[dict[str, str]]:
+    """Return the first parser-observed semantic trigger, not dispatch latch."""
+    state = _request_state(request)
+    commitment = getattr(state, _WIRE_COMMITMENT_STATE_KEY, None) if state else None
+    value = commitment.get(_RESPONSES_REPLAY_FIRST_SEMANTIC_KEY) if isinstance(commitment, Mapping) else None
+    if not isinstance(value, Mapping):
+        return None
+    reason, event_type = value.get("reason"), value.get("event_type")
+    if not isinstance(reason, str) or reason not in _RESPONSES_REPLAY_COMMITMENT_REASONS:
+        return None
+    result = {
+        "reason": reason,
+        "event_type": _responses_replay_event_label(
+            event_type if isinstance(event_type, str) else None,
+            reason=reason,
+        ),
+    }
+    event_hash = value.get("event_type_sha256")
+    if isinstance(event_hash, str) and len(event_hash) == 64:
+        result["event_type_sha256"] = event_hash
+    return result
+
+
+def record_responses_first_semantic_commitment(
+    request: Any, *, reason: str, event_type: Optional[str]
+) -> None:
+    """Retain the parser's first commitment separately from dispatch."""
+    if reason not in _RESPONSES_REPLAY_COMMITMENT_REASONS:
+        return
+    state = _request_state(request)
+    commitment = getattr(state, _WIRE_COMMITMENT_STATE_KEY, None) if state else None
+    if not isinstance(commitment, dict):
+        return
+    if _RESPONSES_REPLAY_FIRST_SEMANTIC_KEY in commitment:
+        return
+    event_label = _responses_replay_event_label(event_type, reason=reason)
+    semantic = {
+        "reason": reason,
+        "event_type": event_label,
+    }
+    if event_label == "unknown_event" and event_type:
+        semantic["event_type_sha256"] = hashlib.sha256(
+            event_type.encode("utf-8")
+        ).hexdigest()
+    commitment[_RESPONSES_REPLAY_FIRST_SEMANTIC_KEY] = semantic
 
 
 _PROVIDER_EXECUTABLE_TOOL_TYPES = frozenset({

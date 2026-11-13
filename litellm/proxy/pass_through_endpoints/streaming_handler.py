@@ -1,5 +1,6 @@
 import asyncio
 import codecs
+import hashlib
 import inspect
 import json
 import os
@@ -22,8 +23,10 @@ from litellm.integrations.aawm_session_history.waits import (
 from litellm._logging import verbose_proxy_logger
 from litellm.integrations.aawm_passthrough_shape_capture import (
     capture_passthrough_stream_shape,
+    capture_responses_failure_evidence,
     diagnostic_payload_capture_enabled,
     passthrough_full_payload_capture_enabled,
+    responses_failure_evidence_capture_enabled,
 )
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.llms.cohere.cancellation import (
@@ -88,6 +91,8 @@ from .aawm_adapter_runtime.provider_call_ledger import (
     _responses_replay_event_label,
     record_responses_replay_rejection,
     get_responses_replay_commitment_reason,
+    get_responses_first_semantic_commitment,
+    record_responses_first_semantic_commitment,
     publish_responses_replay_commitment,
     responses_effective_provider_tools_allowed,
     get_request_provider_call_ledger,
@@ -245,6 +250,7 @@ class ResponsesStreamPreCommitFailure(Exception):
         self.message = message or classification
         self.provider_returned = provider_returned
         self.failure_origin = failure_origin
+        self.responses_diagnostic: Dict[str, Any] = {}
         self.detail = {
             "error": {
                 "message": self.message,
@@ -670,6 +676,8 @@ class _ResponsesPreCommitSSEParser:
         self,
         prefix: _ResponsesPreCommitPrefixStore,
         pipeline: Optional[ResponsesEventPipeline] = None,
+        *,
+        capture_diagnostics: bool = False,
     ) -> None:
         # Keep the prefix reference for compatibility and diagnostics. Framing
         # and JSON admission are owned exclusively by ``pipeline``.
@@ -685,6 +693,8 @@ class _ResponsesPreCommitSSEParser:
         self._first_terminal_decision: Optional[str] = None
         self._commitment_reason: Optional[str] = None
         self.commitment_rejection: Dict[str, str] = {}
+        self._diagnostic_event_prefix: List[Dict[str, Any]] = []
+        self._capture_diagnostics = capture_diagnostics
         self._response_id: Optional[str] = None
         self._output_items: Dict[int, tuple[str, str]] = {}
 
@@ -706,6 +716,45 @@ class _ResponsesPreCommitSSEParser:
             )
             if decision != "failed":
                 decision = "substantive"
+        if self._capture_diagnostics and len(self._diagnostic_event_prefix) < 8:
+            payload = (
+                parsed_event.payload
+                if isinstance(parsed_event.payload, dict)
+                else {}
+            )
+            response = payload.get("response")
+            output = response.get("output") if isinstance(response, dict) else None
+            event_label = _responses_replay_event_label(event_type)
+            event_record = {
+                "event_type": event_label,
+                "sequence_number": payload.get("sequence_number"),
+                "decision": decision,
+                "commitment_reason": commitment_reason,
+                "payload_keys": sorted(str(key)[:64] for key in payload)[:32],
+                "response_status": (
+                    response.get("status") if isinstance(response, dict) else None
+                ),
+                "response_id": (
+                    response.get("id") if isinstance(response, dict) else None
+                ),
+                "output_item_types": (
+                    [
+                        item.get("type")
+                        for item in output[:16]
+                        if isinstance(item, dict)
+                        and isinstance(item.get("type"), str)
+                    ]
+                    if isinstance(output, list)
+                    else None
+                ),
+            }
+            if event_label == "unknown_event" and event_type:
+                event_record["event_type_sha256"] = hashlib.sha256(
+                    event_type.encode("utf-8")
+                ).hexdigest()
+            if parsed_event.is_malformed:
+                event_record["malformed"] = True
+            self._diagnostic_event_prefix.append(event_record)
         if decision in {"failed", "substantive"}:
             # The first terminal/substantive event wins. A later event in the
             # same HTTPX read must not erase the earlier precommit outcome.
@@ -913,6 +962,10 @@ class _ResponsesPreCommitSSEParser:
     @property
     def commitment_reason(self) -> Optional[str]:
         return self._commitment_reason
+
+    @property
+    def diagnostic_event_prefix(self) -> List[Dict[str, Any]]:
+        return list(self._diagnostic_event_prefix)
 
 
 class _PassThroughStreamLineAccumulator:
@@ -2547,11 +2600,14 @@ class PassThroughStreamingHandler:
                     reason="provider_execution_possible",
                 )
 
+        capture_diagnostics = responses_failure_evidence_capture_enabled()
         prefix = _ResponsesPreCommitPrefixStore(
             max_buffer_bytes,
             max_storage_bytes=pipeline.max_stream_bytes,
         )
-        parser = _ResponsesPreCommitSSEParser(prefix, pipeline)
+        parser = _ResponsesPreCommitSSEParser(
+            prefix, pipeline, capture_diagnostics=capture_diagnostics
+        )
         iterator: Any = None
         retired = False
         response_stream = getattr(response, "stream", None)
@@ -2585,13 +2641,18 @@ class PassThroughStreamingHandler:
 
         def _bound_failure(exc: BaseException) -> ResponsesStreamPreCommitFailure:
             bound_failure = ResponsesBoundFailure.from_exception(exc)
-            return PassThroughStreamingHandler._build_responses_pre_commit_failure(
+            failure = PassThroughStreamingHandler._build_responses_pre_commit_failure(
                 error_payload=bound_failure.error_payload,
                 event_type=bound_failure.code,
                 openai_alpha_capacity_retry_enabled=(
                     openai_alpha_capacity_retry_enabled
                 ),
             )
+            failure.responses_diagnostic = {
+                "first_semantic_commitment": get_responses_first_semantic_commitment(request) if request is not None else None,
+                "event_prefix": parser.diagnostic_event_prefix,
+            }
+            return failure
 
         try:
             iterator = response.aiter_bytes()
@@ -2621,6 +2682,10 @@ class PassThroughStreamingHandler:
                         failure_origin="local_transport",
                     )
                     read_failure.__cause__ = exc
+                    read_failure.responses_diagnostic = {
+                        "first_semantic_commitment": get_responses_first_semantic_commitment(request) if request is not None else None,
+                        "event_prefix": parser.diagnostic_event_prefix,
+                    }
                     return (
                         _PrefixedHttpxByteStream(response, prefix, iterator),
                         read_failure,
@@ -2703,6 +2768,11 @@ class PassThroughStreamingHandler:
                             openai_alpha_capacity_retry_enabled
                         ),
                     )
+                    failure.responses_diagnostic = {
+                        "first_semantic_commitment": get_responses_first_semantic_commitment(request) if request is not None else None,
+                        "event_prefix": parser.diagnostic_event_prefix,
+                        "replay_rejection": dict(parser.commitment_rejection),
+                    }
                     no_effect_capacity_failure = (
                         failure.provider_returned
                         and not parser.commitment_rejection
@@ -2795,6 +2865,11 @@ class PassThroughStreamingHandler:
                             openai_alpha_capacity_retry_enabled
                         ),
                     )
+                    failure.responses_diagnostic = {
+                        "first_semantic_commitment": get_responses_first_semantic_commitment(request) if request is not None else None,
+                        "event_prefix": parser.diagnostic_event_prefix,
+                        "replay_rejection": dict(parser.commitment_rejection),
+                    }
                     no_effect_capacity_failure = (
                         failure.provider_returned
                         and not parser.commitment_rejection
@@ -2853,6 +2928,11 @@ class PassThroughStreamingHandler:
                         openai_alpha_capacity_retry_enabled
                     ),
                 )
+                failure.responses_diagnostic = {
+                    "first_semantic_commitment": get_responses_first_semantic_commitment(request) if request is not None else None,
+                    "event_prefix": parser.diagnostic_event_prefix,
+                    "replay_rejection": dict(parser.commitment_rejection),
+                }
                 no_effect_capacity_failure = (
                     failure.provider_returned
                     and not parser.commitment_rejection
@@ -2893,6 +2973,10 @@ class PassThroughStreamingHandler:
                         failure_origin="local_missing_terminal",
                     )
                 )
+                missing_terminal.responses_diagnostic = {
+                    "first_semantic_commitment": get_responses_first_semantic_commitment(request) if request is not None else None,
+                    "event_prefix": parser.diagnostic_event_prefix,
+                }
                 # OPENAI-080 (R8): a truncated UTF-8 remainder after accepted
                 # safe events commits with "prefix_limit".  Replay the
                 # exact prefix and let the live pipeline finish.
@@ -2923,6 +3007,35 @@ class PassThroughStreamingHandler:
                 request, parser.commitment_reason, event_type, parser.commitment_rejection
             )
             return prefixed, None
+        except Exception as exc:
+            if request is not None:
+                capture_responses_failure_evidence(
+                    failure=exc,
+                    request=request,
+                    metadata={},
+                    diagnostic={
+                        "first_semantic_commitment": get_responses_first_semantic_commitment(request),
+                        "event_prefix": parser.diagnostic_event_prefix,
+                    },
+                )
+            prefix.close()
+            close_iterator = getattr(iterator, "aclose", None)
+            if callable(close_iterator):
+                try:
+                    result = close_iterator()
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    pass
+            close_response = getattr(response, "aclose", None)
+            if callable(close_response):
+                try:
+                    result = close_response()
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    pass
+            raise
         except BaseException:
             prefix.close()
             close_iterator = getattr(iterator, "aclose", None)
@@ -3517,6 +3630,12 @@ class PassThroughStreamingHandler:
                 if is_fork_owned_responses_stream
                 else None
             )
+            capture_diagnostics = responses_failure_evidence_capture_enabled()
+            diagnostic_event_prefix: List[Dict[str, Any]] = []
+            diagnostic_parser = _ResponsesPreCommitSSEParser(
+                _ResponsesPreCommitPrefixStore(0),
+                capture_diagnostics=capture_diagnostics,
+            )
             responses_terminal_seen = False
             responses_substantive_seen = False
             held_responses_done_suffix = b""
@@ -3640,6 +3759,11 @@ class PassThroughStreamingHandler:
                 nonlocal responses_tracking_finalized
                 if responses_sse_tracker is None:
                     return None
+                if capture_diagnostics:
+                    diagnostic_parser._record_event(parsed_event)
+                    diagnostic_event_prefix[:] = (
+                        diagnostic_parser.diagnostic_event_prefix
+                    )
                 if parsed_event.is_malformed:
                     OpenAIPassthroughLoggingHandler._mark_responses_sse_parse_ambiguity(
                         responses_sse_tracker
@@ -3918,6 +4042,17 @@ class PassThroughStreamingHandler:
                 nonlocal responses_sse_event_buffer, responses_terminal_seen
                 failure_context = _build_postcommit_responses_failure_context(
                     failure
+                )
+                failure.responses_diagnostic = {
+                    "first_semantic_commitment": get_responses_first_semantic_commitment(operational_request),
+                    "event_prefix": diagnostic_event_prefix,
+                    "tracker": metadata.get("aawm_stream_tracker_state", {}),
+                }
+                capture_responses_failure_evidence(
+                    failure=failure,
+                    request=operational_request,
+                    metadata=metadata,
+                    diagnostic=failure.responses_diagnostic,
                 )
                 if isinstance(error_log_context, dict):
                     error_log_context.update(failure_context)
@@ -4655,6 +4790,20 @@ class PassThroughStreamingHandler:
                     first_emitted_at=local_first_emitted_at,
                 )
             )
+            if locals().get("is_fork_owned_responses_stream") is True:
+                failure_diagnostic = {
+                    "first_semantic_commitment": get_responses_first_semantic_commitment(
+                        operational_request
+                    ),
+                    "event_prefix": diagnostic_event_prefix,
+                    "tracker": metadata.get("aawm_stream_tracker_state", {}),
+                }
+                capture_responses_failure_evidence(
+                    failure=e,
+                    request=operational_request,
+                    metadata=metadata,
+                    diagnostic=failure_diagnostic,
+                )
             if isinstance(e, ResponsesBoundFailure):
                 bound_failure = e
                 failure_kind = (
@@ -6923,6 +7072,11 @@ def _maybe_set_replay_latch(
     if request is None or commitment_reason is None:
         return
     try:
+        record_responses_first_semantic_commitment(
+            request,
+            reason=commitment_reason,
+            event_type=event_type,
+        )
         first_commitment = get_responses_replay_commitment_reason(request) is None
         publish_responses_replay_commitment(
             request,
