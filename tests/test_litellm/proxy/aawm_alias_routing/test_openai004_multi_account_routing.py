@@ -5615,6 +5615,45 @@ aliases:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["basic", "work"])
+async def test_openai_proxy_route_alias_reaches_handler_with_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+) -> None:
+    monkeypatch.setenv("LITELLM_CODEX_OAUTH_INVENTORY", "configured-inventory.json")
+    request = _direct_request()
+    body = {"model": model, "input": "hello"}
+    monkeypatch.setattr(lpe, "get_request_body", AsyncMock(return_value=body))
+    monkeypatch.setattr(
+        lpe, "_resolve_codex_auto_agent_alias_model", lambda *_a, **_k: model
+    )
+    bind_account = AsyncMock()
+    monkeypatch.setattr(
+        codex_oauth, "select_and_bind_direct_codex_oauth_inventory", bind_account
+    )
+    handler = AsyncMock(return_value=Response(content=b"alias response"))
+    monkeypatch.setattr(
+        lpe.BaseOpenAIPassThroughHandler,
+        "_base_openai_pass_through_handler",
+        handler,
+    )
+    assert lpe._should_use_direct_codex_oauth_inventory(
+        request, endpoint="v1/responses", request_body=body
+    )
+
+    response = await lpe.openai_proxy_route(
+        endpoint="v1/responses",
+        request=request,
+        fastapi_response=Response(),
+        user_api_key_dict=object(),
+    )
+
+    assert response.body == b"alias response"
+    handler.assert_awaited_once()
+    bind_account.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_openai_proxy_route_direct_cooldown_bypass_is_one_shot_before_account_failover(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

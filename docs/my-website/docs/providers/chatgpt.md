@@ -108,6 +108,9 @@ The active model map must include this capability. The bundled map includes it;
 The route preserves a received `x-openai-subagent` header and body
 `client_metadata`, while inventory-selected credentials remain authoritative.
 Authentication, session ownership, and actual provider rejections still apply.
+This direct-route header handling requires a bound account selection. Alias
+requests such as `basic` and `work` keep their existing alias dispatch and do
+not bind a direct account at the outer Responses route.
 The exemption adds no fallback, retry, or automatic approval decision. Local
 admission does not guarantee provider availability under exhausted allowance.
 
