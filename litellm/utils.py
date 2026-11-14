@@ -6049,6 +6049,9 @@ def _get_model_info_helper(  # noqa: PLR0915
                 litellm_provider=_model_info.get("litellm_provider", custom_llm_provider),
                 mode=_model_info.get("mode"),  # type: ignore
                 supports_system_messages=_model_info.get("supports_system_messages", None),
+                codex_oauth_ordinary_quota_exempt=_model_info.get(
+                    "codex_oauth_ordinary_quota_exempt", None
+                ),
                 supports_response_schema=_model_info.get("supports_response_schema", None),
                 supports_vision=_model_info.get("supports_vision", None),
                 supports_function_calling=_model_info.get("supports_function_calling", None),

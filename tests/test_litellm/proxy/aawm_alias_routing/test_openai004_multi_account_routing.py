@@ -203,9 +203,6 @@ def _stream_unpersisted_item_not_found_error() -> HTTPException:
     ).as_http_exception()
 
 
-
-
-
 def _record(
     label: str,
     account_hash: str,
@@ -4127,6 +4124,83 @@ async def test_direct_responses_skips_exhausted_account_and_fails_over(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "quota_exempt"),
+    [("codex-auto-review", True), ("gpt-5.3-codex", False)],
+)
+@pytest.mark.parametrize("hydrated", [True, False])
+async def test_native_review_admission_is_independent_of_ordinary_quota(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    quota_exempt: bool,
+    hydrated: bool,
+) -> None:
+    loaded = _patch_direct_inventory_auth(monkeypatch)
+    monkeypatch.setattr(
+        session_affinity,
+        "get_session_owner_record",
+        AsyncMock(return_value=(None, None, None)),
+    )
+    if not hydrated:
+        monkeypatch.setattr(
+            selection, "_hydrate_codex_oauth_quota_observations", AsyncMock()
+        )
+    now = datetime.now(timezone.utc)
+    previous_snapshot = snapshot_select.get_active_routing_snapshot()
+    snapshot_select.set_active_routing_snapshot(None)
+    alias_routing_state.reset_for_tests()
+    alias_routing_state.record_normalized_quota_observations(
+        [
+            _quota_observation(
+                account_hash=f"hash-account-{number}",
+                observed_at=now,
+                reset_at=now + timedelta(hours=2),
+                quota_period="five_hour",
+                window_minutes=300,
+                exhausted=True,
+                model=model,
+            )
+            for number in (1, 2)
+        ]
+    )
+    body = {
+        "model": model,
+        "input": "review",
+        "client_metadata": {"x-openai-subagent": "guardian"},
+        "litellm_metadata": {"codex_oauth_ordinary_quota_exempt": True},
+    }
+    try:
+        if quota_exempt:
+            (
+                auth,
+                selected,
+                _,
+            ) = await codex_oauth.select_and_bind_direct_codex_oauth_inventory(
+                _direct_request(), request_body=body
+            )
+            assert auth.account_label == "account1"
+            assert "account1" in loaded
+            assert (
+                selected["quota_selection"]["bypass_reason"]
+                == "ordinary_quota_inapplicable"
+            )
+        else:
+            with pytest.raises(HTTPException) as exc_info:
+                await codex_oauth.select_and_bind_direct_codex_oauth_inventory(
+                    _direct_request(), request_body=body
+                )
+            assert exc_info.value.status_code == 429
+            assert exc_info.value.detail["attempted_provider_call"] is False
+            assert all(
+                item["reason"] == "quota_exhausted"
+                for item in exc_info.value.detail["skipped_candidates"]
+            )
+    finally:
+        snapshot_select.set_active_routing_snapshot(previous_snapshot)
+        alias_routing_state.reset_for_tests()
+
+
+@pytest.mark.asyncio
 async def test_direct_responses_request_local_usage_limit_selects_next_account(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5383,9 +5457,21 @@ async def test_priority_stability_ignores_stale_balancing_cadence(
 
 
 @pytest.mark.asyncio
-async def test_openai_proxy_route_direct_uses_inventory_without_diagnostic_read(
+@pytest.mark.parametrize(
+    ("model", "subagent", "provider_refusal"),
+    [
+        ("gpt-5.6-sol", None, False),
+        ("codex-auto-review", None, False),
+        ("codex-auto-review", "guardian", False),
+        ("codex-auto-review", "guardian", True),
+    ],
+)
+async def test_openai_proxy_route_direct_uses_inventory_without_diagnostic_read(  # noqa: PLR0915
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    model: str,
+    subagent: str | None,
+    provider_refusal: bool,
 ) -> None:
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
         config_startup,
@@ -5397,9 +5483,12 @@ async def test_openai_proxy_route_direct_uses_inventory_without_diagnostic_read(
     )
 
     loaded = _patch_direct_inventory_auth(monkeypatch)
+    monkeypatch.setenv("AAWM_SESSION_HISTORY_SPOOL_DIR", str(tmp_path / "spool"))
     redis = _FakeRedisCache()
     request = _direct_request()
-    body = {"model": "gpt-5.6-sol", "input": "hello"}
+    body = {"model": model, "input": "hello"}
+    if subagent is not None:
+        request.scope["headers"].append((b"x-openai-subagent", subagent.encode()))
     startup_inventory_reads: list[None] = []
     config_dir = tmp_path / "alias_config"
     config_dir.mkdir()
@@ -5424,9 +5513,25 @@ aliases:
         return dict(body)
 
     captured: dict[str, Any] = {}
+    calls = 0
+    refusal = HTTPException(
+        status_code=429,
+        detail={
+            "error": {"type": "usage_limit_reached", "code": "usage_limit_reached"},
+            "failover_disposition": "usage_limit_reached",
+            "retry_after_seconds": 17,
+        },
+    )
+    refusal._aawm_provider_returned = True
+    refusal.attempted_provider_call = True
+    monkeypatch.setattr(lpe, "_persist_codex_cooldown_durable", AsyncMock())
 
     async def _fake_base_handler(**kwargs):
+        nonlocal calls
+        calls += 1
         captured.update(kwargs)
+        if provider_refusal:
+            raise refusal
         return Response(content=b"ok", status_code=200)
 
     monkeypatch.setattr(lpe, "get_request_body", _fake_get_body)
@@ -5471,20 +5576,35 @@ aliases:
         assert set(active_snapshot.aliases) == {"unrelated-alias"}
         assert body["model"] not in active_snapshot.aliases
         with _patch_dual(redis):
-            response = await lpe.openai_proxy_route(
-                endpoint="v1/responses",
-                request=request,
-                fastapi_response=Response(),
-                user_api_key_dict=object(),  # type: ignore[arg-type]
-            )
+            if provider_refusal:
+                with pytest.raises(HTTPException) as raised:
+                    await lpe.openai_proxy_route(
+                        endpoint="v1/responses",
+                        request=request,
+                        fastapi_response=Response(),
+                        user_api_key_dict=object(),
+                    )
+                assert raised.value is refusal
+            else:
+                response = await lpe.openai_proxy_route(
+                    endpoint="v1/responses",
+                    request=request,
+                    fastapi_response=Response(),
+                    user_api_key_dict=object(),  # type: ignore[arg-type]
+                )
     finally:
         snapshot_select.set_active_routing_snapshot(previous_snapshot)
-    assert response.status_code == 200
+    # Preserve the existing finite fresh-request account failover policy.
+    assert calls == (2 if provider_refusal else 1)
+    if not provider_refusal:
+        assert response.status_code == 200
     assert captured.get("api_key") is None
     assert captured.get("forward_headers") is False
     extra = captured.get("extra_headers") or {}
-    assert extra.get("Authorization") == "Bearer server-token-account1"
-    assert extra.get("ChatGPT-Account-Id") == "server-acct-account1"
+    assert extra.get("x-openai-subagent") == subagent
+    final_account = "account2" if provider_refusal else "account1"
+    assert extra.get("Authorization") == f"Bearer server-token-{final_account}"
+    assert extra.get("ChatGPT-Account-Id") == f"server-acct-{final_account}"
     assert "inbound-client-secret" not in str(extra)
     assert "inbound-chatgpt-account" not in str(extra)
     target = str(captured.get("base_target_url") or "")

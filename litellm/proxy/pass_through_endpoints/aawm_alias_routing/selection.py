@@ -4914,6 +4914,7 @@ def _apply_codex_oauth_account_context_to_state(
     state: dict[str, Any],
     *,
     context: dict[str, Any],
+    ordinary_quota_exempt: bool = False,
 ) -> dict[str, Any]:
     state["auth_status"] = context.get("auth_status") or "degraded"
     for field in (
@@ -4924,7 +4925,11 @@ def _apply_codex_oauth_account_context_to_state(
         if field in context:
             state[field] = context[field]
     account_hash = state["candidate"].get("codex_oauth_account_hash")
-    if isinstance(account_hash, str) and account_hash:
+    if ordinary_quota_exempt:
+        # Do not attach ordinary windows, reset waits, or balancing evidence.
+        # Account telemetry remains available to ordinary-model requests.
+        state["ordinary_quota_applicable"] = False
+    elif isinstance(account_hash, str) and account_hash:
         if isinstance(context.get("quota_evidence"), dict):
             state["codex_oauth_quota_evidence"] = context["quota_evidence"]
         state = _attach_normalized_quota_state(

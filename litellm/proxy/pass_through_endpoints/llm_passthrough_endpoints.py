@@ -6797,6 +6797,10 @@ async def openai_proxy_route(  # noqa: PLR0915
     while True:
         try:
             if use_direct_codex_oauth_inventory:
+                if direct_codex_selection_state.get("ordinary_quota_applicable") is False:
+                    subagent = request.headers.get("x-openai-subagent")
+                    if subagent is not None and extra_headers is not None:
+                        extra_headers["x-openai-subagent"] = subagent
                 _aawm_dev_fault_plan.note_direct_openai_managed_attempt(
                     request,
                     request_body,

@@ -431,6 +431,10 @@ def _extract_codex_usage_limit_error_observations(
         observed_at,
         "codex_usage_limit_error",
     )
+    # A reviewer refusal does not establish exhaustion of ordinary allowance.
+    # Explicit quota headers are still extracted independently.
+    from litellm.utils import get_model_info
+
     observations: List[Dict[str, Any]] = []
     for candidate in _extract_error_payload_dicts(result) + _iter_rate_limit_dicts(
         *_rate_limit_candidate_roots(kwargs, result)
@@ -442,6 +446,13 @@ def _extract_codex_usage_limit_error_observations(
         message = _clean_non_empty_string(error.get("message"))
         if error_type != "usage_limit_reached" and not (isinstance(message, str) and "usage limit" in message.lower()):
             continue
+        try:
+            if get_model_info(model=str(context.get("model") or "")).get(
+                "codex_oauth_ordinary_quota_exempt"
+            ) is True:
+                continue
+        except Exception:
+            pass
         reset_hint_seconds = _parse_reset_hint_seconds(
             error.get("resets_in_seconds"),
             message,

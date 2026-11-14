@@ -1209,6 +1209,10 @@ class BaseOpenAIPassThroughHandler:
                     defer_session_owner_promotion=defer_managed_xai_promotion,
                     blocked_pass_through_prefixed_headers=list(
                         _OPENAI_PROTECTED_PASSTHROUGH_HEADERS
+                    ) + (
+                        ["x-openai-subagent"]
+                        if getattr(request.state, "aawm_direct_codex_ordinary_quota_exempt", False) is True
+                        else []
                     ),
                 )
 

@@ -32,6 +32,7 @@ from litellm.llms.chatgpt.common_utils import (
     get_chatgpt_default_headers,
 )
 from litellm.proxy.common_utils.http_parsing_utils import _safe_get_request_headers
+from litellm.utils import get_model_info
 from litellm.secret_managers.codex_oauth_inventory import (
     CodexOAuthCredentialRecord,
     CodexOAuthCredentialSnapshot,
@@ -1781,6 +1782,21 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
         and not bypass_already_consumed
         and _selection._lookup_active_snapshot_canonical_alias(model, request=request) is None
     )
+    # Quota applicability is trusted model policy, independent of the one-shot
+    # cooldown bypass and of client-supplied Guardian markers.
+    ordinary_quota_exempt = False
+    if (
+        explicit_model is not None
+        and _selection._lookup_active_snapshot_canonical_alias(model, request=request)
+        is None
+    ):
+        try:
+            ordinary_quota_exempt = (
+                get_model_info(model=model).get("codex_oauth_ordinary_quota_exempt")
+                is True
+            )
+        except Exception:  # Unknown models retain ordinary admission.
+            pass
     inventory: Optional[CodexOAuthInventory] = None
     try:
         inventory = await _load_request_codex_oauth_inventory(request)
@@ -1985,6 +2001,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                 request,
                 state,
                 context=context,
+                ordinary_quota_exempt=ordinary_quota_exempt,
             )
         )
 
@@ -2027,7 +2044,9 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     selected_state = _selection._select_first_available_codex_oauth_account_state(
         selection_states,
         bypass_reason=(
-            "account_pinned"
+            "ordinary_quota_inapplicable"
+            if ordinary_quota_exempt
+            else "account_pinned"
             if affinity is not None
             else "ordinary_continuation"
             if _codex_auto_agent_request_has_continuation_state(body) and not planned_portable_failover
@@ -2287,6 +2306,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
         extra_fields={
             "openai_passthrough_route_family": "codex_responses",
             "codex_oauth_direct_inventory": True,
+            "codex_oauth_ordinary_quota_applicable": not ordinary_quota_exempt,
             "codex_oauth_quota_balancing": selected_state.get(
                 "quota_balancing",
             )
@@ -2323,6 +2343,9 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     )
     _safe_set_request_parsed_body(request, metadata_body)
     setattr(request.state, "aawm_direct_codex_oauth_inventory", True)
+    setattr(
+        request.state, "aawm_direct_codex_ordinary_quota_exempt", ordinary_quota_exempt
+    )
     return selected_auth, selection_state, metadata_body
 
 

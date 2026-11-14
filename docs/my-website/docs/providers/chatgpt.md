@@ -93,6 +93,24 @@ litellm --config config.yaml
 
 ## Configuration
 
+### Native Codex automatic review
+
+On the direct Codex OAuth Responses route, `codex-auto-review` uses the native
+model without an alias. Its trusted model capability,
+`codex_oauth_ordinary_quota_exempt`, makes ordinary Codex allowance inapplicable
+to local admission and account ranking. Ordinary quota observations remain
+available for other models; reviewer refusals do not imply ordinary quota
+exhaustion. Explicit provider quota headers are still recorded.
+
+The active model map must include this capability. The bundled map includes it;
+`LITELLM_LOCAL_MODEL_COST_MAP=True` selects that map.
+
+The route preserves a received `x-openai-subagent` header and body
+`client_metadata`, while inventory-selected credentials remain authoritative.
+Authentication, session ownership, and actual provider rejections still apply.
+The exemption adds no fallback, retry, or automatic approval decision. Local
+admission does not guarantee provider availability under exhausted allowance.
+
 ### Environment Variables
 
 - `CHATGPT_TOKEN_DIR`: Custom token storage directory

@@ -7726,7 +7726,8 @@ def test_build_rate_limit_observations_drops_only_malformed_codex_headers() -> N
     assert observations == []
 
 
-def test_codex_rate_limit_observations_preserve_selected_account_hash_over_bearer() -> None:
+@pytest.mark.parametrize("model", ["gpt-5.5", "codex-auto-review"])
+def test_codex_rate_limit_observations_preserve_selected_account_hash_over_bearer(model: str) -> None:
     """OPENAI-023: successful Codex headers key to the selected account, not
     to the bearer identity that rotates between requests."""
     selected_account_hash = "codex-account-hash-alpha"
@@ -7735,7 +7736,7 @@ def test_codex_rate_limit_observations_preserve_selected_account_hash_over_beare
 
     for call_id, bearer_token in enumerate(bearer_tokens, start=1):
         kwargs = _base_kwargs()
-        kwargs["model"] = "gpt-5.5"
+        kwargs["model"] = model
         kwargs["custom_llm_provider"] = "openai"
         kwargs["litellm_call_id"] = f"call-openai-023-success-{call_id}"
         kwargs["litellm_params"]["metadata"].update(
@@ -7837,13 +7838,14 @@ def test_codex_provider_account_hash_preserves_exact_selected_value() -> None:
     assert aawm_agent_identity._extract_rate_limit_account_hash(kwargs, metadata) == selected_account_hash
 
 
-def test_codex_usage_limit_error_preserves_selected_account_hash_over_bearer() -> None:
+@pytest.mark.parametrize("model", ["gpt-5.5", "codex-auto-review"])
+def test_codex_usage_limit_error_preserves_selected_account_hash_over_bearer(model: str) -> None:
     """OPENAI-023: exhaustion also keys to the selected account, not the
     caller identity."""
     selected_account_hash = "codex-account-hash-alpha"
     bearer_token = "Bearer codex-access-rotated"
     kwargs = _base_kwargs()
-    kwargs["model"] = "gpt-5.5"
+    kwargs["model"] = model
     kwargs["custom_llm_provider"] = "openai"
     kwargs["litellm_call_id"] = "call-openai-023-usage-limit"
     kwargs["litellm_params"]["metadata"].update(
@@ -7872,6 +7874,9 @@ def test_codex_usage_limit_error_preserves_selected_account_hash_over_bearer() -
         end_time=end_time,
     )
 
+    if model == "codex-auto-review":
+        assert observations == []
+        return
     assert len(observations) == 1
     observation = observations[0]
     assert observation["source"] == "codex_usage_limit_error"

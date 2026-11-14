@@ -18225,6 +18225,7 @@
         "supports_vision": true
     },
     "chatgpt/codex-auto-review": {
+        "codex_oauth_ordinary_quota_exempt": true,
         "cache_read_input_token_cost": 1.75e-07,
         "cache_read_input_token_cost_priority": 3.5e-07,
         "input_cost_per_token": 1.75e-06,
@@ -41200,6 +41201,7 @@
         "supports_vision": true
     },
     "codex-auto-review": {
+        "codex_oauth_ordinary_quota_exempt": true,
         "cache_read_input_token_cost": 1.75e-07,
         "cache_read_input_token_cost_priority": 3.5e-07,
         "input_cost_per_token": 1.75e-06,

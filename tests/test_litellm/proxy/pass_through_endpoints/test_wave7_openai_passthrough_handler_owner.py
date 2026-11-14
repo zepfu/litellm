@@ -1047,6 +1047,85 @@ class TestBaseHandlerDispatch:
 
 
 class TestCodexResponsesEgressContract:
+    @pytest.mark.parametrize("subagent", [None, "guardian"])
+    def test_native_review_preserves_identity_at_final_header_composition(
+        self, subagent, monkeypatch
+    ):
+        from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+            HttpPassThroughEndpointHelpers,
+        )
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import codex_oauth
+
+        body = {
+            "model": "codex-auto-review",
+            "input": "review",
+            "client_metadata": {"x-openai-subagent": "guardian"},
+        }
+        endpoint_func = AsyncMock(return_value="review-result")
+        create_fn = MagicMock(return_value=endpoint_func)
+        install_runtime(
+            _make_runtime(
+                get_request_body_fn=AsyncMock(return_value=deepcopy(body)),
+                create_pass_through_route_fn=create_fn,
+            )
+        )
+        request = _fake_request("POST")
+        request.state = SimpleNamespace(aawm_direct_codex_ordinary_quota_exempt=True)
+        request.headers = {
+            "x-pass-X-OpenAI-Subagent": "conflict",
+            "x-pass-Authorization": "Bearer caller-token",
+            "x-pass-ChatGPT-Account-Id": "caller-account",
+        }
+        selected = {
+            "Authorization": "Bearer selected-token",
+            "ChatGPT-Account-Id": "selected-account",
+        }
+        if subagent is not None:
+            selected["x-openai-subagent"] = subagent
+        monkeypatch.setattr(
+            codex_oauth,
+            "_get_bound_codex_oauth_candidate_identity",
+            lambda request: {
+                "account_label": "account1",
+                "account_hash": "hash1",
+                "lane_key": "lane1",
+                "model": body["model"],
+            },
+        )
+        monkeypatch.setattr(
+            codex_oauth,
+            "_load_bound_codex_oauth_auth",
+            AsyncMock(return_value=SimpleNamespace(headers=selected)),
+        )
+        asyncio.run(
+            BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
+                endpoint="/v1/responses",
+                request=request,
+                fastapi_response=MagicMock(),
+                user_api_key_dict=MagicMock(),
+                base_target_url="https://chatgpt.com/backend-api/codex",
+                api_key=None,
+                custom_llm_provider=litellm.LlmProviders.OPENAI,
+                extra_headers=selected,
+            )
+        )
+        route = create_fn.call_args.kwargs
+        final_headers = HttpPassThroughEndpointHelpers.forward_headers_from_request(
+            request_headers=request.headers,
+            headers=route["custom_headers"],
+            forward_headers=route["_forward_headers"],
+            blocked_pass_through_prefixed_headers=route[
+                "blocked_pass_through_prefixed_headers"
+            ],
+        )
+        normalized = {key.lower(): value for key, value in final_headers.items()}
+        assert normalized["authorization"] == "Bearer selected-token"
+        assert normalized["chatgpt-account-id"] == "selected-account"
+        assert normalized.get("x-openai-subagent") == subagent
+        outbound_body = endpoint_func.await_args.kwargs["custom_body"]
+        assert outbound_body["model"] == body["model"]
+        assert outbound_body["client_metadata"] == body["client_metadata"]
+
     @pytest.mark.parametrize(
         "request_body",
         [
