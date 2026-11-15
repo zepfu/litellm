@@ -76,6 +76,15 @@ for chunk in response:
     print(chunk)
 ```
 
+### AAWM alias failover
+
+For fresh AAWM alias requests, an NVIDIA HTTP 410 response identifying the
+selected model as having reached its end of life makes that candidate
+unavailable, allowing selection of the next eligible candidate. This requires
+provider attribution and a matching model identity; an unrelated or local 410
+does not trigger model-retirement failover. Existing continuation and replay
+safety checks still apply.
+
 ### Chat token-limit adaptation
 
 NVIDIA NIM chat requests use model metadata to resolve the OpenAI token-limit
