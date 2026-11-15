@@ -1480,6 +1480,95 @@ async def test_alias_injection_is_managed_openai_only(
 
 
 @pytest.mark.asyncio
+async def test_nvidia_retired_model_failure_reaches_next_alias_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_gate(monkeypatch)
+    _patch_candidate_loop_runtime(monkeypatch)
+    request = _request(path="/openai/v1/responses")
+    retired_candidate = {
+        "provider": "nvidia",
+        "model": "nvidia/moonshotai/kimi-k3",
+        "route_family": "codex_nvidia_completion_adapter",
+        "last_resort": False,
+    }
+    alternate_candidate = {
+        "provider": "nvidia",
+        "model": "nvidia/deepseek-ai/deepseek-v4-flash",
+        "route_family": "codex_nvidia_completion_adapter",
+        "last_resort": False,
+    }
+    candidates = [retired_candidate, alternate_candidate]
+    selected: list[str] = []
+    performed: list[str] = []
+    classifications: list[str] = []
+
+    class _NvidiaRetiredModelError(Exception):
+        status_code = 410
+        llm_provider = "nvidia_nim"
+        body = {
+            "error": {
+                "type": "invalid_request_error",
+                "message": (
+                    "The model 'moonshotai/kimi-k3' has reached its end of life "
+                    "on2026-10-15 and is no longer available"
+                ),
+            }
+        }
+
+    retired_error = _NvidiaRetiredModelError("provider model retired")
+
+    async def _select_candidate(**kwargs: Any) -> dict[str, Any]:
+        candidate = candidates.pop(0)
+        selected.append(candidate["model"])
+        return {
+            "candidate": candidate,
+            "lane_key": "nvidia_nim",
+            "cooldown_key": f"nvidia:{candidate['model']}:nvidia_nim",
+            "selection_reason": "first_available",
+            "request_mode": "fresh",
+            "session_key": None,
+            "skipped": [],
+        }
+
+    async def _perform_candidate(**kwargs: Any) -> Response:
+        model = kwargs["candidate"]["model"]
+        performed.append(model)
+        if model == retired_candidate["model"]:
+            raise retired_error
+        return Response(content=b"ok", status_code=200)
+
+    response = await candidate_loop.handle_alias_route(
+        _alias_services(
+            select_candidate=_select_candidate,
+            perform_candidate=_perform_candidate,
+            classifications=classifications,
+        ),
+        alias_family="codex_auto_agent",
+        alias_model="provider-nvidia",
+        request=request,
+        prepared_request_body={
+            "model": "provider-nvidia",
+            "input": "test",
+        },
+        max_candidate_attempts=2,
+        get_active_cooldown_state_fn=_zero_cooldown,
+        attempts_metadata_key="codex_auto_agent_attempts",
+        skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+        no_candidate_detail="no candidate",
+        log_label="Codex",
+    )
+
+    assert response.status_code == 200
+    assert selected == [
+        "nvidia/moonshotai/kimi-k3",
+        "nvidia/deepseek-ai/deepseek-v4-flash",
+    ]
+    assert performed == selected
+    assert classifications == ["candidate_unavailable"]
+
+
+@pytest.mark.asyncio
 async def test_malformed_header_preserves_managed_alias_behavior_and_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

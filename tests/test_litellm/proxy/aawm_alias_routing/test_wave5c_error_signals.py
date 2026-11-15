@@ -820,6 +820,11 @@ class TestNvidiaModelUnavailable:
         [
             (400, "The model 'acme/future-model' does not exist"),
             (404, "The model 'nvidia/acme/future-model' does not exist"),
+            (
+                410,
+                "The model 'acme/future-model' has reached its end of life "
+                "on2026-10-15 and is no longer available",
+            ),
         ],
     )
     def test_exact_provider_model_error_is_candidate_unavailable(
@@ -966,6 +971,31 @@ class TestNvidiaModelUnavailable:
                 },
                 id="unaccepted-status",
             ),
+            pytest.param(
+                _nvidia_candidate(),
+                410,
+                {
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": (
+                            "The model 'acme/other-model' has reached its "
+                            "end of life on2026-10-15 and is no longer available"
+                        ),
+                    }
+                },
+                id="retirement-for-different-model",
+            ),
+            pytest.param(
+                _nvidia_candidate(),
+                410,
+                {
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "Model endpoint is unavailable",
+                    }
+                },
+                id="generic-gone",
+            ),
         ],
     )
     def test_non_model_nvidia_failures_do_not_cool_candidate(
@@ -1018,6 +1048,29 @@ class TestNvidiaModelUnavailable:
                 attempted_provider_call=True,
             )
             is False
+        )
+
+        retired_message = (
+            "The model 'acme/future-model' has reached its end of life "
+            "on2026-10-15 and is no longer available"
+        )
+        unmarked_retirement = _nvidia_model_error(
+            status_code=410,
+            message=retired_message,
+            provider_returned=False,
+        )
+        assert not _is_nvidia_completion_adapter_model_unavailable_response(
+            unmarked_retirement,
+            candidate=candidate,
+            attempted_provider_call=True,
+        )
+        assert (
+            _match_codex_auto_agent_provider_attributed_model_unavailable(
+                unmarked_retirement,
+                candidate=candidate,
+                attempted_provider_call=True,
+            )
+            is None
         )
 
     def test_native_litellm_provider_body_is_model_bound(self) -> None:

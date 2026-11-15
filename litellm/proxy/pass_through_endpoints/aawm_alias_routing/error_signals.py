@@ -2177,6 +2177,11 @@ _NVIDIA_COMPLETION_ADAPTER_ROUTE_FAMILY = "codex_nvidia_completion_adapter"
 _NVIDIA_MODEL_DOES_NOT_EXIST_RE = re.compile(
     r"\AThe model '([^']+)' does not exist\Z"
 )
+_NVIDIA_MODEL_RETIRED_RE = re.compile(
+    r"\AThe model '([^']+)' has reached its end of life on\s*"
+    r"\d{4}-\d{2}-\d{2}(?:\b.*)?\Z",
+    re.IGNORECASE,
+)
 
 
 def _is_nvidia_completion_adapter_model_unavailable_response(
@@ -2209,9 +2214,10 @@ def _is_nvidia_completion_adapter_model_unavailable_response(
         or not isinstance(candidate, dict)
         or candidate.get("provider") != _CODEX_AUTO_AGENT_NVIDIA_PROVIDER
         or candidate.get("route_family") != _NVIDIA_COMPLETION_ADAPTER_ROUTE_FAMILY
-        or _extract_adapter_exception_status_code(exc) not in {400, 404}
+        or _extract_adapter_exception_status_code(exc) not in {400, 404, 410}
     ):
         return False
+    status_code = _extract_adapter_exception_status_code(exc)
 
     selected_model = candidate.get("model")
     if not isinstance(selected_model, str):
@@ -2271,7 +2277,12 @@ def _is_nvidia_completion_adapter_model_unavailable_response(
     _collect_messages(response_text)
 
     for message in messages:
-        match = _NVIDIA_MODEL_DOES_NOT_EXIST_RE.fullmatch(message)
+        matcher = (
+            _NVIDIA_MODEL_RETIRED_RE
+            if status_code == 410
+            else _NVIDIA_MODEL_DOES_NOT_EXIST_RE
+        )
+        match = matcher.fullmatch(message)
         if match is not None and match.group(1) in selected_model_variants:
             return True
     return False
@@ -2701,10 +2712,22 @@ def _match_codex_auto_agent_provider_attributed_model_unavailable(
         not isinstance(provider, str)
         or not provider.strip()
         or not attempted_provider_call
-        or getattr(exc, "_aawm_provider_returned", False) is not True
     ):
         return None
     status_code = _extract_adapter_exception_status_code(exc)
+    if status_code == 410:
+        if not _is_nvidia_completion_adapter_model_unavailable_response(
+            exc,
+            candidate=candidate,
+            attempted_provider_call=attempted_provider_call,
+        ):
+            return None
+        return ProviderAttributedModelUnavailableMatch(
+            provider=provider,
+            status_code=status_code,
+        )
+    if getattr(exc, "_aawm_provider_returned", False) is not True:
+        return None
     if status_code not in {400, 404}:
         return None
 
