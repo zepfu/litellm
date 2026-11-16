@@ -358,6 +358,15 @@ upstream catalog; its configured presence does not establish availability.
 
 ## Candidate failure fall-through
 
+For a fresh Codex alias request, exhausting the bounded same-route retry can
+authorize a transition to the next eligible configured candidate. Reselection
+excludes the failed candidate through nested `alias_reference` branches while
+preserving the remaining configured order. A non-OAuth candidate's rejection
+from OAuth account failover does not prevent this candidate transition. The
+transition consumes the request owner's decision when the next candidate is
+dispatched; it is not a redispatch handoff. Continuation, replay-safety, and
+request-budget restrictions still apply.
+
 During Codex alias selection, a deterministic preflight rejection with
 `candidate_status: ineligible` and an approved reason (`retired`, `disabled`,
 `unsupported`, `contract_incompatible`, or `preflight_skipped`) is recorded as
