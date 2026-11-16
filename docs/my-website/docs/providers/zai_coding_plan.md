@@ -104,6 +104,15 @@ alias ingress. Coding Plan is Codex-only: there is no
 `sota-zcode`. Do not add `sota-zai` to `sota.yaml` TUI dispatch. Leave
 `aawm-sota-glm`, ordinary `zai`, and every `aawm-code*` unchanged.
 
+### Provider-error failover
+
+The Coding Plan adapter preserves provider attribution when LiteLLM remaps an
+HTTP error response from the selected Coding Plan endpoint. This lets the
+existing alias policy recognize provider-returned HTTP 429 errors and retry or
+select another eligible candidate. Local errors without a matching upstream
+response do not gain provider attribution. Existing continuation and replay
+safety checks still apply.
+
 ## Cost provenance
 
 Coding Plan generations record:
