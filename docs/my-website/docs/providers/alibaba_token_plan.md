@@ -123,8 +123,8 @@ The AAWM proxy configuration may expose:
 
 Alpha mounts overrides from `config/alpha-alias-overrides/` that place
 `qwen4-max-preview` first in `sota-alibaba`, `provider-alibaba`, and
-`expert-other`, with configured effort `max`. The Qwen4 candidate is available
-all day; existing fallback candidates and schedules are preserved. `sota`
+`expert-other`, with configured effort `max`. Qwen4 inherits the existing
+Qwen3.8 schedule; fallback candidates and schedules are preserved. `sota`
 inherits this order for Qwen clients, and `expert` references `expert-other`.
 Canonical alias files and dev/production deployments retain their current
 order. Only `docker-compose.alpha.yml` mounts the three Qwen overrides.

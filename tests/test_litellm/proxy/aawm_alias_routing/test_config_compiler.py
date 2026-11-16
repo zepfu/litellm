@@ -54,7 +54,7 @@ def test_should_prioritize_qwen4_only_in_alpha_overrides(tmp_path: Path) -> None
         candidates = alpha.aliases[name].candidates
         assert original[0].model == "alibaba_token_plan/qwen3.8-max"
         assert candidates[0].model == "alibaba_token_plan/qwen4-max-preview"
-        assert candidates[0].schedule is None
+        assert candidates[0].schedule == original[0].schedule
         assert candidates[0].reasoning_effort == "max"
         assert candidates[1:] == original
     assert alpha.aliases["expert"].candidates == canonical.aliases["expert"].candidates
