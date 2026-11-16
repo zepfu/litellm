@@ -29843,7 +29843,7 @@ class TestOpenAIPassthroughRoute:
             )
             attempts.append(authorization)
             if authorization == "Bearer account1":
-                raise HTTPException(
+                provider_error = HTTPException(
                     status_code=429,
                     detail={
                         "error": {"code": "usage_limit_reached"},
@@ -29852,6 +29852,8 @@ class TestOpenAIPassthroughRoute:
                     },
                     headers={"Retry-After": "900"},
                 )
+                setattr(provider_error, "_aawm_provider_returned", True)
+                raise provider_error
             return Response(content=b"ok", status_code=200)
 
         with patch(
@@ -29866,6 +29868,9 @@ class TestOpenAIPassthroughRoute:
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_grok_native_oauth_request_body",
             return_value=False,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.error_signals._extract_adapter_exception_status_code",
+            return_value=None,
         ), patch(
             "litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth.select_and_bind_direct_codex_oauth_inventory",
             new=AsyncMock(side_effect=bindings),
@@ -29887,6 +29892,11 @@ class TestOpenAIPassthroughRoute:
             )
 
         assert response.status_code == 200
+        assert (
+            getattr(request.state, "_aawm_direct_codex_account_failover_planned")
+            is True
+        )
+        assert request.state.aawm_capacity_recovery_decision["capacity"] is True
         assert attempts == ["Bearer account1", "Bearer account2"]
         assert mock_bind.await_count == 2
         mock_publish.assert_called_once_with(
