@@ -2468,6 +2468,7 @@ _HOST_FUNCTION_NAMES = (
     "_handle_codex_alibaba_token_plan_adapter_route",
     # Z.AI Coding Plan
     "_prepare_codex_zai_coding_plan_adapter_route",
+    "_mark_zai_coding_plan_provider_response",
     "_perform_codex_zai_coding_plan_adapter_call",
     "_handle_codex_zai_coding_plan_adapter_route",
     # OpenCode
@@ -10881,6 +10882,35 @@ async def _prepare_codex_zai_coding_plan_adapter_route(
     )
 
 
+def _mark_zai_coding_plan_provider_response(
+    exc: Exception,
+    *,
+    target_url: Union[str, httpx.URL],
+) -> None:
+    """Preserve provider attribution when LiteLLM remaps an HTTP response error."""
+    expected_url = httpx.URL(str(target_url))
+    current: Optional[BaseException] = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        response = getattr(current, "response", None)
+        request = getattr(response, "request", None)
+        response_url = getattr(request, "url", None)
+        response_status = getattr(response, "status_code", None)
+        if response_url is not None and isinstance(response_status, int):
+            try:
+                if (
+                    400 <= response_status <= 599
+                    and httpx.URL(str(response_url)) == expected_url
+                ):
+                    setattr(exc, "_aawm_provider_returned", True)
+                    setattr(exc, "attempted_provider_call", True)
+                    return
+            except (TypeError, ValueError):
+                pass
+        current = current.__cause__ or current.__context__
+
+
 async def _perform_codex_zai_coding_plan_adapter_call(
     *,
     config: "_aawm_adapter_config.AnthropicCompletionAdapterConfig",
@@ -10928,17 +10958,21 @@ async def _perform_codex_zai_coding_plan_adapter_call(
     )
     if isinstance(getattr(_watermark_egress, "body", None), dict):
         completion_kwargs = _watermark_egress.body
-    completion_response = await litellm.acompletion(
-        **completion_kwargs,
-        api_key=api_key,
-        api_base=api_base,
-        litellm_metadata=litellm_metadata,
-        proxy_server_request={
-            "headers": dict(request.headers),
-            "body": prepared_request_body,
-        },
-        shared_session=_get_proxy_shared_aiohttp_session(),
-    )
+    try:
+        completion_response = await litellm.acompletion(
+            **completion_kwargs,
+            api_key=api_key,
+            api_base=api_base,
+            litellm_metadata=litellm_metadata,
+            proxy_server_request={
+                "headers": dict(request.headers),
+                "body": prepared_request_body,
+            },
+            shared_session=_get_proxy_shared_aiohttp_session(),
+        )
+    except Exception as exc:
+        _mark_zai_coding_plan_provider_response(exc, target_url=target_url)
+        raise
     if client_requested_stream:
         return StreamingResponse(
             _responses_sse_from_iterator(

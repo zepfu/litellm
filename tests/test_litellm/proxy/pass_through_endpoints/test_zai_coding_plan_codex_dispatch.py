@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 from fastapi import Response
 from starlette.requests import Request
@@ -455,6 +456,39 @@ class _StructuredCodingPlanError(Exception):
         }
 
 
+def test_should_mark_only_exact_zai_provider_http_responses() -> None:
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
+
+    target_url = ZAI_CODING_PLAN_CHAT_COMPLETIONS_URL
+    local_error = _StructuredCodingPlanError(
+        code=429,
+        message="local rate limit",
+        status_code=429,
+    )
+    lpe._mark_zai_coding_plan_provider_response(
+        local_error,
+        target_url=target_url,
+    )
+    assert getattr(local_error, "_aawm_provider_returned", False) is False
+    assert getattr(local_error, "attempted_provider_call", False) is False
+
+    wrong_endpoint_error = _StructuredCodingPlanError(
+        code=429,
+        message="rate limit from a different endpoint",
+        status_code=429,
+    )
+    wrong_endpoint_error.response = httpx.Response(
+        status_code=429,
+        request=httpx.Request("POST", "https://example.com/v1/chat/completions"),
+    )
+    lpe._mark_zai_coding_plan_provider_response(
+        wrong_endpoint_error,
+        target_url=target_url,
+    )
+    assert getattr(wrong_endpoint_error, "_aawm_provider_returned", False) is False
+    assert getattr(wrong_endpoint_error, "attempted_provider_call", False) is False
+
+
 def test_should_map_coding_plan_1113_to_wrong_base_terminal_error() -> None:
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
         candidate_loop,
@@ -579,10 +613,11 @@ def test_should_keep_unmarked_local_zai_model_codes_terminal(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error_code", (1211, 1311))
-async def test_should_fail_over_in_order_after_zai_model_admission_failure(  # noqa: PLR0915
+@pytest.mark.parametrize("error_code", (1211, 1311, 429))
+async def test_should_fail_over_in_order_after_zai_provider_failure(  # noqa: PLR0915
     monkeypatch: pytest.MonkeyPatch,
     error_code: int,
+    respx_mock,
 ) -> None:
     from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
@@ -591,6 +626,50 @@ async def test_should_fail_over_in_order_after_zai_model_admission_failure(  # n
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
         AliasRoutingStateManager,
     )
+
+    if error_code == 429:
+        import litellm
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            error_signals,
+        )
+        from litellm.llms.zai_coding_plan.chat.transformation import (
+            ZAI_CODING_PLAN_CHAT_COMPLETIONS_URL,
+        )
+        from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+
+        def _close_logging_coroutine(async_coroutine, metadata=None):
+            _ = metadata
+            close = getattr(async_coroutine, "close", None)
+            if callable(close):
+                close()
+
+        monkeypatch.setattr(
+            GLOBAL_LOGGING_WORKER,
+            "ensure_initialized_and_enqueue",
+            _close_logging_coroutine,
+        )
+        monkeypatch.setattr(
+            error_signals,
+            "RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS",
+            0.0,
+        )
+        monkeypatch.setenv("ZAI_KEY", "coding-plan-key")
+        monkeypatch.delenv("ZAI_API_KEY", raising=False)
+        monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+        monkeypatch.setattr(litellm, "enable_preview_features", True)
+        respx_mock.post(ZAI_CODING_PLAN_CHAT_COMPLETIONS_URL).respond(
+            status_code=429,
+            json={
+                "error": {
+                    "type": "throttling_error",
+                    "code": "429",
+                    "message": (
+                        "Insufficient balance or no resource package. "
+                        "Please recharge."
+                    ),
+                }
+            },
+        )
 
     request = Request(
         {
@@ -652,6 +731,16 @@ async def test_should_fail_over_in_order_after_zai_model_admission_failure(  # n
         _ = candidate_body
         provider_calls.append(candidate["provider"])
         if candidate["provider"] == "zai_coding_plan":
+            if error_code == 429:
+                return await _handle_codex_zai_coding_plan_adapter_route(
+                    endpoint="/v1/responses",
+                    request=request,
+                    fastapi_response=MagicMock(spec=Response),
+                    user_api_key_dict=MagicMock(),
+                    prepared_request_body=candidate_body,
+                    adapter_model=candidate["model"],
+                    use_alias_candidate_probe=True,
+                )
             exc = _StructuredCodingPlanError(
                 code=error_code,
                 message=f"model admission rejected: {error_code}",
@@ -686,6 +775,7 @@ async def test_should_fail_over_in_order_after_zai_model_admission_failure(  # n
         return None
 
     session_affinity = MagicMock()
+    session_affinity.DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS = 0
     session_affinity.classify_session_owner_replay_safety_body.return_value = None
     session_affinity.is_replay_safe_session_owner_redispatch_body.return_value = True
     session_affinity.resolve_canonical_session_identity.return_value = None
@@ -778,31 +868,66 @@ async def test_should_fail_over_in_order_after_zai_model_admission_failure(  # n
         raise_redispatch_fn=None,
     )
 
-    response = await candidate_loop.handle_alias_route(
-        services,
-        alias_family="codex_auto_agent",
-        alias_model="sota-zai",
-        request=request,
-        prepared_request_body={"model": "sota-zai", "input": "hello"},
-        max_candidate_attempts=2,
-        get_active_cooldown_state_fn=_active_cooldown,
-        attempts_metadata_key="codex_auto_agent_attempts",
-        skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
-        no_candidate_detail="no candidates",
-        log_label="Codex",
-    )
+    try:
+        response = await candidate_loop.handle_alias_route(
+            services,
+            alias_family="codex_auto_agent",
+            alias_model="sota-zai",
+            request=request,
+            prepared_request_body={"model": "sota-zai", "input": "hello"},
+            max_candidate_attempts=2,
+            get_active_cooldown_state_fn=_active_cooldown,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidates",
+            log_label="Codex",
+        )
+    finally:
+        if error_code == 429:
+            await GLOBAL_LOGGING_WORKER.stop()
+            await litellm.close_litellm_async_clients()
 
     assert response == {"provider": "alibaba_token_plan", "ok": True}
-    assert provider_calls == ["zai_coding_plan", "alibaba_token_plan"]
-    assert len(publication_plans) == 1
-    assert publication_plans[0].memory_keys == (_ZAI_COOLDOWN_KEY,)
-    assert publication_plans[0].durable_keys == (_ZAI_COOLDOWN_KEY,)
-    assert len(failure_attempts) == 1
-    assert failure_attempts[0]["error_class"] == "candidate_unavailable"
-    assert failure_attempts[0]["error_code"] == str(error_code)
-    assert failure_attempts[0]["error_type"] == "invalid_request_error"
-    assert failure_attempts[0]["error_status_code"] == 400
-    assert failure_attempts[0]["cooldown_scope"] == "candidate"
+    if error_code == 429:
+        assert provider_calls[-1] == "alibaba_token_plan"
+        assert provider_calls[:-1]
+        assert all(provider == "zai_coding_plan" for provider in provider_calls[:-1])
+        assert len(provider_calls) <= (
+            error_signals.RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS + 1
+        )
+    else:
+        assert provider_calls == ["zai_coding_plan", "alibaba_token_plan"]
+    if error_code == 429:
+        assert respx_mock.calls.call_count > 0
+    assert publication_plans
+    assert all(
+        plan.memory_keys == (_ZAI_COOLDOWN_KEY,)
+        and plan.durable_keys == (_ZAI_COOLDOWN_KEY,)
+        for plan in publication_plans
+    )
+    assert failure_attempts
+    if error_code == 429:
+        provider_failure_attempts = [
+            attempt
+            for attempt in failure_attempts
+            if attempt.get("error_status_code") == 429
+        ]
+        assert provider_failure_attempts
+        assert all(
+            attempt["error_class"] == "rate_limited"
+            and attempt["error_code"] == "429"
+            and attempt["error_type"] == "throttling_error"
+            and attempt["error_status_code"] == 429
+            and attempt["provider_returned"] is True
+            for attempt in provider_failure_attempts
+        )
+    else:
+        assert len(failure_attempts) == 1
+        assert failure_attempts[0]["error_class"] == "candidate_unavailable"
+        assert failure_attempts[0]["error_code"] == str(error_code)
+        assert failure_attempts[0]["error_type"] == "invalid_request_error"
+        assert failure_attempts[0]["error_status_code"] == 400
+        assert failure_attempts[0]["cooldown_scope"] == "candidate"
 
 
 @pytest.mark.parametrize("error_code", (1211, 1311))
