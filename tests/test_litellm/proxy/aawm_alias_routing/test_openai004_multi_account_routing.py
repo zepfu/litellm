@@ -4141,6 +4141,13 @@ async def test_native_review_admission_is_independent_of_ordinary_quota(
         "get_session_owner_record",
         AsyncMock(return_value=(None, None, None)),
     )
+    monkeypatch.setattr(
+        codex_oauth,
+        "get_model_info",
+        lambda model, **_: {
+            "codex_oauth_ordinary_quota_exempt": model == "codex-auto-review"
+        },
+    )
     if not hydrated:
         monkeypatch.setattr(
             selection, "_hydrate_codex_oauth_quota_observations", AsyncMock()
@@ -4159,7 +4166,7 @@ async def test_native_review_admission_is_independent_of_ordinary_quota(
                     quota_period="five_hour",
                     window_minutes=300,
                     exhausted=True,
-                    model=model,
+                    model="gpt-5.3-codex",
                 )
                 for number in (1, 2)
             ]

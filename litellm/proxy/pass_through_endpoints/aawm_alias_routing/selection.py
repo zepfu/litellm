@@ -4930,6 +4930,8 @@ def _apply_codex_oauth_account_context_to_state(
         # still honors durable account-exhaustion evidence. Selection bypasses
         # weekly balancing, so ordinary remaining values do not choose a lane.
         state["ordinary_quota_applicable"] = False
+        if isinstance(context.get("quota_evidence"), dict):
+            state["codex_oauth_quota_evidence"] = context["quota_evidence"]
         state = _attach_normalized_quota_state(state)
     elif isinstance(account_hash, str) and account_hash:
         if isinstance(context.get("quota_evidence"), dict):
