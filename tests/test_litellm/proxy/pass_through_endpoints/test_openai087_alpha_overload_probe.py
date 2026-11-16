@@ -18,6 +18,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control
     build_alpha_overload_probe_receipt,
     build_synthetic_overload_response,
     claim_alpha_overload_slot,
+    get_alpha_overload_probe_control,
     get_alpha_overload_probe_receipts,
     resolve_alpha_overload_probe,
 )
@@ -61,7 +62,7 @@ def _bind_control(
     request: Request,
     monkeypatch: pytest.MonkeyPatch,
     *,
-    plan: str = "overload,success",
+    plan: str = "overload,overload,overload",
 ) -> AlphaOverloadProbeControl:
     monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
     monkeypatch.setenv(ALPHA_OVERLOAD_PROBE_ENABLED_ENV, "1")
@@ -76,19 +77,15 @@ def _bind_control(
     )
     control = resolve_alpha_overload_probe(request, user_api_key_dict=_admin())
     assert isinstance(control, AlphaOverloadProbeControl)
-    expected_actions: tuple[str, ...] = (
-        ("overload",) if plan == "overload" else ("overload", "success")
+    expected_actions: tuple[str, ...] = tuple(
+        action.strip() for action in plan.split(",") if action.strip()
     )
     assert control.plan == AlphaOverloadProbePlan(actions=expected_actions)
     assert control.request_identity == "probe-request-id"
     return control
 
 
-def _request_state_keys(request: Request) -> tuple[str, ...]:
-    return tuple(vars(request.state)["_state"])
-
-
-def test_safe_off_paths_leave_request_state_unchanged(
+def test_safe_off_paths_are_public_no_ops(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("AAWM_LITELLM_ENVIRONMENT", raising=False)
@@ -99,30 +96,55 @@ def test_safe_off_paths_leave_request_state_unchanged(
     assert not alpha_overload_probe_control_enabled()
     assert resolve_alpha_overload_probe(request, user_api_key_dict=None) is None
     assert claim_alpha_overload_slot(request) is None
-    assert not any(key.startswith("aawm_") for key in _request_state_keys(request))
+    assert get_alpha_overload_probe_control(request) is None
     assert get_alpha_overload_probe_receipts(request) == ()
 
     monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
     monkeypatch.delenv(ALPHA_OVERLOAD_PROBE_ENABLED_ENV, raising=False)
     assert resolve_alpha_overload_probe(request) is None
     assert claim_alpha_overload_slot(request) is None
-    assert not any(key.startswith("aawm_") for key in _request_state_keys(request))
+    assert get_alpha_overload_probe_control(request) is None
+    assert get_alpha_overload_probe_receipts(request) == ()
 
     request = _request()
     monkeypatch.setenv(ALPHA_OVERLOAD_PROBE_ENABLED_ENV, "1")
     assert resolve_alpha_overload_probe(request) is None
-    assert not any(key.startswith("aawm_") for key in _request_state_keys(request))
+    assert get_alpha_overload_probe_control(request) is None
+    assert get_alpha_overload_probe_receipts(request) == ()
 
 
 def test_enabled_plan_claims_fixed_slots_then_exhausts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request = _request("overload,success")
-    control = _bind_control(request, monkeypatch)
+    control = _bind_control(request, monkeypatch, plan="overload,success")
 
     assert claim_alpha_overload_slot(request, control=control) == "overload"
     assert claim_alpha_overload_slot(request, control=control) == "success"
     assert claim_alpha_overload_slot(request, control=control) is None
+
+
+def test_terminal_overload_plan_claims_exact_budget_then_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request("overload,overload,overload")
+    control = _bind_control(request, monkeypatch)
+
+    assert claim_alpha_overload_slot(request, control=control) == "overload"
+    assert claim_alpha_overload_slot(request, control=control) == "overload"
+    assert claim_alpha_overload_slot(request, control=control) == "overload"
+    with pytest.raises(HTTPException) as raised:
+        claim_alpha_overload_slot(request, control=control)
+    assert raised.value.status_code == 409
+    assert raised.value.detail["error"] == (
+        "alpha_overload_probe_terminal_plan_exhausted"
+    )
+    with pytest.raises(HTTPException) as raised:
+        claim_alpha_overload_slot(request, control=control)
+    assert raised.value.status_code == 409
+    assert raised.value.detail["error"] == (
+        "alpha_overload_probe_terminal_plan_exhausted"
+    )
 
 
 @pytest.mark.parametrize("error_code", sorted(ALPHA_OVERLOAD_PROBE_ERROR_CODES))
@@ -161,35 +183,51 @@ def test_synthetic_response_is_terminal_httpx_sse(
 def test_receipt_records_synthetic_no_io_bound_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    request = _request("overload")
-    control = _bind_control(request, monkeypatch, plan="overload")
+    request = _request("overload,overload,overload")
+    control = _bind_control(
+        request,
+        monkeypatch,
+        plan="overload,overload,overload",
+    )
+    assert claim_alpha_overload_slot(request, control=control) == "overload"
     assert claim_alpha_overload_slot(request, control=control) == "overload"
 
-    receipt = build_alpha_overload_probe_receipt(
+    selection = {
+        "alias_model": "gpt-6.1-sol",
+        "candidate": {
+            "provider": "openai",
+            "model": "gpt-6.1-sol",
+            "route_family": "codex_responses",
+        },
+    }
+    first_receipt = build_alpha_overload_probe_receipt(
         request,
         control=control,
-        selection={
-            "alias_model": "gpt-6.1-sol",
-            "candidate": {
-                "provider": "openai",
-                "model": "gpt-6.1-sol",
-                "route_family": "codex_responses",
-            },
-        },
+        selection=selection,
+    )
+    second_receipt = build_alpha_overload_probe_receipt(
+        request,
+        control=control,
+        selection=selection,
     )
 
-    assert get_alpha_overload_probe_receipts(request) == (receipt,)
-    assert receipt["schema"] == "aawm_openai_alpha_overload_probe_receipt_v1"
-    assert receipt["request_identity"] == "probe-request-id"
-    assert receipt["plan"] == "overload"
-    assert receipt["action"] == "inject_synthetic_overload"
-    assert receipt["event_type"] == "response.failed"
-    assert receipt["error_code"] == "server_is_overloaded"
-    assert receipt["synthetic"] is True
-    assert receipt["attempted_provider_call"] is False
-    assert receipt["provider_returned"] is False
-    assert receipt["provider"] == "openai"
-    assert receipt["model"] == "gpt-6.1-sol"
+    assert get_alpha_overload_probe_receipts(request) == (
+        first_receipt,
+        second_receipt,
+    )
+    assert [receipt["sequence"] for receipt in (first_receipt, second_receipt)] == [1, 2]
+    for receipt in (first_receipt, second_receipt):
+        assert receipt["schema"] == "aawm_openai_alpha_overload_probe_receipt_v1"
+        assert receipt["request_identity"] == "probe-request-id"
+        assert receipt["plan"] == "overload,overload,overload"
+        assert receipt["action"] == "inject_synthetic_overload"
+        assert receipt["event_type"] == "response.failed"
+        assert receipt["error_code"] == "server_is_overloaded"
+        assert receipt["synthetic"] is True
+        assert receipt["attempted_provider_call"] is False
+        assert receipt["provider_returned"] is False
+        assert receipt["provider"] == "openai"
+        assert receipt["model"] == "gpt-6.1-sol"
 
 
 def test_malformed_plan_fails_closed_without_binding(
