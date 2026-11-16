@@ -583,6 +583,11 @@ These retry policies do not establish a quota-only account-migration rule or
 prove that a transient overload is account exhaustion. Do not replay committed
 output or executed tools to recover availability.
 
+Raw OpenAI HTTP failures with `capacity_exhausted` or `server_is_overloaded`
+in `error.code` or `error.type` use the same bounded capacity-retry policy.
+Explicit quota, authentication, and terminal failures retain their existing
+classification and take precedence over these capacity aliases.
+
 Direct Codex account-failure routing also checks the request's replay commitment
 before credential reload, ownership reset or overflow selection. If provider
 execution is possible or response delivery has begun, it preserves the original
