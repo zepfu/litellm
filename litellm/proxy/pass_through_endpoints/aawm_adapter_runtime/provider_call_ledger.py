@@ -733,8 +733,9 @@ def is_openai_wire_replay_prohibited(
 
     A provider-confirmed pre-first-byte capacity rejection is the sole bounded
     exception to the provisional ``provider_execution_possible`` latch.  The
-    request ledger's one-shot authorization is required; without it, callers
-    must continue to treat the latch as an unknown-outcome replay barrier.
+    request ledger's one-shot authorization or a typed capacity-recovery
+    authorization is required; without either, callers must continue to treat
+    the latch as an unknown-outcome replay barrier.
     """
 
     if not isinstance(commitment, Mapping):
@@ -756,10 +757,7 @@ def is_openai_wire_replay_prohibited(
                 )
             except Exception:
                 capacity_retry_permitted = False
-        if (
-            commitment.get("capacity_recovery_authorized") is True
-            and ledger is None
-        ):
+        if commitment.get("capacity_recovery_authorized") is True:
             capacity_retry_permitted = True
         if not capacity_retry_permitted:
             return True

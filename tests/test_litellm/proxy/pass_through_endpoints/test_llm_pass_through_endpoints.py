@@ -29869,9 +29869,6 @@ class TestOpenAIPassthroughRoute:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_grok_native_oauth_request_body",
             return_value=False,
         ), patch(
-            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.error_signals._extract_adapter_exception_status_code",
-            return_value=None,
-        ), patch(
             "litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth.select_and_bind_direct_codex_oauth_inventory",
             new=AsyncMock(side_effect=bindings),
         ) as mock_bind, patch.object(
