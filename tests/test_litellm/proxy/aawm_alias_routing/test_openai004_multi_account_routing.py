@@ -4149,42 +4149,33 @@ async def test_native_review_admission_is_independent_of_ordinary_quota(
     previous_snapshot = snapshot_select.get_active_routing_snapshot()
     snapshot_select.set_active_routing_snapshot(None)
     alias_routing_state.reset_for_tests()
-    alias_routing_state.record_normalized_quota_observations(
-        [
-            _quota_observation(
-                account_hash=f"hash-account-{number}",
-                observed_at=now,
-                reset_at=now + timedelta(hours=2),
-                quota_period="five_hour",
-                window_minutes=300,
-                exhausted=True,
-                model=model,
-            )
-            for number in (1, 2)
-        ]
-    )
+    if hydrated:
+        alias_routing_state.record_normalized_quota_observations(
+            [
+                _quota_observation(
+                    account_hash=f"hash-account-{number}",
+                    observed_at=now,
+                    reset_at=now + timedelta(hours=2),
+                    quota_period="five_hour",
+                    window_minutes=300,
+                    exhausted=True,
+                    model=model,
+                )
+                for number in (1, 2)
+            ]
+        )
     body = {
         "model": model,
         "input": "review",
         "client_metadata": {"x-openai-subagent": "guardian"},
-        "litellm_metadata": {"codex_oauth_ordinary_quota_exempt": True},
+        "litellm_metadata": {
+            "codex_oauth_ordinary_quota_exempt": quota_exempt,
+        },
     }
+    if not hydrated:
+        assert isinstance(selection._hydrate_codex_oauth_quota_observations, AsyncMock)
     try:
-        if quota_exempt:
-            (
-                auth,
-                selected,
-                _,
-            ) = await codex_oauth.select_and_bind_direct_codex_oauth_inventory(
-                _direct_request(), request_body=body
-            )
-            assert auth.account_label == "account1"
-            assert "account1" in loaded
-            assert (
-                selected["quota_selection"]["bypass_reason"]
-                == "ordinary_quota_inapplicable"
-            )
-        else:
+        if hydrated:
             with pytest.raises(HTTPException) as exc_info:
                 await codex_oauth.select_and_bind_direct_codex_oauth_inventory(
                     _direct_request(), request_body=body
@@ -4194,6 +4185,38 @@ async def test_native_review_admission_is_independent_of_ordinary_quota(
             assert all(
                 item["reason"] == "quota_exhausted"
                 for item in exc_info.value.detail["skipped_candidates"]
+            )
+        elif quota_exempt:
+            auth, selected, metadata = (
+                await codex_oauth.select_and_bind_direct_codex_oauth_inventory(
+                    _direct_request(), request_body=body
+                )
+            )
+            assert auth.account_label == "account1"
+            assert "account1" in loaded
+            assert (
+                metadata["litellm_metadata"][
+                    "codex_oauth_ordinary_quota_applicable"
+                ]
+                is False
+            )
+            assert (
+                selected["quota_selection"]["bypass_reason"]
+                == "ordinary_quota_inapplicable"
+            )
+        else:
+            auth, selected, metadata = (
+                await codex_oauth.select_and_bind_direct_codex_oauth_inventory(
+                    _direct_request(), request_body=body
+                )
+            )
+            assert auth.account_label == "account1"
+            assert "account1" in loaded
+            assert (
+                metadata["litellm_metadata"][
+                    "codex_oauth_ordinary_quota_applicable"
+                ]
+                is True
             )
     finally:
         snapshot_select.set_active_routing_snapshot(previous_snapshot)
@@ -4205,6 +4228,11 @@ async def test_direct_responses_request_local_usage_limit_selects_next_account(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_direct_inventory_auth(monkeypatch)
+    monkeypatch.setattr(
+        session_affinity,
+        "get_session_owner_record",
+        AsyncMock(return_value=(None, None, None)),
+    )
     request = _direct_request()
     body = {"model": "gpt-5.6-sol", "input": "hello"}
     alias_routing_state.reset_for_tests()
@@ -5513,7 +5541,9 @@ aliases:
         return dict(body)
 
     captured: dict[str, Any] = {}
+    captured_sends: list[dict[str, Any]] = []
     calls = 0
+    persist_cooldown = AsyncMock()
     refusal = HTTPException(
         status_code=429,
         detail={
@@ -5524,12 +5554,17 @@ aliases:
     )
     refusal._aawm_provider_returned = True
     refusal.attempted_provider_call = True
-    monkeypatch.setattr(lpe, "_persist_codex_cooldown_durable", AsyncMock())
+    monkeypatch.setattr(
+        lpe,
+        "_persist_codex_cooldown_durable",
+        persist_cooldown,
+    )
 
     async def _fake_base_handler(**kwargs):
         nonlocal calls
         calls += 1
         captured.update(kwargs)
+        captured_sends.append(dict(kwargs.get("extra_headers") or {}))
         if provider_refusal:
             raise refusal
         return Response(content=b"ok", status_code=200)
@@ -5596,6 +5631,16 @@ aliases:
         snapshot_select.set_active_routing_snapshot(previous_snapshot)
     # Preserve the existing finite fresh-request account failover policy.
     assert calls == (2 if provider_refusal else 1)
+    if provider_refusal:
+        assert [headers.get("Authorization") for headers in captured_sends] == [
+            "Bearer server-token-account1",
+            "Bearer server-token-account2",
+        ]
+        assert [headers.get("ChatGPT-Account-Id") for headers in captured_sends] == [
+            "server-acct-account1",
+            "server-acct-account2",
+        ]
+        assert all(headers.get("x-openai-subagent") == subagent for headers in captured_sends)
     if not provider_refusal:
         assert response.status_code == 200
     assert captured.get("api_key") is None
