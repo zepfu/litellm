@@ -547,6 +547,7 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
     )
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control import (
         ALPHA_PROBE_PLAN_HEADER,
+        ALPHA_OVERLOAD_PROBE_PLAN_HEADER,
         resolve_alpha_probe_control,
     )
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_build import (
@@ -586,7 +587,11 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
             for key, value in alpha_probe_headers.items()
             if not (
                 isinstance(key, str)
-                and key.casefold() == ALPHA_PROBE_PLAN_HEADER.casefold()
+                and key.casefold()
+                in {
+                    ALPHA_PROBE_PLAN_HEADER.casefold(),
+                    ALPHA_OVERLOAD_PROBE_PLAN_HEADER.casefold(),
+                }
             )
         },
     )
