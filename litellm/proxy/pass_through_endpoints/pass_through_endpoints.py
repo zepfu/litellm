@@ -3181,6 +3181,17 @@ def _classify_passthrough_raw_http_error(
             ("server_overloaded", "transient_capacity", True),
             reason="provider_capacity_alias",
         )
+    if (
+        code in {"capacity_exhausted", "server_is_overloaded"}
+        or error_type in {
+            "capacity_exhausted",
+            "server_is_overloaded",
+        }
+    ):
+        return _finish(
+            ("server_overloaded", "transient_capacity", True),
+            reason="raw_capacity_alias",
+        )
     return _finish(classified, reason="responses_classifier")
 
 
