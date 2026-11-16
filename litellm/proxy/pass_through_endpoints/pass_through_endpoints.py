@@ -10706,6 +10706,39 @@ async def pass_through_request(  # noqa: PLR0915
                 prepared_request: httpx.Request,
                 send_stream: bool,
             ) -> httpx.Response:
+                from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control import (
+                    build_alpha_overload_probe_receipt,
+                    build_synthetic_overload_response,
+                    claim_alpha_overload_slot,
+                    resolve_alpha_overload_probe,
+                )
+
+                overload_probe_control = resolve_alpha_overload_probe(
+                    request,
+                    user_api_key_dict=user_api_key_dict,
+                )
+                if overload_probe_control is not None:
+                    overload_probe_action = claim_alpha_overload_slot(
+                        request,
+                        control=overload_probe_control,
+                    )
+                    if overload_probe_action == "overload":
+                        synthetic_overload_response = (
+                            build_synthetic_overload_response(
+                                error_code="server_is_overloaded"
+                            )
+                        )
+                        synthetic_overload_response.extensions[
+                            "aawm_alpha_probe_synthetic"
+                        ] = True
+                        build_alpha_overload_probe_receipt(
+                            request,
+                            control=overload_probe_control,
+                            candidate=immutable_openai_binding.candidate_context,
+                        )
+                        return synthetic_overload_response
+                    if overload_probe_action is None:
+                        request.state.aawm_openai_alpha_probe_exhausted = True
                 ensure_openai_wire_replay_allowed(
                     request,
                     ledger=openai_call_ledger,
@@ -13701,6 +13734,25 @@ def create_pass_through_route(
             # not turn a direct native OpenAI request into a caller-managed
             # retry with no outer owner; callers must opt in explicitly.
             param_caller_managed_hidden_retry = bool(caller_managed_hidden_retry)
+            from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control import (
+                ALPHA_OVERLOAD_PROBE_PLAN_HEADER,
+                resolve_alpha_overload_probe,
+            )
+
+            raw_probe_plan = next(
+                (
+                    str(value)
+                    for name, value in request.headers
+                    if str(name).casefold()
+                    == ALPHA_OVERLOAD_PROBE_PLAN_HEADER.casefold()
+                ),
+                None,
+            )
+            if raw_probe_plan is not None:
+                resolve_alpha_overload_probe(
+                    request,
+                    user_api_key_dict=user_api_key_dict,
+                )
 
             # Construct the full target URL with subpath if needed
             full_target = (

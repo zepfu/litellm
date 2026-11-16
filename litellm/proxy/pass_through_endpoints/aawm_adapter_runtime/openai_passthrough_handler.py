@@ -1159,6 +1159,20 @@ class BaseOpenAIPassThroughHandler:
                         protected_headers=selected_openai_headers,
                     )
                 )
+            from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control import (
+                ALPHA_OVERLOAD_PROBE_PLAN_HEADER,
+            )
+
+            if isinstance(extra_headers, dict):
+                extra_headers = {
+                    name: value
+                    for name, value in extra_headers.items()
+                    if not (
+                        isinstance(name, str)
+                        and name.casefold()
+                        == ALPHA_OVERLOAD_PROBE_PLAN_HEADER.casefold()
+                    )
+                }
 
             def _assemble_provider_headers(current_api_key: Optional[str]):
                 if managed_xai_oauth_request:
