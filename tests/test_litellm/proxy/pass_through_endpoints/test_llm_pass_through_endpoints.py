@@ -18056,6 +18056,206 @@ async def test_codex_auto_agent_alias_selects_spark_first(monkeypatch):
     assert selection['skipped'] == []
 
 
+def _build_test_session_owner_redis_cache():
+    owner_records: dict[str, dict[str, Any]] = {}
+
+    class _OwnerRedisClient:
+        async def eval(self, script, _numkeys, key, *args):
+            current = owner_records.get(key)
+            if "last_renewed_at_epoch" in script:
+                if current is None or current.get("reservation_token") != args[0]:
+                    return 0
+                renewed = json.loads(args[1])
+                owner_records[key] = renewed
+                return 1
+            if "PERSIST" in script and "reservation_token" in script:
+                if current is None or current.get("reservation_token") != args[0]:
+                    return [0, json.dumps(current or {})]
+                owned = json.loads(args[1])
+                if current.get("reserved_at_epoch") is not None:
+                    owned["reserved_at_epoch"] = current["reserved_at_epoch"]
+                owner_records[key] = owned
+                return [1, json.dumps(owned)]
+            if "DEL" in script and "reserved" in script:
+                if current is None:
+                    return 0
+                if current.get("state") == "owned":
+                    return 2
+                if current.get("reservation_token") == args[0]:
+                    owner_records.pop(key, None)
+                    return 1
+                return 0
+            raise AssertionError(f"unexpected session-owner storage script: {script[:60]}")
+
+    class _OwnerRedisCache:
+        def __init__(self):
+            self.client = _OwnerRedisClient()
+
+        def check_and_fix_namespace(self, *, key):
+            return key
+
+        def init_async_client(self):
+            return self.client
+
+        async def async_set_cache(self, *, key, value, nx=False, **_kwargs):
+            if nx and key in owner_records:
+                return False
+            owner_records[key] = copy.deepcopy(value)
+            return True
+
+    owner_cache = _OwnerRedisCache()
+
+    async def _owner_cache():
+        return owner_cache, None
+
+    async def _read_owner_record(*, cache_key, **_kwargs):
+        record = owner_records.get(cache_key)
+        return copy.deepcopy(record) if record is not None else None
+
+    return _owner_cache, _read_owner_record
+
+
+@pytest.mark.asyncio
+async def test_fresh_nested_codex_alias_transitions_after_provider_429(monkeypatch):
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        candidate_loop,
+        codex_oauth,
+        cooldown_state,
+        durable,
+        selection,
+        session_affinity,
+        snapshot_select,
+        xai_oauth,
+    )
+    from litellm.proxy import aawm_alias_routing_redis
+
+    request = _build_codex_auto_agent_request("fresh-failover-session")
+    body = {
+        "model": "work",
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "READ_ROUTE_OK"}],
+            }
+        ],
+        "stream": False,
+        "store": False,
+        "tools": [],
+    }
+    owner_cache, read_owner_record = _build_test_session_owner_redis_cache()
+
+    async def _no_inventory(*_args, **_kwargs):
+        raise codex_oauth.CodexOAuthInventoryError("test inventory unavailable")
+
+    async def _no_storage(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(session_affinity, "_get_redis_cache", owner_cache)
+    monkeypatch.setattr(session_affinity, "_read_session_owner_record", read_owner_record)
+    monkeypatch.setattr(xai_oauth, "configured_xai_oauth_records", lambda: ())
+    monkeypatch.setattr(codex_oauth, "_load_request_codex_oauth_inventory", _no_inventory)
+    monkeypatch.setattr(cooldown_state, "get_aawm_alias_routing_dual_cache", lambda: None)
+    monkeypatch.setattr(durable, "get_aawm_alias_routing_dual_cache", lambda: None)
+    monkeypatch.setattr(
+        aawm_alias_routing_redis,
+        "get_status",
+        lambda: {"configured": False},
+    )
+    monkeypatch.setattr(selection, "_hydrate_zai_coding_plan_quota_observations", _no_storage)
+    monkeypatch.setattr(selection, "_hydrate_alibaba_token_plan_quota_observations", _no_storage)
+    monkeypatch.setattr(llm_passthrough_endpoints, "_persist_codex_cooldown_durable", _no_storage)
+    monkeypatch.setattr(llm_passthrough_endpoints, "_set_codex_auto_agent_session_affinity", _no_storage)
+    real_asyncio_sleep = asyncio.sleep
+
+    async def _instant_sleep(_seconds):
+        await real_asyncio_sleep(0)
+
+    monkeypatch.setattr(
+        candidate_loop,
+        "asyncio",
+        SimpleNamespace(
+            CancelledError=asyncio.CancelledError,
+            sleep=_instant_sleep,
+        ),
+    )
+
+    real_datetime = datetime
+
+    class _ScheduleProbeDatetime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            probe_time = real_datetime(2026, 11, 16, 23, 59, tzinfo=timezone.utc)
+            return probe_time if tz is None else probe_time.astimezone(tz)
+
+    # At 07:59 +08:00 both configured Z.AI windows are open; the work alias's
+    # DeepSeek alternate is open too. Keep this time deterministic across runs.
+    monkeypatch.setattr(snapshot_select, "datetime", _ScheduleProbeDatetime)
+
+    provider_calls: list[str] = []
+
+    async def _perform_candidate(*, request, candidate, candidate_body, **_kwargs):
+        provider_calls.append(candidate["provider"])
+        if candidate["provider"] == "zai_coding_plan":
+            error = HTTPException(
+                status_code=429,
+                detail={
+                    "error": {
+                        "type": "rate_limit_error",
+                        "code": "429",
+                        "message": "Insufficient balance or no resource package.",
+                    }
+                },
+            )
+            error._aawm_provider_returned = True
+            error.attempted_provider_call = True
+            raise error
+        assert candidate["provider"] == "alibaba_token_plan"
+        return Response(content='{"ok": true}', media_type="application/json")
+
+    monkeypatch.setattr(
+        llm_passthrough_endpoints,
+        "_perform_codex_auto_agent_alias_candidate_request",
+        _perform_candidate,
+    )
+    redispatch_calls: list[dict[str, Any]] = []
+    real_redispatch = llm_passthrough_endpoints._raise_codex_auto_agent_redispatch_required
+
+    def _capture_redispatch(**kwargs):
+        redispatch_calls.append(dict(kwargs))
+        return real_redispatch(**kwargs)
+
+    monkeypatch.setattr(
+        llm_passthrough_endpoints,
+        "_raise_codex_auto_agent_redispatch_required",
+        _capture_redispatch,
+    )
+
+    try:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+            canonical_alias="work",
+        )
+    except HTTPException as exc:
+        raise AssertionError(
+            f"alias route did not reach its configured alternate: {exc.detail}"
+        ) from exc
+
+    assert response.status_code == 200
+    assert response.body == b'{"ok": true}'
+    assert provider_calls == [
+        "zai_coding_plan",
+        "zai_coding_plan",
+        "alibaba_token_plan",
+    ]
+    assert not redispatch_calls
+
 
 @pytest.mark.parametrize(
     ("alias_model", "target_model"),
