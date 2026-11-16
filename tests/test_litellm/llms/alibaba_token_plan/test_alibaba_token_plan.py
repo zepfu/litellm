@@ -35,6 +35,7 @@ def test_catalog_constant_is_metadata_only() -> None:
     """ALIBABA_TOKEN_PLAN_MODEL_IDS is retained as catalog metadata only;
     admission and credential discovery are structural, not enumerated."""
     assert ALIBABA_TOKEN_PLAN_MODEL_IDS == {
+        "qwen4-max-preview",
         "qwen3.8-max",
         "qwen3.8-max-preview",
         "qwen3.7-plus",
@@ -44,6 +45,19 @@ def test_catalog_constant_is_metadata_only() -> None:
         "deepseek-v4-pro",
         "glm-5.3",
     }
+
+
+def test_should_map_qwen4_alias_effort_and_combined_output_budget() -> None:
+    body = AlibabaTokenPlanChatConfig().transform_request(
+        model="qwen4-max-preview",
+        messages=[{"role": "user", "content": "Hello"}],
+        optional_params={"reasoning_effort": "max", "max_tokens": 1024},
+        litellm_params={},
+        headers={},
+    )
+    assert body["model"] == "qwen4-max-preview"
+    assert body["reasoning_effort"] == "xhigh"
+    assert body["max_tokens"] == 1024
 
 
 @pytest.mark.parametrize(

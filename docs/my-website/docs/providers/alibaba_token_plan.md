@@ -16,6 +16,7 @@ alias routes remain separate.
 
 ## Supported models
 
+- `alibaba_token_plan/qwen4-max-preview`
 - `alibaba_token_plan/qwen3.8-max`
 - `alibaba_token_plan/qwen3.7-plus`
 - `alibaba_token_plan/qwen3.7-max`
@@ -44,6 +45,7 @@ body. Source: the QwenCloud OpenAI chat API reference.
 
 | Model | Configured effort | Serialized field |
 | --- | --- | --- |
+| `qwen4-max-preview` | `max` on alpha | `reasoning_effort=xhigh`; native values are `low`, `medium`, and `xhigh` |
 | `qwen3.8-max` | `max` | `reasoning_effort=xhigh` (`max` and `high` map to `xhigh`; `none` sets `enable_thinking=false`) |
 | `qwen3.7-max`, `qwen3.7-plus` | `max` when set | `enable_thinking=true`. `reasoning_effort` is not a supported wire field |
 | `deepseek-v4-pro`, `glm-5.3` | `max` | `reasoning_effort=max` (native `high` or `max`; `low`/`medium` map to `high`; `xhigh` maps to `max`) |
@@ -119,6 +121,19 @@ The AAWM proxy configuration may expose:
 - `sota-zai`: last-resort Alibaba Token Plan GLM 5.3 after Z.AI Coding
   Plan `zai_coding_plan/glm-5.3`. Do not invent a second public name.
 
+Alpha mounts overrides from `config/alpha-alias-overrides/` that place
+`qwen4-max-preview` first in `sota-alibaba`, `provider-alibaba`, and
+`expert-other`, with configured effort `max`. The Qwen4 candidate is available
+all day; existing fallback candidates and schedules are preserved. `sota`
+inherits this order for Qwen clients, and `expert` references `expert-other`.
+Canonical alias files and dev/production deployments retain their current
+order. Only `docker-compose.alpha.yml` mounts the three Qwen overrides.
+
+The preview supports a 1M-token context and up to 393,216 output tokens.
+Its `max_tokens` budget includes both thinking and the final answer. Alibaba
+may report the canonical name `qwen4.0-max-preview` in responses. The announced
+preview ends November 25, 2026 (UTC+8).
+
 Codex Responses ingress uses
 `codex_alibaba_token_plan_chat_completions_adapter`. Anthropic Messages ingress
 uses `anthropic_alibaba_token_plan_chat_completions_adapter`. Both preserve the
@@ -171,6 +186,16 @@ missing attribution remains unpriced. Reference totals are metadata only and do
 not populate `response_cost` or `session_history.response_cost_usd`.
 Sources: [Model pricing](https://www.alibabacloud.com/help/en/model-studio/model-pricing)
 and [context cache](https://www.alibabacloud.com/help/en/model-studio/context-cache).
+
+Qwen4-Max-Preview uses the production Qwen4-Max standard Singapore
+international list rates as a comparison baseline: `$1.50` per million input
+tokens and `$4.50` per million output tokens. This is labeled
+`production_model_baseline`, with basis model `qwen4-max`; it claims neither
+model equivalence nor the preview's invoice price. The preview is available
+only through Token Plan and has no published pay-as-you-go tariff. Promotional
+Credits discounts are excluded. Cache-bearing requests remain unpriced until
+their cache tariffs are verified. Source:
+[Qwen4-Max-Preview](https://www.alibabacloud.com/help/en/model-studio/qwen4-max-preview).
 
 ## Quota observability
 

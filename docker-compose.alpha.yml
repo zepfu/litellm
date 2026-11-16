@@ -70,6 +70,10 @@ services:
       # Alpha-only OpenAI candidates and the canonical model-map fallback.
       - /home/zepfu/projects/litellm/config/alpha-alias-overrides/provider-openai.yaml:/app/litellm/proxy/aawm_alias_config/provider-openai.yaml:ro
       - /home/zepfu/projects/litellm/model_prices_and_context_window.json:/app/litellm/bundled_model_prices_and_context_window_fallback.json:ro
+      # Temporary Qwen4 priority overrides apply only to this alpha service.
+      - /home/zepfu/projects/litellm/config/alpha-alias-overrides/sota-alibaba.yaml:/app/litellm/proxy/aawm_alias_config/sota-alibaba.yaml:ro
+      - /home/zepfu/projects/litellm/config/alpha-alias-overrides/provider-alibaba.yaml:/app/litellm/proxy/aawm_alias_config/provider-alibaba.yaml:ro
+      - /home/zepfu/projects/litellm/config/alpha-alias-overrides/expert-other.yaml:/app/litellm/proxy/aawm_alias_config/expert-other.yaml:ro
       # Writable runtime data also stays in persistent root paths.
       - /home/zepfu/projects/litellm/.analysis:/app/.analysis
       - /home/zepfu/projects/litellm/captures:/tmp/captures

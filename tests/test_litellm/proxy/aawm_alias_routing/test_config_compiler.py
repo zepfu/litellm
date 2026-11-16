@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+import shutil
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -32,6 +34,31 @@ aliases:
         route_family: codex_responses
         priority: 0
 """
+
+
+def test_should_prioritize_qwen4_only_in_alpha_overrides(tmp_path: Path) -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        DEFAULT_CONFIG_DIR,
+        compile_directory,
+    )
+
+    canonical = compile_directory(DEFAULT_CONFIG_DIR)
+    alpha_dir = tmp_path / "aliases"
+    shutil.copytree(DEFAULT_CONFIG_DIR, alpha_dir)
+    root = Path(__file__).resolve().parents[4]
+    for override in (root / "config/alpha-alias-overrides").glob("*.yaml"):
+        shutil.copyfile(override, alpha_dir / override.name)
+    alpha = compile_directory(alpha_dir)
+    for name in ("sota-alibaba", "provider-alibaba", "expert-other"):
+        original = canonical.aliases[name].candidates
+        candidates = alpha.aliases[name].candidates
+        assert original[0].model == "alibaba_token_plan/qwen3.8-max"
+        assert candidates[0].model == "alibaba_token_plan/qwen4-max-preview"
+        assert candidates[0].schedule is None
+        assert candidates[0].reasoning_effort == "max"
+        assert candidates[1:] == original
+    assert alpha.aliases["expert"].candidates == canonical.aliases["expert"].candidates
+    assert alpha.aliases["sota"].dispatch == canonical.aliases["sota"].dispatch
 
 
 def test_compile_produces_snapshot_with_epoch_hash_version() -> None:
