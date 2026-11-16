@@ -238,6 +238,8 @@ class ResponsesStreamPreCommitFailure(Exception):
         provider_returned: bool = True,
         failure_origin: Optional[str] = None,
     ) -> None:
+        if pre_commit_retry_exhausted:
+            retryable = False
         self.error_class = error_class
         self.classification = classification
         self.retryable = retryable
@@ -2522,8 +2524,6 @@ class PassThroughStreamingHandler:
             status_code = 429
         if not sanitized_message:
             sanitized_message = classification
-        if pre_commit_retry_exhausted and retryable:
-            retryable = True
         return ResponsesStreamPreCommitFailure(
             error_class=error_class,
             classification=classification,

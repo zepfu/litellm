@@ -56,6 +56,12 @@ _ALPHA_OVERLOAD_PLAN_DEFINITIONS: dict[str, tuple[str, ...]] = {
     # recovery attempt; this helper performs no provider call itself.
     "overload": ("overload",),
     "overload,success": ("overload", "success"),
+    "overload,overload,overload,success": (
+        "overload",
+        "overload",
+        "overload",
+        "success",
+    ),
 }
 ALPHA_OVERLOAD_PROBE_PLAN_NAMES = frozenset(_ALPHA_OVERLOAD_PLAN_DEFINITIONS)
 ALPHA_OVERLOAD_PROBE_ERROR_CODES = frozenset(
@@ -729,7 +735,7 @@ def _next_receipt_sequence(
     current = getattr(state, state_key, 0)
     current_int = _safe_int(current)
     next_value = (current_int if current_int is not None and current_int >= 0 else 0) + 1
-    setattr(state, _RECEIPT_SEQUENCE_STATE_KEY, next_value)
+    setattr(state, state_key, next_value)
     return next_value
 
 

@@ -2299,6 +2299,7 @@ def _record_openai_raw_retry_event(  # noqa: PLR0915
     provider_error_type: Optional[str] = None,
     provider_error_message: Optional[str] = None,
     failure_origin_label: Optional[str] = None,
+    extras: Optional[Mapping[str, Any]] = None,
 ) -> None:
     if diagnostic_enabled is not True:
         return
@@ -2371,6 +2372,26 @@ def _record_openai_raw_retry_event(  # noqa: PLR0915
                 cleaned_value = _clean_passthrough_error_context_value(value)
                 if cleaned_value is not None:
                     event[event_key] = cleaned_value
+
+        if extras is not None:
+            allowed_extras = {
+                key: extras[key]
+                for key in (
+                    "schema",
+                    "sequence",
+                    "action",
+                    "error_code",
+                    "synthetic",
+                    "attempted_provider_call",
+                    "plan",
+                    "source",
+                    "environment",
+                    "provider_returned",
+                )
+                if key in extras
+            }
+            if allowed_extras:
+                event.update(allowed_extras)
 
         if isinstance(ledger, Mapping):
             _merge_openai_raw_retry_authorization_fields(event, ledger)
@@ -10710,6 +10731,7 @@ async def pass_through_request(  # noqa: PLR0915
                     build_alpha_overload_probe_receipt,
                     build_synthetic_overload_response,
                     claim_alpha_overload_slot,
+                    get_alpha_overload_probe_receipts,
                     resolve_alpha_overload_probe,
                 )
 
@@ -10735,6 +10757,45 @@ async def pass_through_request(  # noqa: PLR0915
                             request,
                             control=overload_probe_control,
                             candidate=immutable_openai_binding.candidate_context,
+                        )
+                        receipts = get_alpha_overload_probe_receipts(request)
+                        overload_probe_receipt = receipts[-1] if receipts else None
+                        _record_openai_raw_retry_event(
+                            event_type="openai_alpha_overload_probe",
+                            event_stage="synthetic_overload_injection",
+                            request=request,
+                            kwargs=kwargs,
+                            custom_llm_provider=custom_llm_provider,
+                            litellm_call_id=litellm_call_id,
+                            failure=None,
+                            response=synthetic_overload_response,
+                            error_class="server_overloaded",
+                            classification="transient_capacity",
+                            retryable=True,
+                            diagnostic_enabled=True,
+                            extras={
+                                "schema": (
+                                    "aawm_openai_alpha_overload_probe_receipt_v1"
+                                ),
+                                "sequence": (
+                                    overload_probe_receipt.get("sequence")
+                                    if isinstance(
+                                        overload_probe_receipt,
+                                        Mapping,
+                                    )
+                                    else None
+                                ),
+                                "action": "inject_synthetic_overload",
+                                "error_code": "server_is_overloaded",
+                                "synthetic": True,
+                                "attempted_provider_call": False,
+                                "plan": ",".join(
+                                    overload_probe_control.plan.actions
+                                ),
+                                "source": "alpha_overload_probe",
+                                "environment": overload_probe_control.environment,
+                                "provider_returned": False,
+                            },
                         )
                         return synthetic_overload_response
                     if overload_probe_action is None:
