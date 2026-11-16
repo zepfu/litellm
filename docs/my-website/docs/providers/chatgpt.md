@@ -98,9 +98,11 @@ litellm --config config.yaml
 On the direct Codex OAuth Responses route, `codex-auto-review` uses the native
 model without an alias. Its trusted model capability,
 `codex_oauth_ordinary_quota_exempt`, makes ordinary Codex allowance inapplicable
-to local admission and account ranking. Ordinary quota observations remain
-available for other models; reviewer refusals do not imply ordinary quota
-exhaustion. Explicit provider quota headers are still recorded.
+to charging and weekly account balancing. Auto-review consumes no ordinary
+quota, but an exhausted account can still reject it. Account availability is
+checked separately from charging so the inventory can select another account.
+Reviewer refusals do not imply ordinary quota exhaustion. Explicit provider
+quota headers are still recorded.
 
 The active model map must include this capability. The bundled map includes it;
 `LITELLM_LOCAL_MODEL_COST_MAP=True` selects that map.
@@ -111,8 +113,14 @@ Authentication, session ownership, and actual provider rejections still apply.
 This direct-route header handling requires a bound account selection. Alias
 requests such as `basic` and `work` keep their existing alias dispatch and do
 not bind a direct account at the outer Responses route.
-The exemption adds no fallback, retry, or automatic approval decision. Local
-admission does not guarantee provider availability under exhausted allowance.
+If a provider confirms account exhaustion before output is committed, the
+direct route can use its existing bounded account-failover path to retry with
+another eligible inventory account. Credential binding, ownership, replay
+safety and the provider-call budget still apply. Unknown failures and committed
+output do not acquire retry permission from the quota exemption.
+
+The exemption does not approve commands; Codex's built-in reviewer still makes
+the approval decision. Local admission does not guarantee provider availability.
 
 ### Environment Variables
 
