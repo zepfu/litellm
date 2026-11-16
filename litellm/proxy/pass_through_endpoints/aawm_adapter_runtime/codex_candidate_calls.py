@@ -10894,7 +10894,10 @@ def _mark_zai_coding_plan_provider_response(
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         response = getattr(current, "response", None)
-        request = getattr(response, "request", None)
+        try:
+            request = getattr(response, "request", None)
+        except RuntimeError:
+            request = None
         response_url = getattr(request, "url", None)
         response_status = getattr(response, "status_code", None)
         if response_url is not None and isinstance(response_status, int):

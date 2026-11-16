@@ -488,6 +488,27 @@ def test_should_mark_only_exact_zai_provider_http_responses() -> None:
     assert getattr(wrong_endpoint_error, "_aawm_provider_returned", False) is False
     assert getattr(wrong_endpoint_error, "attempted_provider_call", False) is False
 
+    requestless_response_error = httpx.HTTPStatusError(
+        "429 Too Many Requests",
+        request=httpx.Request("POST", target_url),
+        response=httpx.Response(status_code=429),
+    )
+    with pytest.raises(httpx.HTTPStatusError) as raised:
+        try:
+            raise requestless_response_error
+        except httpx.HTTPStatusError as exc:
+            lpe._mark_zai_coding_plan_provider_response(
+                exc,
+                target_url=target_url,
+            )
+            raise
+    assert raised.value is requestless_response_error
+    assert (
+        getattr(requestless_response_error, "_aawm_provider_returned", False)
+        is False
+    )
+    assert getattr(requestless_response_error, "attempted_provider_call", False) is False
+
 
 def test_should_map_coding_plan_1113_to_wrong_base_terminal_error() -> None:
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
