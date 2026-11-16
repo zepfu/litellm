@@ -3642,17 +3642,6 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
     provider_status_code = (
         _aawm_error_signals._extract_adapter_exception_status_code(exc)
     )
-    if (
-        provider_status_code is None
-        and error_class == "usage_limit_reached"
-        and provider_returned
-        and _aawm_codex_oauth.is_direct_codex_usage_limit_error(exc)
-    ):
-        # Exact direct classification proved a provider-confirmed 429
-        # account-limit response.  Preserve that HTTP fact for the common
-        # owner when provider status extraction lost it, while retaining an
-        # explicitly extracted non-429 provider status.
-        provider_status_code = status.HTTP_429_TOO_MANY_REQUESTS
     capacity_decision = capacity_recovery_owner.observe(
         CapacityRecoveryObservation(
             provider_returned=provider_returned,
