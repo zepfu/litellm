@@ -656,6 +656,37 @@ are selected earlier and keep ownership. Model metadata describes capabilities
 and pricing but is not credential admission. There is no `OPENAI_API_KEY`
 fallback for those otherwise-unclaimed explicit Responses requests.
 
+## Bounded alpha overload acceptance (OPENAI-087)
+
+The request-local overload probe is disabled by default. It requires both
+`AAWM_OPENAI_ALPHA_OVERLOAD_PROBE_ENABLED=1` and
+`AAWM_LITELLM_ENVIRONMENT=litellm-alpha`, a fresh request, and the existing
+CFG-004 admin authentication. A configured proxy master key is required;
+without it, probe authorization returns `503 auth_unavailable`. Preserve this
+guard and existing clients when preparing activation.
+
+The server-only `x-aawm-openai-alpha-overload-probe-plan` header accepts these
+fixed plans:
+
+| Plan | Behavior |
+| --- | --- |
+| `overload` | One synthetic overload, followed by ordinary recovery eligibility |
+| `overload,success` | One synthetic overload, then a real provider attempt |
+| `overload,overload,overload` | Three synthetic overloads; an extra claim fails closed before provider I/O |
+
+Each synthetic response is HTTP 200 SSE containing `response.failed` with
+`server_is_overloaded` and no output. It must pass through the normal
+pre-output parser and request-scoped recovery coordinator after the normal
+provider-call reservation. The probe does not add a retry owner or change
+account selection, replay protection, deadlines, or call limits. A `success`
+slot permits a real attempt; it does not guarantee provider success.
+
+Acceptance must distinguish logical reservations, synthetic responses, actual
+provider I/O, and the final delivered result. An ordinary successful request
+alone does not prove overload recovery. Synthetic probes do not reproduce or
+establish the cause of a historical upstream incident. Restore the enable flag
+to `0` after bounded acceptance and verify the ordinary route.
+
 ## Shared atomic 0600 publication
 
 All credential writers share the same private publish pipeline under
