@@ -78,6 +78,7 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_led
 )
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.capacity_recovery import (
     CapacityRecoveryAction,
+    CapacityRecoveryDecision,
     CapacityRecoveryObservation,
     annotate_capacity_recovery,
     get_or_create_capacity_recovery_owner,
@@ -1880,6 +1881,8 @@ async def handle_alias_route(  # noqa: PLR0915
     codex_failure_evidence_alias = alias_model if is_codex_alias else None
     failed_provider_candidate_keys: set[str] = set()
     deterministically_ineligible_candidate_keys: set[str] = set()
+    pending_capacity_route_transition: Optional[CapacityRecoveryDecision] = None
+    pending_capacity_route_transition_from_key: Optional[str] = None
 
     register_aawm_route_rollup_access_log_replacement(request)
     _bind_auto_agent_alias_request_identity(request)
@@ -2765,11 +2768,9 @@ async def handle_alias_route(  # noqa: PLR0915
                 same_route_retry_available=False,
             )
             transient_provider_recovery_decision = recovery_decision
-            transient_provider_exhaustion = recovery_decision.action in {
-                CapacityRecoveryAction.RETRY_SAME_ROUTE,
-                CapacityRecoveryAction.ROUTE_TRANSITION,
-                CapacityRecoveryAction.REDISPATCH,
-            }
+            transient_provider_exhaustion = (
+                recovery_decision.action is CapacityRecoveryAction.REDISPATCH
+            )
         if transient_provider_exhaustion:
             if transient_provider_recovery_decision is not None:
                 capacity_recovery_owner.acknowledge_handoff(
@@ -4403,6 +4404,8 @@ async def handle_alias_route(  # noqa: PLR0915
                         async def _perform_candidate_request() -> Response:  # noqa: PLR0915
                             nonlocal attempted_provider_call
                             nonlocal selection_provider_egress_reached
+                            nonlocal pending_capacity_route_transition
+                            nonlocal pending_capacity_route_transition_from_key
                             candidate_is_openai = (
                                 str(candidate.get("provider") or "").strip().lower()
                                 == "openai"
@@ -4461,6 +4464,17 @@ async def handle_alias_route(  # noqa: PLR0915
                                 )
                             perform_exc: Optional[BaseException] = None
                             try:
+                                if (
+                                    pending_capacity_route_transition is not None
+                                    and cooldown_key
+                                    != pending_capacity_route_transition_from_key
+                                ):
+                                    capacity_recovery_owner.consume_decision(
+                                        pending_capacity_route_transition,
+                                        consumer="alias-candidate-transition",
+                                    )
+                                    pending_capacity_route_transition = None
+                                    pending_capacity_route_transition_from_key = None
                                 response = await perform_candidate_request_fn(
                                     candidate=candidate,
                                     candidate_body=candidate_body,
@@ -6702,16 +6716,25 @@ async def handle_alias_route(  # noqa: PLR0915
                     )
                 )
                 if account_failover_planned:
-                    if capacity_route_transition_decision is not None:
-                        capacity_recovery_owner.consume_decision(
-                            capacity_route_transition_decision,
-                            consumer="alias-account-transition",
-                        )
                     _carry_native_openai_responses_owner_snapshot(
                         durable_source_snapshot
                     )
+                fresh_candidate_transition = (
+                    capacity_route_transition_decision is not None
+                    and not account_failover_planned
+                    and is_codex_alias
+                    and _genuinely_fresh_dispatch(selection)
+                )
                 if (
-                    cooldown_scope == "none"
+                    capacity_route_transition_decision is not None
+                    and (account_failover_planned or fresh_candidate_transition)
+                ):
+                    pending_capacity_route_transition = (
+                        capacity_route_transition_decision
+                    )
+                    pending_capacity_route_transition_from_key = cooldown_key
+                if (
+                    (cooldown_scope == "none" or fresh_candidate_transition)
                     and not _provider_owned_continuation()
                     and not deterministically_ineligible
                     and (
