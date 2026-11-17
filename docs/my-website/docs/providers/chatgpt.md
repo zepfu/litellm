@@ -115,9 +115,11 @@ requests such as `basic` and `work` keep their existing alias dispatch and do
 not bind a direct account at the outer Responses route.
 If a provider confirms account exhaustion before output is committed, the
 direct route can use its existing bounded account-failover path to retry with
-another eligible inventory account. Credential binding, ownership, replay
-safety and the provider-call budget still apply. Unknown failures and committed
-output do not acquire retry permission from the quota exemption.
+another eligible inventory account. A reused native reviewer remains eligible
+for account failover when its request includes continuation or encrypted
+reasoning state. Credential binding, ownership and the provider-call budget
+still apply. Unknown failures and committed output do not acquire retry
+permission from the quota exemption.
 
 The exemption does not approve commands; Codex's built-in reviewer still makes
 the approval decision. Local admission does not guarantee provider availability.
