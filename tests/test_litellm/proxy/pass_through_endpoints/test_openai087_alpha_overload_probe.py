@@ -20,12 +20,12 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control
     _ALPHA_OVERLOAD_PLAN_DEFINITIONS,
     AlphaOverloadProbePlan,
     AlphaOverloadProbeControl,
-    AlphaOverloadProbePlan,
     alpha_probe_control_enabled,
     alpha_overload_probe_control_enabled,
     build_alpha_overload_probe_receipt,
     build_synthetic_overload_response,
     claim_alpha_overload_slot,
+    get_alpha_overload_probe_control,
     get_alpha_overload_probe_receipts,
     resolve_alpha_overload_probe,
 )
@@ -37,9 +37,7 @@ from litellm.proxy.pass_through_endpoints.streaming_handler import (
 def _request(plan: str | None = None) -> Request:
     headers = []
     if plan is not None:
-        headers.append(
-            (b"x-aawm-openai-alpha-overload-probe-plan", plan.encode())
-        )
+        headers.append((b"x-aawm-openai-alpha-overload-probe-plan", plan.encode()))
     return Request(
         {
             "type": "http",
@@ -69,7 +67,7 @@ def _bind_control(
     request: Request,
     monkeypatch: pytest.MonkeyPatch,
     *,
-    plan: str = "overload,success",
+    plan: str = "overload,overload,overload",
 ) -> AlphaOverloadProbeControl:
     monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
     monkeypatch.setenv(ALPHA_OVERLOAD_PROBE_ENABLED_ENV, "1")
@@ -84,18 +82,12 @@ def _bind_control(
     )
     control = resolve_alpha_overload_probe(request, user_api_key_dict=_admin())
     assert isinstance(control, AlphaOverloadProbeControl)
-    assert control.plan == AlphaOverloadProbePlan(
-        actions=_ALPHA_OVERLOAD_PLAN_DEFINITIONS[plan]
-    )
+    assert control.plan == AlphaOverloadProbePlan(actions=_ALPHA_OVERLOAD_PLAN_DEFINITIONS[plan])
     assert control.request_identity == "probe-request-id"
     return control
 
 
-def _request_state_keys(request: Request) -> tuple[str, ...]:
-    return tuple(vars(request.state)["_state"])
-
-
-def test_safe_off_paths_leave_request_state_unchanged(
+def test_safe_off_paths_are_public_no_ops(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("AAWM_LITELLM_ENVIRONMENT", raising=False)
@@ -106,26 +98,28 @@ def test_safe_off_paths_leave_request_state_unchanged(
     assert not alpha_overload_probe_control_enabled()
     assert resolve_alpha_overload_probe(request, user_api_key_dict=None) is None
     assert claim_alpha_overload_slot(request) is None
-    assert not any(key.startswith("aawm_") for key in _request_state_keys(request))
+    assert get_alpha_overload_probe_control(request) is None
     assert get_alpha_overload_probe_receipts(request) == ()
 
     monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
     monkeypatch.delenv(ALPHA_OVERLOAD_PROBE_ENABLED_ENV, raising=False)
     assert resolve_alpha_overload_probe(request) is None
     assert claim_alpha_overload_slot(request) is None
-    assert not any(key.startswith("aawm_") for key in _request_state_keys(request))
+    assert get_alpha_overload_probe_control(request) is None
+    assert get_alpha_overload_probe_receipts(request) == ()
 
     request = _request()
     monkeypatch.setenv(ALPHA_OVERLOAD_PROBE_ENABLED_ENV, "1")
     assert resolve_alpha_overload_probe(request) is None
-    assert not any(key.startswith("aawm_") for key in _request_state_keys(request))
+    assert get_alpha_overload_probe_control(request) is None
+    assert get_alpha_overload_probe_receipts(request) == ()
 
 
 def test_enabled_plan_claims_fixed_slots_then_exhausts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request = _request("overload,success")
-    control = _bind_control(request, monkeypatch)
+    control = _bind_control(request, monkeypatch, plan="overload,success")
 
     assert claim_alpha_overload_slot(request, control=control) == "overload"
     assert claim_alpha_overload_slot(request, control=control) == "success"
@@ -142,13 +136,13 @@ def test_three_overload_plan_claims_fixed_slots_then_exhausts(
         plan="overload,overload,overload,success",
     )
 
-    assert control.plan == AlphaOverloadProbePlan(
-        actions=("overload", "overload", "overload", "success")
-    )
-    assert [
-        claim_alpha_overload_slot(request, control=control)
-        for _ in range(4)
-    ] == ["overload", "overload", "overload", "success"]
+    assert control.plan == AlphaOverloadProbePlan(actions=("overload", "overload", "overload", "success"))
+    assert [claim_alpha_overload_slot(request, control=control) for _ in range(4)] == [
+        "overload",
+        "overload",
+        "overload",
+        "success",
+    ]
     assert claim_alpha_overload_slot(request, control=control) is None
 
 
@@ -162,14 +156,30 @@ def test_receipt_sequences_are_isolated_by_state_key(
         plan="overload,overload,overload,success",
     )
 
-    sequences = [
-        build_alpha_overload_probe_receipt(request, control=control)["sequence"]
-        for _ in range(3)
-    ]
+    sequences = [build_alpha_overload_probe_receipt(request, control=control)["sequence"] for _ in range(3)]
 
     assert sequences == [1, 2, 3]
     assert getattr(request.state, _OVERLOAD_RECEIPT_SEQUENCE_STATE_KEY) == 3
     assert not hasattr(request.state, _RECEIPT_SEQUENCE_STATE_KEY)
+
+
+def test_terminal_overload_plan_claims_exact_budget_then_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request("overload,overload,overload")
+    control = _bind_control(request, monkeypatch)
+
+    assert claim_alpha_overload_slot(request, control=control) == "overload"
+    assert claim_alpha_overload_slot(request, control=control) == "overload"
+    assert claim_alpha_overload_slot(request, control=control) == "overload"
+    with pytest.raises(HTTPException) as raised:
+        claim_alpha_overload_slot(request, control=control)
+    assert raised.value.status_code == 409
+    assert raised.value.detail["error"] == ("alpha_overload_probe_terminal_plan_exhausted")
+    with pytest.raises(HTTPException) as raised:
+        claim_alpha_overload_slot(request, control=control)
+    assert raised.value.status_code == 409
+    assert raised.value.detail["error"] == ("alpha_overload_probe_terminal_plan_exhausted")
 
 
 @pytest.mark.parametrize("error_code", sorted(ALPHA_OVERLOAD_PROBE_ERROR_CODES))
@@ -193,11 +203,12 @@ def test_synthetic_response_is_terminal_httpx_sse(
     assert payload["response"]["error"]["code"] == error_code
     assert payload["response"]["error"]["type"] == "server_error"
 
-    decision, error_payload, event_type, commitment_reason = (
-        PassThroughStreamingHandler._inspect_responses_pre_commit_chunks(
-            [response.content]
-        )
-    )
+    (
+        decision,
+        error_payload,
+        event_type,
+        commitment_reason,
+    ) = PassThroughStreamingHandler._inspect_responses_pre_commit_chunks([response.content])
     assert decision == "failed"
     assert event_type == "response.failed"
     assert commitment_reason is None
@@ -208,35 +219,51 @@ def test_synthetic_response_is_terminal_httpx_sse(
 def test_receipt_records_synthetic_no_io_bound_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    request = _request("overload")
-    control = _bind_control(request, monkeypatch, plan="overload")
+    request = _request("overload,overload,overload")
+    control = _bind_control(
+        request,
+        monkeypatch,
+        plan="overload,overload,overload",
+    )
+    assert claim_alpha_overload_slot(request, control=control) == "overload"
     assert claim_alpha_overload_slot(request, control=control) == "overload"
 
-    receipt = build_alpha_overload_probe_receipt(
+    selection = {
+        "alias_model": "gpt-6.1-sol",
+        "candidate": {
+            "provider": "openai",
+            "model": "gpt-6.1-sol",
+            "route_family": "codex_responses",
+        },
+    }
+    first_receipt = build_alpha_overload_probe_receipt(
         request,
         control=control,
-        selection={
-            "alias_model": "gpt-6.1-sol",
-            "candidate": {
-                "provider": "openai",
-                "model": "gpt-6.1-sol",
-                "route_family": "codex_responses",
-            },
-        },
+        selection=selection,
+    )
+    second_receipt = build_alpha_overload_probe_receipt(
+        request,
+        control=control,
+        selection=selection,
     )
 
-    assert get_alpha_overload_probe_receipts(request) == (receipt,)
-    assert receipt["schema"] == "aawm_openai_alpha_overload_probe_receipt_v1"
-    assert receipt["request_identity"] == "probe-request-id"
-    assert receipt["plan"] == "overload"
-    assert receipt["action"] == "inject_synthetic_overload"
-    assert receipt["event_type"] == "response.failed"
-    assert receipt["error_code"] == "server_is_overloaded"
-    assert receipt["synthetic"] is True
-    assert receipt["attempted_provider_call"] is False
-    assert receipt["provider_returned"] is False
-    assert receipt["provider"] == "openai"
-    assert receipt["model"] == "gpt-6.1-sol"
+    assert get_alpha_overload_probe_receipts(request) == (
+        first_receipt,
+        second_receipt,
+    )
+    assert [receipt["sequence"] for receipt in (first_receipt, second_receipt)] == [1, 2]
+    for receipt in (first_receipt, second_receipt):
+        assert receipt["schema"] == "aawm_openai_alpha_overload_probe_receipt_v1"
+        assert receipt["request_identity"] == "probe-request-id"
+        assert receipt["plan"] == "overload,overload,overload"
+        assert receipt["action"] == "inject_synthetic_overload"
+        assert receipt["event_type"] == "response.failed"
+        assert receipt["error_code"] == "server_is_overloaded"
+        assert receipt["synthetic"] is True
+        assert receipt["attempted_provider_call"] is False
+        assert receipt["provider_returned"] is False
+        assert receipt["provider"] == "openai"
+        assert receipt["model"] == "gpt-6.1-sol"
 
 
 def test_malformed_plan_fails_closed_without_binding(
@@ -274,6 +301,32 @@ async def _direct_lease_renewal(_lease, operation, **_kwargs):
     return await operation()
 
 
+async def _direct_run_with_lease_renewal(*, request, operation):
+    return await operation()
+
+
+def _configure_full_boundary_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    monkeypatch.setenv("AAWM_OPENAI_ALPHA_OVERLOAD_PROBE_ENABLED", "1")
+    monkeypatch.setenv("AAWM_OPENAI_MAX_LOGICAL_PROVIDER_CALLS", "32")
+    monkeypatch.setattr(
+        "litellm.proxy.pass_through_endpoints.aawm_adapter_runtime."
+        "provider_call_ledger.ProviderCallLedger.MAX_LOGICAL_PROVIDER_CALLS",
+        32,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry."
+        "_resolve_redis_for_capacity_wakeup",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry." "_CLIENT_DISCONNECT_POLL_SECONDS",
+        0.001,
+        raising=False,
+    )
+
+
 @pytest.mark.asyncio
 async def test_full_boundary_recovers_after_three_synthetic_overloads(
     monkeypatch: pytest.MonkeyPatch,
@@ -294,32 +347,14 @@ async def test_full_boundary_recovers_after_three_synthetic_overloads(
         pass_through_endpoints as pte,
     )
 
-    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
-    monkeypatch.setenv("AAWM_OPENAI_ALPHA_OVERLOAD_PROBE_ENABLED", "1")
-    monkeypatch.setenv("AAWM_OPENAI_MAX_LOGICAL_PROVIDER_CALLS", "32")
-    monkeypatch.setattr(
-        "litellm.proxy.pass_through_endpoints.aawm_adapter_runtime."
-        "provider_call_ledger.ProviderCallLedger.MAX_LOGICAL_PROVIDER_CALLS",
-        32,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry."
-        "_resolve_redis_for_capacity_wakeup",
-        lambda *_args, **_kwargs: None,
-    )
-    monkeypatch.setattr(
-        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry."
-        "_CLIENT_DISCONNECT_POLL_SECONDS",
-        0.001,
-        raising=False,
-    )
+    _configure_full_boundary_retry(monkeypatch)
 
     plan = "overload,overload,overload,success"
     body = {"model": "gpt-6.1-sol", "stream": True}
     request = _full_boundary_request(plan, body)
+    request.is_disconnected = AsyncMock(return_value=False)
     _bind_control(request, monkeypatch, plan=plan)
-    target = "https://chatgpt.com/backend-api/codex/responses"
+    target = "https://api.openai.com/v1/responses"
     success_chunks = [
         (
             b'event: response.created\ndata: {"type":"response.created",'
@@ -327,9 +362,29 @@ async def test_full_boundary_recovers_after_three_synthetic_overloads(
             b'"status":"in_progress","model":"gpt-6.1-sol","output":[]}}\n\n'
         ),
         (
-            b'event: response.completed\ndata: {"type":"response.completed",'
-            b'"response":{"id":"resp_success","status":"completed"}}\n\n'
-        ),
+            "event: response.completed\ndata: "
+            + json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_success",
+                        "status": "completed",
+                        "usage": {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "total_tokens": 0,
+                        },
+                        "aawm_route_identity": {
+                            "producer_provider": "openai",
+                            "producer_model": "gpt-6.1-sol",
+                            "producer_route_family": "openai",
+                        },
+                    },
+                },
+                separators=(",", ":"),
+            )
+            + "\n\n"
+        ).encode("utf-8"),
         b"data: [DONE]\n\n",
     ]
     success_response = httpx.Response(
@@ -347,7 +402,7 @@ async def test_full_boundary_recovers_after_three_synthetic_overloads(
     ), patch.object(
         pte,
         "_aawm_run_with_session_owner_lease_renewal",
-        new=AsyncMock(side_effect=_direct_lease_renewal),
+        new=_direct_run_with_lease_renewal,
     ), patch.object(
         pte,
         "_aawm_session_owner_on_upstream_result",
@@ -361,8 +416,7 @@ async def test_full_boundary_recovers_after_three_synthetic_overloads(
         "run_with_session_owner_lease_renewal",
         new=_direct_lease_renewal,
     ), patch(
-        "litellm.proxy.pass_through_endpoints.pass_through_endpoints."
-        "get_async_httpx_client",
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints." "get_async_httpx_client",
     ) as mock_get_client, patch(
         "litellm.proxy.proxy_server.proxy_logging_obj",
     ) as mock_logging_obj, patch.object(
@@ -407,24 +461,15 @@ async def test_full_boundary_recovers_after_three_synthetic_overloads(
     assert mock_client.send.await_count == 3
     assert len(captured_prepared_requests) == 3
     assert all(
-        "x-aawm-openai-alpha-overload-probe-plan"
-        not in prepared.headers
-        for prepared in captured_prepared_requests
+        "x-aawm-openai-alpha-overload-probe-plan" not in prepared.headers for prepared in captured_prepared_requests
     )
 
     receipts = get_alpha_overload_probe_receipts(request)
     assert [receipt["sequence"] for receipt in receipts] == [1, 2, 3]
-    assert (
-        getattr(request.state, _OVERLOAD_RECEIPT_SEQUENCE_STATE_KEY)
-        == 3
-    )
+    assert getattr(request.state, _OVERLOAD_RECEIPT_SEQUENCE_STATE_KEY) == 3
 
     retry_events = getattr(request.state, "aawm_openai_raw_retry_events", [])
-    probe_events = [
-        event
-        for event in retry_events
-        if event.get("event_type") == "openai_alpha_overload_probe"
-    ]
+    probe_events = [event for event in retry_events if event.get("event_type") == "openai_alpha_overload_probe"]
     assert len(probe_events) == 3
     for sequence, event in enumerate(probe_events, start=1):
         assert event["schema"] == "aawm_openai_alpha_overload_probe_receipt_v1"

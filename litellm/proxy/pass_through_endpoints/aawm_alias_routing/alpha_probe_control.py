@@ -51,10 +51,12 @@ _ALPHA_PLAN_DEFINITIONS: dict[str, tuple[int, str]] = {
 }
 ALPHA_PROBE_PLAN_NAMES = frozenset(_ALPHA_PLAN_DEFINITIONS)
 _ALPHA_OVERLOAD_PLAN_DEFINITIONS: dict[str, tuple[str, ...]] = {
-    # The first slot is the synthetic SSE transport failure.  The optional
-    # second slot deliberately returns control to the caller for one real
-    # recovery attempt; this helper performs no provider call itself.
+    # The first three slots cover the existing logical retry budget.  Each
+    # claimed overload remains one synthetic SSE response; after the final
+    # slot, a terminal plan fails closed rather than falling through.  The
+    # explicit two-slot plan returns control for one real recovery attempt.
     "overload": ("overload",),
+    "overload,overload,overload": ("overload", "overload", "overload"),
     "overload,success": ("overload", "success"),
     "overload,overload,overload,success": (
         "overload",
@@ -113,6 +115,11 @@ class AlphaOverloadProbePlan:
     def __post_init__(self) -> None:
         if self.actions not in _ALPHA_OVERLOAD_PLAN_DEFINITIONS.values():
             raise ValueError("unsupported alpha overload probe plan")
+
+    @property
+    def is_terminal(self) -> bool:
+        """Return whether exhaustion must block any ordinary provider send."""
+        return self.actions == ("overload", "overload", "overload")
 
 
 @dataclass(frozen=True)
@@ -474,8 +481,24 @@ def claim_alpha_overload_slot(
     slot_index = getattr(state, _OVERLOAD_SLOT_STATE_KEY, 0)
     if isinstance(slot_index, bool) or not isinstance(slot_index, int):
         slot_index = 0
-    if slot_index < 0 or slot_index >= len(bound_control.plan.actions):
-        return None
+    if slot_index < 0:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "alpha_overload_probe_slot_state_invalid",
+                "message": "alpha overload probe slot state is invalid",
+            },
+        )
+    if slot_index >= len(bound_control.plan.actions):
+        if not bound_control.plan.is_terminal:
+            return None
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "alpha_overload_probe_terminal_plan_exhausted",
+                "message": "alpha overload probe terminal plan is exhausted",
+            },
+        )
     action = bound_control.plan.actions[slot_index]
     setattr(state, _OVERLOAD_SLOT_STATE_KEY, slot_index + 1)
     return action
