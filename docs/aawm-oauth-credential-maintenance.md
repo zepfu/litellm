@@ -663,7 +663,10 @@ The request-local overload probe is disabled by default. It requires both
 `AAWM_LITELLM_ENVIRONMENT=litellm-alpha`, a fresh request, and the existing
 CFG-004 admin authentication. A configured proxy master key is required;
 without it, probe authorization returns `503 auth_unavailable`. Preserve this
-guard and existing clients when preparing activation.
+guard. A temporary master key changes authentication for existing clients:
+other bearer keys can return `400 no_db_connection` when no proxy database is
+configured. Keep acceptance bounded and restore the original authentication
+configuration and probe flag afterward.
 
 The probe captures freshness once, before normal ownership admission, in its
 immutable request control. Client continuations and prior held ownership are
@@ -678,7 +681,7 @@ fixed plans:
 | --- | --- |
 | `overload` | One synthetic overload, followed by ordinary recovery eligibility |
 | `overload,success` | One synthetic overload, then a real provider attempt |
-| `overload,overload,overload` | Three synthetic overloads exhaust the normal call budget and return terminal overload `503` with no provider I/O |
+| `overload,overload,overload` | Three synthetic overloads exhaust the normal call budget with no provider I/O; a fresh replay-safe native request returns retryable `409 aawm_session_owner_redispatch_required` |
 
 Each synthetic response is HTTP 200 SSE containing `response.failed` with
 `server_is_overloaded` and no output. It must pass through the normal
@@ -691,6 +694,15 @@ Under the normal three-call budget, `overload,success` reserves calls 1 and 2,
 makes one actual provider send, and leaves one call available. Acceptance
 requires nonempty recovered assistant output. The triple-overload plan reserves
 calls 1, 2, and 3, makes no actual sends, and leaves no calls available.
+
+The inner overload failure is retryable `503 server_is_overloaded`. The native
+endpoint's existing outer owner converts exhausted, fresh replay-safe requests
+to `409 aawm_session_owner_redispatch_required` with
+`failure_phase=direct_openai_capacity_redispatch`; it asks the caller to
+redispatch with a fresh ledger. Its `attempted_provider_call=true` describes
+logical attempt consumption, not physical I/O. The synthetic receipts retain
+`attempted_provider_call=false` and `provider_returned=false` for each injected
+response. The inner `503` remains when caller redispatch is unavailable.
 
 Acceptance must distinguish logical reservations, synthetic responses, actual
 provider I/O, and the final delivered result. An ordinary successful request
