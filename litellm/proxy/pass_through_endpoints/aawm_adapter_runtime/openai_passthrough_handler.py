@@ -889,27 +889,39 @@ class BaseOpenAIPassThroughHandler:
             ALPHA_OVERLOAD_PROBE_PLAN_HEADER,
             alpha_overload_probe_control_enabled,
             _request_header,
+            get_alpha_overload_probe_control,
             resolve_alpha_overload_probe,
         )
 
-        if (
-            alpha_overload_probe_control_enabled()
-            and _request_header(request, ALPHA_OVERLOAD_PROBE_PLAN_HEADER) is not None
-        ):
+        if alpha_overload_probe_control_enabled():
             direct_overload_body = (
                 endpoint_custom_body
                 if isinstance(endpoint_custom_body, dict)
                 else prepared_request_body
             )
-            resolve_alpha_overload_probe(
+            cached_control = get_alpha_overload_probe_control(request)
+            overload_plan_header = _request_header(
                 request,
-                user_api_key_dict=user_api_key_dict,
-                request_body=direct_overload_body,
-                session_identity=_sa.resolve_canonical_session_identity(
-                    request,
-                    direct_overload_body,
-                ),
+                ALPHA_OVERLOAD_PROBE_PLAN_HEADER,
             )
+            if cached_control is not None:
+                if overload_plan_header is not None:
+                    resolve_alpha_overload_probe(
+                        request,
+                        user_api_key_dict=user_api_key_dict,
+                        request_body=direct_overload_body,
+                        session_identity=None,
+                    )
+            elif overload_plan_header is not None:
+                resolve_alpha_overload_probe(
+                    request,
+                    user_api_key_dict=user_api_key_dict,
+                    request_body=direct_overload_body,
+                    session_identity=_sa.resolve_canonical_session_identity(
+                        request,
+                        direct_overload_body,
+                    ),
+                )
 
         session_owner_lease = None
         canonical_session_identity = None
