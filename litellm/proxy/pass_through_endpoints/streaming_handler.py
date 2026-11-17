@@ -238,8 +238,6 @@ class ResponsesStreamPreCommitFailure(Exception):
         provider_returned: bool = True,
         failure_origin: Optional[str] = None,
     ) -> None:
-        if pre_commit_retry_exhausted:
-            retryable = False
         self.error_class = error_class
         self.classification = classification
         self.retryable = retryable
