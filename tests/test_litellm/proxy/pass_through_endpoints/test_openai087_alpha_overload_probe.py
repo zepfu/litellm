@@ -304,6 +304,46 @@ async def test_codex_dispatch_rejects_bound_overload_probe_on_continuation(
 
 
 @pytest.mark.asyncio
+async def test_generated_pass_through_route_succeeds_without_probe_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import litellm.proxy.pass_through_endpoints.pass_through_endpoints as pte
+
+    from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+        create_pass_through_route,
+    )
+
+    request = _request(None)
+    request._parse_request_data = AsyncMock(return_value=(None, None, None, False))
+    route = create_pass_through_route(
+        endpoint="ordinary-openai",
+        target="https://example.test/v1/responses",
+        custom_headers={},
+        _forward_headers=False,
+        custom_llm_provider="openai",
+    )
+    route_response = Response(content=b"ok", status_code=200)
+    pass_through_request = AsyncMock(return_value=route_response)
+    monkeypatch.setattr(pte, "pass_through_request", pass_through_request)
+    monkeypatch.setattr(
+        pte.InitPassThroughEndpointHelpers,
+        "_is_mapped_pass_through_route",
+        lambda _path: True,
+    )
+
+    result = await route(
+        request=request,
+        fastapi_response=Response(),
+        user_api_key_dict=_admin(),
+    )
+
+    assert result is route_response
+    assert pass_through_request.await_count == 1
+    assert pass_through_request.await_args.kwargs["custom_llm_provider"] == "openai"
+    assert get_alpha_overload_probe_control(request) is None
+
+
+@pytest.mark.asyncio
 def test_terminal_overload_plan_claims_exact_budget_then_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

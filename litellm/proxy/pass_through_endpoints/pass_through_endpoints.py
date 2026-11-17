@@ -13828,7 +13828,7 @@ def create_pass_through_route(
 
             raw_probe_plan = next(
                 (
-                    str(value)
+                    value
                     for name, value in request.headers
                     if str(name).casefold()
                     == ALPHA_OVERLOAD_PROBE_PLAN_HEADER.casefold()
