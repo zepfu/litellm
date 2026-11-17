@@ -12,6 +12,7 @@ from fastapi import HTTPException
 
 from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+    authorize_capacity_recovery_replay,
     ProviderCallLedger,
     ProviderCallLedgerExhausted,
     ensure_openai_wire_replay_allowed,
@@ -61,6 +62,17 @@ def test_provider_429_can_cross_dispatch_commitment_after_ledger_authorization()
     )
 
     request = _request_with_commitment("provider_execution_possible")
+    ensure_openai_wire_replay_allowed(request, ledger=ledger)
+
+
+def test_typed_capacity_handoff_can_cross_dispatch_commitment_with_ledger():
+    request = _request_with_commitment("provider_execution_possible")
+    ledger = ProviderCallLedger(
+        provider="openai",
+        max_logical_provider_calls=3,
+        deadline_seconds=60,
+    )
+    authorize_capacity_recovery_replay(request)
     ensure_openai_wire_replay_allowed(request, ledger=ledger)
 
 

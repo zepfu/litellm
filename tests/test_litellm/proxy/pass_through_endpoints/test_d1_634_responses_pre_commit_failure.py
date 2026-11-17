@@ -9861,6 +9861,7 @@ async def test_provider_capacity_retry_can_cross_provisional_execution_commitmen
     """A provider-confirmed pre-first-byte capacity failure gets one retry."""
 
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        authorize_capacity_recovery_replay,
         ensure_openai_wire_replay_allowed,
         get_or_create_openai_provider_call_ledger,
         get_request_openai_wire_commitment,
@@ -9894,6 +9895,7 @@ async def test_provider_capacity_retry_can_cross_provisional_execution_commitmen
         target_identity=target,
         account_context=candidate_context,
     )
+    authorize_capacity_recovery_replay(request)
     assert ledger.authorize_capacity_retry(
         target=target,
         candidate_context=candidate_context,
@@ -9906,8 +9908,9 @@ async def test_provider_capacity_retry_can_cross_provisional_execution_commitmen
     commitment = get_request_openai_wire_commitment(request)
     assert is_openai_wire_replay_prohibited(commitment)
     assert not is_openai_wire_replay_prohibited(commitment, ledger=ledger)
-    # The permit is the only condition that may cross the provisional latch;
-    # the subsequent reservation consumes it before the retry send.
+    # A typed provider-confirmed capacity handoff or ledger permit may cross
+    # the provisional latch; the subsequent reservation consumes the permit
+    # before the retry send.
     ensure_openai_wire_replay_allowed(request, ledger=ledger)
 
     failure = ResponsesStreamPreCommitFailure(

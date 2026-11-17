@@ -29843,7 +29843,7 @@ class TestOpenAIPassthroughRoute:
             )
             attempts.append(authorization)
             if authorization == "Bearer account1":
-                raise HTTPException(
+                provider_error = HTTPException(
                     status_code=429,
                     detail={
                         "error": {"code": "usage_limit_reached"},
@@ -29852,6 +29852,8 @@ class TestOpenAIPassthroughRoute:
                     },
                     headers={"Retry-After": "900"},
                 )
+                setattr(provider_error, "_aawm_provider_returned", True)
+                raise provider_error
             return Response(content=b"ok", status_code=200)
 
         with patch(
@@ -29887,6 +29889,11 @@ class TestOpenAIPassthroughRoute:
             )
 
         assert response.status_code == 200
+        assert (
+            getattr(request.state, "_aawm_direct_codex_account_failover_planned")
+            is True
+        )
+        assert request.state.aawm_capacity_recovery_decision["capacity"] is True
         assert attempts == ["Bearer account1", "Bearer account2"]
         assert mock_bind.await_count == 2
         mock_publish.assert_called_once_with(

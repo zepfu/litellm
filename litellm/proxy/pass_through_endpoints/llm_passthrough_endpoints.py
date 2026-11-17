@@ -3639,10 +3639,13 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
         attempt_record=injected_attempt_record,
     )
     wire_commitment = get_request_openai_wire_commitment(request)
+    provider_status_code = (
+        _aawm_error_signals._extract_adapter_exception_status_code(exc)
+    )
     capacity_decision = capacity_recovery_owner.observe(
         CapacityRecoveryObservation(
             provider_returned=provider_returned,
-            status_code=_aawm_error_signals._extract_adapter_exception_status_code(exc),
+            status_code=provider_status_code,
             error_class=error_class,
             retryable=bool(getattr(exc, "retryable", False)),
             commitment=wire_commitment,
