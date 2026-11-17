@@ -886,23 +886,30 @@ class BaseOpenAIPassThroughHandler:
             )
 
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control import (
+            ALPHA_OVERLOAD_PROBE_PLAN_HEADER,
+            alpha_overload_probe_control_enabled,
+            _request_header,
             resolve_alpha_overload_probe,
         )
 
-        direct_overload_body = (
-            endpoint_custom_body
-            if isinstance(endpoint_custom_body, dict)
-            else None
-        )
-        resolve_alpha_overload_probe(
-            request,
-            user_api_key_dict=user_api_key_dict,
-            request_body=direct_overload_body,
-            session_identity=_sa.resolve_canonical_session_identity(
+        if (
+            alpha_overload_probe_control_enabled()
+            and _request_header(request, ALPHA_OVERLOAD_PROBE_PLAN_HEADER) is not None
+        ):
+            direct_overload_body = (
+                endpoint_custom_body
+                if isinstance(endpoint_custom_body, dict)
+                else prepared_request_body
+            )
+            resolve_alpha_overload_probe(
                 request,
-                direct_overload_body,
-            ),
-        )
+                user_api_key_dict=user_api_key_dict,
+                request_body=direct_overload_body,
+                session_identity=_sa.resolve_canonical_session_identity(
+                    request,
+                    direct_overload_body,
+                ),
+            )
 
         session_owner_lease = None
         canonical_session_identity = None
