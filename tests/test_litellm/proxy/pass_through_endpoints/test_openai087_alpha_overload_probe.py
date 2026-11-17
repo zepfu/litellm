@@ -64,6 +64,23 @@ def _request(plan: str | None = None) -> Request:
     )
 
 
+def _get_request() -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "scheme": "http",
+            "path": "/openai_passthrough/v1/models",
+            "raw_path": b"/openai_passthrough/v1/models",
+            "query_string": b"",
+            "headers": [],
+            "client": ("127.0.0.1", 4100),
+            "server": ("testserver", 80),
+            "http_version": "1.1",
+        }
+    )
+
+
 def _admin() -> SimpleNamespace:
     from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 
@@ -388,6 +405,60 @@ async def test_codex_dispatch_preserves_capture_after_header_scrub(
 
     assert raised.value.status_code == 409
     assert raised.value.detail["reason"] == "non_fresh_or_bound_body"
+
+
+@pytest.mark.asyncio
+async def test_enabled_native_handler_get_without_marker_is_ordinary_no_op(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    monkeypatch.setenv(ALPHA_OVERLOAD_PROBE_ENABLED_ENV, "1")
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+        openai_passthrough_handler,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        attempt_records,
+    )
+
+    request = _get_request()
+    request.state._cached_headers = {"content-type": "application/json"}
+    ordinary_response = Response(content=b"ok", status_code=200)
+    route = AsyncMock(return_value=ordinary_response)
+    prior_runtime = openai_passthrough_handler.BaseOpenAIPassThroughHandler._runtime
+    runtime = openai_passthrough_handler.build_runtime_from_host()
+    monkeypatch.setattr(
+        openai_passthrough_handler.BaseOpenAIPassThroughHandler,
+        "_runtime",
+        runtime,
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints."
+        "create_pass_through_route",
+        lambda **_kwargs: route,
+    )
+
+    try:
+        result = await openai_passthrough_handler.BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
+            endpoint="/v1/models",
+            request=request,
+            fastapi_response=Response(),
+            user_api_key_dict=_admin(),
+            base_target_url="https://example.test/openai_passthrough",
+            api_key="sk-test",
+            custom_llm_provider="openai",
+        )
+    finally:
+        openai_passthrough_handler.BaseOpenAIPassThroughHandler._runtime = prior_runtime
+
+    assert result is ordinary_response
+    assert route.await_count == 1
+    assert route.await_args.kwargs["custom_body"] is None
+    assert get_alpha_overload_probe_control(request) is None
+    assert get_alpha_overload_probe_receipts(request) == ()
+    assert not hasattr(
+        request.state,
+        attempt_records._AAWM_ALIAS_REQUEST_CALL_ID_STATE_KEY,
+    )
 
 
 @pytest.mark.asyncio

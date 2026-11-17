@@ -894,11 +894,6 @@ class BaseOpenAIPassThroughHandler:
         )
 
         if alpha_overload_probe_control_enabled():
-            direct_overload_body = (
-                endpoint_custom_body
-                if isinstance(endpoint_custom_body, dict)
-                else prepared_request_body
-            )
             cached_control = get_alpha_overload_probe_control(request)
             overload_plan_header = _request_header(
                 request,
@@ -909,10 +904,17 @@ class BaseOpenAIPassThroughHandler:
                     resolve_alpha_overload_probe(
                         request,
                         user_api_key_dict=user_api_key_dict,
-                        request_body=direct_overload_body,
+                        request_body=None,
                         session_identity=None,
                     )
             elif overload_plan_header is not None:
+                direct_overload_body = (
+                    endpoint_custom_body
+                    if isinstance(endpoint_custom_body, dict)
+                    else prepared_request_body
+                    if request.method == "POST"
+                    else None
+                )
                 resolve_alpha_overload_probe(
                     request,
                     user_api_key_dict=user_api_key_dict,
