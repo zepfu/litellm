@@ -10728,12 +10728,11 @@ async def pass_through_request(  # noqa: PLR0915
                 send_stream: bool,
             ) -> httpx.Response:
                 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control import (
-                    retained_alpha_overload_probe_rejection_reason,
                     build_alpha_overload_probe_receipt,
                     build_synthetic_overload_response,
                     claim_alpha_overload_slot,
                     get_alpha_overload_probe_receipts,
-                    resolve_alpha_overload_probe,
+                    get_alpha_overload_probe_control,
                 )
 
                 ensure_openai_wire_replay_allowed(
@@ -11039,36 +11038,9 @@ async def pass_through_request(  # noqa: PLR0915
                         reservation_ordinal=reservation.ordinal,
                     )
 
-                overload_probe_control = resolve_alpha_overload_probe(
-                    request,
-                    user_api_key_dict=user_api_key_dict,
+                overload_probe_control = get_alpha_overload_probe_control(
+                    request
                 )
-                if overload_probe_control is not None and not has_prior_provider_send:
-                    overload_probe_rejection_reason = (
-                        retained_alpha_overload_probe_rejection_reason(
-                            request,
-                            request_body=(
-                                provider_bound_body
-                                if isinstance(provider_bound_body, dict)
-                                else None
-                            ),
-                            session_identity=canonical_session_identity,
-                        )
-                    )
-                    if overload_probe_rejection_reason is not None:
-                        raise HTTPException(
-                            status_code=409,
-                            detail={
-                                "error": (
-                                    "alpha_overload_probe_requires_fresh_unbound_request"
-                                ),
-                                "message": (
-                                    "alpha overload probe requires a fresh, unbound "
-                                    "native request"
-                                ),
-                                "reason": overload_probe_rejection_reason,
-                            },
-                        )
                 if overload_probe_control is not None:
                     overload_probe_action = claim_alpha_overload_slot(
                         request,
@@ -13823,14 +13795,12 @@ def create_pass_through_route(
             param_caller_managed_hidden_retry = bool(caller_managed_hidden_retry)
             from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control import (
                 ALPHA_OVERLOAD_PROBE_PLAN_HEADER,
+                get_alpha_overload_probe_control,
                 resolve_alpha_overload_probe,
             )
 
             if request.headers.get(ALPHA_OVERLOAD_PROBE_PLAN_HEADER) is not None:
-                resolve_alpha_overload_probe(
-                    request,
-                    user_api_key_dict=user_api_key_dict,
-                )
+                resolve_alpha_overload_probe(request, user_api_key_dict=user_api_key_dict)
 
             # Construct the full target URL with subpath if needed
             full_target = (
@@ -13869,6 +13839,14 @@ def create_pass_through_route(
                 final_custom_body = custom_body
             elif isinstance(custom_body_data, dict):
                 final_custom_body = custom_body_data
+
+            if request.headers.get(ALPHA_OVERLOAD_PROBE_PLAN_HEADER) is not None:
+                resolve_alpha_overload_probe(
+                    request,
+                    user_api_key_dict=user_api_key_dict,
+                    request_body=final_custom_body,
+                )
+                get_alpha_overload_probe_control(request)
 
             return await pass_through_request(  # type: ignore
                 request=request,

@@ -40,9 +40,6 @@ _OVERLOAD_RECEIPT_SEQUENCE_STATE_KEY = (
     "aawm_openai_alpha_overload_probe_receipt_sequence"
 )
 _OVERLOAD_RECEIPT_SCHEMA = "aawm_openai_alpha_overload_probe_receipt_v1"
-_OVERLOAD_PRE_ADMISSION_STATE_KEY = (
-    "aawm_openai_alpha_overload_probe_pre_admission"
-)
 _IDENTIFIER_RE = re.compile(r"[^A-Za-z0-9_.:/@+-]+")
 _HEX_RE = re.compile(r"\A[0-9A-Fa-f]{8,128}\Z")
 
@@ -61,12 +58,6 @@ _ALPHA_OVERLOAD_PLAN_DEFINITIONS: dict[str, tuple[str, ...]] = {
     "overload": ("overload",),
     "overload,overload,overload": ("overload", "overload", "overload"),
     "overload,success": ("overload", "success"),
-    "overload,overload,overload,success": (
-        "overload",
-        "overload",
-        "overload",
-        "success",
-    ),
 }
 ALPHA_OVERLOAD_PROBE_PLAN_NAMES = frozenset(_ALPHA_OVERLOAD_PLAN_DEFINITIONS)
 ALPHA_OVERLOAD_PROBE_ERROR_CODES = frozenset(
@@ -130,9 +121,10 @@ class AlphaOverloadProbeControl:
     """Request-local authorization and immutable synthetic plan state."""
 
     plan: AlphaOverloadProbePlan
+    request_identity: str
+    pre_admission_rejection_reason: Optional[str] = None
     environment: str = ALPHA_PROBE_ENVIRONMENT
     authorization: str = "cfg004_user_api_key_auth"
-    request_identity: Optional[str] = None
 
 
 def alpha_probe_control_enabled() -> bool:
@@ -373,51 +365,26 @@ def resolve_alpha_overload_probe(
     request: Request,
     *,
     user_api_key_dict: Any = None,
+    request_body: Optional[Mapping[str, Any]] = None,
+    session_identity: Optional[str] = None,
 ) -> Optional[AlphaOverloadProbeControl]:
     """Resolve and cache one authenticated synthetic SSE overload control.
 
-    The disabled gate and missing header are ordinary no-control paths.  Once
-    the gate and exact header are present, plan validation, CFG-004 primary
-    admin authentication, and request-identity binding all fail closed.
+    The disabled gate and missing header are ordinary no-control paths.  The
+    first binding parses the server-approved plan, performs CFG-004 primary
+    admin authentication, binds request identity, and classifies freshness
+    once before ordinary admission.  Later calls only reuse that frozen
+    control idempotently.
     """
     if not alpha_overload_probe_control_enabled():
         return None
 
     state = _request_state(request)
-    if state is None:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": "alpha_overload_probe_request_state_unavailable",
-                "message": "alpha overload probe request state unavailable",
-            },
-        )
     existing = getattr(state, _OVERLOAD_CONTROL_STATE_KEY, None)
-    raw_plan = _request_header(request, ALPHA_OVERLOAD_PROBE_PLAN_HEADER)
     if existing is not None:
-        if raw_plan is None:
-            return (
-                existing
-                if isinstance(existing, AlphaOverloadProbeControl)
-                else None
-            )
-        plan = _resolve_overload_plan(raw_plan)
-        if (
-            not isinstance(existing, AlphaOverloadProbeControl)
-            or existing.plan != plan
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "error": "alpha_overload_probe_control_conflict",
-                    "message": (
-                        "alpha overload probe control is already bound "
-                        "to this request"
-                    ),
-                },
-            )
-        return existing
+        return get_alpha_overload_probe_control(request)
 
+    raw_plan = _request_header(request, ALPHA_OVERLOAD_PROBE_PLAN_HEADER)
     if raw_plan is None:
         return None
     plan = _resolve_overload_plan(raw_plan)
@@ -435,110 +402,67 @@ def resolve_alpha_overload_probe(
                 "message": "alpha overload probe request identity unavailable",
             },
         )
+    pre_admission_rejection_reason = alpha_overload_probe_rejection_reason(
+        request,
+        request_body=request_body,
+        session_identity=session_identity,
+    )
     control = AlphaOverloadProbeControl(
         plan=plan,
         request_identity=request_identity,
+        pre_admission_rejection_reason=pre_admission_rejection_reason,
     )
     setattr(state, _OVERLOAD_CONTROL_STATE_KEY, control)
     return control
 
 
-def retained_alpha_overload_probe_rejection_reason(
-    request: Request,
-    *,
-    request_body: Optional[Mapping[str, Any]] = None,
-    session_identity: Optional[str] = None,
-) -> Optional[str]:
-    """Return the freshness classification retained before request admission."""
-
-    request_state = getattr(request, "state", None)
-    if hasattr(request_state, _OVERLOAD_PRE_ADMISSION_STATE_KEY):
-        return getattr(
-            request_state,
-            _OVERLOAD_PRE_ADMISSION_STATE_KEY,
-            None,
-        )
-
-    from . import audit_build
-    from . import session_affinity
-
-    if audit_build._codex_auto_agent_request_has_continuation_state(
-        request_body
-    ):
-        return "non_fresh_or_bound_body"
-    if session_affinity.request_session_owner_already_guarded(request):
-        return "session_owner_guarded"
-    if session_affinity.get_request_session_owner_lease(request) is not None:
-        return "session_owner_lease"
-    if session_affinity.request_has_effective_session_identity(request):
-        return "effective_session_identity"
-
-    consult_identity = getattr(
-        request_state,
-        "_aawm_session_owner_consult_identity",
-        None,
-    )
-    consult_cache_key = getattr(
-        request_state,
-        "_aawm_session_owner_consult_cache_key",
-        None,
-    )
-    consult_record = getattr(
-        request_state,
-        "_aawm_session_owner_consult_record",
-        None,
-    )
-    expected_cache_key = (
-        session_affinity.build_aawm_alias_routing_session_owner_cache_key(
-            session_identity=session_identity
-        )
-        if session_identity is not None
-        else None
-    )
-    consulted_owner_id = (
-        session_affinity._clean_optional_str(consult_record.get("owner"))
-        if isinstance(consult_record, dict)
-        else None
-    )
-    consulted_owned_thread = (
-        session_identity is not None
-        and consult_identity == session_identity
-        and consult_cache_key == expected_cache_key
-        and isinstance(consult_record, dict)
-        and session_affinity._record_state(consult_record) == "owned"
-        and consulted_owner_id is not None
-    )
-    if consulted_owned_thread:
-        return "session_owner_consult_owned"
-    return None
-
-
-def retain_alpha_overload_pre_admission(
-    request: Request,
-    *,
-    request_body: Optional[Mapping[str, Any]] = None,
-    session_identity: Optional[str] = None,
-) -> None:
-    """Classify and retain freshness before any ownership state is minted."""
-
-    state = _request_state(request)
-    if state is None:
-        return
-    reason = alpha_overload_probe_rejection_reason(
-        request,
-        request_body=request_body,
-        session_identity=session_identity,
-    )
-    setattr(state, _OVERLOAD_PRE_ADMISSION_STATE_KEY, reason)
-
-
 def get_alpha_overload_probe_control(
     request: Request,
 ) -> Optional[AlphaOverloadProbeControl]:
-    """Return the already-bound synthetic control without authorizing."""
+    """Return and validate the already-bound synthetic control.
+
+    This reader never authorizes, re-authenticates, rebinds identity, or
+    recaptures freshness.  A malformed capture or a negative pre-admission
+    classification fails closed.
+    """
     state = _request_state(request)
     value = getattr(state, _OVERLOAD_CONTROL_STATE_KEY, None) if state else None
-    return value if isinstance(value, AlphaOverloadProbeControl) else None
+    if value is None:
+        return None
+    if not isinstance(value, AlphaOverloadProbeControl):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "alpha_overload_probe_control_conflict",
+                "message": (
+                    "alpha overload probe control is already bound "
+                    "to this request"
+                ),
+            },
+        )
+    if (
+        not isinstance(value.request_identity, str)
+        or not value.request_identity.strip()
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "alpha_overload_probe_request_identity_unavailable",
+                "message": "alpha overload probe request identity unavailable",
+            },
+        )
+    if value.pre_admission_rejection_reason is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "alpha_overload_probe_requires_fresh_unbound_request",
+                "message": (
+                    "alpha overload probe requires a fresh, unbound request"
+                ),
+                "reason": value.pre_admission_rejection_reason,
+            },
+        )
+    return value
 
 
 def claim_alpha_overload_slot(
@@ -1033,8 +957,6 @@ __all__ = [
     "alpha_overload_probe_rejection_reason",
     "alpha_probe_control_enabled",
     "alpha_overload_probe_control_enabled",
-    "retained_alpha_overload_probe_rejection_reason",
-    "retain_alpha_overload_pre_admission",
     "build_alpha_probe_receipt",
     "build_alpha_overload_probe_receipt",
     "build_synthetic_overload_response",

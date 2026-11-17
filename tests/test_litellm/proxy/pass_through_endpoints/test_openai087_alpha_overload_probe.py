@@ -28,7 +28,6 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control
     get_alpha_overload_probe_control,
     get_alpha_overload_probe_receipts,
     resolve_alpha_overload_probe,
-    retain_alpha_overload_pre_admission,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry import (
     OpenAIAlphaCapacityRetryCoordinator,
@@ -77,6 +76,9 @@ def _bind_control(
     monkeypatch: pytest.MonkeyPatch,
     *,
     plan: str = "overload,overload,overload",
+    request_body: dict[str, Any] | None = None,
+    session_identity: str | None = None,
+    allow_nonfresh: bool = False,
 ) -> AlphaOverloadProbeControl:
     monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
     monkeypatch.setenv(ALPHA_OVERLOAD_PROBE_ENABLED_ENV, "1")
@@ -89,8 +91,15 @@ def _bind_control(
         "_bind_auto_agent_alias_request_identity",
         lambda _request: "probe-request-id",
     )
-    control = resolve_alpha_overload_probe(request, user_api_key_dict=_admin())
+    control = resolve_alpha_overload_probe(
+        request,
+        user_api_key_dict=_admin(),
+        request_body=request_body,
+        session_identity=session_identity,
+    )
     assert isinstance(control, AlphaOverloadProbeControl)
+    if not allow_nonfresh:
+        assert control.pre_admission_rejection_reason is None
     assert control.plan == AlphaOverloadProbePlan(actions=_ALPHA_OVERLOAD_PLAN_DEFINITIONS[plan])
     assert control.request_identity == "probe-request-id"
     return control
@@ -135,35 +144,27 @@ def test_enabled_plan_claims_fixed_slots_then_exhausts(
     assert claim_alpha_overload_slot(request, control=control) is None
 
 
-def test_three_overload_plan_claims_fixed_slots_then_exhausts(
+def test_supported_three_overload_plan_claims_fixed_slots(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    request = _request("overload,overload,overload,success")
-    control = _bind_control(
-        request,
-        monkeypatch,
-        plan="overload,overload,overload,success",
-    )
+    request = _request("overload,overload,overload")
+    control = _bind_control(request, monkeypatch)
 
-    assert control.plan == AlphaOverloadProbePlan(actions=("overload", "overload", "overload", "success"))
-    assert [claim_alpha_overload_slot(request, control=control) for _ in range(4)] == [
+    assert control.plan == AlphaOverloadProbePlan(
+        actions=("overload", "overload", "overload")
+    )
+    assert [claim_alpha_overload_slot(request, control=control) for _ in range(3)] == [
         "overload",
         "overload",
         "overload",
-        "success",
     ]
-    assert claim_alpha_overload_slot(request, control=control) is None
 
 
 def test_receipt_sequences_are_isolated_by_state_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    request = _request("overload,overload,overload,success")
-    control = _bind_control(
-        request,
-        monkeypatch,
-        plan="overload,overload,overload,success",
-    )
+    request = _request("overload,success")
+    control = _bind_control(request, monkeypatch, plan="overload,success")
 
     sequences = [build_alpha_overload_probe_receipt(request, control=control)["sequence"] for _ in range(3)]
 
@@ -262,11 +263,17 @@ async def test_codex_dispatch_rejects_bound_overload_probe_on_continuation(
     request.state._cached_headers = {
         "x-aawm-openai-alpha-overload-probe-plan": "overload,success",
     }
-    _bind_control(request, monkeypatch, plan="overload,success")
     monkeypatch.setattr(
         audit_build,
         "_codex_auto_agent_request_has_continuation_state",
         lambda body: bool(body.get("previous_response_id")),
+    )
+    _bind_control(
+        request,
+        monkeypatch,
+        plan="overload,success",
+        request_body={"model": "codex-auto-agent", "previous_response_id": "resp_parent"},
+        allow_nonfresh=True,
     )
     host = {
         "_resolve_codex_auto_agent_alias_model": (lambda body, *, endpoint, request: "codex-auto-agent"),
@@ -276,6 +283,16 @@ async def test_codex_dispatch_rejects_bound_overload_probe_on_continuation(
         "_resolve_codex_kimi_chat_completions_adapter_model": (lambda body, *, endpoint: None),
         "_resolve_codex_alibaba_token_plan_adapter_model": (lambda body, *, endpoint: None),
         "_resolve_codex_zai_coding_plan_adapter_model": (lambda body, *, endpoint: None),
+        "_apply_codex_auto_agent_prevention_guidance_to_request_body": (
+            lambda body: (body, [])
+        ),
+        "_apply_aawm_read_agent_guidance_to_request_body": (
+            lambda body, *, target_field: (body, [])
+        ),
+        "_prepare_request_body_for_passthrough_observability": (
+            lambda *, request, request_body: request_body
+        ),
+        "_safe_set_request_parsed_body": lambda request, body: None,
         "_handle_codex_auto_agent_alias_route": AsyncMock(return_value=Response()),
     }
     codex_dispatch.install(host)
@@ -305,13 +322,12 @@ async def test_codex_dispatch_rejects_bound_overload_probe_on_continuation(
 
 
 @pytest.mark.asyncio
-async def test_codex_dispatch_rejects_bound_overload_probe_after_header_scrub(
+async def test_codex_dispatch_preserves_capture_after_header_scrub(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
         codex_dispatch,
     )
-
     request = _request("overload,success")
     request.scope["parsed_body"] = (
         ("model",),
@@ -321,10 +337,13 @@ async def test_codex_dispatch_rejects_bound_overload_probe_after_header_scrub(
         "content-type": "application/json",
         "x-aawm-openai-alpha-overload-probe-plan": "overload,success",
     }
-    setattr(request.state, "_aawm_session_owner_guarded", True)
-    _bind_control(request, monkeypatch, plan="overload,success")
-    retain_alpha_overload_pre_admission(request)
-    setattr(request.state, "_aawm_session_owner_guarded", False)
+    _bind_control(
+        request,
+        monkeypatch,
+        plan="overload,success",
+        request_body={"model": "gpt-6.1-sol", "previous_response_id": "resp_parent"},
+        allow_nonfresh=True,
+    )
     host = {
         "_resolve_codex_auto_agent_alias_model": (
             lambda body, *, endpoint, request: None
@@ -363,11 +382,7 @@ async def test_codex_dispatch_rejects_bound_overload_probe_after_header_scrub(
         )
 
     assert raised.value.status_code == 409
-    assert raised.value.detail["reason"] == "session_owner_guarded"
-    assert (
-        "x-aawm-openai-alpha-overload-probe-plan"
-        not in request.state._cached_headers
-    )
+    assert raised.value.detail["reason"] == "non_fresh_or_bound_body"
 
 
 @pytest.mark.asyncio
@@ -631,6 +646,7 @@ async def _run_full_boundary_probe(
     expected_error: str | None = None,
     request_body: dict[str, Any] | None = None,
     expected_freshness_reason: str | None = None,
+    allow_nonfresh: bool = False,
 ) -> SimpleNamespace:
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
         audit_build,
@@ -649,7 +665,13 @@ async def _run_full_boundary_probe(
     body = request_body or {"model": "gpt-6.1-sol", "stream": True}
     request = _full_boundary_request(plan, body)
     request.is_disconnected = AsyncMock(return_value=False)
-    _bind_control(request, monkeypatch, plan=plan)
+    _bind_control(
+        request,
+        monkeypatch,
+        plan=plan,
+        request_body=body,
+        allow_nonfresh=allow_nonfresh,
+    )
     if expected_freshness_reason is not None:
         monkeypatch.setattr(
             audit_build,
@@ -906,6 +928,7 @@ async def test_native_first_send_rejects_continuation_before_provider_call(
             "stream": True,
             "previous_response_id": "resp_parent",
         },
+        allow_nonfresh=True,
         expected_freshness_reason="non_fresh_or_bound_body",
     )
 

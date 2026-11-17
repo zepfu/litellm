@@ -548,8 +548,6 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control import (
         ALPHA_PROBE_PLAN_HEADER,
         ALPHA_OVERLOAD_PROBE_PLAN_HEADER,
-        retained_alpha_overload_probe_rejection_reason,
-        retain_alpha_overload_pre_admission,
         resolve_alpha_probe_control,
         resolve_alpha_overload_probe,
     )
@@ -560,11 +558,8 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
     # Resolve the control before removing its header from the request-local
     # forwarding cache. Non-alias Codex routes still need the server-only
     # header removed before their pass-through path runs.
-    retain_alpha_overload_pre_admission(
-        request,
-        request_body=prepared_request_body,
-        session_identity=_sid,
-    )
+    # The ownership consult is intentionally read-only here: any consulted
+    # owned-record evidence is part of the one-time freshness classification.
     alpha_probe_control = (
         resolve_alpha_probe_control(
             request,
@@ -573,9 +568,11 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
         if codex_auto_agent_alias is not None
         else None
     )
-    alpha_overload_probe_control = resolve_alpha_overload_probe(
+    resolve_alpha_overload_probe(
         request,
         user_api_key_dict=user_api_key_dict,
+        request_body=prepared_request_body,
+        session_identity=_sid,
     )
 
     # _safe_get_request_headers caches the forwarding map on request state.
@@ -609,28 +606,6 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
     )
 
     if codex_auto_agent_alias is not None:
-        if alpha_overload_probe_control is not None:
-            overload_probe_rejection_reason = (
-                retained_alpha_overload_probe_rejection_reason(
-                    request,
-                    request_body=prepared_request_body,
-                    session_identity=_sid,
-                )
-            )
-
-            if overload_probe_rejection_reason is not None:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "error": "alpha_overload_probe_requires_fresh_unbound_request",
-                        "message": (
-                            "alpha overload probe requires a fresh, unbound Codex "
-                            "auto-agent request"
-                        ),
-                        "reason": overload_probe_rejection_reason,
-                    },
-                )
-
         if alpha_probe_control is not None:
             alpha_probe_rejection_reason: Optional[str] = None
             if _codex_auto_agent_request_has_continuation_state(
@@ -743,26 +718,6 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
             forward_headers=forward_headers,
             canonical_alias=codex_auto_agent_alias,
         )
-
-    if alpha_overload_probe_control is not None:
-        overload_probe_rejection_reason = retained_alpha_overload_probe_rejection_reason(
-            request,
-            request_body=prepared_request_body,
-            session_identity=_sid,
-        )
-
-        if overload_probe_rejection_reason is not None:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "error": "alpha_overload_probe_requires_fresh_unbound_request",
-                    "message": (
-                        "alpha overload probe requires a fresh, unbound native "
-                        "Codex request"
-                    ),
-                    "reason": overload_probe_rejection_reason,
-                },
-            )
 
     opencode_go_adapter_model = _resolve_codex_opencode_go_adapter_model(
         prepared_request_body,
