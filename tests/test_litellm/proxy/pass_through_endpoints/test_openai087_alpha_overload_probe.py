@@ -416,10 +416,14 @@ async def test_generated_pass_through_route_reads_nonempty_starlette_headers(
 ) -> None:
     import litellm.proxy.pass_through_endpoints.pass_through_endpoints as pte
 
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control import (
+        ALPHA_OVERLOAD_PROBE_ENABLED_ENV,
+    )
     from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
         create_pass_through_route,
     )
 
+    monkeypatch.setenv(ALPHA_OVERLOAD_PROBE_ENABLED_ENV, "0")
     request = _request(None)
     request.scope["headers"] = [(b"host", b"testserver")]
     request._parse_request_data = AsyncMock(return_value=(None, None, None, False))
