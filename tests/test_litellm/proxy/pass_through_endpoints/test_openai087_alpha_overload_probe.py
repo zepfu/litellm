@@ -880,13 +880,9 @@ def _new_connected_probe_request(plan: str, body: dict[str, Any]) -> Request:
     request.scope["headers"].extend(
         [
             (b"originator", b"codex"),
-            (b"chatgpt-account-id", b"probe-account"),
+            (b"x-request-id", b"probe-request-trace"),
         ]
     )
-    request.scope["_cached_headers"] = {
-        "originator": "codex",
-        "chatgpt-account-id": "probe-account",
-    }
     request.state.aawm_openai_candidate_context = {
         "provider": "openai",
         "model": body["model"],
@@ -926,7 +922,7 @@ async def _run_connected_boundary_probe(
                 user_api_key_dict=_admin(),
                 target_url="https://api.openai.com/v1/responses",
                 api_key="sk-test",
-                forward_headers=False,
+                forward_headers=True,
             )
         assert raised.value.status_code == 409
         assert getattr(
@@ -977,7 +973,7 @@ async def _run_connected_boundary_probe(
         )
 
     try:
-        result = await codex_dispatch.try_dispatch_codex_request(
+        await codex_dispatch.try_dispatch_codex_request(
             endpoint="/v1/responses",
             request=request,
             request_body=body,
@@ -986,7 +982,7 @@ async def _run_connected_boundary_probe(
             user_api_key_dict=_admin(),
             target_url="https://api.openai.com/v1/responses",
             api_key="sk-test",
-            forward_headers=False,
+            forward_headers=True,
         )
     except HTTPException as exc:
         mock_client = MagicMock()
@@ -1004,9 +1000,11 @@ async def _run_connected_boundary_probe(
             host=host,
             rejection=exc,
         )
-    assert result is None
-    assert "x-aawm-openai-alpha-overload-probe-plan" not in (request.state._cached_headers)
-
+    assert isinstance(get_alpha_overload_probe_control(request), AlphaOverloadProbeControl)
+    assert (
+        "x-aawm-openai-alpha-overload-probe-plan"
+        not in request.state._cached_headers
+    )
     target = "https://api.openai.com/v1/responses"
     success_chunks = _success_chunks()
     captured_prepared_requests: list[httpx.Request] = []
@@ -1063,7 +1061,7 @@ async def _run_connected_boundary_probe(
                 custom_body=body,
                 custom_llm_provider="openai",
                 stream=True,
-                forward_headers=False,
+                forward_headers=True,
             )
         except ProxyException as exc:
             probe_result = exc
@@ -1178,6 +1176,12 @@ async def test_connected_boundary_recovers_after_one_synthetic_overload(
     assert durable_before["state"] == "reserved"
     assert durable_before["reservation_token"] == lease_before.reservation_token
     sent_prepared_request = result.mock_client.send.call_args.args[0]
+    for prepared_request in result.captured_prepared_requests:
+        assert (
+            "x-aawm-openai-alpha-overload-probe-plan"
+            not in prepared_request.headers
+        )
+        assert prepared_request.headers["x-request-id"] == "probe-request-trace"
     assert (
         "x-aawm-openai-alpha-overload-probe-plan" not in sent_prepared_request.headers
     )
