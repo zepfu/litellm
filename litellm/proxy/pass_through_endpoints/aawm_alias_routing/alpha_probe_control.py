@@ -504,6 +504,69 @@ def claim_alpha_overload_slot(
     return action
 
 
+def alpha_overload_probe_rejection_reason(
+    request: Request,
+    *,
+    request_body: Optional[Mapping[str, Any]] = None,
+    session_identity: Optional[str] = None,
+) -> Optional[str]:
+    """Return why *request* is not fresh, without binding probe state."""
+
+    from . import audit_build
+    from . import session_affinity
+
+    if audit_build._codex_auto_agent_request_has_continuation_state(
+        request_body
+    ):
+        return "non_fresh_or_bound_body"
+    if session_affinity.request_session_owner_already_guarded(request):
+        return "session_owner_guarded"
+    if session_affinity.get_request_session_owner_lease(request) is not None:
+        return "session_owner_lease"
+    if session_affinity.request_has_effective_session_identity(request):
+        return "effective_session_identity"
+
+    request_state = getattr(request, "state", None)
+    consult_identity = getattr(
+        request_state,
+        "_aawm_session_owner_consult_identity",
+        None,
+    )
+    consult_cache_key = getattr(
+        request_state,
+        "_aawm_session_owner_consult_cache_key",
+        None,
+    )
+    consult_record = getattr(
+        request_state,
+        "_aawm_session_owner_consult_record",
+        None,
+    )
+    expected_cache_key = (
+        session_affinity.build_aawm_alias_routing_session_owner_cache_key(
+            session_identity=session_identity
+        )
+        if session_identity is not None
+        else None
+    )
+    consulted_owner_id = (
+        session_affinity._clean_optional_str(consult_record.get("owner"))
+        if isinstance(consult_record, dict)
+        else None
+    )
+    consulted_owned_thread = (
+        session_identity is not None
+        and consult_identity == session_identity
+        and consult_cache_key == expected_cache_key
+        and isinstance(consult_record, dict)
+        and session_affinity._record_state(consult_record) == "owned"
+        and consulted_owner_id is not None
+    )
+    if consulted_owned_thread:
+        return "session_owner_consult_owned"
+    return None
+
+
 def build_synthetic_overload_response(
     *,
     error_code: str = "server_is_overloaded",
@@ -869,6 +932,7 @@ __all__ = [
     "AlphaOverloadProbePlan",
     "AlphaProbeControl",
     "AlphaProbePlan",
+    "alpha_overload_probe_rejection_reason",
     "alpha_probe_control_enabled",
     "alpha_overload_probe_control_enabled",
     "build_alpha_probe_receipt",

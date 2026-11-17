@@ -10728,6 +10728,7 @@ async def pass_through_request(  # noqa: PLR0915
                 send_stream: bool,
             ) -> httpx.Response:
                 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control import (
+                    alpha_overload_probe_rejection_reason,
                     build_alpha_overload_probe_receipt,
                     build_synthetic_overload_response,
                     claim_alpha_overload_slot,
@@ -11042,6 +11043,32 @@ async def pass_through_request(  # noqa: PLR0915
                     request,
                     user_api_key_dict=user_api_key_dict,
                 )
+                if overload_probe_control is not None and not has_prior_provider_send:
+                    overload_probe_rejection_reason = (
+                        alpha_overload_probe_rejection_reason(
+                            request,
+                            request_body=(
+                                provider_bound_body
+                                if isinstance(provider_bound_body, dict)
+                                else None
+                            ),
+                            session_identity=canonical_session_identity,
+                        )
+                    )
+                    if overload_probe_rejection_reason is not None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "error": (
+                                    "alpha_overload_probe_requires_fresh_unbound_request"
+                                ),
+                                "message": (
+                                    "alpha overload probe requires a fresh, unbound "
+                                    "native request"
+                                ),
+                                "reason": overload_probe_rejection_reason,
+                            },
+                        )
                 if overload_probe_control is not None:
                     overload_probe_action = claim_alpha_overload_slot(
                         request,

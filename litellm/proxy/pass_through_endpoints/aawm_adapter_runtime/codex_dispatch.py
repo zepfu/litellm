@@ -548,7 +548,9 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control import (
         ALPHA_PROBE_PLAN_HEADER,
         ALPHA_OVERLOAD_PROBE_PLAN_HEADER,
+        alpha_overload_probe_rejection_reason,
         resolve_alpha_probe_control,
+        resolve_alpha_overload_probe,
     )
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_build import (
         _codex_auto_agent_request_has_continuation_state,
@@ -559,6 +561,14 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
     # header removed before their pass-through path runs.
     alpha_probe_control = (
         resolve_alpha_probe_control(
+            request,
+            user_api_key_dict=user_api_key_dict,
+        )
+        if codex_auto_agent_alias is not None
+        else None
+    )
+    alpha_overload_probe_control = (
+        resolve_alpha_overload_probe(
             request,
             user_api_key_dict=user_api_key_dict,
         )
@@ -597,6 +607,26 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
     )
 
     if codex_auto_agent_alias is not None:
+        if alpha_overload_probe_control is not None:
+            overload_probe_rejection_reason = alpha_overload_probe_rejection_reason(
+                request,
+                request_body=prepared_request_body,
+                session_identity=_sid,
+            )
+
+            if overload_probe_rejection_reason is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "alpha_overload_probe_requires_fresh_unbound_request",
+                        "message": (
+                            "alpha overload probe requires a fresh, unbound Codex "
+                            "auto-agent request"
+                        ),
+                        "reason": overload_probe_rejection_reason,
+                    },
+                )
+
         if alpha_probe_control is not None:
             alpha_probe_rejection_reason: Optional[str] = None
             if _codex_auto_agent_request_has_continuation_state(
