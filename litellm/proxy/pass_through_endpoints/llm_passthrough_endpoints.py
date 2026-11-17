@@ -3613,7 +3613,14 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             ),
         }
         retry_attempt_record.update(retry_after_hint)
-    has_continuation_state = selection.get("request_mode") != "fresh"
+    # A reused native reviewer carries reasoning history without pinning its
+    # account recovery to the account that produced that history.
+    is_native_review = _sa._request_is_codex_auto_review(
+        request, alias_model=request_body.get("model")
+    )
+    has_continuation_state = (
+        selection.get("request_mode") != "fresh" and not is_native_review
+    )
     account_failover_replay_safe = (
         _sa.is_replay_safe_session_owner_redispatch_body(request_body)
     )

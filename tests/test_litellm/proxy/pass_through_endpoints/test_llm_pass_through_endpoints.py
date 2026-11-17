@@ -29784,8 +29784,9 @@ class TestOpenAIPassthroughRoute:
         mock_persist.assert_not_awaited()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("model", ["gpt-5.6-sol", "codex-auto-review"])
     async def test_openai006_fresh_direct_usage_limit_retries_next_account(
-        self, monkeypatch
+        self, monkeypatch, model
     ):
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
             codex_oauth,
@@ -29795,7 +29796,13 @@ class TestOpenAIPassthroughRoute:
         )
 
         monkeypatch.setenv("LITELLM_CODEX_OAUTH_INVENTORY", '{"schema_version":1}')
-        body = {"model": "gpt-5.6-sol", "input": "hello"}
+        is_review = model == "codex-auto-review"
+        body = {"model": model, "input": "hello"}
+        if is_review:
+            body["input"] = [
+                {"type": "reasoning", "encrypted_content": "retained-review-state", "summary": []},
+                {"role": "user", "content": "review the next command"},
+            ]
         request = self._openai006_request()
 
         def _auth(label: str, account_hash: str):
@@ -29811,16 +29818,18 @@ class TestOpenAIPassthroughRoute:
             return {
                 "candidate": {
                     "provider": "openai",
-                    "model": "gpt-5.6-sol",
+                    "model": model,
                     "route_family": "codex_responses",
+                    "codex_oauth_credential_affinity": "interchangeable",
                     "codex_oauth_account_label": label,
                     "codex_oauth_account_hash": account_hash,
                     "codex_oauth_lane_key": lane,
                 },
                 "lane_key": lane,
-                "cooldown_key": f"openai:gpt-5.6-sol:{lane}",
+                "cooldown_key": f"openai:{model}:{lane}",
                 "failover_ordinal": ordinal,
-                "request_mode": "fresh",
+                "request_mode": "ordinary_continuation" if is_review else "fresh",
+                "has_account_bound_state": is_review,
             }
 
         bindings = [
@@ -29897,7 +29906,7 @@ class TestOpenAIPassthroughRoute:
         assert attempts == ["Bearer account1", "Bearer account2"]
         assert mock_bind.await_count == 2
         mock_publish.assert_called_once_with(
-            keys=("openai:gpt-5.6-sol:codex-oauth:account1:hash-account-1",),
+            keys=(f"openai:{model}:codex-oauth:account1:hash-account-1",),
             seconds=900.0,
             allow_ttl_shrink=True,
         )
