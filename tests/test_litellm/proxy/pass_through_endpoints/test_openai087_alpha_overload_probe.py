@@ -15,6 +15,7 @@ import pytest
 from fastapi import HTTPException, Request, Response
 
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control import (
+    ALPHA_OVERLOAD_PROBE_PLAN_HEADER,
     ALPHA_OVERLOAD_PROBE_ENABLED_ENV,
     ALPHA_OVERLOAD_PROBE_ERROR_CODES,
     _OVERLOAD_RECEIPT_SEQUENCE_STATE_KEY,
@@ -37,7 +38,7 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_led
     ProviderCallLedger,
     get_request_provider_call_ledger,
 )
-from litellm.proxy._types import ProxyException
+from litellm.proxy._types import LitellmUserRoles, ProxyException, UserAPIKeyAuth
 from litellm.proxy.pass_through_endpoints.streaming_handler import (
     PassThroughStreamingHandler,
 )
@@ -69,6 +70,8 @@ def _admin() -> SimpleNamespace:
     return SimpleNamespace(
         user_role=LitellmUserRoles.PROXY_ADMIN,
         token=UserAPIKeyAuth._safe_hash_litellm_api_key("sk-master-key"),
+        end_user_id=None,
+        spend=0.0,
     )
 
 
@@ -472,6 +475,107 @@ async def test_generated_pass_through_route_reads_nonempty_starlette_headers(
 
 
 @pytest.mark.asyncio
+async def test_generated_entry_scrubs_forwarded_alpha_probe_header_before_prepare(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import litellm.proxy.pass_through_endpoints.pass_through_endpoints as pte
+
+    from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+        create_pass_through_route,
+    )
+
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    monkeypatch.setenv(ALPHA_OVERLOAD_PROBE_ENABLED_ENV, "1")
+    from litellm.proxy import proxy_server
+
+    monkeypatch.setattr(proxy_server, "master_key", "sk-master-key")
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="sk-master-key",
+        user_role=LitellmUserRoles.PROXY_ADMIN,
+    )
+    request = _request(None)
+    request.scope["headers"].append(
+        (
+            ALPHA_OVERLOAD_PROBE_PLAN_HEADER.encode(),
+            b"overload,success",
+        )
+    )
+    request.scope["headers"].append((b"x-request-id", b"probe-request-trace"))
+    request._parse_request_data = AsyncMock(return_value=(None, None, None, False))
+    request.is_disconnected = AsyncMock(return_value=False)
+    route = create_pass_through_route(
+        endpoint="generated-openai",
+        target="https://api.openai.com/v1/responses",
+        custom_headers={},
+        _forward_headers=True,
+        custom_llm_provider="openai",
+    )
+    captured_prepared_requests: list[httpx.Request] = []
+    mock_client = MagicMock()
+    sent_response: dict[str, httpx.Response] = {}
+
+    def build_prepared_request(**kwargs):
+        prepared = httpx.Request(
+            kwargs.get("method", "POST"),
+            kwargs["url"],
+            headers=kwargs["headers"],
+            json=kwargs.get("json"),
+        )
+        captured_prepared_requests.append(prepared)
+        return prepared
+
+    mock_client.build_request = MagicMock(side_effect=build_prepared_request)
+    def send_prepared_request(prepared_request, **_kwargs):
+        response = httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            content=b"ok",
+            request=prepared_request,
+        )
+        sent_response["value"] = response
+        return response
+
+    mock_client.send = AsyncMock(side_effect=send_prepared_request)
+    with patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints."
+        "get_async_httpx_client"
+    ) as mock_get_async_client, patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj",
+    ) as mock_logging_obj, patch.object(
+        pte.pass_through_endpoint_logging,
+        "pass_through_async_success_handler",
+        new_callable=AsyncMock,
+    ):
+        mock_get_async_client.return_value = SimpleNamespace(client=mock_client)
+        mock_logging_obj.configure_mock(
+            pre_call_hook=AsyncMock(side_effect=lambda **kwargs: kwargs["data"]),
+            post_call_success_hook=AsyncMock(),
+            post_call_failure_hook=AsyncMock(),
+        )
+        result = await route(
+            request=request,
+            fastapi_response=Response(),
+            user_api_key_dict=user_api_key_dict,
+            custom_body={"model": "gpt-6.1-sol", "stream": False},
+        )
+
+    assert result.status_code == 200
+    assert result.body == b"ok"
+    assert isinstance(
+        get_alpha_overload_probe_control(request),
+        AlphaOverloadProbeControl,
+    )
+    assert mock_client.send.await_count == 1
+    # The first "overload" slot is a synthetic response, so two outgoing
+    # requests are prepared but only the second reaches the mock transport.
+    assert len(captured_prepared_requests) == 2
+    assert mock_client.send.call_args.args[0] is captured_prepared_requests[1]
+    for prepared_request in captured_prepared_requests:
+        assert ALPHA_OVERLOAD_PROBE_PLAN_HEADER not in prepared_request.headers
+        assert prepared_request.headers["x-request-id"] == "probe-request-trace"
+
+
+@pytest.mark.asyncio
 async def test_terminal_overload_plan_claims_exact_budget_then_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -780,7 +884,6 @@ async def _seed_owner(
         ex=600,
         nx=True,
     )
-    assert fake_client.exists(cache_key)
     raw_record = await fake_client.get(cache_key)
     assert json.loads(raw_record.decode("utf-8"))["state"] == state
 

@@ -113,6 +113,9 @@ from litellm.proxy.aawm_route_logging import (
 )
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
 from litellm.proxy.litellm_pre_call_utils import clean_headers
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control import (
+    ALPHA_OVERLOAD_PROBE_PLAN_HEADER,
+)
 from litellm.proxy.common_utils.http_parsing_utils import (
     _read_request_body,
     _safe_get_request_headers,
@@ -9409,6 +9412,10 @@ async def pass_through_request(  # noqa: PLR0915
             allowed_pass_through_prefixed_headers=allowed_pass_through_prefixed_headers,
             blocked_pass_through_prefixed_headers=effective_blocked_pass_through_prefixed_headers,
         )
+        for header_name in list(headers):
+            if str(header_name).casefold() == ALPHA_OVERLOAD_PROBE_PLAN_HEADER:
+                del headers[header_name]
+
         if openai_bound_egress:
             for name, value in headers.items():
                 normalized = str(name).casefold()
