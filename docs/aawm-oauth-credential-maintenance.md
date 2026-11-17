@@ -665,6 +665,12 @@ CFG-004 admin authentication. A configured proxy master key is required;
 without it, probe authorization returns `503 auth_unavailable`. Preserve this
 guard and existing clients when preparing activation.
 
+The probe captures freshness once, before normal ownership admission, in its
+immutable request control. Client continuations and prior held ownership are
+rejected before reserving a provider call. Ownership created during the same
+fresh request does not change that decision. The bound control survives removal
+of the server-only header; disabled or unmarked requests create no probe state.
+
 The server-only `x-aawm-openai-alpha-overload-probe-plan` header accepts these
 fixed plans:
 
@@ -672,7 +678,7 @@ fixed plans:
 | --- | --- |
 | `overload` | One synthetic overload, followed by ordinary recovery eligibility |
 | `overload,success` | One synthetic overload, then a real provider attempt |
-| `overload,overload,overload` | Three synthetic overloads; an extra claim fails closed before provider I/O |
+| `overload,overload,overload` | Three synthetic overloads exhaust the normal call budget and return terminal overload `503` with no provider I/O |
 
 Each synthetic response is HTTP 200 SSE containing `response.failed` with
 `server_is_overloaded` and no output. It must pass through the normal
@@ -680,6 +686,11 @@ pre-output parser and request-scoped recovery coordinator after the normal
 provider-call reservation. The probe does not add a retry owner or change
 account selection, replay protection, deadlines, or call limits. A `success`
 slot permits a real attempt; it does not guarantee provider success.
+
+Under the normal three-call budget, `overload,success` reserves calls 1 and 2,
+makes one actual provider send, and leaves one call available. Acceptance
+requires nonempty recovered assistant output. The triple-overload plan reserves
+calls 1, 2, and 3, makes no actual sends, and leaves no calls available.
 
 Acceptance must distinguish logical reservations, synthetic responses, actual
 provider I/O, and the final delivered result. An ordinary successful request
