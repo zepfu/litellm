@@ -13794,13 +13794,8 @@ def create_pass_through_route(
             # retry with no outer owner; callers must opt in explicitly.
             param_caller_managed_hidden_retry = bool(caller_managed_hidden_retry)
             from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control import (
-                ALPHA_OVERLOAD_PROBE_PLAN_HEADER,
-                get_alpha_overload_probe_control,
                 resolve_alpha_overload_probe,
             )
-
-            if request.headers.get(ALPHA_OVERLOAD_PROBE_PLAN_HEADER) is not None:
-                resolve_alpha_overload_probe(request, user_api_key_dict=user_api_key_dict)
 
             # Construct the full target URL with subpath if needed
             full_target = (
@@ -13840,13 +13835,11 @@ def create_pass_through_route(
             elif isinstance(custom_body_data, dict):
                 final_custom_body = custom_body_data
 
-            if request.headers.get(ALPHA_OVERLOAD_PROBE_PLAN_HEADER) is not None:
-                resolve_alpha_overload_probe(
-                    request,
-                    user_api_key_dict=user_api_key_dict,
-                    request_body=final_custom_body,
-                )
-                get_alpha_overload_probe_control(request)
+            resolve_alpha_overload_probe(
+                request,
+                user_api_key_dict=user_api_key_dict,
+                request_body=final_custom_body,
+            )
 
             return await pass_through_request(  # type: ignore
                 request=request,

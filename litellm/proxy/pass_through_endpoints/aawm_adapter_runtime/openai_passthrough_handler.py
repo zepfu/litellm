@@ -885,6 +885,25 @@ class BaseOpenAIPassThroughHandler:
                 session_affinity as _sa,
             )
 
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control import (
+            resolve_alpha_overload_probe,
+        )
+
+        direct_overload_body = (
+            endpoint_custom_body
+            if isinstance(endpoint_custom_body, dict)
+            else None
+        )
+        resolve_alpha_overload_probe(
+            request,
+            user_api_key_dict=user_api_key_dict,
+            request_body=direct_overload_body,
+            session_identity=_sa.resolve_canonical_session_identity(
+                request,
+                direct_overload_body,
+            ),
+        )
+
         session_owner_lease = None
         canonical_session_identity = None
         requested_attributes = None

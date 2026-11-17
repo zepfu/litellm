@@ -122,7 +122,7 @@ class AlphaOverloadProbeControl:
 
     plan: AlphaOverloadProbePlan
     request_identity: str
-    pre_admission_rejection_reason: Optional[str] = None
+    pre_admission_rejection_reason: Optional[str]
     environment: str = ALPHA_PROBE_ENVIRONMENT
     authorization: str = "cfg004_user_api_key_auth"
 
@@ -365,7 +365,7 @@ def resolve_alpha_overload_probe(
     request: Request,
     *,
     user_api_key_dict: Any = None,
-    request_body: Optional[Mapping[str, Any]] = None,
+    request_body: Optional[Mapping[str, Any]],
     session_identity: Optional[str] = None,
 ) -> Optional[AlphaOverloadProbeControl]:
     """Resolve and cache one authenticated synthetic SSE overload control.
@@ -373,20 +373,37 @@ def resolve_alpha_overload_probe(
     The disabled gate and missing header are ordinary no-control paths.  The
     first binding parses the server-approved plan, performs CFG-004 primary
     admin authentication, binds request identity, and classifies freshness
-    once before ordinary admission.  Later calls only reuse that frozen
-    control idempotently.
+    once before ordinary admission.  Later calls validate and reuse that
+    frozen control; a presently supplied conflicting plan fails closed.
     """
     if not alpha_overload_probe_control_enabled():
+        return None
+
+    raw_plan = _request_header(request, ALPHA_OVERLOAD_PROBE_PLAN_HEADER)
+    if raw_plan is None:
         return None
 
     state = _request_state(request)
     existing = getattr(state, _OVERLOAD_CONTROL_STATE_KEY, None)
     if existing is not None:
+        control = get_alpha_overload_probe_control(request)
+        raw_plan = _request_header(request, ALPHA_OVERLOAD_PROBE_PLAN_HEADER)
+        if raw_plan is not None:
+            plan = _resolve_overload_plan(raw_plan)
+            if control is not None and control.plan != plan:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "alpha_overload_probe_control_conflict",
+                        "message": (
+                            "alpha overload probe control is already bound "
+                            "to this request"
+                        ),
+                    },
+                )
+            return control
         return get_alpha_overload_probe_control(request)
 
-    raw_plan = _request_header(request, ALPHA_OVERLOAD_PROBE_PLAN_HEADER)
-    if raw_plan is None:
-        return None
     plan = _resolve_overload_plan(raw_plan)
     _check_cfg004_admin_auth(user_api_key_dict)
     from . import attempt_records as _attempt_records
@@ -413,7 +430,7 @@ def resolve_alpha_overload_probe(
         pre_admission_rejection_reason=pre_admission_rejection_reason,
     )
     setattr(state, _OVERLOAD_CONTROL_STATE_KEY, control)
-    return control
+    return get_alpha_overload_probe_control(request)
 
 
 def get_alpha_overload_probe_control(
@@ -425,6 +442,9 @@ def get_alpha_overload_probe_control(
     recaptures freshness.  A malformed capture or a negative pre-admission
     classification fails closed.
     """
+    if not alpha_overload_probe_control_enabled():
+        return None
+
     state = _request_state(request)
     value = getattr(state, _OVERLOAD_CONTROL_STATE_KEY, None) if state else None
     if value is None:
