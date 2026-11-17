@@ -28,6 +28,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control
     get_alpha_overload_probe_control,
     get_alpha_overload_probe_receipts,
     resolve_alpha_overload_probe,
+    retain_alpha_overload_pre_admission,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry import (
     OpenAIAlphaCapacityRetryCoordinator,
@@ -304,6 +305,166 @@ async def test_codex_dispatch_rejects_bound_overload_probe_on_continuation(
 
 
 @pytest.mark.asyncio
+async def test_codex_dispatch_rejects_bound_overload_probe_after_header_scrub(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+        codex_dispatch,
+    )
+
+    request = _request("overload,success")
+    request.scope["parsed_body"] = (
+        ("model",),
+        {"model": "gpt-6.1-sol"},
+    )
+    request.state._cached_headers = {
+        "content-type": "application/json",
+        "x-aawm-openai-alpha-overload-probe-plan": "overload,success",
+    }
+    setattr(request.state, "_aawm_session_owner_guarded", True)
+    _bind_control(request, monkeypatch, plan="overload,success")
+    retain_alpha_overload_pre_admission(request)
+    setattr(request.state, "_aawm_session_owner_guarded", False)
+    host = {
+        "_resolve_codex_auto_agent_alias_model": (
+            lambda body, *, endpoint, request: None
+        ),
+        "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: None,
+        "_resolve_codex_opencode_go_adapter_model": lambda body, *, endpoint: None,
+        "_resolve_codex_nous_chat_completions_adapter_model": (
+            lambda body, *, endpoint: None
+        ),
+        "_resolve_codex_kimi_chat_completions_adapter_model": (
+            lambda body, *, endpoint: None
+        ),
+        "_resolve_codex_alibaba_token_plan_adapter_model": (
+            lambda body, *, endpoint: None
+        ),
+        "_resolve_codex_zai_coding_plan_adapter_model": (
+            lambda body, *, endpoint: None
+        ),
+        "_normalize_codex_reasoning_effort_for_resolved_route": (
+            lambda body, *, resolved_route: (body, None)
+        ),
+    }
+    codex_dispatch.install(host)
+
+    with pytest.raises(HTTPException) as raised:
+        await host["try_dispatch_codex_request"](
+            endpoint="/v1/responses",
+            request=request,
+            request_body={"model": "gpt-6.1-sol"},
+            prepared_request_body={"model": "gpt-6.1-sol"},
+            fastapi_response=Response(),
+            user_api_key_dict=_admin(),
+            target_url="https://example.test/responses",
+            api_key="sk-test",
+            forward_headers=False,
+        )
+
+    assert raised.value.status_code == 409
+    assert raised.value.detail["reason"] == "session_owner_guarded"
+    assert (
+        "x-aawm-openai-alpha-overload-probe-plan"
+        not in request.state._cached_headers
+    )
+
+
+@pytest.mark.asyncio
+async def test_connected_unbound_native_dispatch_sends_without_probe_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import litellm.proxy.pass_through_endpoints.pass_through_endpoints as pte
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+        codex_dispatch,
+    )
+
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    monkeypatch.setenv(ALPHA_OVERLOAD_PROBE_ENABLED_ENV, "1")
+    from litellm.proxy import proxy_server
+
+    monkeypatch.setattr(proxy_server, "master_key", "sk-master-key")
+
+    request = _request("overload,success")
+    request.scope["parsed_body"] = (
+        ("model",),
+        {"model": "gpt-6.1-sol"},
+    )
+    request.is_disconnected = AsyncMock(return_value=False)
+    request.state._cached_headers = {
+        "content-type": "application/json",
+        "x-aawm-openai-alpha-overload-probe-plan": "overload,success",
+    }
+    ensure_pre_egress = AsyncMock(return_value=None)
+    host = {
+        "_resolve_codex_auto_agent_alias_model": (
+            lambda body, *, endpoint, request: None
+        ),
+        "_resolve_codex_opencode_zen_adapter_model": (
+            lambda body, *, endpoint: None
+        ),
+        "_resolve_codex_opencode_go_adapter_model": (
+            lambda body, *, endpoint: None
+        ),
+        "_resolve_codex_nous_chat_completions_adapter_model": (
+            lambda body, *, endpoint: None
+        ),
+        "_resolve_codex_kimi_chat_completions_adapter_model": (
+            lambda body, *, endpoint: None
+        ),
+        "_resolve_codex_alibaba_token_plan_adapter_model": (
+            lambda body, *, endpoint: None
+        ),
+        "_resolve_codex_zai_coding_plan_adapter_model": (
+            lambda body, *, endpoint: None
+        ),
+        "_normalize_codex_reasoning_effort_for_resolved_route": (
+            lambda body, *, resolved_route: (body, None)
+        ),
+        "_ensure_codex_nested_session_owner_pre_egress": ensure_pre_egress,
+    }
+    codex_dispatch.install(host)
+
+    route_response = Response(content=b"connected-native", status_code=200)
+    pass_through_request = AsyncMock(return_value=route_response)
+    monkeypatch.setattr(pte, "pass_through_request", pass_through_request)
+
+    result = await host["try_dispatch_codex_request"](
+        endpoint="/v1/responses",
+        request=request,
+        request_body={"model": "gpt-6.1-sol"},
+        prepared_request_body={"model": "gpt-6.1-sol"},
+        fastapi_response=Response(),
+        user_api_key_dict=_admin(),
+        target_url="https://example.test/responses",
+        api_key="sk-test",
+        forward_headers=False,
+    )
+
+    assert result is route_response
+    assert pass_through_request.await_count == 1
+    assert pass_through_request.await_args.kwargs["request"] is request
+    provider_bound_body = pass_through_request.await_args.kwargs["custom_body"]
+    assert provider_bound_body["model"] == "gpt-6.1-sol"
+    assert (
+        provider_bound_body["litellm_metadata"][
+            "opencode_zen_unsupported_tools_mode"
+        ]
+        == "drop"
+    )
+    assert (
+        "x-aawm-openai-alpha-overload-probe-plan"
+        not in request.state._cached_headers
+    )
+    assert isinstance(
+        get_alpha_overload_probe_control(request),
+        AlphaOverloadProbeControl,
+    )
+    assert get_alpha_overload_probe_receipts(request) == ()
+    assert ensure_pre_egress.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_generated_pass_through_route_succeeds_without_probe_header(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -340,6 +501,46 @@ async def test_generated_pass_through_route_succeeds_without_probe_header(
     assert result is route_response
     assert pass_through_request.await_count == 1
     assert pass_through_request.await_args.kwargs["custom_llm_provider"] == "openai"
+    assert get_alpha_overload_probe_control(request) is None
+
+
+@pytest.mark.asyncio
+async def test_generated_pass_through_route_reads_nonempty_starlette_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import litellm.proxy.pass_through_endpoints.pass_through_endpoints as pte
+
+    from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+        create_pass_through_route,
+    )
+
+    request = _request(None)
+    request.scope["headers"] = [(b"host", b"testserver")]
+    request._parse_request_data = AsyncMock(return_value=(None, None, None, False))
+    route = create_pass_through_route(
+        endpoint="ordinary-openai",
+        target="https://example.test/v1/responses",
+        custom_headers={},
+        _forward_headers=False,
+        custom_llm_provider="openai",
+    )
+    route_response = Response(content=b"ok", status_code=200)
+    pass_through_request = AsyncMock(return_value=route_response)
+    monkeypatch.setattr(pte, "pass_through_request", pass_through_request)
+    monkeypatch.setattr(
+        pte.InitPassThroughEndpointHelpers,
+        "_is_mapped_pass_through_route",
+        lambda _path: True,
+    )
+
+    result = await route(
+        request=request,
+        fastapi_response=Response(),
+        user_api_key_dict=_admin(),
+    )
+
+    assert result is route_response
+    assert pass_through_request.await_count == 1
     assert get_alpha_overload_probe_control(request) is None
 
 

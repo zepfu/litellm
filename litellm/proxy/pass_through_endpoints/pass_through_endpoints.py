@@ -10728,7 +10728,7 @@ async def pass_through_request(  # noqa: PLR0915
                 send_stream: bool,
             ) -> httpx.Response:
                 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control import (
-                    alpha_overload_probe_rejection_reason,
+                    retained_alpha_overload_probe_rejection_reason,
                     build_alpha_overload_probe_receipt,
                     build_synthetic_overload_response,
                     claim_alpha_overload_slot,
@@ -11045,7 +11045,7 @@ async def pass_through_request(  # noqa: PLR0915
                 )
                 if overload_probe_control is not None and not has_prior_provider_send:
                     overload_probe_rejection_reason = (
-                        alpha_overload_probe_rejection_reason(
+                        retained_alpha_overload_probe_rejection_reason(
                             request,
                             request_body=(
                                 provider_bound_body
@@ -13826,16 +13826,7 @@ def create_pass_through_route(
                 resolve_alpha_overload_probe,
             )
 
-            raw_probe_plan = next(
-                (
-                    value
-                    for name, value in request.headers
-                    if str(name).casefold()
-                    == ALPHA_OVERLOAD_PROBE_PLAN_HEADER.casefold()
-                ),
-                None,
-            )
-            if raw_probe_plan is not None:
+            if request.headers.get(ALPHA_OVERLOAD_PROBE_PLAN_HEADER) is not None:
                 resolve_alpha_overload_probe(
                     request,
                     user_api_key_dict=user_api_key_dict,

@@ -40,6 +40,9 @@ _OVERLOAD_RECEIPT_SEQUENCE_STATE_KEY = (
     "aawm_openai_alpha_overload_probe_receipt_sequence"
 )
 _OVERLOAD_RECEIPT_SCHEMA = "aawm_openai_alpha_overload_probe_receipt_v1"
+_OVERLOAD_PRE_ADMISSION_STATE_KEY = (
+    "aawm_openai_alpha_overload_probe_pre_admission"
+)
 _IDENTIFIER_RE = re.compile(r"[^A-Za-z0-9_.:/@+-]+")
 _HEX_RE = re.compile(r"\A[0-9A-Fa-f]{8,128}\Z")
 
@@ -380,11 +383,6 @@ def resolve_alpha_overload_probe(
     if not alpha_overload_probe_control_enabled():
         return None
 
-    raw_plan = _request_header(request, ALPHA_OVERLOAD_PROBE_PLAN_HEADER)
-    if raw_plan is None:
-        return None
-    plan = _resolve_overload_plan(raw_plan)
-
     state = _request_state(request)
     if state is None:
         raise HTTPException(
@@ -395,7 +393,15 @@ def resolve_alpha_overload_probe(
             },
         )
     existing = getattr(state, _OVERLOAD_CONTROL_STATE_KEY, None)
+    raw_plan = _request_header(request, ALPHA_OVERLOAD_PROBE_PLAN_HEADER)
     if existing is not None:
+        if raw_plan is None:
+            return (
+                existing
+                if isinstance(existing, AlphaOverloadProbeControl)
+                else None
+            )
+        plan = _resolve_overload_plan(raw_plan)
         if (
             not isinstance(existing, AlphaOverloadProbeControl)
             or existing.plan != plan
@@ -412,6 +418,9 @@ def resolve_alpha_overload_probe(
             )
         return existing
 
+    if raw_plan is None:
+        return None
+    plan = _resolve_overload_plan(raw_plan)
     _check_cfg004_admin_auth(user_api_key_dict)
     from . import attempt_records as _attempt_records
 
@@ -432,6 +441,95 @@ def resolve_alpha_overload_probe(
     )
     setattr(state, _OVERLOAD_CONTROL_STATE_KEY, control)
     return control
+
+
+def retained_alpha_overload_probe_rejection_reason(
+    request: Request,
+    *,
+    request_body: Optional[Mapping[str, Any]] = None,
+    session_identity: Optional[str] = None,
+) -> Optional[str]:
+    """Return the freshness classification retained before request admission."""
+
+    request_state = getattr(request, "state", None)
+    if hasattr(request_state, _OVERLOAD_PRE_ADMISSION_STATE_KEY):
+        return getattr(
+            request_state,
+            _OVERLOAD_PRE_ADMISSION_STATE_KEY,
+            None,
+        )
+
+    from . import audit_build
+    from . import session_affinity
+
+    if audit_build._codex_auto_agent_request_has_continuation_state(
+        request_body
+    ):
+        return "non_fresh_or_bound_body"
+    if session_affinity.request_session_owner_already_guarded(request):
+        return "session_owner_guarded"
+    if session_affinity.get_request_session_owner_lease(request) is not None:
+        return "session_owner_lease"
+    if session_affinity.request_has_effective_session_identity(request):
+        return "effective_session_identity"
+
+    consult_identity = getattr(
+        request_state,
+        "_aawm_session_owner_consult_identity",
+        None,
+    )
+    consult_cache_key = getattr(
+        request_state,
+        "_aawm_session_owner_consult_cache_key",
+        None,
+    )
+    consult_record = getattr(
+        request_state,
+        "_aawm_session_owner_consult_record",
+        None,
+    )
+    expected_cache_key = (
+        session_affinity.build_aawm_alias_routing_session_owner_cache_key(
+            session_identity=session_identity
+        )
+        if session_identity is not None
+        else None
+    )
+    consulted_owner_id = (
+        session_affinity._clean_optional_str(consult_record.get("owner"))
+        if isinstance(consult_record, dict)
+        else None
+    )
+    consulted_owned_thread = (
+        session_identity is not None
+        and consult_identity == session_identity
+        and consult_cache_key == expected_cache_key
+        and isinstance(consult_record, dict)
+        and session_affinity._record_state(consult_record) == "owned"
+        and consulted_owner_id is not None
+    )
+    if consulted_owned_thread:
+        return "session_owner_consult_owned"
+    return None
+
+
+def retain_alpha_overload_pre_admission(
+    request: Request,
+    *,
+    request_body: Optional[Mapping[str, Any]] = None,
+    session_identity: Optional[str] = None,
+) -> None:
+    """Classify and retain freshness before any ownership state is minted."""
+
+    state = _request_state(request)
+    if state is None:
+        return
+    reason = alpha_overload_probe_rejection_reason(
+        request,
+        request_body=request_body,
+        session_identity=session_identity,
+    )
+    setattr(state, _OVERLOAD_PRE_ADMISSION_STATE_KEY, reason)
 
 
 def get_alpha_overload_probe_control(
@@ -935,6 +1033,8 @@ __all__ = [
     "alpha_overload_probe_rejection_reason",
     "alpha_probe_control_enabled",
     "alpha_overload_probe_control_enabled",
+    "retained_alpha_overload_probe_rejection_reason",
+    "retain_alpha_overload_pre_admission",
     "build_alpha_probe_receipt",
     "build_alpha_overload_probe_receipt",
     "build_synthetic_overload_response",
