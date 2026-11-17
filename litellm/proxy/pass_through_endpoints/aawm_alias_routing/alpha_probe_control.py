@@ -401,6 +401,10 @@ def resolve_alpha_overload_probe(
             return control
         return control
 
+    raw_plan = _request_header(request, ALPHA_OVERLOAD_PROBE_PLAN_HEADER)
+    if raw_plan is None:
+        return None
+
     plan = _resolve_overload_plan(raw_plan)
     _check_cfg004_admin_auth(user_api_key_dict)
     from . import attempt_records as _attempt_records
@@ -427,7 +431,7 @@ def resolve_alpha_overload_probe(
         pre_admission_rejection_reason=pre_admission_rejection_reason,
     )
     setattr(state, _OVERLOAD_CONTROL_STATE_KEY, control)
-    return control
+    return get_alpha_overload_probe_control(request)
 
 
 def get_alpha_overload_probe_control(
