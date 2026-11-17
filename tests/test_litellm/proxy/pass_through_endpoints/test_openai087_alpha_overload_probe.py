@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -35,6 +34,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry im
 )
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
     ProviderCallLedger,
+    get_request_provider_call_ledger,
 )
 from litellm.proxy._types import ProxyException
 from litellm.proxy.pass_through_endpoints.streaming_handler import (
@@ -344,7 +344,7 @@ async def _run_full_boundary_probe(
     monkeypatch: pytest.MonkeyPatch,
     *,
     plan: str,
-    expected_error: Optional[str] = None,
+    expected_error: str | None = None,
 ) -> SimpleNamespace:
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
         session_affinity as sa,
@@ -471,8 +471,8 @@ async def _run_full_boundary_probe(
             )
         except ProxyException as exc:
             assert expected_error is not None
-            assert str(exc.code) == "409"
-            assert exc.detail["error"] == expected_error
+            assert str(exc.code) == "503"
+            assert exc.detail["error"]["code"] == expected_error
             return SimpleNamespace(
                 request=request,
                 response=None,
@@ -532,10 +532,6 @@ def _assert_overload_events(
 async def test_full_boundary_recovers_after_one_synthetic_overload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
-        get_request_provider_call_ledger,
-    )
-
     plan = "overload,success"
     result = await _run_full_boundary_probe(monkeypatch, plan=plan)
     request = result.request
@@ -552,9 +548,9 @@ async def test_full_boundary_recovers_after_one_synthetic_overload(
 
     ledger = get_request_provider_call_ledger(request)
     assert isinstance(ledger, ProviderCallLedger)
-    assert ledger.logical_provider_calls == 1
-    assert [reservation.ordinal for reservation in ledger.reservations] == [1]
-    assert ledger.snapshot()["remaining_logical_provider_calls"] == 2
+    assert ledger.logical_provider_calls == 2
+    assert [reservation.ordinal for reservation in ledger.reservations] == [1, 2]
+    assert ledger.snapshot()["remaining_logical_provider_calls"] == 1
     assert not hasattr(request.state, "aawm_openai_alpha_probe_exhausted")
 
 
@@ -566,20 +562,18 @@ async def test_full_boundary_terminal_overloads_send_no_provider_request(
     result = await _run_full_boundary_probe(
         monkeypatch,
         plan=plan,
-        expected_error="alpha_overload_probe_terminal_plan_exhausted",
+        expected_error="server_is_overloaded",
     )
 
     assert result.mock_client.send.await_count == 0
-    assert len(result.captured_prepared_requests) == 4
     request = result.request
-    assert getattr(request.state, "aawm_openai_alpha_probe_exhausted") is True
     _assert_overload_events(request, plan=plan, sequences=[1, 2, 3])
 
     ledger = get_request_provider_call_ledger(request)
     assert isinstance(ledger, ProviderCallLedger)
-    assert ledger.logical_provider_calls == 0
-    assert ledger.reservations == ()
+    assert ledger.logical_provider_calls == 3
+    assert [reservation.ordinal for reservation in ledger.reservations] == [1, 2, 3]
     snapshot = ledger.snapshot()
-    assert snapshot["logical_provider_calls"] == 0
-    assert snapshot["remaining_logical_provider_calls"] == 3
-    assert snapshot["next_attempt_ordinal"] == 1
+    assert snapshot["logical_provider_calls"] == 3
+    assert snapshot["remaining_logical_provider_calls"] == 0
+    assert snapshot["next_attempt_ordinal"] == 4

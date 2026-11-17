@@ -10735,71 +10735,6 @@ async def pass_through_request(  # noqa: PLR0915
                     resolve_alpha_overload_probe,
                 )
 
-                overload_probe_control = resolve_alpha_overload_probe(
-                    request,
-                    user_api_key_dict=user_api_key_dict,
-                )
-                if overload_probe_control is not None:
-                    overload_probe_action = claim_alpha_overload_slot(
-                        request,
-                        control=overload_probe_control,
-                    )
-                    if overload_probe_action == "overload":
-                        synthetic_overload_response = (
-                            build_synthetic_overload_response(
-                                error_code="server_is_overloaded"
-                            )
-                        )
-                        synthetic_overload_response.extensions[
-                            "aawm_alpha_probe_synthetic"
-                        ] = True
-                        build_alpha_overload_probe_receipt(
-                            request,
-                            control=overload_probe_control,
-                            candidate=immutable_openai_binding.candidate_context,
-                        )
-                        receipts = get_alpha_overload_probe_receipts(request)
-                        overload_probe_receipt = receipts[-1] if receipts else None
-                        _record_openai_raw_retry_event(
-                            event_type="openai_alpha_overload_probe",
-                            event_stage="synthetic_overload_injection",
-                            request=request,
-                            kwargs=kwargs,
-                            custom_llm_provider=custom_llm_provider,
-                            litellm_call_id=litellm_call_id,
-                            failure=None,
-                            response=synthetic_overload_response,
-                            error_class="server_overloaded",
-                            classification="transient_capacity",
-                            retryable=True,
-                            diagnostic_enabled=True,
-                            extras={
-                                "schema": (
-                                    "aawm_openai_alpha_overload_probe_receipt_v1"
-                                ),
-                                "sequence": (
-                                    overload_probe_receipt.get("sequence")
-                                    if isinstance(
-                                        overload_probe_receipt,
-                                        Mapping,
-                                    )
-                                    else None
-                                ),
-                                "action": "inject_synthetic_overload",
-                                "error_code": "server_is_overloaded",
-                                "synthetic": True,
-                                "attempted_provider_call": False,
-                                "plan": ",".join(
-                                    overload_probe_control.plan.actions
-                                ),
-                                "source": "alpha_overload_probe",
-                                "environment": overload_probe_control.environment,
-                                "provider_returned": False,
-                            },
-                        )
-                        return synthetic_overload_response
-                    if overload_probe_action is None:
-                        request.state.aawm_openai_alpha_probe_exhausted = True
                 ensure_openai_wire_replay_allowed(
                     request,
                     ledger=openai_call_ledger,
@@ -11102,6 +11037,70 @@ async def pass_through_request(  # noqa: PLR0915
                         ledger_calls_before=ledger_calls_before,
                         reservation_ordinal=reservation.ordinal,
                     )
+
+                overload_probe_control = resolve_alpha_overload_probe(
+                    request,
+                    user_api_key_dict=user_api_key_dict,
+                )
+                if overload_probe_control is not None:
+                    overload_probe_action = claim_alpha_overload_slot(
+                        request,
+                        control=overload_probe_control,
+                    )
+                    if overload_probe_action == "overload":
+                        synthetic_overload_response = (
+                            build_synthetic_overload_response(
+                                error_code="server_is_overloaded"
+                            )
+                        )
+                        synthetic_overload_response.extensions[
+                            "aawm_alpha_probe_synthetic"
+                        ] = True
+                        build_alpha_overload_probe_receipt(
+                            request,
+                            control=overload_probe_control,
+                            candidate=immutable_openai_binding.candidate_context,
+                        )
+                        receipts = get_alpha_overload_probe_receipts(request)
+                        overload_probe_receipt = receipts[-1] if receipts else None
+                        _record_openai_raw_retry_event(
+                            event_type="openai_alpha_overload_probe",
+                            event_stage="synthetic_overload_injection",
+                            request=request,
+                            kwargs=kwargs,
+                            custom_llm_provider=custom_llm_provider,
+                            litellm_call_id=litellm_call_id,
+                            failure=None,
+                            response=synthetic_overload_response,
+                            error_class="server_overloaded",
+                            classification="transient_capacity",
+                            retryable=True,
+                            diagnostic_enabled=True,
+                            extras={
+                                "schema": (
+                                    "aawm_openai_alpha_overload_probe_receipt_v1"
+                                ),
+                                "sequence": (
+                                    overload_probe_receipt.get("sequence")
+                                    if isinstance(
+                                        overload_probe_receipt,
+                                        Mapping,
+                                    )
+                                    else None
+                                ),
+                                "action": "inject_synthetic_overload",
+                                "error_code": "server_is_overloaded",
+                                "synthetic": True,
+                                "attempted_provider_call": False,
+                                "plan": ",".join(
+                                    overload_probe_control.plan.actions
+                                ),
+                                "source": "alpha_overload_probe",
+                                "environment": overload_probe_control.environment,
+                                "provider_returned": False,
+                            },
+                        )
+                        return synthetic_overload_response
                 try:
                     if managed_xai_oauth_request:
                         _record_xai_oauth_send_auth_shape(
