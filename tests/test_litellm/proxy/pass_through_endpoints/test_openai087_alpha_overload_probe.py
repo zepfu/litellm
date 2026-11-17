@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -29,6 +30,13 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control
     get_alpha_overload_probe_receipts,
     resolve_alpha_overload_probe,
 )
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry import (
+    OpenAIAlphaCapacityRetryCoordinator,
+)
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+    ProviderCallLedger,
+)
+from litellm.proxy._types import ProxyException
 from litellm.proxy.pass_through_endpoints.streaming_handler import (
     PassThroughStreamingHandler,
 )
@@ -291,10 +299,14 @@ def _full_boundary_request(plan: str, body: dict[str, Any]) -> StarletteRequest:
 class _SuccessAsyncStream(httpx.AsyncByteStream):
     def __init__(self, chunks: list[bytes]):
         self.chunks = chunks
+        self.closed = False
 
     async def __aiter__(self):
         for chunk in self.chunks:
             yield chunk
+
+    async def aclose(self):
+        self.closed = True
 
 
 async def _direct_lease_renewal(_lease, operation, **_kwargs):
@@ -305,16 +317,17 @@ async def _direct_run_with_lease_renewal(*, request, operation):
     return await operation()
 
 
+async def _no_wait_with_wakeup(
+    _coordinator,
+    _wait_seconds,
+    **_metadata,
+):
+    return "timer"
+
+
 def _configure_full_boundary_retry(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
     monkeypatch.setenv("AAWM_OPENAI_ALPHA_OVERLOAD_PROBE_ENABLED", "1")
-    monkeypatch.setenv("AAWM_OPENAI_MAX_LOGICAL_PROVIDER_CALLS", "32")
-    monkeypatch.setattr(
-        "litellm.proxy.pass_through_endpoints.aawm_adapter_runtime."
-        "provider_call_ledger.ProviderCallLedger.MAX_LOGICAL_PROVIDER_CALLS",
-        32,
-        raising=False,
-    )
     monkeypatch.setattr(
         "litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry."
         "_resolve_redis_for_capacity_wakeup",
@@ -327,13 +340,12 @@ def _configure_full_boundary_retry(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-@pytest.mark.asyncio
-async def test_full_boundary_recovers_after_three_synthetic_overloads(
+async def _run_full_boundary_probe(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control import (
-        get_alpha_overload_probe_receipts,
-    )
+    *,
+    plan: str,
+    expected_error: Optional[str] = None,
+) -> SimpleNamespace:
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
         session_affinity as sa,
     )
@@ -343,13 +355,10 @@ async def test_full_boundary_recovers_after_three_synthetic_overloads(
     from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
         pass_through_request,
     )
-    from litellm.proxy.pass_through_endpoints import (
-        pass_through_endpoints as pte,
-    )
+    import litellm.proxy.pass_through_endpoints.pass_through_endpoints as pte
 
     _configure_full_boundary_retry(monkeypatch)
 
-    plan = "overload,overload,overload,success"
     body = {"model": "gpt-6.1-sol", "stream": True}
     request = _full_boundary_request(plan, body)
     request.is_disconnected = AsyncMock(return_value=False)
@@ -415,9 +424,14 @@ async def test_full_boundary_recovers_after_three_synthetic_overloads(
         sa,
         "run_with_session_owner_lease_renewal",
         new=_direct_lease_renewal,
+    ), patch.object(
+        OpenAIAlphaCapacityRetryCoordinator,
+        "sleep_with_wakeup",
+        _no_wait_with_wakeup,
     ), patch(
-        "litellm.proxy.pass_through_endpoints.pass_through_endpoints." "get_async_httpx_client",
-    ) as mock_get_client, patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints."
+        "get_async_httpx_client",
+    ) as mock_get_async_client, patch(
         "litellm.proxy.proxy_server.proxy_logging_obj",
     ) as mock_logging_obj, patch.object(
         pte.pass_through_endpoint_logging,
@@ -438,39 +452,68 @@ async def test_full_boundary_recovers_after_three_synthetic_overloads(
             return prepared
 
         mock_client.build_request = MagicMock(side_effect=build_prepared_request)
-        mock_get_client.return_value = SimpleNamespace(client=mock_client)
+        mock_get_async_client.return_value = SimpleNamespace(client=mock_client)
         mock_logging_obj.configure_mock(
             pre_call_hook=AsyncMock(return_value=body),
             post_call_success_hook=AsyncMock(),
             post_call_failure_hook=AsyncMock(),
         )
 
-        response = await pass_through_request(
-            request=request,
-            target=target,
-            custom_headers={},
-            user_api_key_dict=MagicMock(),
-            custom_body=body,
-            custom_llm_provider="openai",
-            stream=True,
-        )
+        try:
+            response = await pass_through_request(
+                request=request,
+                target=target,
+                custom_headers={},
+                user_api_key_dict=MagicMock(),
+                custom_body=body,
+                custom_llm_provider="openai",
+                stream=True,
+            )
+        except ProxyException as exc:
+            assert expected_error is not None
+            assert str(exc.code) == "409"
+            assert exc.detail["error"] == expected_error
+            return SimpleNamespace(
+                request=request,
+                response=None,
+                mock_client=mock_client,
+                captured_prepared_requests=captured_prepared_requests,
+                success_chunks=success_chunks,
+            )
 
     assert isinstance(response, OpenAIResponsesStreamingResponse)
-    wire = b"".join([chunk async for chunk in response.body_iterator])
-    assert wire == b"".join(success_chunks)
-    assert mock_client.send.await_count == 3
-    assert len(captured_prepared_requests) == 3
-    assert all(
-        "x-aawm-openai-alpha-overload-probe-plan" not in prepared.headers for prepared in captured_prepared_requests
+    return SimpleNamespace(
+        request=request,
+        response=response,
+        mock_client=mock_client,
+        captured_prepared_requests=captured_prepared_requests,
+        success_chunks=success_chunks,
+    )
+
+
+def _assert_overload_events(
+    request: Request,
+    *,
+    plan: str,
+    sequences: list[int],
+) -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control import (
+        get_alpha_overload_probe_receipts,
     )
 
     receipts = get_alpha_overload_probe_receipts(request)
-    assert [receipt["sequence"] for receipt in receipts] == [1, 2, 3]
-    assert getattr(request.state, _OVERLOAD_RECEIPT_SEQUENCE_STATE_KEY) == 3
+    assert [receipt["sequence"] for receipt in receipts] == sequences
+    assert getattr(request.state, _OVERLOAD_RECEIPT_SEQUENCE_STATE_KEY) == len(
+        sequences
+    )
 
     retry_events = getattr(request.state, "aawm_openai_raw_retry_events", [])
-    probe_events = [event for event in retry_events if event.get("event_type") == "openai_alpha_overload_probe"]
-    assert len(probe_events) == 3
+    probe_events = [
+        event
+        for event in retry_events
+        if event.get("event_type") == "openai_alpha_overload_probe"
+    ]
+    assert len(probe_events) == len(sequences)
     for sequence, event in enumerate(probe_events, start=1):
         assert event["schema"] == "aawm_openai_alpha_overload_probe_receipt_v1"
         assert event["sequence"] == sequence
@@ -483,4 +526,60 @@ async def test_full_boundary_recovers_after_three_synthetic_overloads(
         assert event["attempted_provider_call"] is False
         assert event["provider_returned"] is False
         assert event["environment"] == "litellm-alpha"
+
+
+@pytest.mark.asyncio
+async def test_full_boundary_recovers_after_one_synthetic_overload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
+        get_request_provider_call_ledger,
+    )
+
+    plan = "overload,success"
+    result = await _run_full_boundary_probe(monkeypatch, plan=plan)
+    request = result.request
+
+    wire = b"".join([chunk async for chunk in result.response.body_iterator])
+    assert wire == b"".join(result.success_chunks)
+    assert result.mock_client.send.await_count == 1
+    assert len(result.captured_prepared_requests) == 2
+    assert all(
+        "x-aawm-openai-alpha-overload-probe-plan" not in prepared.headers
+        for prepared in result.captured_prepared_requests
+    )
+    _assert_overload_events(request, plan=plan, sequences=[1])
+
+    ledger = get_request_provider_call_ledger(request)
+    assert isinstance(ledger, ProviderCallLedger)
+    assert ledger.logical_provider_calls == 1
+    assert [reservation.ordinal for reservation in ledger.reservations] == [1]
+    assert ledger.snapshot()["remaining_logical_provider_calls"] == 2
     assert not hasattr(request.state, "aawm_openai_alpha_probe_exhausted")
+
+
+@pytest.mark.asyncio
+async def test_full_boundary_terminal_overloads_send_no_provider_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = "overload,overload,overload"
+    result = await _run_full_boundary_probe(
+        monkeypatch,
+        plan=plan,
+        expected_error="alpha_overload_probe_terminal_plan_exhausted",
+    )
+
+    assert result.mock_client.send.await_count == 0
+    assert len(result.captured_prepared_requests) == 4
+    request = result.request
+    assert getattr(request.state, "aawm_openai_alpha_probe_exhausted") is True
+    _assert_overload_events(request, plan=plan, sequences=[1, 2, 3])
+
+    ledger = get_request_provider_call_ledger(request)
+    assert isinstance(ledger, ProviderCallLedger)
+    assert ledger.logical_provider_calls == 0
+    assert ledger.reservations == ()
+    snapshot = ledger.snapshot()
+    assert snapshot["logical_provider_calls"] == 0
+    assert snapshot["remaining_logical_provider_calls"] == 3
+    assert snapshot["next_attempt_ordinal"] == 1
