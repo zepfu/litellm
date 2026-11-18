@@ -1453,6 +1453,29 @@
             "max_output_tokens"
         ]
     },
+    "kimi_code/k3.1-pro": {
+        "cache_creation_input_token_cost": 2e-07,
+        "cache_creation_input_token_cost_above_1hr": 4e-07,
+        "cache_read_input_token_cost": 2e-07,
+        "comment": "Public reference costs for the kimi_code subscription route, not known invoice billing.",
+        "default_reasoning_effort": "high",
+        "input_cost_per_token": 2e-06,
+        "litellm_provider": "kimi_code",
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 1048576,
+        "mode": "chat",
+        "output_cost_per_token": 1e-05,
+        "source": "https://platform.kimi.ai/docs/pricing/chat.md",
+        "supports_function_calling": true,
+        "supports_high_reasoning_effort": true,
+        "supports_low_reasoning_effort": true,
+        "supports_max_reasoning_effort": true,
+        "supports_prompt_caching": true,
+        "supports_reasoning": true,
+        "supports_response_schema": true,
+        "supports_tool_choice": true,
+        "supports_vision": true
+    },
     "kimi_code/kimi-for-coding": {
         "cache_read_input_token_cost": 1.9e-07,
         "comment": "Public reference costs for the kimi_code subscription route, not known invoice billing.",
