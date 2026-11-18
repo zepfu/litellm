@@ -30117,53 +30117,6 @@
             }
         }
     },
-    "nvidia/moonshotai/kimi-k3": {
-        "provider_specific_entry": {
-            "nvidia_nim": {
-                "aawm_reference_pricing": {
-                    "schema_version": 1,
-                    "status": "unpriced",
-                    "kind": "hosted_route_reference",
-                    "billing_mode": "nvidia_nim_hosted_route",
-                    "actual_invoice_cost_known": false,
-                    "currency": "USD",
-                    "basis": {"provider": "nvidia_nim", "model": "nvidia/moonshotai/kimi-k3"},
-                    "cache_mode": "none",
-                    "equivalence_status": "not_exact",
-                    "equivalence_evidence": "NVIDIA Build hosted model page does not expose a verified undiscounted tariff for this exact route; no zero price is inferred.",
-                    "source": {"kind": "official_provider_model_catalog", "label": "NVIDIA Build model catalog", "urls": ["https://build.nvidia.com/models"], "version": "2026-11-04", "verified_on": "2026-11-04"},
-                    "unpriced_reason": "exact_tariff_unavailable"
-                }
-            }
-        },
-        "custom_tool_function_adapters": [
-            "apply_patch"
-        ],
-        "litellm_provider": "nvidia_nim",
-        "mode": "chat",
-        "namespace_tool_function_adapters": {
-            "collaboration": [
-                "followup_task",
-                "interrupt_agent",
-                "list_agents",
-                "send_message",
-                "spawn_agent",
-                "wait_agent"
-            ]
-        },
-        "supports_function_calling": true,
-        "unsupported_hosted_tools": [
-            "custom",
-            "image_generation",
-            "namespace",
-            "tool_search",
-            "web_search"
-        ],
-        "unsupported_input_item_types": [
-            "custom_tool_call",
-            "custom_tool_call_output"
-        ]
-    },
 "nvidia_nim/nvidia/openai/gpt-oss-20b": {
         "litellm_provider": "nvidia_nim",
         "mode": "chat",
@@ -30311,44 +30264,6 @@
                     "basis": {
                         "provider": "nvidia_nim",
                         "model": "nvidia/openai/gpt-oss-120b"
-                    },
-                    "cache_mode": "none",
-                    "equivalence_status": "not_exact",
-                    "equivalence_evidence": "NVIDIA Build hosted model page does not expose a verified undiscounted tariff for this exact route; no zero price is inferred.",
-                    "source": {
-                        "kind": "official_provider_model_catalog",
-                        "label": "NVIDIA Build model catalog",
-                        "urls": [
-                            "https://build.nvidia.com/models"
-                        ],
-                        "version": "2026-11-04",
-                        "verified_on": "2026-11-04"
-                    },
-                    "unpriced_reason": "exact_tariff_unavailable"
-                }
-            }
-        }
-    },
-"nvidia_nim/nvidia/moonshotai/kimi-k3": {
-        "litellm_provider": "nvidia_nim",
-        "mode": "chat",
-        "supports_function_calling": true,
-        "custom_tool_function_adapters": ["apply_patch"],
-        "namespace_tool_function_adapters": {"collaboration": ["followup_task", "interrupt_agent", "list_agents", "send_message", "spawn_agent", "wait_agent"]},
-        "unsupported_hosted_tools": ["custom", "image_generation", "namespace", "tool_search", "web_search"],
-        "unsupported_input_item_types": ["custom_tool_call", "custom_tool_call_output"],
-        "provider_specific_entry": {
-            "nvidia_nim": {
-                "aawm_reference_pricing": {
-                    "schema_version": 1,
-                    "status": "unpriced",
-                    "kind": "hosted_route_reference",
-                    "billing_mode": "nvidia_nim_hosted_route",
-                    "actual_invoice_cost_known": false,
-                    "currency": "USD",
-                    "basis": {
-                        "provider": "nvidia_nim",
-                        "model": "nvidia/moonshotai/kimi-k3"
                     },
                     "cache_mode": "none",
                     "equivalence_status": "not_exact",

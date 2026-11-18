@@ -23,11 +23,6 @@ aliases:
         route_family: codex_nous_chat_completions_adapter
         priority: 150
 
-      - provider: nvidia
-        model: nvidia/moonshotai/kimi-k3
-        route_family: codex_nvidia_completion_adapter
-        priority: 140
-
       - provider: openrouter
         model: openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
         route_family: codex_openrouter_completion_adapter
