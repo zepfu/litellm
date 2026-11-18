@@ -9,6 +9,7 @@ Do not import ``llm_passthrough_endpoints`` at module scope.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Optional
 
 from fastapi import Request, Response
@@ -408,6 +409,24 @@ async def _ensure_codex_nested_session_owner_pre_egress(
         request=request,
         request_body=body,
     )
+    consult_affinity = getattr(
+        request.state,
+        "_aawm_session_owner_consult_affinity",
+        None,
+    )
+    if isinstance(consult_affinity, Mapping):
+        hint_account_keys = {
+            "account_label": ("account_label", "codex_oauth_account_label"),
+            "account_hash": ("account_hash", "codex_oauth_account_hash"),
+            "account_lane": ("account_lane", "codex_oauth_lane_key"),
+        }
+        for account_key, source_keys in hint_account_keys.items():
+            if account_identity.get(account_key):
+                continue
+            for source_key in source_keys:
+                if consult_affinity.get(source_key):
+                    account_identity[account_key] = consult_affinity[source_key]
+                    break
     concrete_attrs = _sa.build_session_owner_attributes(
         provider=provider,
         model=model,

@@ -2209,6 +2209,57 @@ async def test_codex_nested_concrete_same_owner_continuation_passes() -> None:
         assert attrs.get("route_family") != "codex_nested"
         assert attrs.get("provider") != "openai"
 
+        # A reconnecting Codex client returns selected-route metadata without
+        # the account fields attached by the first successful dispatch. The
+        # owned account identity must carry forward from the consult record.
+        continuation_request = type("Req", (), {})()
+        continuation_request.state = type("State", (), {})()
+        continuation_body = {
+            "model": concrete["model"],
+            "litellm_metadata": {
+                "codex_auto_agent_selected_provider": concrete["provider"],
+                "codex_auto_agent_selected_model": concrete["model"],
+                "codex_auto_agent_selected_route_family": concrete["route_family"],
+            },
+        }
+        await cd._consult_codex_nested_session_owner(
+            request=continuation_request,
+            prepared_request_body=continuation_body,
+        )
+        continuation_affinity = getattr(
+            continuation_request.state,
+            "_aawm_session_owner_consult_affinity",
+            None,
+        )
+        assert continuation_affinity is not None
+        assert continuation_affinity.get("codex_oauth_lane_key") == concrete[
+            "account_lane"
+        ]
+        assert continuation_affinity.get("codex_oauth_account_label") == concrete[
+            "account_label"
+        ]
+        assert continuation_affinity.get("codex_oauth_account_hash") == concrete[
+            "account_hash"
+        ]
+
+        await cd._ensure_codex_nested_session_owner_pre_egress(
+            request=continuation_request,
+            request_body=continuation_body,
+            session_identity=sid,
+            provider=concrete["provider"],
+            model=concrete["model"],
+            route_family=concrete["route_family"],
+        )
+        continuation_lease = sa.get_request_session_owner_lease(continuation_request)
+        assert continuation_lease is not None
+        continuation_attrs = continuation_lease.attributes or {}
+        assert continuation_attrs.get("provider") == concrete["provider"]
+        assert continuation_attrs.get("model") == concrete["model"]
+        assert continuation_attrs.get("route_family") == concrete["route_family"]
+        assert continuation_attrs.get("account_lane") == concrete["account_lane"]
+        assert continuation_attrs.get("account_label") == concrete["account_label"]
+        assert continuation_attrs.get("account_hash") == concrete["account_hash"]
+
 
 @pytest.mark.asyncio
 async def test_codex_nested_concrete_mismatch_fails_before_send() -> None:
