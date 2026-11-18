@@ -59,6 +59,7 @@ _HOST_FUNCTION_NAMES = (
     "_restore_adapted_custom_tool_calls_in_response_body",
     "_advertised_namespace_tool_function_adapter_map",
     "_advertised_namespace_tool_argument_schemas",
+    "_namespace_schema_for_restored_tool_call",
     "_schema_requires_integer",
     "_is_finite_integral_float",
     "_repair_namespace_argument_value",
@@ -513,6 +514,34 @@ def _restore_adapted_namespace_tool_call_item(
                     }
                 )
     return restored_item, restored_count
+
+
+def _namespace_schema_for_restored_tool_call(
+    *,
+    item_name: Optional[str],
+    item_namespace: Any,
+    schema_by_name: Optional[dict[tuple[str, Optional[str]], dict[str, Any]]],
+) -> Optional[dict[str, Any]]:
+    """Resolve the schema for a restored call from wire or advertised identity."""
+    if schema_by_name is None or item_name is None:
+        return None
+    lookup_name = item_name
+    wire_namespace: Optional[str] = None
+    qualified_namespace, separator, basename = item_name.rpartition(".")
+    if separator and basename:
+        lookup_name = basename
+        wire_namespace = qualified_namespace
+    lookup_namespace = wire_namespace if item_namespace is None else item_namespace
+    schema = schema_by_name.get((lookup_name, lookup_namespace))
+    if schema is None:
+        schema = schema_by_name.get((lookup_name, None))
+    if schema is None and wire_namespace is None:
+        matching_identities = [
+            identity for identity in schema_by_name if identity[0] == lookup_name
+        ]
+        if len(matching_identities) == 1:
+            schema = schema_by_name[matching_identities[0]]
+    return schema
 
 
 def _restore_adapted_namespace_tool_calls_in_response_body(
@@ -1071,27 +1100,11 @@ def _restore_adapted_namespace_tool_calls_in_stream_event_payload(
         item_namespace = item.get("namespace") if isinstance(item, dict) else None
         if item_namespace is not None and not isinstance(item_namespace, str):
             item_namespace = None
-        lookup_name = item_name
-        wire_namespace: Optional[str] = None
-        if item_name is not None:
-            qualified_namespace, separator, basename = item_name.rpartition(".")
-            if separator and basename:
-                lookup_name = basename
-                wire_namespace = qualified_namespace
-        lookup_namespace = wire_namespace if item_namespace is None else item_namespace
-        schema = None
-        if schema_by_name is not None and lookup_name is not None:
-            schema = schema_by_name.get((lookup_name, lookup_namespace))
-            if schema is None:
-                schema = schema_by_name.get((lookup_name, None))
-            if schema is None and wire_namespace is None:
-                matching_identities = [
-                    identity
-                    for identity in schema_by_name
-                    if identity[0] == lookup_name
-                ]
-                if len(matching_identities) == 1:
-                    schema = schema_by_name[matching_identities[0]]
+        schema = _namespace_schema_for_restored_tool_call(
+            item_name=item_name,
+            item_namespace=item_namespace,
+            schema_by_name=schema_by_name,
+        )
         if schema is not None:
             repaired_arguments, repaired_fields = (
                 _repair_adapted_namespace_tool_arguments(
@@ -1107,7 +1120,7 @@ def _restore_adapted_namespace_tool_calls_in_stream_event_payload(
                 if repair_records is not None:
                     repair_records.append(
                         {
-                            "name": lookup_name,
+                            "name": item_name,
                             "fields": repaired_fields,
                         }
                     )

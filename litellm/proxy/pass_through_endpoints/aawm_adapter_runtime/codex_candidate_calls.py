@@ -6992,7 +6992,7 @@ def _refine_codex_collaboration_wait_timeout_schema(
         adapter_model=adapter_model,
     )
     argument_schemas = _advertised_namespace_tool_argument_schemas(request_body)
-    for (tool_name, namespace) in namespace_by_name.items():
+    for (tool_name, _key_namespace), namespace in namespace_by_name.items():
         if (
             _catalog_namespace_adapter_key(namespace) != "collaboration"
             or not _namespace_child_name_allowed(tool_name, {"wait_agent"})

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from litellm.responses.function_name_sanitization import ResponsesFunctionIdentity
 
@@ -61,6 +61,33 @@ class _QueuedEvent:
     context: Any
     original_payload: Optional[dict[str, Any]]
     payload: Optional[dict[str, Any]]
+
+
+def _add_adapted_namespace_identities(
+    adapted_namespace_by_name: Optional[
+        Mapping[tuple[str, Optional[str]], Optional[str]]
+    ],
+    *,
+    identities: tuple[ResponsesFunctionIdentity, ...],
+    add_alias: Callable[[Any, Any], None],
+) -> None:
+    """Bind advertised namespace identities to their exact rendered names."""
+    if not isinstance(adapted_namespace_by_name, Mapping):
+        return
+    for map_key, advertised_namespace in adapted_namespace_by_name.items():
+        if isinstance(map_key, tuple) and len(map_key) == 2:
+            name, namespace = map_key
+        else:
+            name, namespace = map_key, None
+        if (
+            not isinstance(name, str)
+            or advertised_namespace is not None
+            and not isinstance(advertised_namespace, str)
+        ):
+            continue
+        for identity in identities:
+            if identity.namespace == namespace and identity.rendered_name == name:
+                add_alias(name, identity)
 
 
 class CodexSendMessageOutputGate:
@@ -673,24 +700,11 @@ def build_codex_send_message_output_gate(
         if isinstance(mapping, Mapping):
             for name, identity in mapping.items():
                 add_alias(name, identity)
-    if isinstance(adapted_namespace_by_name, Mapping):
-        for map_key, advertised_namespace in adapted_namespace_by_name.items():
-            if isinstance(map_key, tuple) and len(map_key) == 2:
-                name, namespace = map_key
-            else:
-                name, namespace = map_key, None
-            if (
-                not isinstance(name, str)
-                or advertised_namespace is not None
-                and not isinstance(advertised_namespace, str)
-            ):
-                continue
-            for identity in identities:
-                if (
-                    identity.namespace == namespace
-                    and identity.rendered_name == name
-                ):
-                    add_alias(name, identity)
+    _add_adapted_namespace_identities(
+        adapted_namespace_by_name,
+        identities=identities,
+        add_alias=add_alias,
+    )
 
     pair_map: dict[tuple[str, Optional[str]], ResponsesFunctionIdentity] = {}
     ambiguous_pairs: set[tuple[str, Optional[str]]] = set()

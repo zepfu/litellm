@@ -33,6 +33,7 @@ EXPECTED_SYMBOLS = (
     "_restore_adapted_custom_tool_calls_in_response_body",
     "_advertised_namespace_tool_function_adapter_map",
     "_advertised_namespace_tool_argument_schemas",
+    "_namespace_schema_for_restored_tool_call",
     "_schema_requires_integer",
     "_is_finite_integral_float",
     "_repair_namespace_argument_value",
@@ -1913,3 +1914,59 @@ class TestNamespaceIdentityRestore:
         )
         assert count == 1
         assert json.loads(restored["arguments"]) == {"timeout_ms": 120000}
+
+    def test_stream_done_event_repairs_matching_identity(self) -> None:
+        request_body = {
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "ns_one",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "wait_agent",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"timeout_ms": {"type": "integer"}},
+                            },
+                        }
+                    ],
+                },
+                {
+                    "type": "namespace",
+                    "name": "ns_two",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "wait_agent",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"timeout_ms": {"type": "number"}},
+                            },
+                        }
+                    ],
+                },
+            ],
+        }
+        payload = {
+            "type": "response.function_call_arguments.done",
+            "name": "ns_one.wait_agent",
+            "arguments": json.dumps({"timeout_ms": 120000.0}),
+        }
+        records: list[dict[str, Any]] = []
+
+        result, count = mod._restore_adapted_namespace_tool_calls_in_stream_event_payload(
+            payload,
+            namespace_by_name={
+                ("wait_agent", "ns_one"): "ns_one",
+                ("wait_agent", "ns_two"): "ns_two",
+            },
+            schema_by_name=mod._advertised_namespace_tool_argument_schemas(request_body),
+            repair_records=records,
+        )
+
+        assert count == 1
+        assert result is not payload
+        assert result["name"] == "ns_one.wait_agent"
+        assert json.loads(result["arguments"]) == {"timeout_ms": 120000}
+        assert records == [{"name": "ns_one.wait_agent", "fields": ["timeout_ms"]}]

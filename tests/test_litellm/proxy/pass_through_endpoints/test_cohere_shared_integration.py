@@ -476,6 +476,42 @@ def test_cohere_adapter_preserves_rollup_and_session_provenance_labels() -> None
     )
 
 
+def test_cohere_adapter_refines_namespace_wait_timeout_to_integer() -> None:
+    request_body = {
+        "model": _COHERE_MODEL,
+        "input": "wait for agent activity",
+        "stream": True,
+        "tools": [
+            {
+                "type": "namespace",
+                "name": "collaboration",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "wait_agent",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"timeout_ms": {"type": "number"}},
+                            "required": ["timeout_ms"],
+                            "additionalProperties": False,
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+    codex_candidate_calls._refine_codex_collaboration_wait_timeout_schema(
+        request_body,
+        adapter_model=_COHERE_MODEL,
+    )
+
+    timeout_schema = request_body["tools"][0]["tools"][0]["parameters"]["properties"][
+        "timeout_ms"
+    ]
+    assert timeout_schema == {"type": "integer"}
+
+
 def test_cohere_rollup_labels_native_target_and_cooling_status(monkeypatch) -> None:
     status_events: list[dict] = []
     rollup_records: list[dict] = []
