@@ -84,6 +84,36 @@ def _use_current_kimi_code_model_metadata(monkeypatch):
                     "custom_tool_call_output",
                 ],
             },
+            "kimi_code/k3.1-pro": {
+                "custom_tool_function_adapters": ["apply_patch"],
+                "litellm_provider": "kimi_code",
+                "max_input_tokens": 1048576,
+                "mode": "chat",
+                "namespace_tool_function_adapters": {
+                    "collaboration": [
+                        "followup_task",
+                        "interrupt_agent",
+                        "list_agents",
+                        "send_message",
+                        "spawn_agent",
+                        "wait_agent",
+                    ]
+                },
+                "supports_reasoning": True,
+                "supports_vision": True,
+                "unsupported_hosted_tools": [
+                    "custom",
+                    "image_generation",
+                    "namespace",
+                    "tool_search",
+                    "web_search",
+                ],
+                "unsupported_input_item_types": [
+                    "custom_tool_call",
+                    "custom_tool_call_output",
+                ],
+                "unsupported_request_params": ["max_output_tokens"],
+            },
             "kimi_code/kimi-for-coding": {
                 "litellm_provider": "kimi_code",
                 "max_input_tokens": 262144,
@@ -279,6 +309,43 @@ async def test_should_translate_responses_tools_continuation_and_k3_effort():
     assert metadata["kimi_code_upstream_model"] == "k3"
     assert adapter_config.CODEX_KIMI_CHAT_COMPLETIONS.tag_prefix in metadata["tags"]
     assert metadata["langfuse_spans"][-1]["name"] == (adapter_config.CODEX_KIMI_CHAT_COMPLETIONS.span_name)
+
+
+@pytest.mark.asyncio
+async def test_should_apply_k3_1_pro_codex_request_shape_policy():
+    plan = await _prepare_codex_kimi_chat_completions_adapter_route(
+        request=_request(),
+        adapter_model="kimi_code/k3.1-pro",
+        prepared_request_body={
+            "model": "kimi_code/k3.1-pro",
+            "input": [
+                {"role": "user", "content": "inspect"},
+            ],
+            "tools": [
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a patch to files in the workspace.",
+                },
+                {
+                    "type": "web_search",
+                },
+            ],
+            "max_output_tokens": 1048576,
+            "stream": False,
+        },
+    )
+
+    completion_kwargs = plan.perform_kwargs["completion_kwargs"]
+    assert completion_kwargs["model"] == "k3.1-pro"
+    tools = completion_kwargs["tools"]
+    assert len(tools) == 1
+    assert tools[0]["type"] == "function"
+    assert tools[0]["function"]["name"] == "apply_patch"
+    assert "max_output_tokens" not in plan.prepared_request_body
+    assert plan.prepared_request_body["input"] == [
+        {"role": "user", "content": "inspect"}
+    ]
 
 
 @pytest.mark.asyncio

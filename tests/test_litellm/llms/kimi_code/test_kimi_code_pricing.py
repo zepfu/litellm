@@ -88,6 +88,27 @@ def test_should_expose_kimi_code_public_reference_pricing_in_both_model_maps():
             assert model_info[key] == expected_pricing[key]
 
 
+def test_should_apply_codex_request_shape_policy_to_k3_1_pro():
+    with open("model_prices_and_context_window.json") as f:
+        canonical_model_costs = json.load(f)
+    with open("litellm/bundled_model_prices_and_context_window_fallback.json") as f:
+        bundled_model_costs = json.load(f)
+
+    k31_canonical_info = canonical_model_costs["kimi_code/k3.1-pro"]
+    k31_bundled_info = bundled_model_costs["kimi_code/k3.1-pro"]
+    k3_info = canonical_model_costs["kimi_code/k3"]
+
+    for field in (
+        "custom_tool_function_adapters",
+        "namespace_tool_function_adapters",
+        "unsupported_hosted_tools",
+        "unsupported_input_item_types",
+        "unsupported_request_params",
+    ):
+        assert k31_canonical_info[field] == k3_info[field]
+        assert k31_bundled_info[field] == k3_info[field]
+
+
 def test_should_expose_only_documented_k3_cost_capabilities():
     k3_info = _get_kimi_code_model_info("kimi_code/k3")
 

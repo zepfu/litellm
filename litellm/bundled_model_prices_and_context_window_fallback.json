@@ -1458,6 +1458,9 @@
         "cache_creation_input_token_cost_above_1hr": 4e-06,
         "cache_read_input_token_cost": 2e-07,
         "comment": "Public reference costs for the kimi_code subscription route, not known invoice billing.",
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
         "default_reasoning_effort": "high",
         "input_cost_per_token": 2e-06,
         "litellm_provider": "kimi_code",
@@ -1465,6 +1468,16 @@
         "max_output_tokens": 1048576,
         "mode": "chat",
         "output_cost_per_token": 1e-05,
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
         "provider_specific_entry": {
             "kimi_code": {
                 "aawm_reference_pricing": {
@@ -1509,7 +1522,21 @@
         "supports_reasoning": true,
         "supports_response_schema": true,
         "supports_tool_choice": true,
-        "supports_vision": true
+        "supports_vision": true,
+        "unsupported_hosted_tools": [
+            "custom",
+            "image_generation",
+            "namespace",
+            "tool_search",
+            "web_search"
+        ],
+        "unsupported_input_item_types": [
+            "custom_tool_call",
+            "custom_tool_call_output"
+        ],
+        "unsupported_request_params": [
+            "max_output_tokens"
+        ]
     },
     "kimi_code/kimi-for-coding": {
         "cache_read_input_token_cost": 1.9e-07,
