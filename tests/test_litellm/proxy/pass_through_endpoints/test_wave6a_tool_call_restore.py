@@ -396,7 +396,8 @@ class TestNamespaceToolRestore:
     def test_restore_item_adds_namespace(self, host_deps: None) -> None:
         item = {"type": "function_call", "name": "tool_a"}
         restored, count = mod._restore_adapted_namespace_tool_call_item(
-            item, namespace_by_name={"tool_a": "ns_adapter"},
+            item,
+            namespace_by_name={("tool_a", None): "ns_adapter"},
         )
         assert count == 1
         assert restored["namespace"] == "ns_adapter"
@@ -405,7 +406,8 @@ class TestNamespaceToolRestore:
     def test_restore_item_skips_existing_namespace(self, host_deps: None) -> None:
         item = {"type": "function_call", "name": "tool_a", "namespace": "existing"}
         restored, count = mod._restore_adapted_namespace_tool_call_item(
-            item, namespace_by_name={"tool_a": "ns_adapter"},
+            item,
+            namespace_by_name={("tool_a", None): "ns_adapter"},
         )
         assert count == 0
         assert restored is item
@@ -413,7 +415,8 @@ class TestNamespaceToolRestore:
     def test_restore_item_skips_non_function_call(self, host_deps: None) -> None:
         item = {"type": "message", "name": "tool_a"}
         restored, count = mod._restore_adapted_namespace_tool_call_item(
-            item, namespace_by_name={"tool_a": "ns_adapter"},
+            item,
+            namespace_by_name={("tool_a", None): "ns_adapter"},
         )
         assert count == 0
         assert restored is item
@@ -545,20 +548,19 @@ class TestNamespaceArgumentRepair:
     def test_restore_item_repairs_existing_namespace(self, host_deps: None) -> None:
         item = {
             "type": "function_call",
-            "name": "wait_agent",
-            "namespace": "collaboration",
+            "name": "ns_adapter.wait_agent",
             "call_id": "call_wait",
             "arguments": json.dumps({"timeout_ms": 120000.0}),
         }
         records: list[dict[str, Any]] = []
         restored, count = mod._restore_adapted_namespace_tool_call_item(
             item,
-            namespace_by_name={"wait_agent": "collaboration"},
-            schema_by_name={"wait_agent": _WAIT_AGENT_INTEGER_SCHEMA},
+            namespace_by_name={("wait_agent", "ns_adapter"): "ns_adapter"},
+            schema_by_name={("wait_agent", "ns_adapter"): _WAIT_AGENT_INTEGER_SCHEMA},
             repair_records=records,
         )
         assert count == 1
-        assert restored["namespace"] == "collaboration"
+        assert restored["namespace"] == "ns_adapter"
         assert restored["call_id"] == "call_wait"
         assert json.loads(restored["arguments"]) == {"timeout_ms": 120000}
         assert records == [{"name": "wait_agent", "fields": ["timeout_ms"]}]
@@ -613,8 +615,8 @@ class TestNamespaceArgumentRepair:
         }
         result, count = mod._restore_adapted_namespace_tool_calls_in_stream_event_payload(
             payload,
-            namespace_by_name={"tool_a": "ns_adapter"},
-            schema_by_name={"tool_a": _WAIT_AGENT_INTEGER_SCHEMA},
+            namespace_by_name={("tool_a", None): "ns_adapter"},
+            schema_by_name={("tool_a", None): _WAIT_AGENT_INTEGER_SCHEMA},
         )
         assert count == 0
         assert result is payload
@@ -629,8 +631,8 @@ class TestNamespaceArgumentRepair:
         }
         result, count = mod._restore_adapted_namespace_tool_calls_in_stream_event_payload(
             payload,
-            namespace_by_name={"tool_a": "ns_adapter"},
-            schema_by_name={"tool_a": _WAIT_AGENT_INTEGER_SCHEMA},
+            namespace_by_name={("tool_a", None): "ns_adapter"},
+            schema_by_name={("tool_a", None): _WAIT_AGENT_INTEGER_SCHEMA},
         )
         assert count == 1
         assert result["call_id"] == "call_wait"
@@ -1088,7 +1090,8 @@ class TestNamespaceStreamEventPayload:
             "item": {"type": "function_call", "name": "tool_a"},
         }
         result, count = mod._restore_adapted_namespace_tool_calls_in_stream_event_payload(
-            payload, namespace_by_name={"tool_a": "ns_adapter"},
+            payload,
+            namespace_by_name={("tool_a", None): "ns_adapter"},
         )
         assert count == 1
         assert result["item"]["namespace"] == "ns_adapter"
@@ -1102,7 +1105,8 @@ class TestNamespaceStreamEventPayload:
             },
         }
         result, count = mod._restore_adapted_namespace_tool_calls_in_stream_event_payload(
-            payload, namespace_by_name={"tool_a": "ns_adapter"},
+            payload,
+            namespace_by_name={("tool_a", None): "ns_adapter"},
         )
         assert count == 1
         assert result["response"]["output"][0]["namespace"] == "ns_adapter"
@@ -1110,7 +1114,8 @@ class TestNamespaceStreamEventPayload:
     def test_no_match_passthrough(self) -> None:
         payload = {"type": "response.completed", "response": {"output": []}}
         result, count = mod._restore_adapted_namespace_tool_calls_in_stream_event_payload(
-            payload, namespace_by_name={"tool_a": "ns_adapter"},
+            payload,
+            namespace_by_name={("tool_a", None): "ns_adapter"},
         )
         assert count == 0
         assert result is payload
@@ -1132,7 +1137,8 @@ class TestNamespaceSSEEventBlock:
         }
         block = f"event: response.output_item.added\ndata: {json.dumps(payload)}"
         result, count = mod._restore_adapted_namespace_tool_calls_in_sse_event_block(
-            block, namespace_by_name={"tool_a": "ns_adapter"},
+            block,
+            namespace_by_name={("tool_a", None): "ns_adapter"},
         )
         assert count == 1
         assert "ns_adapter" in result
@@ -1140,7 +1146,8 @@ class TestNamespaceSSEEventBlock:
     def test_no_match_passthrough(self) -> None:
         block = "data: [DONE]"
         result, count = mod._restore_adapted_namespace_tool_calls_in_sse_event_block(
-            block, namespace_by_name={"tool_a": "ns_adapter"},
+            block,
+            namespace_by_name={("tool_a", None): "ns_adapter"},
         )
         assert result == block
         assert count == 0
@@ -1161,7 +1168,7 @@ class TestNamespaceSSEEventBlock:
 
         result, count = mod._restore_adapted_namespace_tool_calls_in_sse_event_block(
             block,
-            namespace_by_name={"tool_a": "ns_adapter"},
+            namespace_by_name={("tool_a", None): "ns_adapter"},
         )
         assert count == 1
         assert result is not None
@@ -1722,3 +1729,187 @@ class TestNamespaceStreamingResponse:
         assert function_calls[0]["arguments"] == '{"query":"status"}'
         assert len(messages) == 1
         assert messages[0]["content"][0]["text"] == "visibletext"
+
+
+@pytest.mark.usefixtures("host_deps")
+class TestNamespaceIdentityRestore:
+    """Identity-keyed restoration separates same-basename namespace tools."""
+
+    def test_response_body_restores_same_basename_by_identity(
+        self,
+        host_deps: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        request_body = {
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "ns_one",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "tool_a",
+                            "parameters": {"type": "object", "properties": {}},
+                        }
+                    ],
+                },
+                {
+                    "type": "namespace",
+                    "name": "ns_two",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "tool_a",
+                            "parameters": {"type": "object", "properties": {}},
+                        }
+                    ],
+                },
+            ],
+        }
+        body = {
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "ns_one.tool_a",
+                    "call_id": "call_one",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call",
+                    "name": "ns_two.tool_a",
+                    "call_id": "call_two",
+                    "arguments": "{}",
+                },
+            ],
+        }
+        monkeypatch.setattr(
+            lpe,
+            "_get_namespace_tool_function_adapter_names_for_model",
+            lambda model: (
+                {"ns_one": {"tool_a"}, "ns_two": {"tool_a"}}
+                if model == "test-model"
+                else {}
+            ),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            lpe,
+            "_adapt_codex_namespace_tool_definitions",
+            lambda tools, *, adapter_names: (
+                None,
+                [
+                    {"name": "tool_a", "namespace": "ns_one"},
+                    {"name": "tool_a", "namespace": "ns_two"},
+                ],
+                [],
+            ),
+            raising=False,
+        )
+        result, count = mod._restore_adapted_namespace_tool_calls_in_response_body(
+            body,
+            request_body=request_body,
+            adapter_model="other-model",
+        )
+        assert count == 0
+        result, count = mod._restore_adapted_namespace_tool_calls_in_response_body(
+            body,
+            request_body=request_body,
+            adapter_model="test-model",
+        )
+        assert count == 2
+        assert result["output"][0]["name"] == "tool_a"
+        assert result["output"][0]["namespace"] == "ns_one"
+        assert result["output"][0]["call_id"] == "call_one"
+        assert result["output"][1]["name"] == "tool_a"
+        assert result["output"][1]["namespace"] == "ns_two"
+        assert result["output"][1]["call_id"] == "call_two"
+
+    def test_explicit_map_preserves_existing_namespace_items(self) -> None:
+        request_body = {
+            "litellm_metadata": {
+                "cohere_v2_namespace_function_map": {
+                    ("tool_a", "ns_one"): "ns_one",
+                }
+            }
+        }
+        explicit_map = mod._explicit_cohere_v2_namespace_function_map(request_body)
+        item = {
+            "type": "function_call",
+            "name": "tool_a",
+            "namespace": "ns_one",
+        }
+        restored, count = mod._restore_adapted_namespace_tool_call_item(
+            item,
+            namespace_by_name=explicit_map,
+            schema_by_name=mod._advertised_namespace_tool_argument_schemas(request_body),
+        )
+        assert count == 0
+        assert restored is item
+
+    def test_legacy_string_key_map_attaches_unnamespaced_identity(self) -> None:
+        request_body = {
+            "litellm_metadata": {
+                "cohere_v2_namespace_function_map": {"tool_a": "ns_legacy"}
+            }
+        }
+        namespace_map = mod._explicit_cohere_v2_namespace_function_map(request_body)
+        item = {"type": "function_call", "name": "tool_a"}
+        restored, count = mod._restore_adapted_namespace_tool_call_item(
+            item,
+            namespace_by_name=namespace_map,
+            schema_by_name=mod._advertised_namespace_tool_argument_schemas(request_body),
+        )
+        assert count == 1
+        assert restored["name"] == "tool_a"
+        assert restored["namespace"] == "ns_legacy"
+
+    def test_identity_schema_repairs_matching_child(self) -> None:
+        request_body = {
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "ns_one",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "wait_agent",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"timeout_ms": {"type": "integer"}},
+                            },
+                        }
+                    ],
+                },
+                {
+                    "type": "namespace",
+                    "name": "ns_two",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "wait_agent",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"timeout_ms": {"type": "number"}},
+                            },
+                        }
+                    ],
+                },
+            ],
+        }
+        schema_map = mod._advertised_namespace_tool_argument_schemas(request_body)
+        item = {
+            "type": "function_call",
+            "name": "wait_agent",
+            "namespace": "ns_one",
+            "arguments": json.dumps({"timeout_ms": 120000.0}),
+        }
+        restored, count = mod._restore_adapted_namespace_tool_call_item(
+            item,
+            namespace_by_name={
+                ("wait_agent", "ns_one"): "ns_one",
+                ("wait_agent", "ns_two"): "ns_two",
+            },
+            schema_by_name=schema_map,
+        )
+        assert count == 1
+        assert json.loads(restored["arguments"]) == {"timeout_ms": 120000}

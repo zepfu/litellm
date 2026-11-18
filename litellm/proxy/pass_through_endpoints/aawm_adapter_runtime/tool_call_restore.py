@@ -191,18 +191,31 @@ def _restore_adapted_custom_tool_calls_in_response_body(
 
 def _explicit_cohere_v2_namespace_function_map(
     request_body: dict[str, Any],
-) -> dict[str, str]:
+) -> dict[tuple[str, Optional[str]], Optional[str]]:
     metadata = request_body.get("litellm_metadata")
     if not isinstance(metadata, dict):
         return {}
     raw_map = metadata.get("cohere_v2_namespace_function_map")
     if not isinstance(raw_map, dict):
         return {}
-    return {
-        name: namespace
-        for name, namespace in raw_map.items()
-        if isinstance(name, str) and name and isinstance(namespace, str) and namespace
-    }
+    normalized_map: dict[tuple[str, Optional[str]], Optional[str]] = {}
+    for key, namespace in raw_map.items():
+        if isinstance(key, str) and key:
+            identity = (key, None)
+        elif (
+            isinstance(key, tuple)
+            and len(key) == 2
+            and isinstance(key[0], str)
+            and key[0]
+            and (key[1] is None or isinstance(key[1], str))
+        ):
+            identity = (key[0], key[1])
+        else:
+            continue
+        if namespace is not None and not isinstance(namespace, str):
+            continue
+        normalized_map[identity] = namespace
+    return normalized_map
 
 
 def _advertised_namespace_tool_function_adapter_map(
@@ -210,9 +223,9 @@ def _advertised_namespace_tool_function_adapter_map(
     *,
     adapter_model: str,
     _explicit_cohere_v2_namespace_function_map: Callable[
-        [dict[str, Any]], dict[str, str]
+        [dict[str, Any]], dict[tuple[str, Optional[str]], Optional[str]]
     ] = _explicit_cohere_v2_namespace_function_map,
-) -> dict[str, str]:
+) -> dict[tuple[str, Optional[str]], Optional[str]]:
     if not isinstance(request_body, dict):
         return {}
 
@@ -225,23 +238,34 @@ def _advertised_namespace_tool_function_adapter_map(
         request_body.get("tools"),
         adapter_names=adapter_names,
     )
-    allowlist_map = {
-        str(item["name"]): str(item["namespace"])
-        for item in adapted_tools
-        if isinstance(item.get("name"), str) and isinstance(item.get("namespace"), str)
-    }
+    allowlist_map: dict[tuple[str, Optional[str]], Optional[str]] = {}
+    basename_namespaces: dict[str, set[Optional[str]]] = {}
+    for item in adapted_tools:
+        name = item.get("name")
+        namespace = item.get("namespace")
+        if not isinstance(name, str) or not name:
+            continue
+        if isinstance(namespace, str) and namespace:
+            allowlist_map[(name, namespace)] = namespace
+            basename_namespaces.setdefault(name, set()).add(namespace)
+        else:
+            allowlist_map[(name, None)] = None
+            basename_namespaces.setdefault(name, set()).add(None)
+    for name, namespaces in basename_namespaces.items():
+        if len(namespaces) > 1:
+            allowlist_map.pop((name, None), None)
     return {**allowlist_map, **explicit_map}
 
 
 def _advertised_namespace_tool_argument_schemas(
     request_body: Optional[dict[str, Any]],
-) -> dict[str, dict[str, Any]]:
+) -> dict[tuple[str, Optional[str]], dict[str, Any]]:
     if not isinstance(request_body, dict):
         return {}
 
-    schemas: dict[str, dict[str, Any]] = {}
+    schemas: dict[tuple[str, Optional[str]], dict[str, Any]] = {}
 
-    def _add_tool(tool: Any) -> None:
+    def _add_tool(tool: Any, namespace: Optional[str] = None) -> None:
         if not isinstance(tool, dict):
             return
 
@@ -256,12 +280,15 @@ def _advertised_namespace_tool_argument_schemas(
 
         exact_name = name if isinstance(name, str) and name else None
         if exact_name is not None and isinstance(parameters, dict):
-            schemas[exact_name] = parameters
+            schemas[(exact_name, namespace)] = parameters
 
         children = tool.get("tools")
         if isinstance(children, list):
+            child_namespace = namespace
+            if exact_name is not None:
+                child_namespace = exact_name
             for child in children:
-                _add_tool(child)
+                _add_tool(child, child_namespace)
 
     for source in (request_body.get("tools"), request_body.get("functions")):
         if not isinstance(source, list):
@@ -416,8 +443,8 @@ def _attach_namespace_argument_repair_metadata(
 def _restore_adapted_namespace_tool_call_item(
     item: Any,
     *,
-    namespace_by_name: dict[str, str],
-    schema_by_name: Optional[dict[str, dict[str, Any]]] = None,
+    namespace_by_name: dict[tuple[str, Optional[str]], Optional[str]],
+    schema_by_name: Optional[dict[tuple[str, Optional[str]], dict[str, Any]]] = None,
     repair_records: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[Any, int]:
     if not isinstance(item, dict) or item.get("type") != "function_call":
@@ -428,13 +455,46 @@ def _restore_adapted_namespace_tool_call_item(
     restored_item = item
     restored_count = 0
 
-    namespace = namespace_by_name.get(item_name)
-    if namespace is not None and item.get("namespace") is None:
+    item_namespace = item.get("namespace")
+    lookup_name = item_name
+    wire_namespace: Optional[str] = None
+    qualified_namespace, separator, basename = item_name.rpartition(".")
+    if separator and basename:
+        lookup_name = basename
+        wire_namespace = qualified_namespace
+
+    lookup_namespace = wire_namespace if item_namespace is None else item_namespace
+    namespace = namespace_by_name.get((lookup_name, lookup_namespace))
+    if namespace is None and isinstance(item_namespace, str) and item_namespace:
+        namespace = namespace_by_name.get((lookup_name, None))
+    if namespace is None and not isinstance(item_namespace, str):
+        namespace = namespace_by_name.get((lookup_name, None))
+        if namespace is None:
+            namespace_candidates = [
+                candidate_namespace
+                for candidate_name, candidate_namespace in namespace_by_name
+                if candidate_name == lookup_name
+            ]
+            if len(namespace_candidates) == 1:
+                namespace = namespace_candidates[0]
+    if namespace is not None and item_namespace is None:
         restored_item = dict(item)
         restored_item["namespace"] = namespace
+        if wire_namespace is not None:
+            restored_item["name"] = lookup_name
         restored_count = 1
 
-    schema = None if schema_by_name is None else schema_by_name.get(item_name)
+    schema = None
+    if schema_by_name is not None:
+        schema = schema_by_name.get((lookup_name, lookup_namespace))
+        if schema is None:
+            schema = schema_by_name.get((lookup_name, None))
+        if schema is None and wire_namespace is None:
+            matching_identities = [
+                identity for identity in schema_by_name if identity[0] == lookup_name
+            ]
+            if len(matching_identities) == 1:
+                schema = schema_by_name[matching_identities[0]]
     if schema is not None:
         repaired_arguments, repaired_fields = _repair_adapted_namespace_tool_arguments(
             restored_item.get("arguments"),
@@ -448,7 +508,7 @@ def _restore_adapted_namespace_tool_call_item(
             if repair_records is not None:
                 repair_records.append(
                     {
-                        "name": item_name,
+                        "name": lookup_name,
                         "fields": repaired_fields,
                     }
                 )
@@ -982,8 +1042,8 @@ def _restore_adapted_custom_tool_calls_in_streaming_response(
 def _restore_adapted_namespace_tool_calls_in_stream_event_payload(
     event_payload: dict[str, Any],
     *,
-    namespace_by_name: dict[str, str],
-    schema_by_name: Optional[dict[str, dict[str, Any]]] = None,
+    namespace_by_name: dict[tuple[str, Optional[str]], Optional[str]],
+    schema_by_name: Optional[dict[tuple[str, Optional[str]], dict[str, Any]]] = None,
     repair_records: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[dict[str, Any], int]:
     restored_payload = event_payload
@@ -1008,11 +1068,30 @@ def _restore_adapted_namespace_tool_calls_in_stream_event_payload(
             item_name = (
                 nested_name if isinstance(nested_name, str) and nested_name else None
             )
-        schema = (
-            None
-            if schema_by_name is None or item_name is None
-            else schema_by_name.get(item_name)
-        )
+        item_namespace = item.get("namespace") if isinstance(item, dict) else None
+        if item_namespace is not None and not isinstance(item_namespace, str):
+            item_namespace = None
+        lookup_name = item_name
+        wire_namespace: Optional[str] = None
+        if item_name is not None:
+            qualified_namespace, separator, basename = item_name.rpartition(".")
+            if separator and basename:
+                lookup_name = basename
+                wire_namespace = qualified_namespace
+        lookup_namespace = wire_namespace if item_namespace is None else item_namespace
+        schema = None
+        if schema_by_name is not None and lookup_name is not None:
+            schema = schema_by_name.get((lookup_name, lookup_namespace))
+            if schema is None:
+                schema = schema_by_name.get((lookup_name, None))
+            if schema is None and wire_namespace is None:
+                matching_identities = [
+                    identity
+                    for identity in schema_by_name
+                    if identity[0] == lookup_name
+                ]
+                if len(matching_identities) == 1:
+                    schema = schema_by_name[matching_identities[0]]
         if schema is not None:
             repaired_arguments, repaired_fields = (
                 _repair_adapted_namespace_tool_arguments(
@@ -1028,7 +1107,7 @@ def _restore_adapted_namespace_tool_calls_in_stream_event_payload(
                 if repair_records is not None:
                     repair_records.append(
                         {
-                            "name": item_name,
+                            "name": lookup_name,
                             "fields": repaired_fields,
                         }
                     )
@@ -1062,8 +1141,8 @@ def _restore_adapted_namespace_tool_calls_in_stream_event_payload(
 def _restore_adapted_namespace_tool_calls_in_sse_event_block(
     event_block: str,
     *,
-    namespace_by_name: dict[str, str],
-    schema_by_name: Optional[dict[str, dict[str, Any]]] = None,
+    namespace_by_name: dict[tuple[str, Optional[str]], Optional[str]],
+    schema_by_name: Optional[dict[tuple[str, Optional[str]], dict[str, Any]]] = None,
     repair_records: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[str, int]:
     lines = event_block.splitlines()

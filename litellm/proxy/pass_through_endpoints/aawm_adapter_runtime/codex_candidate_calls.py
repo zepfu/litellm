@@ -6992,13 +6992,13 @@ def _refine_codex_collaboration_wait_timeout_schema(
         adapter_model=adapter_model,
     )
     argument_schemas = _advertised_namespace_tool_argument_schemas(request_body)
-    for tool_name, namespace in namespace_by_name.items():
+    for (tool_name, namespace) in namespace_by_name.items():
         if (
             _catalog_namespace_adapter_key(namespace) != "collaboration"
             or not _namespace_child_name_allowed(tool_name, {"wait_agent"})
         ):
             continue
-        wait_schema = argument_schemas.get(tool_name, {})
+        wait_schema = argument_schemas.get((tool_name, namespace), {})
         wait_properties = wait_schema.get("properties")
         if isinstance(wait_properties, dict):
             timeout_schema = wait_properties.get("timeout_ms")

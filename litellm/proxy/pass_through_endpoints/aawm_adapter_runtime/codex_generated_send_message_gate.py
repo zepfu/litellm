@@ -603,7 +603,9 @@ def build_codex_send_message_output_gate(
     upstream_to_original_identities: Optional[
         Mapping[str, ResponsesFunctionIdentity]
     ] = None,
-    adapted_namespace_by_name: Optional[Mapping[str, str]] = None,
+    adapted_namespace_by_name: Optional[
+        Mapping[tuple[str, Optional[str]], Optional[str]]
+    ] = None,
     extra_upstream_to_original_identities: Optional[
         Mapping[str, ResponsesFunctionIdentity]
     ] = None,
@@ -672,8 +674,16 @@ def build_codex_send_message_output_gate(
             for name, identity in mapping.items():
                 add_alias(name, identity)
     if isinstance(adapted_namespace_by_name, Mapping):
-        for name, namespace in adapted_namespace_by_name.items():
-            if not isinstance(name, str) or not isinstance(namespace, str):
+        for map_key, advertised_namespace in adapted_namespace_by_name.items():
+            if isinstance(map_key, tuple) and len(map_key) == 2:
+                name, namespace = map_key
+            else:
+                name, namespace = map_key, None
+            if (
+                not isinstance(name, str)
+                or advertised_namespace is not None
+                and not isinstance(advertised_namespace, str)
+            ):
                 continue
             for identity in identities:
                 if (
