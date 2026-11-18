@@ -1009,6 +1009,14 @@ endpoint may be validated as native Chat V2 on `api.cohere.com` or
 `openrouter/cohere/north-mini-code:free` and remains distinct from the direct
 route.
 
+For direct Cohere Chat V2, namespace children use `namespace.name` wire names
+so different namespaces can share a function basename. Input calls and their
+results retain call IDs. Before returning calls to Codex, restoration recovers
+the original basename and namespace and uses that pair for schema lookup.
+Legacy bare-name calls regain a namespace only when the name is unambiguous.
+Duplicate identities and namespace-specific named tool choices that Cohere
+cannot represent are rejected before egress.
+
 The direct route uses the canonical runtime credential `COHERE_API_KEY`; the
 Compose-only development compatibility source is `COHERE_KEY`. Credential
 values, tokens, and key material must never be persisted in session history,
