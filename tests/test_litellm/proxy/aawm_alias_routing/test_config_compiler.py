@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import shutil
+import datetime as dt
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,11 @@ from pydantic import ValidationError
 
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (  # type: ignore[import-not-found]
     config_compiler as compiler,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import snapshot_select
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
+    AliasReference,
+    RoutingCandidate,
 )
 
 
@@ -49,14 +55,83 @@ def test_should_prioritize_qwen4_only_in_alpha_overrides(tmp_path: Path) -> None
     for override in (root / "config/alpha-alias-overrides").glob("*.yaml"):
         shutil.copyfile(override, alpha_dir / override.name)
     alpha = compile_directory(alpha_dir)
-    for name in ("sota-alibaba", "provider-alibaba", "expert-other"):
+    preview_start = dt.datetime(2026, 11, 11, 2, tzinfo=dt.timezone.utc)
+    preview_end = dt.datetime(2026, 11, 25, 15, 59, 59, 999999, tzinfo=dt.timezone.utc)
+    for name in ("sota-alibaba", "provider-alibaba"):
         original = canonical.aliases[name].candidates
         candidates = alpha.aliases[name].candidates
+        assert isinstance(original[0], RoutingCandidate)
         assert original[0].model == "alibaba_token_plan/qwen3.8-max"
+        assert isinstance(candidates[0], RoutingCandidate)
         assert candidates[0].model == "alibaba_token_plan/qwen4-max-preview"
-        assert candidates[0].schedule == original[0].schedule
+        assert candidates[0].schedule is not None
+        assert candidates[0].schedule.start == preview_start
+        assert candidates[0].schedule.end == preview_end
         assert candidates[0].reasoning_effort == "max"
         assert candidates[1:] == original
+
+    original_expert = canonical.aliases["expert-other"].candidates
+    expert_candidates = alpha.aliases["expert-other"].candidates
+    assert isinstance(expert_candidates[0], AliasReference)
+    assert expert_candidates[0].alias_name == "qwen4-preview-expiry"
+    assert expert_candidates[0].priority == 110
+    assert expert_candidates[0].schedule is not None
+    assert expert_candidates[0].schedule.kind == "daily"
+    assert expert_candidates[0].schedule.start_time == dt.time(22, 0)
+    assert expert_candidates[0].schedule.end_time == dt.time(8, 0)
+    assert expert_candidates[0].schedule.utc_offset == dt.timedelta(hours=8)
+    assert expert_candidates[1:] == original_expert
+
+    preview_reference = alpha.aliases["qwen4-preview-expiry"].candidates[0]
+    assert isinstance(preview_reference, RoutingCandidate)
+    assert preview_reference.model == "alibaba_token_plan/qwen4-max-preview"
+    assert preview_reference.priority == 110
+    assert preview_reference.reasoning_effort == "max"
+    assert preview_reference.schedule is not None
+    assert preview_reference.schedule.start == preview_start
+    assert preview_reference.schedule.end == preview_end
+
+    previous_snapshot = snapshot_select.get_active_routing_snapshot()
+    snapshot_select.set_active_routing_snapshot(alpha)
+    try:
+
+        def selected_models(now: dt.datetime) -> list[str]:
+            selected = snapshot_select._select_snapshot_candidates(
+                "expert-other",
+                ingress="codex",
+                now_utc=now,
+            )
+            return [candidate["model"] for candidate in selected]
+
+        assert selected_models(
+            dt.datetime(2026, 11, 18, 4, tzinfo=dt.timezone.utc)
+        ) == ["xai/grok-4.7"]
+        assert selected_models(
+            dt.datetime(2026, 11, 25, 16, tzinfo=dt.timezone.utc)
+        ) == ["alibaba_token_plan/qwen3.8-max", "xai/grok-4.7"]
+        assert selected_models(
+            dt.datetime(2026, 11, 25, 15, 59, 59, 999999, tzinfo=dt.timezone.utc)
+        ) == [
+            "alibaba_token_plan/qwen4-max-preview",
+            "alibaba_token_plan/qwen3.8-max",
+            "xai/grok-4.7",
+        ]
+        assert selected_models(
+            dt.datetime(2026, 11, 11, 14, tzinfo=dt.timezone.utc)
+        ) == [
+            "alibaba_token_plan/qwen4-max-preview",
+            "alibaba_token_plan/qwen3.8-max",
+            "xai/grok-4.7",
+        ]
+        assert selected_models(
+            dt.datetime(2026, 12, 1, 15, tzinfo=dt.timezone.utc)
+        ) == [
+            "alibaba_token_plan/qwen3.8-max",
+            "xai/grok-4.7",
+        ]
+    finally:
+        snapshot_select.set_active_routing_snapshot(previous_snapshot)
+
     assert alpha.aliases["expert"].candidates == canonical.aliases["expert"].candidates
     assert alpha.aliases["sota"].dispatch == canonical.aliases["sota"].dispatch
 

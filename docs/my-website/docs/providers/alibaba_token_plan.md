@@ -123,8 +123,14 @@ The AAWM proxy configuration may expose:
 
 Alpha mounts overrides from `config/alpha-alias-overrides/` that place
 `qwen4-max-preview` first in `sota-alibaba`, `provider-alibaba`, and
-`expert-other`, with configured effort `max`. Qwen4 inherits the existing
-Qwen3.8 schedule; fallback candidates and schedules are preserved. `sota`
+`expert-other`, with configured effort `max`. Qwen4 is admitted only during
+the official preview availability window, from 10:00 on November 11 through
+24:00 on November 25, 2026 (UTC+8); `provider-alibaba` and `sota-alibaba`
+use an inclusive internal absolute end at the last representable microsecond
+before the exclusive expiry. `expert-other` references a same-file Qwen4 leaf
+bounded to that full preview window; its nightly helper schedule gates the
+reference while the leaf's absolute schedule preserves ordinary priority and
+the half-open expiry. Fallback candidates and schedules are preserved. `sota`
 inherits this order for Qwen clients, and `expert` references `expert-other`.
 Canonical alias files and dev/production deployments retain their current
 order. Only `docker-compose.alpha.yml` mounts the three Qwen overrides.
@@ -132,7 +138,8 @@ order. Only `docker-compose.alpha.yml` mounts the three Qwen overrides.
 The preview supports a 1M-token context and up to 393,216 output tokens.
 Its `max_tokens` budget includes both thinking and the final answer. Alibaba
 may report the canonical name `qwen4.0-max-preview` in responses. The announced
-preview ends November 25, 2026 (UTC+8).
+preview ends after November 25, 2026 at 24:00 (UTC+8), after which the model
+is retired.
 
 Codex Responses ingress uses
 `codex_alibaba_token_plan_chat_completions_adapter`. Anthropic Messages ingress
@@ -187,19 +194,21 @@ not populate `response_cost` or `session_history.response_cost_usd`.
 Sources: [Model pricing](https://www.alibabacloud.com/help/en/model-studio/model-pricing)
 and [context cache](https://www.alibabacloud.com/help/en/model-studio/context-cache).
 
-Qwen4-Max-Preview uses the production Qwen4-Max standard Singapore
-international PAYG list rates as a comparison baseline: `$1.50` per million
-input tokens, `$4.50` per million output tokens, `$0.075` per million cache
-hits, `$1.875` per million 5-minute cache-creation tokens, and `$3` per million
-1-hour cache-creation tokens. This is labeled `production_model_baseline`, with
-basis model `qwen4-max`; it claims neither model equivalence nor the preview's
-invoice price, including for cache-bearing usage. The preview is available only
-through Token Plan and has no published pay-as-you-go tariff. Promotional
-Credits discounts are excluded. When implicit and explicit cache rates differ,
-missing cache-kind attribution remains unpriced. The 1-hour creation rate is
-reference metadata; the shared reference-cost contract prices only the 5-minute
-creation rate. Source:
-[Model pricing](https://www.alibabacloud.com/help/en/model-studio/model-pricing).
+Qwen4-Max-Preview is available only through Token Plan, with no published
+pay-as-you-go tariff; the preview ends before November 25, 2026 at 16:00 UTC
+and the model is retired afterward. It uses the production Qwen4-Max standard
+Singapore international PAYG list rates as a comparison baseline: `$1.50` per
+million input tokens, `$4.50` per million output tokens, `$0.075` per million
+cache hits, `$1.875` per million 5-minute cache-creation tokens, and `$3` per
+million 1-hour cache-creation tokens. This is labeled
+`production_model_baseline`, with basis model `qwen4-max`; it claims neither
+model equivalence nor the preview's invoice price, including for cache-bearing
+usage. Promotional Credits discounts are excluded. When implicit and explicit
+cache rates differ, missing cache-kind attribution remains unpriced. The
+1-hour creation rate is reference metadata; the shared reference-cost contract
+prices only the 5-minute creation rate. Sources:
+[Qwen4-Max-Preview](https://www.alibabacloud.com/help/en/model-studio/qwen4-max-preview)
+and [Model pricing](https://www.alibabacloud.com/help/en/model-studio/model-pricing).
 
 ## Quota observability
 

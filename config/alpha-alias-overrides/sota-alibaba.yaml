@@ -8,6 +8,9 @@ aliases:
         route_family: codex_alibaba_token_plan_chat_completions_adapter
         priority: 110
         reasoning_effort: max
+        schedule:
+          start: "2026-11-11T02:00:00Z"
+          end: "2026-11-25T15:59:59.999999Z"
 
       - provider: alibaba_token_plan
         model: alibaba_token_plan/qwen3.8-max

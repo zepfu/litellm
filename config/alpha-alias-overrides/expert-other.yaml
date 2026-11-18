@@ -4,11 +4,8 @@ defaults: {}
 aliases:
   - name: expert-other
     candidates:
-      - provider: alibaba_token_plan
-        model: alibaba_token_plan/qwen4-max-preview
-        route_family: codex_alibaba_token_plan_chat_completions_adapter
+      - alias_reference: qwen4-preview-expiry
         priority: 110
-        reasoning_effort: max
         schedule:
           start_time: "22:00:00"
           end_time: "08:00:00"
@@ -27,3 +24,14 @@ aliases:
         model: xai/grok-4.7
         route_family: codex_grok_native_responses_adapter
         priority: 0
+
+  - name: qwen4-preview-expiry
+    candidates:
+      - provider: alibaba_token_plan
+        model: alibaba_token_plan/qwen4-max-preview
+        route_family: codex_alibaba_token_plan_chat_completions_adapter
+        priority: 110
+        reasoning_effort: max
+        schedule:
+          start: "2026-11-11T02:00:00Z"
+          end: "2026-11-25T15:59:59.999999Z"
