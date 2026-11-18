@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Tuple
 
 from litellm.types.utils import Usage
 from litellm.litellm_core_utils.llm_cost_calc.utils import generic_cost_per_token
+from litellm.llms.xai.reference_cost import calculate_xai_reference_cost
 
 if TYPE_CHECKING:
     from litellm.types.utils import ModelInfo
@@ -43,6 +44,28 @@ def cost_per_token(model: str, usage: Usage) -> Tuple[float, float]:
         prompt_tokens_details=usage.prompt_tokens_details,
         completion_tokens_details=None,
     )
+
+    # Grok 4.7 includes exactly 200k input tokens in its higher request tier.
+    if (
+        model in {"grok-4.7", "xai/grok-4.7", "oa_xai/grok-4.7"}
+        and usage.prompt_tokens == 200_000
+    ):
+        reference = calculate_xai_reference_cost(
+            model="xai/grok-4.7" if model == "grok-4.7" else model,
+            prompt_tokens=usage.prompt_tokens,
+            cache_read_input_tokens=(
+                getattr(usage.prompt_tokens_details, "cached_tokens", 0)
+                if usage.prompt_tokens_details
+                else 0
+            ),
+            completion_tokens=total_completion_tokens,
+        )
+        if reference:
+            return (
+                reference["reference_cost_cached_input_usd"]
+                + reference["reference_cost_uncached_input_usd"],
+                reference["reference_cost_output_usd"],
+            )
 
     prompt_cost, completion_cost = generic_cost_per_token(
         model=model, usage=modified_usage, custom_llm_provider="xai"

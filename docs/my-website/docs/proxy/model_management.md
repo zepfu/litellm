@@ -73,7 +73,14 @@ Config-driven alias routing uses:
   xAI OIDC; the two xAI routes remain distinct.
 - `sota`: selects the producer-family `sota-*` alias from TUI origin, defaulting to `sota-openai`.
 - Grok 4.6 (`xai/grok-4.6`, `oa_xai/grok-4.6`): 500k context; created 1785974400 (2026-08-06T00:00:00Z), owned by xAI, no aliases, source `https://docs.x.ai/developers/models/grok-4.6`, verified 2026-08-12; input $2/M, output $6/M, cached input $0.50/M, image input $2/M image tokens; above 200k whole-request input tokens, input/cache/output are $4/$1/$12 per million; managed-route session history records this as a reference rate with invoice cost unknown
-- Grok 4.7 (`xai/grok-4.7`, `oa_xai/grok-4.7`): 500k context; created 1790035200 (2026-09-22T00:00:00Z), owned by xAI, no aliases, source `https://docs.x.ai/developers/models/grok-4.7`, verified 2026-09-22; input $2/M, output $6/M, cached input $0.50/M, image input $2/M image tokens; above 200k whole-request input tokens, input/cache/output are $4/$1/$12 per million; managed-route session history records this as a reference rate with invoice cost unknown. Grok 4.7 always returns Responses `reasoning.encrypted_content` even when not requested.
+- Grok 4.7 (`xai/grok-4.7`, `oa_xai/grok-4.7`): 500k context;
+  created 1790035200 (2026-09-22T00:00:00Z), owned by xAI, no aliases,
+  source `https://docs.x.ai/developers/models/grok-4.7`, verified 2026-09-22;
+  input $2/M, output $6/M, cached input $0.50/M, image input $2/M image
+  tokens. At or above 200k whole-request input tokens, input/cache/output
+  are $4/$1/$12 per million. Managed-route session history records this as
+  a reference rate with invoice cost unknown. Grok 4.7 always returns
+  Responses `reasoning.encrypted_content` even when not requested.
 - Cursor Agent Composer 2.5 standard (`cursor_agent/composer-2.5`): CLI slug `composer-2.5`, not Fast and not xAI `grok-composer-2.5-fast`; public list $0.50/$0.20/$2.50 per million input/cache-read/output, reference-only with invoice cost unknown
 - Cursor Grok 4.7 (`cursor_agent/cursor-grok-4.7-high`): CLI slug `cursor-grok-4.7-high`, distinct from `oa_xai/grok-4.6` and `xai/grok-4.6`; standard 256K context is $2/$0.50/$6 per million input/cache-read/output, and the documented 500K long-context tier is $4/$1/$12; reference-only with invoice cost unknown, with no cache-write price published and no temporary launch discount baked in
 - `sota-alibaba`: `alibaba_token_plan/qwen3.8-max` → `alibaba_token_plan/qwen3.7-max`

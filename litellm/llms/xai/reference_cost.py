@@ -127,9 +127,11 @@ def calculate_xai_reference_cost(
     )
     uncached_input_tokens = whole_request_tokens - cached_input_tokens
     output_tokens = _nonnegative_int(completion_tokens)
-    active_tier = (
-        configured_tier if whole_request_tokens > threshold_tokens else "base"
+    high_tier = whole_request_tokens > threshold_tokens or (
+        model in {"xai/grok-4.7", "oa_xai/grok-4.7"}
+        and whole_request_tokens == threshold_tokens
     )
+    active_tier = configured_tier if high_tier else "base"
     rate_suffix = "" if active_tier == "base" else f"_{active_tier}"
     cached_rate = _nonnegative_float(
         model_info.get(f"cache_read_input_token_cost{rate_suffix}")

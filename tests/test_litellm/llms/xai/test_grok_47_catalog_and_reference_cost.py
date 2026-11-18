@@ -6,6 +6,8 @@ import litellm
 import pytest
 
 from litellm.utils import supports_xhigh_reasoning_effort
+from litellm.llms.xai.cost_calculator import cost_per_token
+from litellm.types.utils import Usage
 from litellm.llms.xai.reference_cost import (
     build_xai_grok_46_reference_cost_metadata,
     calculate_xai_reference_cost,
@@ -208,10 +210,14 @@ def test_should_register_native_and_managed_grok_47_descriptors() -> None:
     ("prompt_tokens", "cached_tokens", "completion_tokens", "tier", "expected"),
     (
         (100_000, 20_000, 10_000, "base", 0.23),
+        (199_999, 50_000, 1_000, "base", 0.330998),
+        (200_000, 50_000, 1_000, "above_200k_tokens", 0.662),
         (200_001, 50_001, 1_000, "above_200k_tokens", 0.662001),
     ),
 )
+@pytest.mark.parametrize("model", ("xai/grok-4.7", "oa_xai/grok-4.7"))
 def test_should_price_grok_47_using_whole_request_tier(
+    model: str,
     prompt_tokens: int,
     cached_tokens: int,
     completion_tokens: int,
@@ -219,7 +225,7 @@ def test_should_price_grok_47_using_whole_request_tier(
     expected: float,
 ) -> None:
     result = calculate_xai_reference_cost(
-        model="oa_xai/grok-4.7",
+        model=model,
         prompt_tokens=prompt_tokens,
         cache_read_input_tokens=cached_tokens,
         completion_tokens=completion_tokens,
@@ -227,6 +233,20 @@ def test_should_price_grok_47_using_whole_request_tier(
 
     assert result["reference_cost_tier"] == tier
     assert result["reference_cost_total_usd"] == pytest.approx(expected)
+    prompt_cost, output_cost = cost_per_token(
+        model=model,
+        usage=Usage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+            prompt_tokens_details={"cached_tokens": cached_tokens},
+        ),
+    )
+    assert prompt_cost == pytest.approx(
+        result["reference_cost_cached_input_usd"]
+        + result["reference_cost_uncached_input_usd"]
+    )
+    assert output_cost == pytest.approx(result["reference_cost_output_usd"])
 
 
 def test_should_price_grok_47_from_the_exact_catalog_entry() -> None:
