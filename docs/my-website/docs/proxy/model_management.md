@@ -22,22 +22,31 @@ Retrieve detailed information about each model listed in the `/model/info` endpo
 
 ## AAWM OpenAI catalog
 
-The canonical and bundled cost maps include `gpt-6-astra`, `gpt-6-sol`,
-`gpt-6.1-sol`, `gpt-6.1-terra`, and `gpt-6-luna` at standard synchronous
+The canonical and bundled cost maps include `gpt-6.2-astra`, `gpt-6.2-sol`,
+`gpt-6-astra`, `gpt-6-sol`, `gpt-6.1-sol`, `gpt-6.1-terra`, and `gpt-6-luna`
+at standard synchronous
 OpenAI API list prices. Batch, Flex, Fast, Ultrafast, regional, and
 subscription pricing are separate and excluded from this reference valuation.
 
 Per 1M tokens, the entries use input/cache-read/cache-write-30m/
 cache-write-12h/output:
 
+- `gpt-6.2-astra`: $8/$0.40/$10/$20/$40
+- `gpt-6.2-sol`: $2/$0.10/$2.50/$5/$10
 - `gpt-6-astra`: $10/$1/$12.50/$25/$50
 - `gpt-6-sol`: $2/$0.20/$2.50/$5/$10
 - `gpt-6.1-sol`: $2/$0.10/$2.50/$5/$10
 - `gpt-6.1-terra`: $1/$0.05/$1.25/$2.50/$5
 - `gpt-6-luna`: $0.10/$0.01/$0.125/$0.25/$0.50
 
+GPT-6.2 Astra and Sol accept up to 922K input tokens and 128K output tokens
+in a 1,050K context window. Both support Responses, streaming, image input
+and function calling; reasoning effort `none` is rejected.
+
 For prompt input above 272K tokens, the corresponding full-request tariffs
-are Astra $20/$2/$25/$50/$75, GPT-6 Sol $4/$0.40/$5/$10/$15, GPT-6.1 Sol
+are GPT-6.2 Astra $16/$0.80/$20/$40/$60,
+GPT-6.2 Sol $4/$0.20/$5/$10/$15,
+GPT-6 Astra $20/$2/$25/$50/$75, GPT-6 Sol $4/$0.40/$5/$10/$15, GPT-6.1 Sol
 $4/$0.20/$5/$10/$15, GPT-6.1 Terra $2/$0.10/$2.50/$5/$7.50, and Luna
 $0.20/$0.02/$0.25/$0.50/$0.75. The retained `gpt-5.6-terra` entry uses
 $2/$0.20/$2.50/$5/$12 at the base tier and
@@ -45,6 +54,8 @@ $4/$0.40/$5/$10/$18 above 272K. Cache-write prices use the published
 30-minute and 12-hour fields; unpublished cache-write prices remain absent.
 
 Sources: [OpenAI pricing](https://developers.openai.com/api/docs/pricing),
+[GPT-6.2 Astra](https://developers.openai.com/api/docs/models/gpt-6.2-astra),
+[GPT-6.2 Sol](https://developers.openai.com/api/docs/models/gpt-6.2-sol),
 [GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra),
 [GPT-6 Sol](https://developers.openai.com/api/docs/models/gpt-6-sol),
 [GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol),
