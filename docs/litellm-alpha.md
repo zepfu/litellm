@@ -163,11 +163,11 @@ The current alpha alias YAML exposes these test paths:
 - `work` references `work-other`, then keeps its Claude-only native Sonnet
   leaves and OpenAI `gpt-6-luna`. `work-other` orders the nightly DeepSeek
   promotion, Z.AI Coding Plan, Moonshot, then xAI.
-- `expert` references `expert-other` before OpenAI `gpt-6.1-terra`;
+- `expert` references `expert-other` before OpenAI `gpt-6.2-astra`;
   `expert-other` orders nightly Alibaba Qwen Max, Cursor Grok, then native xAI.
 - `auto-review` references `auto-review-other`, then Luna and OpenRouter
   DeepSeek. `codex-auto-review` references that same public graph.
-- `sota-openai` uses OpenAI `gpt-6-astra`.
+- `sota-openai` uses OpenAI `gpt-6.2-astra`.
 - `provider-openai` includes `gpt-6.1-sol` after Luna and Terra, retaining
   Astra as the last candidate. Codex can also select the
   concrete `gpt-6.1-sol` model through alpha's Responses passthrough.

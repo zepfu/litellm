@@ -454,7 +454,7 @@ replacement takes effect on the next Kimi request for every consumer.
 ## Maintained `expert` and `expert-other` alias behavior
 
 The `expert` alias first references `expert-other` (priority 110), then falls
-back to OpenAI/Codex `gpt-6-astra` (`codex_responses`, priority 0,
+back to OpenAI/Codex `gpt-6.2-astra` (`codex_responses`, priority 0,
 `reasoning_effort: low`). `expert-other` orders scheduled Alibaba Token Plan
 `alibaba_token_plan/qwen4-max-preview` (priority 110, `22:00-08:00 UTC+8`,
 absolute-bounded to the official preview window ending before November 25,
@@ -479,7 +479,7 @@ then Alibaba Token Plan `alibaba_token_plan/deepseek-v4.1-flash`
 ## Maintained `sota-openai` alias behavior
 
 The `sota-openai` alias is compiled from `sota-openai.yaml` and currently has
-one candidate: OpenAI/Codex `gpt-6-astra` (`codex_responses`, priority 100,
+one candidate: OpenAI/Codex `gpt-6.2-astra` (`codex_responses`, priority 100,
 `reasoning_effort: high`). The generic `sota` dispatch selects
 `sota-openai` for Codex and default origins. Its `grok` branch selects
 `sota-xai`, whose order is native xAI/OIDC `xai/grok-4.7`, then managed

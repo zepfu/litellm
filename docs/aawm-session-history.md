@@ -1894,7 +1894,7 @@ normal upstream usage and cost calculation path.
 
 The config-driven `sota-openai` route uses this order:
 
-1. `gpt-6-astra`
+1. `gpt-6.2-astra`
 
 The config-driven `sota-xai` route uses this order:
 

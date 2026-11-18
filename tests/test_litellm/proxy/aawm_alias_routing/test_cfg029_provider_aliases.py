@@ -102,7 +102,7 @@ _OPERATIONAL_ALIAS_ORDER = {
         ("REF", "expert-other", None, 100),
         (
             "openai",
-            "gpt-6.1-terra",
+            "gpt-6.2-astra",
             "codex_responses",
             0,
         ),
@@ -160,7 +160,7 @@ _OPERATIONAL_ALIAS_ORDER = {
         ("REF", "auto-review", None, 100),
     ],
     "sota-openai": [
-        ("openai", "gpt-5.6-sol", "codex_responses", 100),
+        ("openai", "gpt-6.2-astra", "codex_responses", 100),
     ],
 }
 _WITHDRAWN_OX_ALPHA_MODELS = frozenset(

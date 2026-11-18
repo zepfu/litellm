@@ -72,7 +72,7 @@ combines maximum reasoning with proactive subagent delegation, not an API
 
 Config-driven alias routing uses:
 
-- `sota-openai`: `gpt-6-astra` (priority 100) with `reasoning_effort: high`
+- `sota-openai`: `gpt-6.2-astra` (priority 100) with `reasoning_effort: high`
 - `sota-xai`: `xai/grok-4.7` via native xAI OIDC (priority 100), then
   `oa_xai/grok-4.7` via managed xAI OAuth (priority 90). Cursor Agent
   `cursor_agent/cursor-grok-4.7-high` stays on `sota-cursor`.
@@ -111,7 +111,7 @@ Config-driven alias routing uses:
   `sota-deepseek` (110, `22:00-08:00 UTC+8`), `sota-moonshot` (90),
   Muse `muse-spark-1.3-contributor` (85), then `sota-xai` (80).
   Each timed candidate is omitted from new selection outside its own window.
-- `expert`: `expert-other` (priority 100) → OpenAI/Codex `gpt-6-astra`
+- `expert`: `expert-other` (priority 100) → OpenAI/Codex `gpt-6.2-astra`
   (`codex_responses`, priority 0) with authoritative `reasoning_effort: low`
 - `expert-other`: during `22:00-08:00 UTC+8`, Alibaba `alibaba_token_plan/qwen3.8-max` (100) is admitted before native xAI `xai/grok-4.7` (0)
 - `auto-review`: `auto-review-other` (100) → Luna at low effort (90) → priority-zero OpenRouter DeepSeek at low effort; `codex-auto-review` is a public alias reference to this graph

@@ -5,7 +5,7 @@ aliases:
   - name: sota-openai
     candidates:
       - provider: openai
-        model: gpt-6-astra
+        model: gpt-6.2-astra
         route_family: codex_responses
         priority: 100
         reasoning_effort: high
