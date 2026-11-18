@@ -1056,6 +1056,12 @@ because their required equivalence evidence is absent. Alibaba subscription
 routes retain unknown invoice cost even when a direct list-rate reference is
 available.
 
+Qwen 4 Max uses its Singapore production PAYG baseline of
+`$1.50/$0.075/$1.875/$3/$4.50` per million input, cache-hit, 5-minute
+cache-creation, 1-hour cache-creation, and output tokens for Qwen4-Max-Preview
+reference pricing. It does not establish model or provider-host equivalence and
+does not claim Token Plan invoice cost.
+
 The configured Alibaba Flash route is `deepseek-v4.1-flash`. No retained
 evidence establishes that `deepseek-v4.1-flash-1017` is exactly equivalent,
 entitled under Token Plan, or separately reference-priced. That identifier

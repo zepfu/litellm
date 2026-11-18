@@ -188,14 +188,16 @@ Sources: [Model pricing](https://www.alibabacloud.com/help/en/model-studio/model
 and [context cache](https://www.alibabacloud.com/help/en/model-studio/context-cache).
 
 Qwen4-Max-Preview uses the production Qwen4-Max standard Singapore
-international list rates as a comparison baseline: `$1.50` per million input
-tokens and `$4.50` per million output tokens. This is labeled
-`production_model_baseline`, with basis model `qwen4-max`; it claims neither
-model equivalence nor the preview's invoice price. The preview is available
-only through Token Plan and has no published pay-as-you-go tariff. Promotional
-Credits discounts are excluded. Cache-bearing requests remain unpriced until
-their cache tariffs are verified. Source:
-[Qwen4-Max-Preview](https://www.alibabacloud.com/help/en/model-studio/qwen4-max-preview).
+international PAYG list rates as a comparison baseline: `$1.50` per million
+input tokens, `$4.50` per million output tokens, `$0.075` per million cache
+hits, `$1.875` per million 5-minute cache-creation tokens, and `$3` per million
+1-hour cache-creation tokens. This is labeled `production_model_baseline`, with
+basis model `qwen4-max`; it claims neither model equivalence nor the preview's
+invoice price, including for cache-bearing usage. The preview is available only
+through Token Plan and has no published pay-as-you-go tariff. Promotional
+Credits discounts are excluded. When implicit and explicit cache rates differ,
+missing cache-kind attribution remains unpriced. Source:
+[Model pricing](https://www.alibabacloud.com/help/en/model-studio/model-pricing).
 
 ## Quota observability
 

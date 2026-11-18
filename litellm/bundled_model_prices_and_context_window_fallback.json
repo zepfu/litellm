@@ -61,7 +61,7 @@
                     },
                     "cache_mode": "provider_cache_read_write",
                     "equivalence_status": "production_model_baseline",
-                    "equivalence_evidence": "Qwen4-Max production-model standard Singapore international list rates are a comparison baseline for Qwen4-Max-Preview, not an assertion of identical models or preview invoice pricing. The preview is Token Plan only and has no public per-token tariff. Promotional and off-peak discounts are excluded. Cache rates are not verified; cache-bearing usage remains unpriced.",
+                    "equivalence_evidence": "Qwen4-Max production-model standard Singapore international PAYG list rates are a comparison baseline for Qwen4-Max-Preview, not an assertion of identical models or preview invoice pricing. The preview is Token Plan only and has no public per-token tariff. Promotional and off-peak discounts are excluded. The retained pricing table establishes explicit and implicit cache hit, 5-minute cache creation, and 1-hour cache creation rates but not a preview-to-provider host equivalence for cache usage; usage lacking cache-kind attribution remains unpriced.",
                     "source": {
                         "kind": "official_provider_direct_list_rate_catalog",
                         "label": "Alibaba Cloud Model Studio Qwen4-Max standard Singapore international list rates",
@@ -69,11 +69,15 @@
                             "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
                             "https://www.alibabacloud.com/help/en/model-studio/qwen4-max-preview"
                         ],
-                        "version": "2026-11-16",
-                        "verified_on": "2026-11-16"
+                        "version": "2026-11-18",
+                        "verified_on": "2026-11-18"
                     },
                     "rates": {
                         "input_usd_per_million_tokens": 1.5,
+                        "implicit_cache_read_usd_per_million_tokens": 0.075,
+                        "explicit_cache_read_usd_per_million_tokens": 0.075,
+                        "cache_write_usd_per_million_tokens": 1.875,
+                        "cache_write_1h_usd_per_million_tokens": 3.0,
                         "output_usd_per_million_tokens": 4.5
                     }
                 },
