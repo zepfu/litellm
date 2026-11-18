@@ -10509,7 +10509,7 @@
         "supports_embedding_image_input": true
     },
     "cohere/north-mini-code-1-0": {
-        "comment": "Cohere trial-key route; no verified production list price.",
+        "comment": "Cohere direct API route; free until rate limits for both trial and production keys.",
         "custom_tool_function_adapters": [
             "apply_patch"
         ],
@@ -10533,18 +10533,22 @@
                 "supports_forced_tool_choice": true,
                 "aawm_reference_pricing": {
                     "schema_version": 1,
-                    "status": "unpriced",
-                    "kind": "provider_trial_reference",
-                    "billing_mode": "cohere_trial_key_reference",
+                    "status": "priced",
+                    "kind": "official_provider_catalog",
+                    "billing_mode": "cohere_api_free_until_rate_limits",
                     "actual_invoice_cost_known": false,
                     "currency": "USD",
                     "basis": {
                         "provider": "cohere",
                         "model": "cohere/north-mini-code-1-0"
                     },
+                    "rates": {
+                        "input_usd_per_million_tokens": 0,
+                        "output_usd_per_million_tokens": 0
+                    },
                     "cache_mode": "none",
                     "equivalence_status": "not_applicable",
-                    "equivalence_evidence": "Cohere documents free trial-key usage with model-specific request limits; no verified production list price is represented.",
+                    "equivalence_evidence": "Official Cohere North Mini Code page states both trial and production API keys are free until rate limits are reached. Model Vault production capacity pricing is separate and is not converted to API token rates.",
                     "source": {
                         "kind": "official_provider_catalog",
                         "label": "Cohere North Mini Code model and rate-limit documentation",
@@ -10552,10 +10556,9 @@
                             "https://docs.cohere.com/docs/north-mini-code-1.0",
                             "https://docs.cohere.com/v2/docs/rate-limits"
                         ],
-                        "version": "2026-08-13",
-                        "verified_on": "2026-08-13"
-                    },
-                    "unpriced_reason": "production_list_price_unverified"
+                        "version": "2026-10-27",
+                        "verified_on": "2026-11-18"
+                    }
                 }
             }
         },

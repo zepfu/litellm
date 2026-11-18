@@ -91,7 +91,7 @@ def test_should_resolve_direct_cohere_north_mini_code_rpm_and_catalog_parity(
     assert direct_entry["rpm"] == 20
     assert direct_entry["provider_specific_entry"]["cohere"][
         "aawm_reference_pricing"
-    ]["status"] == "unpriced"
+    ]["status"] == "priced"
     assert "input_cost_per_token" not in direct_entry
     assert "output_cost_per_token" not in direct_entry
 
