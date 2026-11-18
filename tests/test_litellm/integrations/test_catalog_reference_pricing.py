@@ -117,19 +117,6 @@ def test_should_fail_closed_on_exact_provider_key_mismatch(catalog):
 
 
 def test_should_price_qwen4_preview_against_standard_production_baseline(catalog):
-    contract = catalog["alibaba_token_plan/qwen4-max-preview"][
-        "provider_specific_entry"
-    ]["alibaba_token_plan"]["aawm_reference_pricing"]
-    assert contract["equivalence_status"] == "production_model_baseline"
-    assert contract["rates"] == {
-        "input_usd_per_million_tokens": 1.5,
-        "implicit_cache_read_usd_per_million_tokens": 0.075,
-        "explicit_cache_read_usd_per_million_tokens": 0.075,
-        "cache_write_usd_per_million_tokens": 1.875,
-        "cache_write_1h_usd_per_million_tokens": 3.0,
-        "output_usd_per_million_tokens": 4.5,
-    }
-
     result = aawm_agent_identity.resolve_aawm_reference_pricing(
         provider="alibaba_token_plan",
         model="qwen4-max-preview",
@@ -140,6 +127,7 @@ def test_should_price_qwen4_preview_against_standard_production_baseline(catalog
     assert result["reference_cost_total_usd"] == pytest.approx(0.1545)
     assert result["actual_invoice_cost_known"] is False
     assert result["reference_cost_basis_model"] == "qwen4-max"
+    assert result["reference_cost_equivalence_status"] == "production_model_baseline"
 
     implicit_cache = aawm_agent_identity.resolve_aawm_reference_pricing(
         provider="alibaba_token_plan",

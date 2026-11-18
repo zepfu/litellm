@@ -1060,7 +1060,9 @@ Qwen 4 Max uses its Singapore production PAYG baseline of
 `$1.50/$0.075/$1.875/$3/$4.50` per million input, cache-hit, 5-minute
 cache-creation, 1-hour cache-creation, and output tokens for Qwen4-Max-Preview
 reference pricing. It does not establish model or provider-host equivalence and
-does not claim Token Plan invoice cost.
+does not claim Token Plan invoice cost. The 1-hour creation rate is retained as
+reference metadata; the shared reference-cost contract prices only the 5-minute
+creation rate.
 
 The configured Alibaba Flash route is `deepseek-v4.1-flash`. No retained
 evidence establishes that `deepseek-v4.1-flash-1017` is exactly equivalent,

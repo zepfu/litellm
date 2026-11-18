@@ -196,7 +196,9 @@ basis model `qwen4-max`; it claims neither model equivalence nor the preview's
 invoice price, including for cache-bearing usage. The preview is available only
 through Token Plan and has no published pay-as-you-go tariff. Promotional
 Credits discounts are excluded. When implicit and explicit cache rates differ,
-missing cache-kind attribution remains unpriced. Source:
+missing cache-kind attribution remains unpriced. The 1-hour creation rate is
+reference metadata; the shared reference-cost contract prices only the 5-minute
+creation rate. Source:
 [Model pricing](https://www.alibabacloud.com/help/en/model-studio/model-pricing).
 
 ## Quota observability

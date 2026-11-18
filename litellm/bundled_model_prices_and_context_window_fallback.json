@@ -61,7 +61,7 @@
                     },
                     "cache_mode": "provider_cache_read_write",
                     "equivalence_status": "production_model_baseline",
-                    "equivalence_evidence": "Qwen4-Max production-model standard Singapore international PAYG list rates are a comparison baseline for Qwen4-Max-Preview, not an assertion of identical models or preview invoice pricing. The preview is Token Plan only and has no public per-token tariff. Promotional and off-peak discounts are excluded. The retained pricing table establishes explicit and implicit cache hit, 5-minute cache creation, and 1-hour cache creation rates but not a preview-to-provider host equivalence for cache usage; usage lacking cache-kind attribution remains unpriced.",
+                    "equivalence_evidence": "Qwen4-Max production-model standard Singapore international PAYG list rates are a comparison baseline for Qwen4-Max-Preview, not an assertion of identical models or preview invoice pricing. The preview is Token Plan only and has no public per-token tariff. Promotional and off-peak discounts are excluded. The retained pricing table establishes explicit and implicit cache hit, 5-minute cache creation, and 1-hour cache creation rates but not a preview-to-provider host equivalence for cache usage. The 1-hour cache-creation rate is reference metadata; the shared reference-cost contract prices only the 5-minute cache-creation rate. Usage lacking cache-kind attribution remains unpriced.",
                     "source": {
                         "kind": "official_provider_direct_list_rate_catalog",
                         "label": "Alibaba Cloud Model Studio Qwen4-Max standard Singapore international list rates",
