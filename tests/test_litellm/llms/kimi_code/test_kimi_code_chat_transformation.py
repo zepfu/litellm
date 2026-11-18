@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 import litellm
-from litellm.llms.kimi_code import MANAGED_KIMI_CODE_MODEL_IDS
+from litellm.llms.kimi_code import K3_1_PRO_MODEL_ID, MANAGED_KIMI_CODE_MODEL_IDS
 from litellm.llms.kimi_code.chat.transformation import (
     KIMI_CODE_API_BASE,
     KIMI_CODE_CHAT_COMPLETIONS_URL,
@@ -110,10 +110,13 @@ def test_should_resolve_kimi_code_through_managed_provider(monkeypatch: pytest.M
 def test_should_retain_managed_kimi_code_model_id_constants():
     assert MANAGED_KIMI_CODE_MODEL_IDS == {
         "k3",
+        "k3.1-pro",
+        "k3-256k",
         "kimi-for-coding",
         "kimi-for-coding-highspeed",
     }
     assert "k3-preview" not in MANAGED_KIMI_CODE_MODEL_IDS
+    assert K3_1_PRO_MODEL_ID == "k3.1-pro"
 
 
 @pytest.mark.parametrize(

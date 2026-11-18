@@ -9,7 +9,10 @@ from typing import Dict, Final, FrozenSet, Optional, Tuple
 
 K3_MODEL_ID: Final[str] = "k3"
 K3_256K_MODEL_ID: Final[str] = "k3-256k"
-K3_MODEL_IDS: Final[FrozenSet[str]] = frozenset({K3_MODEL_ID, K3_256K_MODEL_ID})
+K3_1_PRO_MODEL_ID: Final[str] = "k3.1-pro"
+K3_MODEL_IDS: Final[FrozenSet[str]] = frozenset(
+    {K3_MODEL_ID, K3_256K_MODEL_ID, K3_1_PRO_MODEL_ID}
+)
 K2_7_MODEL_IDS: Final[FrozenSet[str]] = frozenset({"kimi-for-coding", "kimi-for-coding-highspeed"})
 MANAGED_KIMI_CODE_MODEL_IDS: Final[FrozenSet[str]] = frozenset({*K3_MODEL_IDS, *K2_7_MODEL_IDS})
 KIMI_CODE_PROVIDER_PREFIX: Final[str] = "kimi_code"

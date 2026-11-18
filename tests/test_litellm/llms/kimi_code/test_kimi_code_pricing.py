@@ -13,6 +13,14 @@ KIMI_CODE_REFERENCE_PRICING = {
         "output_cost_per_token": 1.5e-05,
         "source": "https://www.kimi.com/resources/kimi-k3-pricing",
     },
+    "kimi_code/k3.1-pro": {
+        "cache_creation_input_token_cost": 2e-06,
+        "cache_creation_input_token_cost_above_1hr": 4e-06,
+        "cache_read_input_token_cost": 2e-07,
+        "input_cost_per_token": 2e-06,
+        "output_cost_per_token": 1e-05,
+        "source": "https://platform.kimi.ai/docs/pricing/chat.md",
+    },
     "kimi_code/kimi-for-coding": {
         "cache_read_input_token_cost": 1.9e-07,
         "input_cost_per_token": 9.5e-07,
@@ -66,8 +74,9 @@ def test_should_expose_kimi_code_public_reference_pricing_in_both_model_maps():
         assert bundled_model_info["litellm_provider"] == "kimi_code"
         assert canonical_model_info["comment"] == KIMI_CODE_REFERENCE_COST_COMMENT
         assert bundled_model_info["comment"] == KIMI_CODE_REFERENCE_COST_COMMENT
-        assert "max_output_tokens" not in canonical_model_info
-        assert "max_output_tokens" not in bundled_model_info
+        if model != "kimi_code/k3.1-pro":
+            assert "max_output_tokens" not in canonical_model_info
+            assert "max_output_tokens" not in bundled_model_info
         for key, expected_value in expected_pricing.items():
             assert canonical_model_info[key] == expected_value
             assert bundled_model_info[key] == expected_value
@@ -96,6 +105,12 @@ def test_should_expose_only_documented_k3_cost_capabilities():
             3e-07,
             3e-06,
             1.5e-05,
+        ),
+        (
+            "kimi_code/k3.1-pro",
+            2e-07,
+            2e-06,
+            1e-05,
         ),
         (
             "kimi_code/kimi-for-coding",

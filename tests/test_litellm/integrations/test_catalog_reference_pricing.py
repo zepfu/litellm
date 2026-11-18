@@ -78,6 +78,45 @@ def test_should_keep_reference_pricing_catalogs_equal_and_gate_unverified_routes
     )
 
 
+def test_should_resolve_kimi_k3_1_pro_subscription_reference_with_cache_write_metadata(
+    catalog,
+):
+    contract = catalog["kimi_code/k3.1-pro"]["provider_specific_entry"][
+        "kimi_code"
+    ]["aawm_reference_pricing"]
+
+    assert contract["actual_invoice_cost_known"] is False
+    assert contract["kind"] == "provider_subscription_reference"
+    assert contract["billing_mode"] == "kimi_code_subscription"
+    assert contract["cache_mode"] == "provider_cache_read_write"
+    assert contract["rates"] == {
+        "input_usd_per_million_tokens": 2.0,
+        "cache_read_usd_per_million_tokens": 0.2,
+        "cache_write_usd_per_million_tokens": 2.0,
+        "cache_write_1h_usd_per_million_tokens": 4.0,
+        "output_usd_per_million_tokens": 10.0,
+    }
+
+    result = aawm_agent_identity.resolve_aawm_reference_pricing(
+        provider="kimi_code",
+        model="k3.1-pro",
+        prompt_tokens=1_000_000,
+        completion_tokens=1_000_000,
+        usage_obj={
+            "cache_read_input_tokens": 400_000,
+            "cache_write_input_tokens": 600_000,
+        },
+    )
+
+    assert result is not None
+    assert result["reference_cost_status"] == "priced"
+    assert result["reference_cost_kind"] == "provider_subscription_reference"
+    assert result["reference_cost_cache_read_kind"] is None
+    assert result["reference_cost_cache_write_input_tokens"] == 600_000
+    assert result["reference_cost_cache_write_usd"] == pytest.approx(1.2)
+    assert result["reference_cost_total_usd"] == pytest.approx(11.28)
+
+
 def test_should_resolve_direct_cohere_north_mini_code_rpm_and_catalog_parity(
     monkeypatch: pytest.MonkeyPatch,
 ):

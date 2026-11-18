@@ -1454,8 +1454,8 @@
         ]
     },
     "kimi_code/k3.1-pro": {
-        "cache_creation_input_token_cost": 2e-07,
-        "cache_creation_input_token_cost_above_1hr": 4e-07,
+        "cache_creation_input_token_cost": 2e-06,
+        "cache_creation_input_token_cost_above_1hr": 4e-06,
         "cache_read_input_token_cost": 2e-07,
         "comment": "Public reference costs for the kimi_code subscription route, not known invoice billing.",
         "default_reasoning_effort": "high",
@@ -1465,6 +1465,41 @@
         "max_output_tokens": 1048576,
         "mode": "chat",
         "output_cost_per_token": 1e-05,
+        "provider_specific_entry": {
+            "kimi_code": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "priced",
+                    "kind": "provider_subscription_reference",
+                    "billing_mode": "kimi_code_subscription",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "kimi_code",
+                        "model": "kimi_code/k3.1-pro"
+                    },
+                    "rates": {
+                        "input_usd_per_million_tokens": 2.0,
+                        "cache_read_usd_per_million_tokens": 0.2,
+                        "cache_write_usd_per_million_tokens": 2.0,
+                        "cache_write_1h_usd_per_million_tokens": 4.0,
+                        "output_usd_per_million_tokens": 10.0
+                    },
+                    "cache_mode": "provider_cache_read_write",
+                    "equivalence_status": "not_exact",
+                    "equivalence_evidence": "Kimi platform PAYG list rates are a public comparison reference for the managed Kimi Code subscription route, not known invoice billing. The retained table establishes 5-minute and 1-hour cache-creation rates; the shared contract prices only the 5-minute cache-creation rate and the 1-hour rate is reference metadata.",
+                    "source": {
+                        "kind": "official_provider_direct_list_rate_catalog",
+                        "label": "Kimi platform chat model PAYG list rates",
+                        "urls": [
+                            "https://platform.kimi.ai/docs/pricing/chat.md"
+                        ],
+                        "version": "2026-11-12",
+                        "verified_on": "2026-11-18"
+                    }
+                }
+            }
+        },
         "source": "https://platform.kimi.ai/docs/pricing/chat.md",
         "supports_function_calling": true,
         "supports_high_reasoning_effort": true,
