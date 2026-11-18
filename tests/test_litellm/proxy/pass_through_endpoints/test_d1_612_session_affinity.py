@@ -2209,9 +2209,9 @@ async def test_codex_nested_concrete_same_owner_continuation_passes() -> None:
         assert attrs.get("route_family") != "codex_nested"
         assert attrs.get("provider") != "openai"
 
-        # A reconnecting Codex client returns selected-route metadata without
-        # the account fields attached by the first successful dispatch. The
-        # owned account identity must carry forward from the consult record.
+        # A reconnecting Codex client can retain stale request account fields.
+        # For the same concrete owned route, the server-owned account identity
+        # must win so a client cannot steer the session to another account.
         continuation_request = type("Req", (), {})()
         continuation_request.state = type("State", (), {})()
         continuation_body = {
@@ -2220,6 +2220,9 @@ async def test_codex_nested_concrete_same_owner_continuation_passes() -> None:
                 "codex_auto_agent_selected_provider": concrete["provider"],
                 "codex_auto_agent_selected_model": concrete["model"],
                 "codex_auto_agent_selected_route_family": concrete["route_family"],
+                "account_lane": "stale-lane",
+                "account_label": "stale-account",
+                "account_hash": "stale-hash",
             },
         }
         await cd._consult_codex_nested_session_owner(

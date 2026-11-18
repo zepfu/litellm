@@ -415,13 +415,23 @@ async def _ensure_codex_nested_session_owner_pre_egress(
         None,
     )
     if isinstance(consult_affinity, Mapping):
+        hint_route_matches = (
+            str(consult_affinity.get("provider") or "").strip().casefold()
+            == str(provider or "").strip().casefold()
+            and str(consult_affinity.get("model") or "").strip()
+            == str(model or "").strip()
+            and str(consult_affinity.get("route_family") or "")
+            .strip()
+            .casefold()
+            == str(route_family or "").strip().casefold()
+        )
         hint_account_keys = {
             "account_label": ("account_label", "codex_oauth_account_label"),
             "account_hash": ("account_hash", "codex_oauth_account_hash"),
             "account_lane": ("account_lane", "codex_oauth_lane_key"),
         }
         for account_key, source_keys in hint_account_keys.items():
-            if account_identity.get(account_key):
+            if not hint_route_matches and account_identity.get(account_key):
                 continue
             for source_key in source_keys:
                 if consult_affinity.get(source_key):
