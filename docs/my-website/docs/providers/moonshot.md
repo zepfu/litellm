@@ -67,29 +67,30 @@ This is separate from the paid Moonshot API-key integration above. The
 `moonshot/` route continues to use `MOONSHOT_API_KEY`; it is not a substitute
 for the managed OAuth-backed `kimi_code` provider.
 
-Managed Kimi Code accepts only these exact model IDs: `k3`,
-`kimi-for-coding`, and `kimi-for-coding-highspeed`. The authenticated Kimi
+Managed Kimi Code recognizes the K3-family IDs `k3`, `k3-256k` and `k3.1-pro`,
+plus `kimi-for-coding` and `kimi-for-coding-highspeed`. The authenticated Kimi
 Code `/models` response is the capability authority, including whether a
 requested reasoning effort is supported. Missing or unrecognized capability
 data does not justify inventing output ceilings, translating to another model,
 or silently substituting an effort.
 
-Kimi K3.1 Pro has published native API pricing, but the retained evidence does
-not verify its managed Kimi Code model ID or plan entitlement. Native API
-naming alone is insufficient to replace the configured `kimi_code/k3-256k`
-route. Keep the current managed routes unchanged until authenticated
-`/models`, entitlement, and route acceptance evidence identify a supported
-managed model.
+K3.1 Pro is available as `kimi_code/k3.1-pro`. Authenticated discovery confirms
+account access and a 1,048,576-token context. The `provider-kimi_code` and
+`sota-moonshot` aliases retain `kimi_code/k3-256k` until native streaming,
+tool and continuation acceptance qualifies the replacement. Published native
+API rates supply a comparison reference; they do not establish subscription
+invoice cost or exact managed-host equivalence.
 
 AAWM may use internal `k3-low`, `k3-high`, and `k3-max` labels while resolving
 capabilities and public reference pricing. Those labels are observability and
 routing identities only; they are normalized to `k3` for introspection and are
 rejected if they reach provider request transformation.
 
-Kimi subscription reference costs are not invoice spend. Callback observers
-may use the deterministic reference total as generation cost only when they
-also retain `actual_invoice_cost_known=false` and the source/model/kind
-provenance documented in `docs/aawm-session-history.md`.
+Kimi subscription reference costs are separate from invoice spend. Session
+history retains the deterministic reference total with
+`actual_invoice_cost_known=false` and the source/model/kind provenance
+documented in `docs/aawm-session-history.md`. Reference totals do not become
+standard response costs or callback generation costs.
 
 The raw Kimi CLI compatibility gateway is the trusted-local `/kimi/v1` route.
 It accepts only a direct `127.0.0.1` or `::1` peer; forwarded identity headers
