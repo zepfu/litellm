@@ -63,7 +63,10 @@ from litellm.secret_managers.credential_error_sanitizer import (
 
 from . import audit_persist as _aawm_audit_persist
 from . import durable
-from .audit_persist import _emit_aawm_terminal_error
+from .audit_persist import (
+    _emit_aawm_terminal_error,
+    _terminal_error_marker_is_set,
+)
 from .policy import canonicalize_openrouter_native_responses_route_family
 from .types import Payload
 
@@ -8147,6 +8150,9 @@ def _emit_session_owner_redispatch_observability(
                 "litellm_call_id": request_call_id,
             },
             extra_fields={
+                "_aawm_terminal_error_already_emitted": (
+                    _terminal_error_marker_is_set(terminal_marker)
+                ),
                 "session_id": session_identity,
                 "trace_id": request_context.get("trace_id"),
                 "litellm_call_id": request_call_id,

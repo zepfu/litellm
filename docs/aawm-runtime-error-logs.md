@@ -802,11 +802,13 @@ provider/model/route, event and failure classification, status and attempt
 counts, terminal/fallback state, attempted-provider and redispatch booleans,
 and a hashed correlation identifier.
 
-Nested and wrapped paths share the `aawm_terminal_error_emitted` marker. The
-first successful emission sets the marker and later attempts are suppressed,
-so one structured terminal response produces one default line. This operator
-line is separate from durable alias-audit and `session_history` persistence;
-those persistence paths remain unchanged.
+Nested and wrapped paths share the `aawm_terminal_error_emitted` marker.
+Session-owner rejection forwards the direct emitter's marker to its pre-attempt
+audit path, including when the marker is separate from request state. The first
+successful emission sets the marker and later attempts are suppressed, so one
+structured terminal response produces one default line. Durable alias-audit,
+route rollup and `session_history` persistence remain separate and continue
+after the operator line is suppressed.
 
 The fields come from an explicit allowlist, with secret redaction and bounded
 text lengths. Credentials, OAuth/API keys, authorization headers, raw request

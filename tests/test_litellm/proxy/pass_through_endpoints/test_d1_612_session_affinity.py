@@ -4480,8 +4480,15 @@ def test_d614_owner_409_emits_one_proxy_error_and_one_failure_rollup() -> None: 
     assert _D614_RESERVATION_TOKEN not in json.dumps(detail)
 
 
-def test_d614_nested_owner_409_uses_one_terminal_error_marker() -> None:
+@pytest.mark.parametrize("separate_marker", [False, True])
+def test_d614_nested_owner_409_uses_one_terminal_error_marker(
+    separate_marker: bool,
+) -> None:
     from types import SimpleNamespace
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        audit_events,
+        audit_persist,
+    )
 
     state = SimpleNamespace(
         aawm_alias_request_context={
@@ -4495,10 +4502,25 @@ def test_d614_nested_owner_409_uses_one_terminal_error_marker() -> None:
         url=SimpleNamespace(path="/v1/responses"),
     )
     rollup = MagicMock(return_value=True)
+    terminal_marker = {} if separate_marker else None
 
     with patch.object(sa.verbose_proxy_logger, "error") as proxy_error, patch(
         "litellm.proxy.aawm_route_logging.record_aawm_route_rollup_failure",
         rollup,
+    ), patch.object(
+        audit_events, "_build_auto_agent_alias_audit_events", return_value=[{}]
+    ), patch.object(
+        audit_events,
+        "_emit_auto_agent_alias_route_event",
+        audit_persist._emit_auto_agent_alias_route_event,
+    ), patch.object(
+        audit_persist, "_record_auto_agent_alias_route_status_rollup"
+    ) as route_rollup, patch.object(
+        audit_events, "_persist_auto_agent_alias_audit_only_events_best_effort"
+    ) as persist_audit, patch.object(
+        audit_persist, "_aawm_alias_route_verbose_json_enabled", return_value=False
+    ), patch.object(
+        audit_persist, "_aawm_alias_route_healthy_json_enabled", return_value=False
     ):
         for _ in range(2):
             with pytest.raises(HTTPException) as exc_info:
@@ -4508,11 +4530,16 @@ def test_d614_nested_owner_409_uses_one_terminal_error_marker() -> None:
                     alias_model="Codex-auto-agent",
                     failure_phase="session_owner_mismatch",
                     request=request,
+                    terminal_marker=terminal_marker,
                 )
             assert exc_info.value.status_code == 409
 
     proxy_error.assert_called_once()
     assert rollup.call_count == 2
+    assert route_rollup.call_count == 2
+    assert persist_audit.call_count == 2
+    for call in persist_audit.call_args_list:
+        assert call.args[0][-1]["event_type"] == "redispatch_required"
 
 
 def _d614_raise_with_observability(
