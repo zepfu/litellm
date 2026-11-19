@@ -3588,7 +3588,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
                 persist_exc.__class__.__name__,
             )
 
-    candidate = selection.get("candidate")
+    candidate = selection.get("candidate") or {}
     injected_attempt_record = (
         _aawm_dev_fault_plan.update_direct_openai_managed_failure_attempt(
             request,
@@ -3639,6 +3639,14 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
         selection.get("selection_reason")
         == "authenticated_continuation_token_pin"
     )
+    candidate = selection.get("candidate")
+    portable_account_failover = bool(
+        is_usage_limit
+        and account_failover_replay_safe
+        and not authenticated_token_pin
+        and candidate.get("codex_oauth_credential_affinity")
+        == "interchangeable"
+    )
     _aawm_dev_fault_plan.note_direct_openai_managed_failure(
         request,
         request_body,
@@ -3658,6 +3666,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             commitment=wire_commitment,
             continuation=has_continuation_state
             or bool(request_body.get("previous_response_id")),
+            portable_account_failover=portable_account_failover,
             ledger_valid=not getattr(exc, "aawm_call_ledger_exhausted", False),
             alternate_route_available=bool(
                 current_auth is not None and account_failover_replay_safe

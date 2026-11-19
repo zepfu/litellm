@@ -58,6 +58,7 @@ class CapacityRecoveryObservation:
     retryable: bool
     commitment: Optional[Mapping[str, Any]]
     continuation: bool = False
+    portable_account_failover: bool = False
     cancelled: bool = False
     ledger_valid: bool = True
     alternate_route_available: bool = False
@@ -231,7 +232,7 @@ class CapacityRecoveryOwner:
             action, reason = CapacityRecoveryAction.REPLAY_VETO, "provider_outcome_unknown"
         elif not observation.ledger_valid:
             action, reason = CapacityRecoveryAction.REPLAY_VETO, "invalid_ledger"
-        elif observation.continuation:
+        elif observation.continuation and not observation.portable_account_failover:
             action, reason = CapacityRecoveryAction.REPLAY_VETO, "continuation_replay_forbidden"
         elif veto is not None:
             action, reason = CapacityRecoveryAction.REPLAY_VETO, f"wire_{veto}"
