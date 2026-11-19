@@ -3812,6 +3812,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             "server_overloaded",
             "upstream_overloaded",
             "capacity_exhausted",
+            "upstream_transient_internal",
         }
         and attempted_provider_call
         and provider_returned
@@ -6976,6 +6977,15 @@ async def openai_proxy_route(  # noqa: PLR0915
                 direct_account_error_class = "usage_limit_reached"
             elif _aawm_codex_oauth.is_direct_codex_token_invalidated_error(exc):
                 direct_account_error_class = "token_invalidated"
+            elif (
+                use_direct_codex_oauth_inventory
+                and attempted_provider_call
+                and provider_returned
+                and getattr(exc, "error_class", None)
+                == "upstream_transient_internal"
+                and bool(getattr(exc, "retryable", False))
+            ):
+                direct_account_error_class = "upstream_transient_internal"
             elif (
                 use_direct_codex_oauth_inventory
                 and attempted_provider_call
