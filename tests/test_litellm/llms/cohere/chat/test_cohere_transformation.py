@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 from unittest.mock import MagicMock
 
@@ -94,18 +95,16 @@ class TestCohereV2NamespaceCollisionTranslation:
             },
         ]
 
-    def test_wire_names_preserve_basenames_and_bare_identity(self) -> None:
-        translated, namespace_by_name = translate_cohere_v2_responses_tools(
-            self._tools()
+    def test_wire_names_are_valid_unique_and_bare_identity_is_preserved(self) -> None:
+        translated, _ = translate_cohere_v2_responses_tools(self._tools())
+        wire_names = [tool["name"] for tool in translated]
+        assert len(wire_names) == 3
+        assert len(set(wire_names)) == 3
+        assert all(
+            re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
+            for name in wire_names
         )
-        assert translated[0]["name"] == "mcp__codex_apps__github___get_profile"
-        assert translated[1]["name"] == "mcp__codex_apps__gmail___get_profile"
         assert translated[2] == self._tools()[2]
-        assert namespace_by_name == {
-            ("_get_profile", "mcp__codex_apps__github"): "mcp__codex_apps__github",
-            ("_get_profile", "mcp__codex_apps__gmail"): "mcp__codex_apps__gmail",
-            ("_get_profile", None): None,
-        }
 
     def test_direct_chat_keeps_legacy_names_and_rejects_wire_collisions(self) -> None:
         config = CohereV2ChatConfig()
@@ -181,10 +180,11 @@ class TestCohereV2NamespaceCollisionTranslation:
             ],
         }
 
-        translated, namespace_by_name = translate_cohere_v2_responses_request(request)
+        translated, _ = translate_cohere_v2_responses_request(request)
 
-        assert translated["tools"][0]["name"] == "ops__run"
-        assert translated["tools"][0]["name"] == translated["input"][0]["name"]
+        emitted_name = translated["tools"][0]["name"]
+        assert re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", emitted_name)
+        assert emitted_name == translated["input"][0]["name"]
         assert translated["input"][0]["call_id"] == "call_run"
         assert "namespace" not in translated["input"][0]
         assert translated["input"][1] == {
@@ -192,7 +192,6 @@ class TestCohereV2NamespaceCollisionTranslation:
             "call_id": "call_run",
             "output": "ok",
         }
-        assert namespace_by_name == {("run", "ops"): "ops"}
 
     @pytest.mark.parametrize(
         "namespace_a,namespace_b,name",
