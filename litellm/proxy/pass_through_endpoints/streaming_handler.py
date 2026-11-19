@@ -231,6 +231,7 @@ class ResponsesStreamPreCommitFailure(Exception):
         retry_after_seconds: float = RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS,
         error_code: Optional[str] = None,
         error_type: Optional[str] = None,
+        event_type: Optional[str] = None,
         message: Optional[str] = None,
         status_code: Optional[int] = None,
         pre_commit_retry_exhausted: bool = False,
@@ -244,6 +245,7 @@ class ResponsesStreamPreCommitFailure(Exception):
         self.retry_after_seconds = retry_after_seconds
         self.error_code = error_code
         self.error_type = error_type
+        self.event_type = event_type
         self.status_code = status_code
         self.pre_commit_retry_exhausted = pre_commit_retry_exhausted
         self.error_payload = error_payload if isinstance(error_payload, dict) else None
@@ -2529,6 +2531,7 @@ class PassThroughStreamingHandler:
             retry_after_seconds=retry_after_seconds,
             error_code=error_code or event_type,
             error_type=error_type or event_type,
+            event_type=event_type,
             status_code=status_code,
             message=sanitized_message,
             pre_commit_retry_exhausted=pre_commit_retry_exhausted,

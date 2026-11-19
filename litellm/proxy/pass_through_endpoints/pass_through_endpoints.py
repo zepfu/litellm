@@ -13511,9 +13511,6 @@ async def pass_through_request(  # noqa: PLR0915
                         for header_name, header_value in upstream_headers.items()
                     },
                 )
-            if getattr(e, "_aawm_provider_returned", False):
-                setattr(proxy_exc, "_aawm_provider_returned", True)
-            raise proxy_exc
         else:
             error_msg = f"{str(e)}"
             proxy_exc = ProxyException(
@@ -13528,9 +13525,20 @@ async def pass_through_request(  # noqa: PLR0915
                     **_get_passthrough_terminal_wire_headers(e),
                 },
             )
-            if getattr(e, "_aawm_provider_returned", False):
-                setattr(proxy_exc, "_aawm_provider_returned", True)
-            raise proxy_exc
+        if getattr(e, "_aawm_provider_returned", False):
+            setattr(proxy_exc, "_aawm_provider_returned", True)
+        # Keep the provider's typed precommit evidence private to the retry
+        # owner. The wire-facing ProxyException retains its sanitized detail.
+        failure = e.__cause__ if isinstance(e, HTTPException) else e
+        if (
+            caller_managed_hidden_retry
+            and isinstance(failure, ResponsesStreamPreCommitFailure)
+            and failure.error_class == "upstream_transient_internal"
+            and failure.provider_returned
+        ):
+            setattr(proxy_exc, "_aawm_provider_returned", True)
+            setattr(proxy_exc, "_aawm_direct_transient_failure", failure)
+        raise proxy_exc
 
 
 def _update_metadata_with_tags_in_header(request: Request, metadata: dict) -> dict:
