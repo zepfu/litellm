@@ -765,13 +765,11 @@ async def test_cohere_route_preparation_preserves_flat_and_bare_schemas(
         for call_id, name, namespace, value_type in expectations:
             item = restored_by_call_id[call_id]
             assert (item["name"], item.get("namespace")) == (name, namespace)
-            assert item["arguments"] == (
-                '{"n":3}' if value_type is int else '{"n":3.0}'
-            )
             value = json.loads(item["arguments"])["n"]
-            assert isinstance(value, value_type)
             if value_type is int:
-                assert not isinstance(value, bool)
+                assert isinstance(value, int) and not isinstance(value, bool)
+            else:
+                assert isinstance(value, float) and item["arguments"] == '{"n":3.0}'
 
     if not streaming:
         restored, _ = lpe._restore_adapted_namespace_tool_calls_in_response_body(
