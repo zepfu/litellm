@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -462,6 +463,132 @@ class TestNamespaceToolRestore:
         )
         assert ns_count == 0
         assert ns_result is body
+
+    def test_cohere_namespace_wait_round_trip_uses_valid_wire_name(
+        self, host_deps: None
+    ) -> None:
+        request_body = {
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "functions.collaboration",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "wait_agent",
+                            "parameters": {"type": "object", "properties": {}},
+                        }
+                    ],
+                }
+            ],
+            "input": [
+                {
+                    "type": "function_call",
+                    "name": "wait_agent",
+                    "namespace": "functions.collaboration",
+                    "call_id": "call_wait_1",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "namespace": "functions.collaboration",
+                    "call_id": "call_wait_1",
+                    "output": "continued",
+                },
+            ],
+        }
+        translated, _ = translate_cohere_v2_responses_request(request_body)
+        wire_name = translated["tools"][0]["name"]
+        assert re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", wire_name)
+        assert translated["input"][0]["name"] == wire_name
+        assert translated["input"][0]["call_id"] == "call_wait_1"
+        assert translated["input"][1]["call_id"] == "call_wait_1"
+
+        request_body["litellm_metadata"] = translated["litellm_metadata"]
+        response = {
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": wire_name,
+                    "call_id": "call_wait_1",
+                    "arguments": "{}",
+                }
+            ]
+        }
+        restored, count = mod._restore_adapted_namespace_tool_calls_in_response_body(
+            response,
+            request_body=request_body,
+            adapter_model="test-model",
+        )
+        assert count == 1
+        assert restored["output"][0]["name"] == "wait_agent"
+        assert restored["output"][0]["namespace"] == "functions.collaboration"
+        assert restored["output"][0]["call_id"] == "call_wait_1"
+
+    @pytest.mark.parametrize("namespaced_first", [True, False])
+    def test_cohere_flat_and_bare_run_preserve_schema_identity(
+        self, host_deps: None, namespaced_first: bool
+    ) -> None:
+        namespaced_tool = {
+            "type": "function",
+            "namespace": "ops",
+            "name": "run",
+            "parameters": {
+                "type": "object",
+                "properties": {"timeout_ms": {"type": "integer"}},
+            },
+        }
+        bare_tool = {
+            "type": "function",
+            "name": "run",
+            "parameters": {
+                "type": "object",
+                "properties": {"timeout_ms": {"type": "number"}},
+            },
+        }
+        tools = [namespaced_tool, bare_tool] if namespaced_first else [bare_tool, namespaced_tool]
+        request_body = {"tools": tools}
+        translated, _ = translate_cohere_v2_responses_request(request_body)
+        wire_names = {tool["name"]: tool for tool in translated["tools"]}
+        namespaced_wire_name = next(name for name in wire_names if name != "run")
+        assert wire_names[namespaced_wire_name]["parameters"]["properties"]["timeout_ms"] == {
+            "type": "integer"
+        }
+        assert wire_names["run"]["parameters"]["properties"]["timeout_ms"] == {
+            "type": "number"
+        }
+
+        request_body["litellm_metadata"] = translated["litellm_metadata"]
+        response = {
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": namespaced_wire_name,
+                    "call_id": "call_ops",
+                    "arguments": '{"timeout_ms": 120000.0}',
+                },
+                {
+                    "type": "function_call",
+                    "name": "run",
+                    "call_id": "call_bare",
+                    "arguments": '{"timeout_ms": 120000.0}',
+                },
+            ]
+        }
+        restored, count = mod._restore_adapted_namespace_tool_calls_in_response_body(
+            response,
+            request_body=request_body,
+            adapter_model="test-model",
+        )
+        assert count == 1
+        namespaced_call, bare_call = restored["output"]
+        assert (namespaced_call["name"], namespaced_call["namespace"]) == ("run", "ops")
+        assert namespaced_call["call_id"] == "call_ops"
+        assert isinstance(json.loads(namespaced_call["arguments"])["timeout_ms"], int)
+        assert bare_call["name"] == "run"
+        assert "namespace" not in bare_call
+        assert bare_call["call_id"] == "call_bare"
+        assert isinstance(json.loads(bare_call["arguments"])["timeout_ms"], float)
 
 
 # ===========================================================================
