@@ -30573,13 +30573,46 @@ class TestOpenAIPassthroughRoute:
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
             codex_oauth,
         )
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            session_affinity as _sa,
+        )
         from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
             openai_proxy_route,
         )
 
-        monkeypatch.setenv("LITELLM_CODEX_OAUTH_INVENTORY", '{"schema_version":1}')
+        inventory = {
+            "schema_version": 1,
+            "routing": {
+                "credential_affinity": "interchangeable",
+                "strategy": "priority",
+            },
+            "accounts": [
+                {
+                    "label": "account1",
+                    "auth_path": "/tmp/openai006-account1-auth.json",
+                    "lock_path": "/tmp/openai006-account1.lock",
+                    "priority": 10,
+                    "weight": 1.0,
+                    "enabled": True,
+                    "models": ["gpt-5.6-sol"],
+                    "expected_account_hash": "0123456789ab",
+                },
+                {
+                    "label": "account2",
+                    "auth_path": "/tmp/openai006-account2-auth.json",
+                    "lock_path": "/tmp/openai006-account2.lock",
+                    "priority": 20,
+                    "weight": 1.0,
+                    "enabled": True,
+                    "models": ["gpt-5.6-sol"],
+                    "expected_account_hash": "fedcba987654",
+                },
+            ],
+        }
+        monkeypatch.setenv("LITELLM_CODEX_OAUTH_INVENTORY", json.dumps(inventory))
         body = {
             "model": "gpt-5.6-sol",
+            "session_id": "session-openai006",
             "input": [
                 {
                     "type": "function_call_output",
@@ -30590,31 +30623,14 @@ class TestOpenAIPassthroughRoute:
         }
         request = self._openai006_request()
 
-        def _binding(label: str, account_hash: str, ordinal: int):
+        def _auth(label: str, account_hash: str):
             lane = f"codex-oauth:{label}:{account_hash}"
-            auth = codex_oauth.CodexOAuthRequestAuth(
+            return codex_oauth.CodexOAuthRequestAuth(
                 account_label=label,
                 account_hash=account_hash,
                 lane_key=lane,
                 headers={"Authorization": f"Bearer {label}"},
             )
-            selection = {
-                "candidate": {
-                    "provider": "openai",
-                    "model": "gpt-5.6-sol",
-                    "route_family": "codex_responses",
-                    "codex_oauth_account_label": label,
-                    "codex_oauth_account_hash": account_hash,
-                    "codex_oauth_lane_key": lane,
-                    "codex_oauth_credential_affinity": "interchangeable",
-                },
-                "lane_key": lane,
-                "cooldown_key": f"openai:gpt-5.6-sol:{lane}",
-                "failover_ordinal": ordinal,
-                "request_mode": "ordinary_continuation",
-                "has_account_bound_state": True,
-            }
-            return auth, selection, body
 
         attempts: list[str] = []
 
@@ -30624,14 +30640,65 @@ class TestOpenAIPassthroughRoute:
             )
             attempts.append(authorization)
             if authorization == "Bearer account1":
-                raise HTTPException(
+                provider_error = HTTPException(
                     status_code=429,
                     detail={
                         "error": {"code": "usage_limit_reached"},
+                        "quota": {"resets_in_seconds": 900},
                         "failover_disposition": "usage_limit_reached",
                     },
+                    headers={"Retry-After": "900"},
                 )
+                provider_error._aawm_provider_returned = True
+                raise provider_error
             return Response(content=b"ok", status_code=200)
+
+        source_candidate = {
+            "provider": "openai",
+            "model": "gpt-5.6-sol",
+            "route_family": "codex_responses",
+            "codex_oauth_credential_affinity": "interchangeable",
+            "codex_oauth_account_label": "account1",
+            "codex_oauth_account_hash": "0123456789ab",
+            "codex_oauth_lane_key": "codex-oauth:account1:0123456789ab",
+        }
+        source_attributes = _sa.build_session_owner_attributes(
+            provider="openai",
+            model="gpt-5.6-sol",
+            route_family="codex_responses",
+            endpoint_contract="codex_responses",
+            state_format="codex_responses",
+            ingress="pass_through_request",
+            requested_model="gpt-5.6-sol",
+            credential_affinity="interchangeable",
+            candidate=source_candidate,
+        )
+        source_owner_id = "owner-openai006"
+        source_owner_lease = _sa.SessionOwnerLease(
+            session_identity="session-openai006",
+            cache_key=_sa.build_aawm_alias_routing_session_owner_cache_key(
+                session_identity="session-openai006"
+            ),
+            owner_id=source_owner_id,
+            decision=_sa.SessionOwnerGuardDecision.COMPATIBLE_OWNER.value,
+            attributes=source_attributes,
+        )
+        source_owner_record = _sa._build_owned_record(
+            owner_id=source_owner_id,
+            attributes=source_attributes,
+            reservation_token=None,
+        )
+        _sa.set_request_session_owner_lease(request, source_owner_lease)
+
+        async def _load_headers_for_record(_request, record):
+            account_hash = str(record.expected_account_hash)
+            label = str(record.label)
+            assert label in {"account1", "account2"}
+            return _auth(label, account_hash)
+
+        async def _owned_record_for_failover(**kwargs):
+            assert kwargs.get("session_identity") == "session-openai006"
+            return source_owner_record, source_owner_lease.cache_key, None
 
         with patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
@@ -30646,22 +30713,21 @@ class TestOpenAIPassthroughRoute:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_grok_native_oauth_request_body",
             return_value=False,
         ), patch(
-            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth.select_and_bind_direct_codex_oauth_inventory",
-            new=AsyncMock(
-                side_effect=[
-                    _binding("account1", "hash-account-1", 0),
-                    _binding("account2", "hash-account-2", 1),
-                ]
-            ),
-        ) as mock_bind, patch.object(
+            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth._load_codex_oauth_headers_for_record",
+            new=_load_headers_for_record,
+        ), patch.object(
             llm_passthrough_endpoints.BaseOpenAIPassThroughHandler,
             "_base_openai_pass_through_handler",
             new=_usage_limit_then_success,
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._publish_codex_cooldown_memory"
-        ), patch(
+        ) as mock_publish, patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._persist_codex_cooldown_durable",
             new=AsyncMock(),
+        ) as mock_persist, patch.object(
+            _sa,
+            "get_session_owner_record",
+            new=_owned_record_for_failover,
         ):
             response = await openai_proxy_route(
                 endpoint="v1/responses",
@@ -30671,8 +30737,24 @@ class TestOpenAIPassthroughRoute:
             )
 
         assert response.status_code == 200
+        assert (
+            getattr(request.state, "_aawm_direct_codex_account_failover_planned")
+            is True
+        )
         assert attempts == ["Bearer account1", "Bearer account2"]
-        assert mock_bind.await_count == 2
+        selected_account = getattr(
+            request.state,
+            "aawm_codex_oauth_selected_account",
+        )
+        assert selected_account["account_label"] == "account2"
+        mock_publish.assert_called_once_with(
+            keys=(
+                "openai:gpt-5.6-sol:codex-oauth:account1:0123456789ab",
+            ),
+            seconds=900.0,
+            allow_ttl_shrink=True,
+        )
+        mock_persist.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_openai006_malformed_inventory_fails_before_get_credentials(
