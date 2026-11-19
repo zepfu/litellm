@@ -996,6 +996,11 @@ tariff remains the only standard cost input, including an explicit zero tariff.
 Unknown cache token counts and unsupported or non-exact equivalence fail closed
 to `status=unpriced`.
 
+For a recognized OpenAI Responses model whose exact catalog entry marks
+reference pricing `unpriced`, streaming usage and tool logging still complete.
+The logging call omits a computed `response_cost` and retains the unpriced
+reason and provenance. An unavailable tariff is not a published zero price.
+
 ### Direct Cohere provenance
 
 The AAWM direct Codex Cohere alias route is separate from OpenRouter traffic,
