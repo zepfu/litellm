@@ -75,11 +75,10 @@ data does not justify inventing output ceilings, translating to another model,
 or silently substituting an effort.
 
 K3.1 Pro is available as `kimi_code/k3.1-pro`. Authenticated discovery confirms
-account access and a 1,048,576-token context. The `provider-kimi_code` and
-`sota-moonshot` aliases retain `kimi_code/k3-256k` until native streaming,
-tool and continuation acceptance qualifies the replacement. Published native
-API rates supply a comparison reference; they do not establish subscription
-invoice cost or exact managed-host equivalence.
+account access and a 1,048,576-token context. After native streaming, tool and
+continuation qualification, `provider-kimi_code` and `sota-moonshot` select
+this model with max reasoning effort. Published native API rates supply a
+non-exact comparison reference; subscription invoice cost remains unknown.
 
 AAWM may use internal `k3-low`, `k3-high`, and `k3-max` labels while resolving
 capabilities and public reference pricing. Those labels are observability and

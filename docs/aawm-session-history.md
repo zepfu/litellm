@@ -1082,10 +1082,11 @@ Managed Kimi Code uses the same non-invoice semantics. Callback observers may
 persist its provenance metadata, but they do not turn its reference total into
 a standard response cost or callback generation cost.
 
-Kimi K3.1 Pro's published native API pricing does not establish a managed Kimi
-Code model ID or entitlement. The configured `kimi_code/k3-256k` route remains
-unchanged pending authenticated `/models`, entitlement, and route acceptance
-evidence.
+Authenticated managed discovery and stock alpha streaming, tool and
+continuation acceptance qualify `kimi_code/k3.1-pro`. The `provider-kimi_code`
+and `sota-moonshot` aliases select it with max reasoning effort. Native API
+rates supply a non-exact comparison reference; subscription invoice cost stays
+unknown. Missing cache-token counts remain explicitly unpriced.
 
 ## Rate Limit And Billing Observations
 
