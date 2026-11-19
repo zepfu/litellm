@@ -332,6 +332,13 @@ opaque continuation state remains pinned. When no account is admissible,
 routing returns a structured safe `429`; metadata contains only
 label/hash/lane/failover details without raw IDs or secrets.
 
+An ordinary weekly-quota observation alone does not exclude a quota-exempt
+Codex helper. An upstream-verified `usage_limit_reached` refusal does exclude
+the refused account, model and credential lane from fresh helper selection,
+even when ordinary cooldowns are bypassed. It uses the existing provider-reset
+or fallback TTL and configured cap; other models and accounts remain eligible.
+Existing five-hour hard admission still applies.
+
 The required continuation contract permits same-conversation migration in both
 directions when the owner exhausts quota **or available capacity**; capacity
 exhaustion does not also require quota exhaustion. Transient overload alone
