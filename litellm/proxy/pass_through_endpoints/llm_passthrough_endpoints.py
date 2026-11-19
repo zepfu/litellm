@@ -3588,7 +3588,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
                 persist_exc.__class__.__name__,
             )
 
-    candidate = selection.get("candidate") or {}
+    candidate = selection.get("candidate")
     injected_attempt_record = (
         _aawm_dev_fault_plan.update_direct_openai_managed_failure_attempt(
             request,
@@ -3639,7 +3639,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
         selection.get("selection_reason")
         == "authenticated_continuation_token_pin"
     )
-    candidate = selection.get("candidate")
+    candidate = selection.get("candidate") or {}
     portable_account_failover = bool(
         is_usage_limit
         and account_failover_replay_safe
