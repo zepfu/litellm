@@ -3670,7 +3670,8 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
         # continuation and its one same-account retry. Observing them here
         # would cache a decision without that context, including on 429/529.
         if (
-            isinstance(exc, ResponsesStreamPreCommitFailure)
+            getattr(getattr(request, "state", None), "aawm_direct_codex_oauth_inventory", False)
+            and isinstance(exc, ResponsesStreamPreCommitFailure)
             and exc.error_class == "upstream_transient_internal"
         ):
             return
@@ -13540,6 +13541,7 @@ async def pass_through_request(  # noqa: PLR0915
         failure = e.__cause__ if isinstance(e, HTTPException) else e
         if (
             caller_managed_hidden_retry
+            and getattr(request.state, "aawm_direct_codex_oauth_inventory", False)
             and isinstance(failure, ResponsesStreamPreCommitFailure)
             and failure.error_class == "upstream_transient_internal"
             and failure.provider_returned
