@@ -1472,6 +1472,24 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         return None
 
     @staticmethod
+    def _model_info_has_unpriced_aawm_reference_contract(
+        model_info: Any,
+    ) -> bool:
+        provider_entries = model_info.get("provider_specific_entry") if isinstance(
+            model_info,
+            dict,
+        ) else None
+        if not isinstance(provider_entries, dict):
+            return False
+        for provider_entry in provider_entries.values():
+            if not isinstance(provider_entry, dict):
+                continue
+            contract = provider_entry.get("aawm_reference_pricing")
+            if isinstance(contract, dict) and contract.get("status") == "unpriced":
+                return True
+        return False
+
+    @staticmethod
     def _completion_cost_with_model_price_fallback(
         *,
         completion_response: Any,
@@ -1505,6 +1523,15 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                         model
                     )
                 raise
+            if OpenAIPassthroughLoggingHandler._model_info_has_unpriced_aawm_reference_contract(
+                model_info
+            ):
+                verbose_proxy_logger.debug(
+                    "OpenAI passthrough cost unavailable for known unpriced model=%s provider=%s; omitting cost and preserving usage.",
+                    model,
+                    custom_llm_provider,
+                )
+                return None
             input_cost_per_token = model_info.get("input_cost_per_token")
             output_cost_per_token = model_info.get("output_cost_per_token")
             if not isinstance(input_cost_per_token, (int, float)) or not isinstance(
