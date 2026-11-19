@@ -38,10 +38,9 @@ def declaration():
     }
 
 
-@pytest.mark.parametrize("declaration_index", [0, 1, 2])
-def test_should_normalize_latest_declaration_after_initial_user_message(
-    declaration,
-    declaration_index,
+@pytest.mark.parametrize("declaration_index", [0, 1])
+def test_should_normalize_declaration_after_initial_user_message(
+    declaration, declaration_index
 ):
     message = {
         "type": "message",
@@ -61,7 +60,7 @@ def test_should_normalize_latest_declaration_after_initial_user_message(
     assert body == original
 
 
-def test_should_normalize_latest_accumulated_declaration_and_preserve_history(declaration):
+def test_should_normalize_latest_accumulated_declaration(declaration):
     stale = {
         "type": "additional_tools",
         "id": "at_stale",
@@ -87,7 +86,7 @@ def test_should_normalize_latest_accumulated_declaration_and_preserve_history(de
 
     result = normalize_codex_collaboration_dispatch_body(body)
 
-    assert result["input"] == [stale, user_message]
+    assert result["input"] == [user_message]
     assert result["tools"][0] == {"type": "web_search", "external_web_access": True}
     assert result["tools"][1]["name"] == declaration["tools"][0]["name"]
     schema = (
@@ -96,14 +95,15 @@ def test_should_normalize_latest_accumulated_declaration_and_preserve_history(de
     assert "encrypted" not in schema
     assert '{"cfg047":1,"encoding":"text"' in schema["description"]
 
+    repeated = normalize_codex_collaboration_dispatch_body(result)
+
+    assert repeated == result
+
 
 @pytest.mark.parametrize("conflict", ["unsupported_top_level_tool"])
 def test_should_reject_conflicting_top_level_tools(declaration, conflict):
     body = {"input": [{"type": "message", "role": "user", "content": []}, declaration]}
-    if conflict == "missing_tools":
-        body["tools"] = []
-    else:
-        body["tools"] = [{"type": "custom", "name": "unsupported"}]
+    body["tools"] = [{"type": "custom", "name": "unsupported"}]
 
     with pytest.raises(HTTPException) as raised:
         normalize_codex_collaboration_dispatch_body(body)

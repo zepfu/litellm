@@ -938,9 +938,12 @@ def _normalize_tool_schemas_without_error_mapping(
             if hosted_tools is not None:
                 declared_tools = hosted_tools + tools
             normalized_body["tools"] = declared_tools
-            normalized_body["input"] = (
-                input_items[:declaration_index] + input_items[declaration_index + 1 :]
-            )
+            declaration_indexes_set = set(declaration_indexes)
+            normalized_body["input"] = [
+                item
+                for index, item in enumerate(input_items)
+                if index not in declaration_indexes_set
+            ]
             changed = True
     for key in ("tools", "functions"):
         normalized_tools, tools_changed = _normalize_tool_list(
