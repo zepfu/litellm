@@ -459,6 +459,35 @@ def _configure_runtime(
     return codex_home
 
 
+def _generic_failure_sse_response(
+    *, committed_output: bool, status_code: int | None,
+) -> httpx.Response:
+    output = []
+    if committed_output:
+        output.append({
+            "id": "msg_1", "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "Already produced"}],
+        })
+    event = {
+        "type": "response.failed",
+        "sequence_number": 1,
+        "response": {
+            "id": "resp_failed", "status": "failed", "output": output,
+            "error": {
+                "code": "server_error", "type": "server_error",
+                "message": "An error occurred while processing your request.",
+            },
+        },
+    }
+    if status_code is not None:
+        event["response"]["error"]["status_code"] = status_code
+    return httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        stream=_RawSseStream(f"data: {json.dumps(event)}\n\n".encode()),
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("outcome", "expected_sends"),
@@ -526,29 +555,9 @@ async def test_direct_codex_generic_precommit_failure(
             raise asyncio.CancelledError
         if len(sends) == 2 and outcome == "recovered":
             return _sse_response("Recovered", outgoing, response_id="resp_recovered")
-        output = []
-        if outcome == "committed_output":
-            output.append({
-                "id": "msg_1", "type": "message", "role": "assistant",
-                "content": [{"type": "output_text", "text": "Already produced"}],
-            })
-        event = {
-            "type": "response.failed",
-            "sequence_number": 1,
-            "response": {
-                "id": "resp_failed", "status": "failed", "output": output,
-                "error": {
-                    "code": "server_error", "type": "server_error",
-                    "message": "An error occurred while processing your request.",
-                },
-            },
-        }
-        if outcome == "repeated_failure":
-            event["response"]["error"]["status_code"] = 529
-        return httpx.Response(
-            200,
-            headers={"content-type": "text/event-stream"},
-            stream=_RawSseStream(f"data: {json.dumps(event)}\n\n".encode()),
+        return _generic_failure_sse_response(
+            committed_output=outcome == "committed_output",
+            status_code=529 if outcome == "repeated_failure" else None,
         )
 
     async def run():
