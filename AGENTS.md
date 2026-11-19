@@ -123,6 +123,16 @@ Before activation, verify every bind source exists with the expected file or
 directory type and will survive routine cleanup and reboot. Confirm the
 runtime revision, then verify startup and health after a restart or recreation.
 
+## Alpha Activation
+
+The repository-root checkout is alpha's persistent deployment source. Promote
+reviewed code there and use the existing watcher's automatic reload.
+Idle checks are never required for alpha delivery. Do not check or wait for
+idle traffic, an empty backlog, drained requests, or a maintenance window.
+Active traffic does not block promotion or reload and does not require
+another approval. Verify effective source and bounded behavior after reload;
+preserve the workflow's exclusions for other runtimes.
+
 ## Dashboard Constraints
 
 - Reuse `ui/litellm-dashboard` common components. Do not introduce Tremor
