@@ -194,7 +194,43 @@ class TestCohereV2NamespaceCollisionTranslation:
         }
         assert namespace_by_name == {("run", "ops"): "ops"}
 
-    def test_rejects_actual_wire_name_collision(self) -> None:
+    @pytest.mark.parametrize(
+        "namespace_a,namespace_b,name",
+        [
+            ("functions.collaboration", "functions_collaboration", "wait"),
+            ("1ops", "_1ops", "run"),
+        ],
+    )
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_rejects_sanitized_namespace_wire_collisions(
+        self,
+        namespace_a: str,
+        namespace_b: str,
+        name: str,
+        reverse: bool,
+    ) -> None:
+        tools = [
+            {
+                "type": "namespace",
+                "name": namespace_a,
+                "tools": [
+                    {"type": "function", "name": name, "parameters": {"type": "object"}}
+                ],
+            },
+            {
+                "type": "namespace",
+                "name": namespace_b,
+                "tools": [
+                    {"type": "function", "name": name, "parameters": {"type": "object"}}
+                ],
+            },
+        ]
+        if reverse:
+            tools.reverse()
+        with pytest.raises(UnsupportedParamsError, match="reuses function name"):
+            translate_cohere_v2_responses_tools(tools)
+
+    def test_rejects_namespace_wire_name_colliding_with_bare_name(self) -> None:
         tools = [
             {
                 "type": "function",
@@ -215,6 +251,53 @@ class TestCohereV2NamespaceCollisionTranslation:
         ]
         with pytest.raises(UnsupportedParamsError, match="reuses function name"):
             translate_cohere_v2_responses_tools(tools)
+
+    def test_rejects_same_identity_flat_and_container_responses_tool(self) -> None:
+        flat = {
+            "type": "function",
+            "namespace": "ops",
+            "name": "run",
+            "parameters": {"type": "object", "properties": {}},
+        }
+        nested = {
+            "type": "namespace",
+            "name": "ops",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "run",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+        }
+        with pytest.raises(UnsupportedParamsError):
+            translate_cohere_v2_responses_request({"tools": [flat, nested]})
+
+    def test_rejects_duplicate_bare_nested_direct_chat_functions(self) -> None:
+        duplicate_namespace = {
+            "type": "namespace",
+            "name": "ops",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "run",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+                {
+                    "type": "function",
+                    "name": "run",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            ],
+        }
+        with pytest.raises(UnsupportedParamsError):
+            CohereV2ChatConfig().transform_request(
+                model="command-r-plus-latest",
+                messages=[],
+                optional_params={"tools": [duplicate_namespace]},
+                litellm_params={},
+                headers={},
+            )
 
     def test_rejects_ambiguous_basename_tool_choice(self) -> None:
         _, namespace_by_name = translate_cohere_v2_responses_tools(self._tools())

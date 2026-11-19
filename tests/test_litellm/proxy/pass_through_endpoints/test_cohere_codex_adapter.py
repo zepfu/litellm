@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import importlib
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -16,11 +17,13 @@ from fastapi import HTTPException
 from fastapi.responses import Response
 from fastapi.responses import StreamingResponse
 
+from litellm.exceptions import UnsupportedParamsError
 from litellm.proxy._types import ProxyException
 
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
     codex_candidate_calls,
 )
+from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     adapter_driver,
     candidate_loop,
@@ -545,6 +548,331 @@ async def test_should_prepare_valid_cohere_candidate_and_map_upstream_model(cohe
     assert plan.perform_kwargs["completion_kwargs"]["model"] == "command-r-plus"
     assert plan.api_key == COHERE_KEY
     assert str(plan.target_url) == COHERE_TARGET
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.asyncio
+async def test_cohere_route_preparation_round_trips_stock_namespace_identity(
+    cohere_host, streaming
+):
+    body = {
+        "model": "cohere/command-r-plus",
+        "stream": streaming,
+        "input": [
+            {"role": "user", "content": "wait for collaboration"},
+            {
+                "type": "function_call",
+                "name": "wait_agent",
+                "namespace": "functions.collaboration",
+                "call_id": "call_wait_1",
+                "arguments": '{"timeout_ms":3}',
+            },
+            {
+                "type": "function_call_output",
+                "namespace": "functions.collaboration",
+                "call_id": "call_wait_1",
+                "output": "wait completed",
+            },
+        ],
+        "tools": [
+            {
+                "type": "namespace",
+                "name": "functions.collaboration",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "wait_agent",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"timeout_ms": {"type": "integer"}},
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+    plan = await _prepare(cohere_host, stream=streaming, body=body)
+    advertised_tool = plan.perform_kwargs["responses_api_request"]["tools"][0]
+    wire_name = advertised_tool["name"]
+    assert re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", wire_name)
+    assert plan.perform_kwargs["request_input"][1]["name"] == wire_name
+    assert plan.perform_kwargs["request_input"][1]["call_id"] == "call_wait_1"
+    assert plan.perform_kwargs["request_input"][1]["arguments"] == '{"timeout_ms":3}'
+    assert plan.perform_kwargs["request_input"][2]["call_id"] == "call_wait_1"
+    assert plan.perform_kwargs["request_input"][2]["output"] == "wait completed"
+
+    provider_item = {
+        "type": "function_call",
+        "name": wire_name,
+        "call_id": "call_wait_1",
+        "arguments": '{"timeout_ms":3}',
+    }
+    if not streaming:
+        restored, count = lpe._restore_adapted_namespace_tool_calls_in_response_body(
+            {"output": [provider_item]},
+            request_body=body,
+            adapter_model="cohere/command-r-plus",
+        )
+        assert count == 1
+        assert restored["output"][0] == {
+            **provider_item,
+            "name": "wait_agent",
+            "namespace": "functions.collaboration",
+        }
+        return
+
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+        tool_call_restore,
+    )
+
+    events = [
+        {
+            "type": "response.output_item.done",
+            "item": provider_item,
+        },
+        {
+            "type": "response.function_call_arguments.done",
+            "name": wire_name,
+            "call_id": "call_wait_1",
+            "arguments": '{"timeout_ms":3}',
+        },
+        {
+            "type": "response.completed",
+            "response": {"output": [provider_item]},
+        },
+    ]
+
+    async def upstream_events():
+        for event in events:
+            event_type = event["type"]
+            yield f"event: {event_type}\ndata: {json.dumps(event)}\n\n".encode()
+
+    upstream = StreamingResponse(upstream_events(), media_type="text/event-stream")
+    restored_stream = tool_call_restore._restore_adapted_namespace_tool_calls_in_streaming_response(
+        upstream,
+        request_body=body,
+        adapter_model="cohere/command-r-plus",
+    )
+    stream_chunks = [chunk async for chunk in restored_stream.body_iterator]
+    stream_bytes = b"".join(
+        chunk.encode() if isinstance(chunk, str) else chunk for chunk in stream_chunks
+    )
+    restored_events = [
+        json.loads(line[6:])
+        for line in stream_bytes.decode().splitlines()
+        if line.startswith("data: ")
+    ]
+    assert restored_events[0]["item"]["name"] == "wait_agent"
+    assert restored_events[0]["item"]["namespace"] == "functions.collaboration"
+    assert restored_events[0]["item"]["call_id"] == "call_wait_1"
+    assert restored_events[1]["name"] == "wait_agent"
+    assert restored_events[1]["namespace"] == "functions.collaboration"
+    assert restored_events[1]["arguments"] == '{"timeout_ms":3}'
+    assert restored_events[2]["response"]["output"][0]["name"] == "wait_agent"
+    assert restored_events[2]["response"]["output"][0]["namespace"] == (
+        "functions.collaboration"
+    )
+
+
+@pytest.mark.parametrize("namespaced_first", [False, True])
+@pytest.mark.parametrize("include_bare_ops", [False, True])
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.asyncio
+async def test_cohere_route_preparation_preserves_flat_and_bare_schemas(
+    cohere_host, namespaced_first, include_bare_ops, streaming
+):
+    namespaced_tool = {
+        "type": "function",
+        "namespace": "ops",
+        "name": "run",
+        "parameters": {
+            "type": "object",
+            "properties": {"n": {"type": "integer"}},
+        },
+    }
+    bare_run_tool = {
+        "type": "function",
+        "name": "run",
+        "parameters": {
+            "type": "object",
+            "properties": {"n": {"type": "number"}},
+        },
+    }
+    bare_ops_tool = {
+        "type": "function",
+        "name": "ops",
+        "parameters": {
+            "type": "object",
+            "properties": {"n": {"type": "number"}},
+        },
+    }
+    bare_tools = [bare_run_tool, *([bare_ops_tool] if include_bare_ops else [])]
+    tools = [namespaced_tool, *bare_tools] if namespaced_first else [*bare_tools, namespaced_tool]
+    body = {
+        "model": "cohere/command-r-plus",
+        "input": "return tool calls",
+        "tools": tools,
+        "stream": streaming,
+    }
+    plan = await _prepare(cohere_host, stream=streaming, body=body)
+    emitted = plan.perform_kwargs["responses_api_request"]["tools"]
+    namespaced_index = 0 if namespaced_first else len(emitted) - 1
+    namespaced_wire_name = emitted[namespaced_index]["name"]
+    emitted_bare_names = [
+        tool["name"] for index, tool in enumerate(emitted) if index != namespaced_index
+    ]
+    assert all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) for name in emitted_bare_names)
+    assert namespaced_wire_name not in emitted_bare_names
+
+    provider_calls = [
+        {
+            "type": "function_call",
+            "name": namespaced_wire_name,
+            "call_id": "call_namespaced",
+            "arguments": '{"n":3.0}',
+        }
+    ]
+    bare_indexes = [index for index in range(len(emitted)) if index != namespaced_index]
+    provider_calls.extend(
+        [
+            {
+                "type": "function_call",
+                "name": emitted[bare_indexes[0]]["name"],
+                "call_id": "call_bare_run",
+                "arguments": '{"n":3.0}',
+            },
+            *(
+                [
+                    {
+                        "type": "function_call",
+                        "name": emitted[bare_indexes[1]]["name"],
+                        "call_id": "call_bare_ops",
+                        "arguments": '{"n":3.0}',
+                    }
+                ]
+                if include_bare_ops
+                else []
+            ),
+        ]
+    )
+
+    def assert_restored_calls(items):
+        restored_by_call_id = {item["call_id"]: item for item in items}
+        expectations = [("call_bare_run", "run", None, float)]
+        if include_bare_ops:
+            expectations.append(("call_bare_ops", "ops", None, float))
+        expectations.append(("call_namespaced", "run", "ops", int))
+        for call_id, name, namespace, value_type in expectations:
+            item = restored_by_call_id[call_id]
+            assert (item["name"], item.get("namespace")) == (name, namespace)
+            assert item["arguments"] == (
+                '{"n":3}' if value_type is int else '{"n":3.0}'
+            )
+            value = json.loads(item["arguments"])["n"]
+            assert isinstance(value, value_type)
+            if value_type is int:
+                assert not isinstance(value, bool)
+
+    if not streaming:
+        restored, _ = lpe._restore_adapted_namespace_tool_calls_in_response_body(
+            {"output": provider_calls},
+            request_body=body,
+            adapter_model="cohere/command-r-plus",
+        )
+        assert_restored_calls(restored["output"])
+        return
+
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+        tool_call_restore,
+    )
+
+    events = [
+        {
+            "type": "response.output_item.done",
+            "item": call,
+        }
+        for call in provider_calls
+    ]
+    events.extend(
+        {
+            "type": "response.function_call_arguments.done",
+            "name": call["name"],
+            "call_id": call["call_id"],
+            "arguments": call["arguments"],
+        }
+        for call in provider_calls
+    )
+    events.append(
+        {
+            "type": "response.completed",
+            "response": {"output": provider_calls},
+        }
+    )
+
+    async def upstream_events():
+        for event in events:
+            event_type = event["type"]
+            yield f"event: {event_type}\ndata: {json.dumps(event)}\n\n".encode()
+
+    upstream = StreamingResponse(upstream_events(), media_type="text/event-stream")
+    restored_stream = tool_call_restore._restore_adapted_namespace_tool_calls_in_streaming_response(
+        upstream,
+        request_body=body,
+        adapter_model="cohere/command-r-plus",
+    )
+    stream_chunks = [chunk async for chunk in restored_stream.body_iterator]
+    stream_bytes = b"".join(
+        chunk.encode() if isinstance(chunk, str) else chunk for chunk in stream_chunks
+    )
+    restored_events = [
+        json.loads(line[6:])
+        for line in stream_bytes.decode().splitlines()
+        if line.startswith("data: ")
+    ]
+    item_events = [
+        event["item"]
+        for event in restored_events
+        if event["type"] == "response.output_item.done"
+    ]
+    args_events = [
+        event
+        for event in restored_events
+        if event["type"] == "response.function_call_arguments.done"
+    ]
+    terminal = next(
+        event["response"]["output"]
+        for event in restored_events
+        if event["type"] == "response.completed"
+    )
+    assert_restored_calls(item_events)
+    assert_restored_calls(args_events)
+    assert_restored_calls(terminal)
+
+
+@pytest.mark.asyncio
+async def test_cohere_route_preparation_rejects_bare_only_duplicate_before_egress(
+    cohere_host,
+):
+    duplicate_tool = {
+        "type": "function",
+        "name": "run",
+        "parameters": {"type": "object", "properties": {}},
+    }
+    body = {
+        "model": "cohere/command-r-plus",
+        "input": "run",
+        "tools": [duplicate_tool, copy.deepcopy(duplicate_tool)],
+    }
+    error = None
+    try:
+        await _prepare(cohere_host, body=body)
+    except UnsupportedParamsError as exc:
+        error = exc
+    assert (
+        isinstance(error, UnsupportedParamsError),
+        cohere_host.egress.call_count,
+        cohere_host.completion.await_count,
+    ) == (True, 0, 0)
 
 
 @pytest.mark.asyncio

@@ -463,7 +463,6 @@ class TestNamespaceToolRestore:
         assert ns_count == 0
         assert ns_result is body
 
-
 # ===========================================================================
 # SECTION 4B - Schema-driven integer argument repair
 # ===========================================================================
