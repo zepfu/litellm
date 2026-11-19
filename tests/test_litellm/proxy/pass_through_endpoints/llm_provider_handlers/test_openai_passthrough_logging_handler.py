@@ -1335,6 +1335,64 @@ class TestOpenAIPassthroughLoggingHandler:
         assert "API_KEY=leaked" not in metadata_json
         assert '"arguments"' not in metadata_json
 
+    @patch("litellm.completion_cost")
+    def test_openai_streaming_handler_preserves_rebuild_for_unpriced_reference_contract(
+        self, mock_completion_cost
+    ):
+        mock_completion_cost.side_effect = Exception("This model isn't mapped yet")
+
+        mock_logging_obj = self._create_mock_logging_obj()
+        mock_logging_obj.model_call_details = {
+            "custom_llm_provider": "openai",
+            "litellm_params": {},
+        }
+
+        streaming_chunks = [
+            'event: response.created',
+            'data: {"type":"response.created","response":{"id":"resp-daybreak","object":"response","created_at":1775868809,"status":"in_progress","model":"gpt-daybreak-blue-latest","output":[]}}',
+            'event: response.output_item.added',
+            'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_daybreak","id":"fc_daybreak","name":"Bash","arguments":""}}',
+            'event: response.function_call_arguments.done',
+            'data: {"type":"response.function_call_arguments.done","item_id":"fc_daybreak","output_index":0,"arguments":"{\\"command\\":\\"pwd\\"}"}',
+            'event: response.completed',
+            'data: {"type":"response.completed","response":{"id":"resp-daybreak","object":"response","created_at":1775868809,"status":"completed","model":"gpt-daybreak-blue-latest","output":[],"usage":{"input_tokens":271,"output_tokens":7,"total_tokens":278}}}',
+        ]
+
+        result = OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks(
+            litellm_logging_obj=mock_logging_obj,
+            passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
+            url_route="https://api.openai.com/v1/responses",
+            request_body={"model": "gpt-daybreak-blue-latest", "input": "unpriced"},
+            endpoint_type="openai",
+            start_time=self.start_time,
+            all_chunks=streaming_chunks,
+            end_time=self.end_time,
+        )
+
+        usage = result["result"].usage
+        standard_logging_object = result["kwargs"]["standard_logging_object"]
+        assert result["result"] is not None
+        assert result["result"].id == "resp-daybreak"
+        assert result["result"]._hidden_params["responses_output"] == [
+            {
+                "type": "function_call",
+                "call_id": "call_daybreak",
+                "id": "fc_daybreak",
+                "name": "Bash",
+                "arguments": '{"command":"pwd"}',
+            }
+        ]
+        assert usage.prompt_tokens == 271
+        assert usage.completion_tokens == 7
+        assert usage.total_tokens == 278
+        assert standard_logging_object["prompt_tokens"] == 271
+        assert standard_logging_object["completion_tokens"] == 7
+        assert standard_logging_object["total_tokens"] == 278
+        assert "response_cost" not in result["kwargs"]
+        assert "response_cost" not in mock_logging_obj.model_call_details
+        mock_completion_cost.assert_called_once()
+        assert mock_completion_cost.call_args.kwargs["call_type"] == "responses"
+
     def test_openai_passthrough_handler_adds_codex_usage_normalize_span(self):
         codex_response = {
             "id": "resp-codex-span-test",

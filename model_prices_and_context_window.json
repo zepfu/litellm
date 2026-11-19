@@ -43793,5 +43793,109 @@
         "supports_function_calling": true,
         "supports_reasoning": true,
         "supports_tool_choice": true
+    },
+    "gpt-daybreak-blue-latest": {
+        "litellm_provider": "openai",
+        "max_input_tokens": 872000,
+        "mode": "chat",
+        "provider_specific_entry": {
+            "openai": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "unpriced",
+                    "kind": "hosted_route_reference",
+                    "billing_mode": "openai_hosted_route",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "openai",
+                        "model": "gpt-daybreak-blue-latest"
+                    },
+                    "cache_mode": "none",
+                    "equivalence_status": "not_exact",
+                    "equivalence_evidence": "Authenticated OpenAI model catalog confirms the exact Daybreak Blue route and capabilities but does not publish a per-token tariff; no price is inferred from another model.",
+                    "source": {
+                        "kind": "authenticated_provider_model_catalog",
+                        "label": "AAWM authenticated OpenAI model catalog",
+                        "urls": [
+                            "https://chatgpt.com/backend-api/codex/models"
+                        ],
+                        "version": "2026-11-19",
+                        "verified_on": "2026-11-19"
+                    },
+                    "unpriced_reason": "exact_tariff_unavailable"
+                }
+            }
+        },
+        "supported_endpoints": [
+            "/v1/chat/completions",
+            "/v1/responses"
+        ],
+        "supported_modalities": [
+            "text",
+            "image"
+        ],
+        "supported_output_modalities": [
+            "text"
+        ],
+        "supports_function_calling": true,
+        "supports_native_streaming": true,
+        "supports_parallel_function_calling": true,
+        "supports_reasoning": true,
+        "supports_reasoning_summary": true,
+        "supports_vision": true,
+        "supports_xhigh_reasoning_effort": true
+    },
+    "openai/gpt-daybreak-blue-latest": {
+        "litellm_provider": "openai",
+        "max_input_tokens": 872000,
+        "mode": "chat",
+        "provider_specific_entry": {
+            "openai": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "unpriced",
+                    "kind": "hosted_route_reference",
+                    "billing_mode": "openai_hosted_route",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "openai",
+                        "model": "gpt-daybreak-blue-latest"
+                    },
+                    "cache_mode": "none",
+                    "equivalence_status": "not_exact",
+                    "equivalence_evidence": "Authenticated OpenAI model catalog confirms the exact Daybreak Blue route and capabilities but does not publish a per-token tariff; no price is inferred from another model.",
+                    "source": {
+                        "kind": "authenticated_provider_model_catalog",
+                        "label": "AAWM authenticated OpenAI model catalog",
+                        "urls": [
+                            "https://chatgpt.com/backend-api/codex/models"
+                        ],
+                        "version": "2026-11-19",
+                        "verified_on": "2026-11-19"
+                    },
+                    "unpriced_reason": "exact_tariff_unavailable"
+                }
+            }
+        },
+        "supported_endpoints": [
+            "/v1/chat/completions",
+            "/v1/responses"
+        ],
+        "supported_modalities": [
+            "text",
+            "image"
+        ],
+        "supported_output_modalities": [
+            "text"
+        ],
+        "supports_function_calling": true,
+        "supports_native_streaming": true,
+        "supports_parallel_function_calling": true,
+        "supports_reasoning": true,
+        "supports_reasoning_summary": true,
+        "supports_vision": true,
+        "supports_xhigh_reasoning_effort": true
     }
 }
