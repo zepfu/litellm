@@ -459,6 +459,142 @@ def _configure_runtime(
     return codex_home
 
 
+def _generic_failure_sse_response(
+    *, committed_output: bool, status_code: int | None,
+) -> httpx.Response:
+    output = []
+    if committed_output:
+        output.append({
+            "id": "msg_1", "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "Already produced"}],
+        })
+    event = {
+        "type": "response.failed",
+        "sequence_number": 1,
+        "response": {
+            "id": "resp_failed", "status": "failed", "output": output,
+            "error": {
+                "code": "server_error", "type": "server_error",
+                "message": "An error occurred while processing your request.",
+            },
+        },
+    }
+    if status_code is not None:
+        event["response"]["error"]["status_code"] = status_code
+    return httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        stream=_RawSseStream(f"data: {json.dumps(event)}\n\n".encode()),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "expected_sends"),
+    [
+        ("recovered", 2),
+        ("repeated_failure", 2),
+        ("committed_output", 1),
+        ("deadline", 1),
+        ("cancelled", 1),
+    ],
+)
+async def test_direct_codex_generic_precommit_failure(
+    monkeypatch, tmp_path, outcome, expected_sends,
+):
+    from starlette.requests import Request
+    from starlette.responses import Response
+
+    from litellm.proxy._types import ProxyException, UserAPIKeyAuth
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.capacity_recovery import (
+        get_or_create_capacity_recovery_owner,
+    )
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        openai_proxy_route,
+    )
+
+    _configure_runtime(
+        monkeypatch, tmp_path, source_account=ACCOUNT1, fallback_account=ACCOUNT2,
+    )
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    cache = _FakeDualCache(_FakeRedisCache())
+    monkeypatch.setattr(durable, "_dual_cache_override", lambda: cache)
+    body = {"model": MODEL, "stream": True, "input": "Hello"}
+
+    body_sent = False
+
+    async def receive():
+        nonlocal body_sent
+        if body_sent:
+            await asyncio.Event().wait()
+        body_sent = True
+        return {"type": "http.request", "body": json.dumps(body).encode()}
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/openai_passthrough/v1/responses",
+            "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+        },
+        receive=receive,
+    )
+    if outcome == "deadline":
+        get_or_create_capacity_recovery_owner(request, deadline_seconds=0)
+
+    sends = []
+
+    def dispatch(outgoing: httpx.Request) -> httpx.Response:
+        sends.append(
+            (outgoing.headers["ChatGPT-Account-Id"], outgoing.headers["Authorization"])
+        )
+        assert len(sends) <= expected_sends, "unexpected additional provider send"
+        if outcome == "cancelled":
+            raise asyncio.CancelledError
+        if len(sends) == 2 and outcome == "recovered":
+            return _sse_response("Recovered", outgoing, response_id="resp_recovered")
+        return _generic_failure_sse_response(
+            committed_output=outcome == "committed_output",
+            status_code=529 if outcome == "repeated_failure" else None,
+        )
+
+    async def run():
+        response = await openai_proxy_route(
+            endpoint="v1/responses", request=request, fastapi_response=Response(),
+            user_api_key_dict=UserAPIKeyAuth(),
+        )
+        chunks = [
+            chunk.encode() if isinstance(chunk, str) else chunk
+            async for chunk in response.body_iterator
+        ]
+        return b"".join(chunks)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(dispatch)) as client:
+        monkeypatch.setattr(
+            pte, "get_async_httpx_client", lambda *a, **kw: SimpleNamespace(client=client),
+        )
+        if outcome in {"repeated_failure", "deadline"}:
+            with pytest.raises(ProxyException) as failure:
+                await asyncio.wait_for(run(), timeout=5)
+            expected_status = "529" if outcome == "repeated_failure" else "503"
+            assert failure.value.code == expected_status
+        elif outcome == "cancelled":
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(run(), timeout=5)
+        else:
+            wire = await asyncio.wait_for(run(), timeout=5)
+            expected_event = b"response.completed" if outcome == "recovered" else b"response.failed"
+            assert expected_event in wire
+
+    assert sends == [(ACCOUNT1, f"Bearer {_jwt(ACCOUNT1)}")] * expected_sends
+    ledger = pte.get_request_provider_call_ledger(request)
+    assert ledger.logical_provider_calls == expected_sends
+    if outcome == "recovered":
+        assert ledger.snapshot()["capacity_retry_authorized"] is False
+
+
 @pytest.fixture
 def proxy_harness(
     request: pytest.FixtureRequest,

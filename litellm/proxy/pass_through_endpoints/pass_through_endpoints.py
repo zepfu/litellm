@@ -3666,6 +3666,15 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
 
         if capacity_recovery_owner is None:
             return
+        # The inventory-bound caller decides generic failures using the bound
+        # continuation and its one same-account retry. Observing them here
+        # would cache a decision without that context, including on 429/529.
+        if (
+            getattr(getattr(request, "state", None), "aawm_direct_codex_oauth_inventory", False)
+            and isinstance(exc, ResponsesStreamPreCommitFailure)
+            and exc.error_class == "upstream_transient_internal"
+        ):
+            return
         status_code = _extract_exception_status_code(exc)
         failure_class, _failure_classification, retryable = (
             _classify_passthrough_hidden_retry_failure(exc)
@@ -13511,9 +13520,6 @@ async def pass_through_request(  # noqa: PLR0915
                         for header_name, header_value in upstream_headers.items()
                     },
                 )
-            if getattr(e, "_aawm_provider_returned", False):
-                setattr(proxy_exc, "_aawm_provider_returned", True)
-            raise proxy_exc
         else:
             error_msg = f"{str(e)}"
             proxy_exc = ProxyException(
@@ -13528,9 +13534,21 @@ async def pass_through_request(  # noqa: PLR0915
                     **_get_passthrough_terminal_wire_headers(e),
                 },
             )
-            if getattr(e, "_aawm_provider_returned", False):
-                setattr(proxy_exc, "_aawm_provider_returned", True)
-            raise proxy_exc
+        if getattr(e, "_aawm_provider_returned", False):
+            setattr(proxy_exc, "_aawm_provider_returned", True)
+        # Keep the provider's typed precommit evidence private to the retry
+        # owner. The wire-facing ProxyException retains its sanitized detail.
+        failure = e.__cause__ if isinstance(e, HTTPException) else e
+        if (
+            caller_managed_hidden_retry
+            and getattr(request.state, "aawm_direct_codex_oauth_inventory", False)
+            and isinstance(failure, ResponsesStreamPreCommitFailure)
+            and failure.error_class == "upstream_transient_internal"
+            and failure.provider_returned
+        ):
+            setattr(proxy_exc, "_aawm_provider_returned", True)
+            setattr(proxy_exc, "_aawm_direct_transient_failure", failure)
+        raise proxy_exc
 
 
 def _update_metadata_with_tags_in_header(request: Request, metadata: dict) -> dict:

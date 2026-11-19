@@ -3660,6 +3660,8 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
     provider_status_code = (
         _aawm_error_signals._extract_adapter_exception_status_code(exc)
     )
+    generic_transient = error_class == "upstream_transient_internal"
+    event_type = getattr(exc, "event_type", None) or getattr(exc, "error_type", None)
     capacity_decision = capacity_recovery_owner.observe(
         CapacityRecoveryObservation(
             provider_returned=provider_returned,
@@ -3671,16 +3673,21 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             or bool(request_body.get("previous_response_id")),
             portable_account_failover=portable_account_failover,
             ledger_valid=not getattr(exc, "aawm_call_ledger_exhausted", False),
-            alternate_route_available=bool(
-                current_auth is not None and account_failover_replay_safe
+            same_route_retry_available=(
+                not generic_transient or capacity_recovery_owner.retry_ordinal == 0
             ),
-            redispatch_available=bool(account_failover_replay_safe),
+            alternate_route_available=bool(
+                not generic_transient
+                and current_auth is not None
+                and account_failover_replay_safe
+            ),
+            redispatch_available=not generic_transient and bool(account_failover_replay_safe),
             error_payload=(
                 getattr(exc, "error_payload", None)
                 if isinstance(getattr(exc, "error_payload", None), dict)
                 else None
             ),
-            event_type=getattr(exc, "error_type", None),
+            event_type=event_type,
             ledger_snapshot=get_request_provider_call_ledger_snapshot(request),
             observation_key=exc,
         )
@@ -3700,7 +3707,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             request,
             allow_unknown_semantics=(
                 isinstance(getattr(exc, "error_payload", None), dict)
-                and getattr(exc, "error_type", None) == "response.failed"
+                and event_type == "response.failed"
             ),
         )
     wire_replay_blocked = is_openai_wire_replay_prohibited(
@@ -3815,6 +3822,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             "server_overloaded",
             "upstream_overloaded",
             "capacity_exhausted",
+            "upstream_transient_internal",
         }
         and attempted_provider_call
         and provider_returned
@@ -6975,10 +6983,21 @@ async def openai_proxy_route(  # noqa: PLR0915
             ):
                 raise
             direct_account_error_class: Optional[str] = None
+            recovery_exc = exc
+            transient_failure = getattr(exc, "_aawm_direct_transient_failure", None)
             if _aawm_codex_oauth.is_direct_codex_usage_limit_error(exc):
                 direct_account_error_class = "usage_limit_reached"
             elif _aawm_codex_oauth.is_direct_codex_token_invalidated_error(exc):
                 direct_account_error_class = "token_invalidated"
+            elif (
+                use_direct_codex_oauth_inventory
+                and attempted_provider_call
+                and provider_returned
+                and transient_failure is not None
+                and transient_failure.retryable
+            ):
+                direct_account_error_class = transient_failure.error_class
+                recovery_exc = transient_failure
             elif (
                 use_direct_codex_oauth_inventory
                 and attempted_provider_call
@@ -7036,7 +7055,7 @@ async def openai_proxy_route(  # noqa: PLR0915
                 request=request,
                 request_body=request_body,
                 selection=direct_codex_selection_state,
-                exc=exc,
+                exc=recovery_exc,
                 error_class=direct_account_error_class,
                 attempted_provider_call=attempted_provider_call,
                 provider_returned=provider_returned,

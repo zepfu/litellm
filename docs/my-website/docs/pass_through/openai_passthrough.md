@@ -150,6 +150,11 @@ exhaustion preserves accepted complete events before terminating under the
 normal malformed-stream policy. Neither condition permits overload recovery.
 Prefix storage is released before consuming the live remainder.
 
+Direct Codex OAuth requests also use this request-wide owner for retryable
+precommit internal server errors. An authorized same-route retry retains the
+bound account and existing replay, cancellation, deadline and call-budget
+guards. Retry authorization alone does not cause another provider send.
+
 The request-wide capacity deadline and progressive backoff remain in effect
 across attempts. Cancellation ends buffering or backoff and prevents later
 sends. Retry eligibility does not authorize an account change: direct and
