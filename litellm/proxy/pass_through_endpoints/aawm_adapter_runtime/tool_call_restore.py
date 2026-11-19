@@ -65,6 +65,7 @@ _HOST_FUNCTION_NAMES = (
     "_repair_namespace_argument_value",
     "_repair_adapted_namespace_tool_arguments",
     "_attach_namespace_argument_repair_metadata",
+    "_cohere_v2_wire_namespace_identity",
     "_restore_adapted_namespace_tool_call_item",
     "_restore_adapted_namespace_tool_calls_in_response_body",
     "_adapted_custom_tool_stream_state_keys",
@@ -441,12 +442,26 @@ def _attach_namespace_argument_repair_metadata(
     return {**response_body, "litellm_metadata": updated_metadata}
 
 
+def _cohere_v2_wire_namespace_identity(
+    item_name: str,
+    namespace_by_name: dict[tuple[str, Optional[str]], Optional[str]],
+) -> Optional[tuple[str, str]]:
+    matches = [
+        (candidate_name, candidate_namespace)
+        for candidate_name, candidate_namespace in namespace_by_name
+        if candidate_namespace is not None
+        and f"{candidate_namespace}__{candidate_name}" == item_name
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _restore_adapted_namespace_tool_call_item(
     item: Any,
     *,
     namespace_by_name: dict[tuple[str, Optional[str]], Optional[str]],
     schema_by_name: Optional[dict[tuple[str, Optional[str]], dict[str, Any]]] = None,
     repair_records: Optional[list[dict[str, Any]]] = None,
+    cohere_v2_wire_names: bool = False,
 ) -> tuple[Any, int]:
     if not isinstance(item, dict) or item.get("type") != "function_call":
         return item, 0
@@ -459,8 +474,15 @@ def _restore_adapted_namespace_tool_call_item(
     item_namespace = item.get("namespace")
     lookup_name = item_name
     wire_namespace: Optional[str] = None
+    wire_identity = (
+        _cohere_v2_wire_namespace_identity(item_name, namespace_by_name)
+        if item_namespace is None and cohere_v2_wire_names
+        else None
+    )
+    if wire_identity is not None:
+        lookup_name, wire_namespace = wire_identity
     qualified_namespace, separator, basename = item_name.rpartition(".")
-    if separator and basename:
+    if wire_namespace is None and separator and basename:
         lookup_name = basename
         wire_namespace = qualified_namespace
 
@@ -468,7 +490,12 @@ def _restore_adapted_namespace_tool_call_item(
     namespace = namespace_by_name.get((lookup_name, lookup_namespace))
     if namespace is None and isinstance(item_namespace, str) and item_namespace:
         namespace = namespace_by_name.get((lookup_name, None))
-    if namespace is None and not isinstance(item_namespace, str):
+    explicit_bare_identity = (
+        lookup_namespace is None
+        and (lookup_name, None) in namespace_by_name
+        and namespace_by_name[(lookup_name, None)] is None
+    )
+    if namespace is None and not isinstance(item_namespace, str) and not explicit_bare_identity:
         namespace = namespace_by_name.get((lookup_name, None))
         if namespace is None:
             namespace_candidates = [
@@ -521,14 +548,24 @@ def _namespace_schema_for_restored_tool_call(
     item_name: Optional[str],
     item_namespace: Any,
     schema_by_name: Optional[dict[tuple[str, Optional[str]], dict[str, Any]]],
+    cohere_v2_wire_names: bool = False,
 ) -> Optional[dict[str, Any]]:
     """Resolve the schema for a restored call from wire or advertised identity."""
     if schema_by_name is None or item_name is None:
         return None
     lookup_name = item_name
     wire_namespace: Optional[str] = None
+    if cohere_v2_wire_names and item_namespace is None:
+        wire_matches = [
+            (candidate_name, candidate_namespace)
+            for candidate_name, candidate_namespace in schema_by_name
+            if candidate_namespace is not None
+            and f"{candidate_namespace}__{candidate_name}" == item_name
+        ]
+        if len(wire_matches) == 1:
+            lookup_name, wire_namespace = wire_matches[0]
     qualified_namespace, separator, basename = item_name.rpartition(".")
-    if separator and basename:
+    if wire_namespace is None and separator and basename:
         lookup_name = basename
         wire_namespace = qualified_namespace
     lookup_namespace = wire_namespace if item_namespace is None else item_namespace
@@ -556,6 +593,11 @@ def _restore_adapted_namespace_tool_calls_in_response_body(
     )
     if not namespace_by_name:
         return response_body, 0
+    cohere_v2_wire_names = bool(
+        _explicit_cohere_v2_namespace_function_map(request_body)
+        if isinstance(request_body, dict)
+        else {}
+    )
 
     output = response_body.get("output")
     if not isinstance(output, list):
@@ -571,6 +613,7 @@ def _restore_adapted_namespace_tool_calls_in_response_body(
             namespace_by_name=namespace_by_name,
             schema_by_name=schema_by_name,
             repair_records=repair_records,
+            cohere_v2_wire_names=cohere_v2_wire_names,
         )
         restored_output.append(restored_item)
         restored_count += item_restored_count
@@ -1074,6 +1117,7 @@ def _restore_adapted_namespace_tool_calls_in_stream_event_payload(
     namespace_by_name: dict[tuple[str, Optional[str]], Optional[str]],
     schema_by_name: Optional[dict[tuple[str, Optional[str]], dict[str, Any]]] = None,
     repair_records: Optional[list[dict[str, Any]]] = None,
+    cohere_v2_wire_names: bool = False,
 ) -> tuple[dict[str, Any], int]:
     restored_payload = event_payload
     restored_count = 0
@@ -1083,6 +1127,7 @@ def _restore_adapted_namespace_tool_calls_in_stream_event_payload(
         namespace_by_name=namespace_by_name,
         schema_by_name=schema_by_name,
         repair_records=repair_records,
+        cohere_v2_wire_names=cohere_v2_wire_names,
     )
     if item_restored_count:
         restored_payload = dict(restored_payload)
@@ -1092,18 +1137,36 @@ def _restore_adapted_namespace_tool_calls_in_stream_event_payload(
     if event_payload.get("type") == "response.function_call_arguments.done":
         raw_name = event_payload.get("name")
         item_name = raw_name if isinstance(raw_name, str) and raw_name else None
+        item_namespace = event_payload.get("namespace")
+        wire_identity = (
+            _cohere_v2_wire_namespace_identity(item_name, namespace_by_name)
+            if cohere_v2_wire_names
+            and item_name is not None
+            and item_namespace is None
+            else None
+        )
+        if wire_identity is not None:
+            restored_payload = {
+                **restored_payload,
+                "name": wire_identity[0],
+                "namespace": wire_identity[1],
+            }
+            item_name, item_namespace = wire_identity
+            restored_count += 1
         if item_name is None and isinstance(item, dict):
             nested_name = item.get("name")
             item_name = (
                 nested_name if isinstance(nested_name, str) and nested_name else None
             )
-        item_namespace = item.get("namespace") if isinstance(item, dict) else None
+        if item_namespace is None and isinstance(item, dict):
+            item_namespace = item.get("namespace")
         if item_namespace is not None and not isinstance(item_namespace, str):
             item_namespace = None
         schema = _namespace_schema_for_restored_tool_call(
             item_name=item_name,
             item_namespace=item_namespace,
             schema_by_name=schema_by_name,
+            cohere_v2_wire_names=cohere_v2_wire_names,
         )
         if schema is not None:
             repaired_arguments, repaired_fields = (
@@ -1137,6 +1200,7 @@ def _restore_adapted_namespace_tool_calls_in_stream_event_payload(
                     namespace_by_name=namespace_by_name,
                     schema_by_name=schema_by_name,
                     repair_records=repair_records,
+                    cohere_v2_wire_names=cohere_v2_wire_names,
                 )
                 restored_output.append(restored_item)
                 response_restored_count += output_item_restored_count
@@ -1157,6 +1221,7 @@ def _restore_adapted_namespace_tool_calls_in_sse_event_block(
     namespace_by_name: dict[tuple[str, Optional[str]], Optional[str]],
     schema_by_name: Optional[dict[tuple[str, Optional[str]], dict[str, Any]]] = None,
     repair_records: Optional[list[dict[str, Any]]] = None,
+    cohere_v2_wire_names: bool = False,
 ) -> tuple[str, int]:
     lines = event_block.splitlines()
     data_line_indexes = [index for index, line in enumerate(lines) if line.startswith("data:")]
@@ -1178,6 +1243,7 @@ def _restore_adapted_namespace_tool_calls_in_sse_event_block(
         namespace_by_name=namespace_by_name,
         schema_by_name=schema_by_name,
         repair_records=repair_records,
+        cohere_v2_wire_names=cohere_v2_wire_names,
     )
     if not restored_count:
         return event_block, 0
@@ -1208,6 +1274,11 @@ def _restore_adapted_namespace_tool_calls_in_streaming_response(
     )
     if not namespace_by_name:
         return response
+    cohere_v2_wire_names = bool(
+        _explicit_cohere_v2_namespace_function_map(request_body)
+        if isinstance(request_body, dict)
+        else {}
+    )
 
     schema_by_name = _advertised_namespace_tool_argument_schemas(request_body)
     original_iterator = response.body_iterator
@@ -1229,6 +1300,7 @@ def _restore_adapted_namespace_tool_calls_in_streaming_response(
                         payload,
                         namespace_by_name=namespace_by_name,
                         schema_by_name=schema_by_name,
+                        cohere_v2_wire_names=cohere_v2_wire_names,
                     ),
                 )
             else:
@@ -1236,6 +1308,7 @@ def _restore_adapted_namespace_tool_calls_in_streaming_response(
                     event_block,
                     namespace_by_name=namespace_by_name,
                     schema_by_name=schema_by_name,
+                    cohere_v2_wire_names=cohere_v2_wire_names,
                 )
             if restored_block is None:
                 continue

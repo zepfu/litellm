@@ -22,6 +22,7 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.direct_openai_function_call_history import (
     normalize_direct_openai_legacy_function_call_history_ids,
 )
+from litellm.llms.cohere.chat.v2_transformation import translate_cohere_v2_responses_request
 from litellm.responses.litellm_completion_transformation.function_call_identity import (
     generate_responses_custom_tool_call_item_id,
     is_native_responses_custom_tool_call_item_id,
@@ -39,6 +40,7 @@ EXPECTED_SYMBOLS = (
     "_repair_namespace_argument_value",
     "_repair_adapted_namespace_tool_arguments",
     "_attach_namespace_argument_repair_metadata",
+    "_cohere_v2_wire_namespace_identity",
     "_restore_adapted_namespace_tool_call_item",
     "_restore_adapted_namespace_tool_calls_in_response_body",
     "_adapted_custom_tool_stream_state_keys",
@@ -1846,6 +1848,145 @@ class TestNamespaceIdentityRestore:
         )
         assert count == 0
         assert restored is item
+
+    def test_cohere_wire_identity_restores_exact_bare_and_namespaced_calls(
+        self,
+        host_deps: None,
+    ) -> None:
+        source_request = {
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "run",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"timeout_ms": {"type": "number"}},
+                    },
+                },
+                {
+                    "type": "namespace",
+                    "name": "ops",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "run",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"timeout_ms": {"type": "integer"}},
+                            },
+                        }
+                    ],
+                },
+            ],
+            "input": [],
+        }
+        translated_request, _ = translate_cohere_v2_responses_request(
+            source_request
+        )
+        request_for_restore = {
+            **source_request,
+            "litellm_metadata": translated_request["litellm_metadata"],
+        }
+        provider_response = {
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "run",
+                    "call_id": "call_bare",
+                    "arguments": '{"timeout_ms":120000.0}',
+                },
+                {
+                    "type": "function_call",
+                    "name": "ops__run",
+                    "call_id": "call_ops",
+                    "arguments": '{"timeout_ms":120000.0}',
+                },
+            ],
+        }
+
+        restored, count = mod._restore_adapted_namespace_tool_calls_in_response_body(
+            provider_response,
+            request_body=request_for_restore,
+            adapter_model="no-adapter",
+        )
+
+        assert count == 1
+        assert restored["output"][0] == {
+            "type": "function_call",
+            "name": "run",
+            "call_id": "call_bare",
+            "arguments": '{"timeout_ms":120000.0}',
+        }
+        assert restored["output"][1] == {
+            "type": "function_call",
+            "name": "run",
+            "call_id": "call_ops",
+            "namespace": "ops",
+            "arguments": '{"timeout_ms": 120000}',
+        }
+
+        from fastapi.responses import StreamingResponse
+
+        stream_payload = {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "name": "ops__run",
+                "call_id": "call_stream",
+            },
+        }
+
+        async def upstream_events():
+            yield (
+                "event: response.output_item.done\ndata: "
+                + json.dumps(stream_payload)
+                + "\n\n"
+            ).encode()
+
+        upstream = StreamingResponse(
+            upstream_events(),
+            media_type="text/event-stream",
+        )
+        restored_stream = mod._restore_adapted_namespace_tool_calls_in_streaming_response(
+            upstream,
+            request_body=request_for_restore,
+            adapter_model="no-adapter",
+        )
+        stream_chunks = asyncio.run(_collect_response_chunks(restored_stream))
+        stream_wire = b"".join(
+            chunk if isinstance(chunk, bytes) else chunk.encode()
+            for chunk in stream_chunks
+        )
+        streamed = json.loads(stream_wire.split(b"data:", 1)[1].strip())
+        assert streamed["item"]["name"] == "run"
+        assert streamed["item"]["namespace"] == "ops"
+
+        explicit_map = mod._explicit_cohere_v2_namespace_function_map(
+            request_for_restore
+        )
+        arguments_done, arguments_done_count = mod._restore_adapted_namespace_tool_calls_in_stream_event_payload(
+            {
+                "type": "response.function_call_arguments.done",
+                "name": "ops__run",
+                "arguments": '{"timeout_ms":120000.0}',
+            },
+            namespace_by_name=explicit_map,
+            schema_by_name=mod._advertised_namespace_tool_argument_schemas(
+                request_for_restore
+            ),
+            cohere_v2_wire_names=True,
+        )
+        assert arguments_done_count == 2
+        assert arguments_done["name"] == "run"
+        assert arguments_done["namespace"] == "ops"
+        assert arguments_done["arguments"] == '{"timeout_ms": 120000}'
+
+        legacy, legacy_count = mod._restore_adapted_namespace_tool_call_item(
+            {"type": "function_call", "name": "run"},
+            namespace_by_name={("run", "ops"): "ops"},
+        )
+        assert legacy_count == 1
+        assert legacy["namespace"] == "ops"
 
     def test_legacy_string_key_map_attaches_unnamespaced_identity(self) -> None:
         request_body = {

@@ -3,6 +3,7 @@ import sys
 from unittest.mock import MagicMock
 
 import pytest
+from litellm.exceptions import UnsupportedParamsError
 
 sys.path.insert(
     0, os.path.abspath("../../../../..")
@@ -11,6 +12,7 @@ sys.path.insert(
 from litellm.llms.cohere.chat.transformation import CohereChatConfig
 from litellm.llms.cohere.chat.v2_transformation import (
     COHERE_V2_NAMESPACE_FUNCTION_MAP_KEY,
+    CohereV2ChatConfig,
     translate_cohere_v2_responses_input,
     translate_cohere_v2_responses_request,
     translate_cohere_v2_responses_tools,
@@ -92,22 +94,126 @@ class TestCohereV2NamespaceCollisionTranslation:
             },
         ]
 
-    def test_qualified_wire_names_preserve_basenames(self) -> None:
+    def test_wire_names_preserve_basenames_and_bare_identity(self) -> None:
         translated, namespace_by_name = translate_cohere_v2_responses_tools(
             self._tools()
         )
-        assert translated[0]["name"] == "mcp__codex_apps__github._get_profile"
-        assert translated[1]["name"] == "mcp__codex_apps__gmail._get_profile"
+        assert translated[0]["name"] == "mcp__codex_apps__github___get_profile"
+        assert translated[1]["name"] == "mcp__codex_apps__gmail___get_profile"
         assert translated[2] == self._tools()[2]
         assert namespace_by_name == {
             ("_get_profile", "mcp__codex_apps__github"): "mcp__codex_apps__github",
             ("_get_profile", "mcp__codex_apps__gmail"): "mcp__codex_apps__gmail",
+            ("_get_profile", None): None,
         }
 
-    def test_rejects_duplicate_identity(self) -> None:
-        tools = self._tools()
-        tools.append(dict(tools[0]))
-        with pytest.raises(Exception, match="reuses function name"):
+    def test_direct_chat_keeps_legacy_names_and_rejects_wire_collisions(self) -> None:
+        config = CohereV2ChatConfig()
+        single_namespace = [
+            {
+                "type": "namespace",
+                "name": "ops",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "run",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            }
+        ]
+        body = config.transform_request(
+            model="command-r-plus-latest",
+            messages=[],
+            optional_params={"tools": single_namespace},
+            litellm_params={},
+            headers={},
+        )
+        assert body["tools"][0]["function"]["name"] == "run"
+
+        ambiguous_namespaces = [
+            single_namespace[0],
+            {
+                "type": "namespace",
+                "name": "admin",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "run",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            },
+        ]
+        with pytest.raises(UnsupportedParamsError, match="reuses function name"):
+            config.transform_request(
+                model="command-r-plus-latest",
+                messages=[],
+                optional_params={"tools": ambiguous_namespaces},
+                litellm_params={},
+                headers={},
+            )
+
+    def test_flat_namespace_tool_and_history_use_the_same_wire_name(self) -> None:
+        request = {
+            "tools": [
+                {
+                    "type": "function",
+                    "namespace": "ops",
+                    "name": "run",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            "input": [
+                {
+                    "type": "function_call",
+                    "name": "run",
+                    "namespace": "ops",
+                    "call_id": "call_run",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "namespace": "ops",
+                    "call_id": "call_run",
+                    "output": "ok",
+                },
+            ],
+        }
+
+        translated, namespace_by_name = translate_cohere_v2_responses_request(request)
+
+        assert translated["tools"][0]["name"] == "ops__run"
+        assert translated["tools"][0]["name"] == translated["input"][0]["name"]
+        assert translated["input"][0]["call_id"] == "call_run"
+        assert "namespace" not in translated["input"][0]
+        assert translated["input"][1] == {
+            "type": "function_call_output",
+            "call_id": "call_run",
+            "output": "ok",
+        }
+        assert namespace_by_name == {("run", "ops"): "ops"}
+
+    def test_rejects_actual_wire_name_collision(self) -> None:
+        tools = [
+            {
+                "type": "function",
+                "name": "ops__run",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "type": "namespace",
+                "name": "ops",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "run",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            },
+        ]
+        with pytest.raises(UnsupportedParamsError, match="reuses function name"):
             translate_cohere_v2_responses_tools(tools)
 
     def test_rejects_ambiguous_basename_tool_choice(self) -> None:
@@ -151,7 +257,7 @@ class TestCohereV2NamespaceCollisionTranslation:
             original_items,
             namespace_by_name,
         )
-        assert translated[0]["name"] == "mcp__codex_apps__github._get_profile"
+        assert translated[0]["name"] == "mcp__codex_apps__github___get_profile"
         assert translated[0]["call_id"] == "call_github"
         assert translated[0]["arguments"] == "{}"
         assert "namespace" not in translated[0]

@@ -713,6 +713,11 @@ def _claim_cohere_v2_function_name(
     occupied[identity] = namespace or location
 
 
+def _cohere_v2_wire_function_name(name: str, namespace: Optional[str]) -> str:
+    """Return a Cohere-safe, distinct name for a namespaced function."""
+    return f"{namespace}__{name}" if namespace is not None else name
+
+
 def _tool_namespace(tool: dict[str, Any]) -> Optional[str]:
     namespace = tool.get("namespace")
     if isinstance(namespace, str) and namespace.strip():
@@ -739,9 +744,8 @@ def translate_cohere_v2_responses_tools(
 ) -> tuple[Any, dict[tuple[str, Optional[str]], Optional[str]]]:
     """Flatten namespace/function tools into Responses function tools.
 
-    Namespace children keep their original basename for restoration and use
-    ``namespace.basename`` on the wire so same-basename functions in distinct
-    namespaces remain distinct. The returned map is keyed by that source
+    Namespace children use ``namespace__basename`` on the wire so their names
+    remain distinct and valid for Cohere. The returned map is keyed by source
     ``(name, namespace)`` identity; a ``None`` namespace records an
     un-namespaced function whose wire name was unchanged.
 
@@ -764,24 +768,21 @@ def translate_cohere_v2_responses_tools(
         tool_type = _cohere_v2_tool_type(tool)
         if tool_type == "function":
             name, _, _ = _cohere_v2_function_parts(tool)
-            if name is not None:
-                _claim_cohere_v2_function_name(
-                    name,
-                    occupied,
-                    location=f"tools[{index}]",
-                )
             namespace = _tool_namespace(tool)
-            if namespace is not None:
-                if name is None:
-                    _reject_cohere_v2_tool_schema(f"tools[{index}] has a namespace without a function name")
+            if namespace is not None and name is None:
+                _reject_cohere_v2_tool_schema(f"tools[{index}] has a namespace without a function name")
+            if name is not None:
+                wire_name = _cohere_v2_wire_function_name(name, namespace)
                 _claim_cohere_v2_function_name(
-                    name,
+                    wire_name,
                     occupied,
                     location=f"tools[{index}]",
-                    namespace=namespace,
                 )
                 namespace_by_name[(name, namespace)] = namespace
-                translated.append(_responses_function_tool(tool, location=f"tools[{index}]"))
+            if namespace is not None:
+                flat_tool = _responses_function_tool(tool, location=f"tools[{index}]")
+                flat_tool["name"] = _cohere_v2_wire_function_name(name, namespace)
+                translated.append(flat_tool)
                 changed = True
             else:
                 translated.append(tool)
@@ -805,12 +806,12 @@ def translate_cohere_v2_responses_tools(
                 _reject_cohere_v2_tool_schema(f"{location} is not an object")
             flat_tool = _responses_function_tool(child, location=location)
             child_name = flat_tool["name"]
-            flat_tool["name"] = f"{namespace_name}.{child_name}"
+            wire_name = _cohere_v2_wire_function_name(child_name, namespace_name)
+            flat_tool["name"] = wire_name
             _claim_cohere_v2_function_name(
-                child_name,
+                wire_name,
                 occupied,
                 location=location,
-                namespace=namespace_name,
             )
             namespace_by_name[(child_name, namespace_name)] = namespace_name
             translated.append(flat_tool)
@@ -857,7 +858,6 @@ def _extend_chat_namespace_tool(
             child_name,
             occupied,
             location=child_location,
-            namespace=namespace_name,
         )
         namespace_by_name[(child_name, namespace_name)] = namespace_name
         translated.append(chat_tool)
@@ -997,7 +997,7 @@ def translate_cohere_v2_responses_input(
     input_items: Any,
     namespace_by_name: dict[tuple[str, Optional[str]], Optional[str]],
 ) -> Any:
-    """Drop namespace labels from correlated calls without changing ids or arguments."""
+    """Use advertised Cohere wire names for correlated calls and preserve IDs."""
     if not isinstance(input_items, list) or not namespace_by_name:
         return input_items
     translated: list[Any] = []
@@ -1007,7 +1007,6 @@ def translate_cohere_v2_responses_input(
             translated.append(item)
             continue
         item_type = item.get("type")
-        namespace = item.get("namespace")
         if item_type == "function_call_output":
             translated.append({key: value for key, value in item.items() if key != "namespace"})
             changed = True
@@ -1015,33 +1014,22 @@ def translate_cohere_v2_responses_input(
         if item_type != "function_call":
             _reject_cohere_v2_tool_schema(f"input[{index}] type {item_type!r} carries a namespace")
         function_name = _cohere_v2_nonempty_name(item.get("name"))
-        advertised_namespace = None
-        if function_name is not None:
-            if isinstance(namespace, str) and namespace.strip():
-                advertised_namespace = namespace_by_name.get((function_name, namespace))
-            else:
-                qualified_namespace, separator, basename = function_name.rpartition(".")
-                if separator:
-                    advertised_namespace = namespace_by_name.get(
-                        (basename, qualified_namespace)
-                    )
-                    function_name = basename
-                else:
-                    advertised_namespace = namespace_by_name.get((function_name, None))
-        if advertised_namespace is None:
+        namespace = item.get("namespace")
+        if function_name is None or not isinstance(namespace, str) or not namespace.strip():
+            _reject_cohere_v2_tool_schema(f"input[{index}] has a namespace without a function name")
+        qualified_namespace, separator, basename = function_name.rpartition(".")
+        if separator and qualified_namespace == namespace:
+            function_name = basename
+        identity = (function_name, namespace)
+        if identity not in namespace_by_name:
             _reject_cohere_v2_tool_schema(
                 f"input[{index}] function_call does not match a translated namespace function"
             )
-        wire_name = function_name
-        if advertised_namespace is not None:
-            wire_name = f"{advertised_namespace}.{function_name}"
-        translated_item = {
-            key: value for key, value in item.items() if key != "namespace"
-        }
+        wire_name = _cohere_v2_wire_function_name(function_name, namespace)
+        translated_item = {key: value for key, value in item.items() if key != "namespace"}
         translated_item["name"] = wire_name
         translated.append(translated_item)
         changed = True
-        continue
     if not changed:
         return input_items
     return translated
@@ -1049,7 +1037,7 @@ def translate_cohere_v2_responses_input(
 
 def translate_cohere_v2_responses_request(
     request_body: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, str]]:
+) -> tuple[dict[str, Any], dict[tuple[str, Optional[str]], Optional[str]]]:
     """Translate a Responses request before the shared chat converter."""
     translated_tools, namespace_by_name = translate_cohere_v2_responses_tools(request_body.get("tools"))
     translated_choice = translate_cohere_v2_tool_choice(
