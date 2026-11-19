@@ -38,8 +38,11 @@ def declaration():
     }
 
 
-@pytest.mark.parametrize("declaration_index", [0, 1])
-def test_should_normalize_declaration_after_initial_user_message(declaration, declaration_index):
+@pytest.mark.parametrize("declaration_index", [0, 1, 2])
+def test_should_normalize_latest_declaration_after_initial_user_message(
+    declaration,
+    declaration_index,
+):
     message = {
         "type": "message",
         "role": "user",
@@ -58,13 +61,49 @@ def test_should_normalize_declaration_after_initial_user_message(declaration, de
     assert body == original
 
 
-@pytest.mark.parametrize("conflict", ["duplicate", "top_level_tools"])
-def test_should_reject_ambiguous_declarations(declaration, conflict):
+def test_should_normalize_latest_accumulated_declaration_and_preserve_history(declaration):
+    stale = {
+        "type": "additional_tools",
+        "id": "at_stale",
+        "role": "developer",
+        "tools": [],
+    }
+    latest = {
+        "type": "additional_tools",
+        "id": "at_latest",
+        "role": "developer",
+        "tools": [declaration["tools"][0]],
+    }
+    user_message = {
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "Continue with the same tools."}],
+    }
+    body = {
+        "model": "codex-auto-agent",
+        "tools": [{"type": "web_search", "external_web_access": True}],
+        "input": [stale, user_message, latest],
+    }
+
+    result = normalize_codex_collaboration_dispatch_body(body)
+
+    assert result["input"] == [stale, user_message]
+    assert result["tools"][0] == {"type": "web_search", "external_web_access": True}
+    assert result["tools"][1]["name"] == declaration["tools"][0]["name"]
+    schema = (
+        result["tools"][1]["tools"][0]["parameters"]["properties"]["message"]
+    )
+    assert "encrypted" not in schema
+    assert '{"cfg047":1,"encoding":"text"' in schema["description"]
+
+
+@pytest.mark.parametrize("conflict", ["unsupported_top_level_tool"])
+def test_should_reject_conflicting_top_level_tools(declaration, conflict):
     body = {"input": [{"type": "message", "role": "user", "content": []}, declaration]}
-    if conflict == "duplicate":
-        body["input"].append(deepcopy(declaration))
-    else:
+    if conflict == "missing_tools":
         body["tools"] = []
+    else:
+        body["tools"] = [{"type": "custom", "name": "unsupported"}]
 
     with pytest.raises(HTTPException) as raised:
         normalize_codex_collaboration_dispatch_body(body)

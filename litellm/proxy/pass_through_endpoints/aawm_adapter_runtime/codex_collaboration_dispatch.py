@@ -891,6 +891,13 @@ def _normalize_tool_list(
     return (normalized_tools if changed else tools), changed
 
 
+def _has_unsupported_hosted_tools(tools: Any) -> bool:
+    return any(
+        not isinstance(tool, dict) or tool.get("type") != "web_search"
+        for tool in tools
+    )
+
+
 def _normalize_tool_schemas_without_error_mapping(
     body: dict[str, Any],
     *,
@@ -900,9 +907,10 @@ def _normalize_tool_schemas_without_error_mapping(
 ) -> dict[str, Any]:
     normalized_body = body
     changed = False
-    # Stock Codex Responses Lite can put the current toolset after initial
-    # user context. Materialize its sole developer declaration before the
-    # existing schema, alias, adapter and restoration paths inspect it.
+    # Stock Codex Responses Lite retains prior developer declarations and can
+    # put the accumulated catalog after initial history. The final declaration
+    # is authoritative; materialize it before the existing schema, alias,
+    # adapter and restoration paths inspect it.
     input_items = body.get("input")
     if isinstance(input_items, list) and input_items:
         declaration_indexes = [
@@ -913,19 +921,23 @@ def _normalize_tool_schemas_without_error_mapping(
             and item.get("role") == "developer"
         ]
         if declaration_indexes:
-            declaration_index = declaration_indexes[0]
+            declaration_index = declaration_indexes[-1]
             declaration = input_items[declaration_index]
             tools = declaration.get("tools")
+            hosted_tools = body.get("tools")
             if (
-                len(declaration_indexes) != 1
-                or not isinstance(tools, list)
-                or body.get("tools") is not None
+                not isinstance(tools, list)
+                or not isinstance(hosted_tools, (list, type(None)))
+                or (hosted_tools is not None and _has_unsupported_hosted_tools(hosted_tools))
             ):
                 raise CodexCollaborationDispatchError(
                     "unsupported_collaboration_message_schema"
                 )
             normalized_body = dict(body)
-            normalized_body["tools"] = tools
+            declared_tools = tools
+            if hosted_tools is not None:
+                declared_tools = hosted_tools + tools
+            normalized_body["tools"] = declared_tools
             normalized_body["input"] = (
                 input_items[:declaration_index] + input_items[declaration_index + 1 :]
             )
@@ -1702,7 +1714,7 @@ def _validate_visible_agent_message(
     return None
 
 
-def _normalize_agent_message_item(
+def _normalize_agent_message_item(  # noqa: PLR0915
     item: dict[str, Any],
     *,
     capture_evidence: Any = None,
