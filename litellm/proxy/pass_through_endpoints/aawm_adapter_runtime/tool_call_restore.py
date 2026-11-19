@@ -119,6 +119,9 @@ def install(host_globals: dict) -> None:
     host_globals["_explicit_cohere_v2_namespace_function_map"] = _mod[
         "_explicit_cohere_v2_namespace_function_map"
     ]
+    host_globals["_restored_namespace_for_tool_call"] = _mod[
+        "_restored_namespace_for_tool_call"
+    ]
 
 
 # ── Extracted functions ─────────────────────────────────────────────
@@ -194,6 +197,7 @@ def _restore_adapted_custom_tool_calls_in_response_body(
 def _explicit_cohere_v2_namespace_function_map(
     request_body: dict[str, Any],
 ) -> dict[tuple[str, Optional[str]], Optional[str]]:
+    """Return each advertised source identity's exact Cohere wire name."""
     metadata = request_body.get("litellm_metadata")
     if not isinstance(metadata, dict):
         return {}
@@ -272,6 +276,16 @@ def _advertised_namespace_tool_argument_schemas(
             return
 
         function_block = tool.get("function")
+        tool_namespace = tool.get("namespace")
+        if not isinstance(tool_namespace, str) or not tool_namespace.strip():
+            tool_namespace = (
+                function_block.get("namespace")
+                if isinstance(function_block, dict)
+                else None
+            )
+        exact_namespace = namespace
+        if isinstance(tool_namespace, str) and tool_namespace.strip():
+            exact_namespace = tool_namespace
         name = tool.get("name")
         parameters = tool.get("parameters")
         if isinstance(function_block, dict):
@@ -282,11 +296,11 @@ def _advertised_namespace_tool_argument_schemas(
 
         exact_name = name if isinstance(name, str) and name else None
         if exact_name is not None and isinstance(parameters, dict):
-            schemas[(exact_name, namespace)] = parameters
+            schemas[(exact_name, exact_namespace)] = parameters
 
         children = tool.get("tools")
         if isinstance(children, list):
-            child_namespace = namespace
+            child_namespace = exact_namespace
             if exact_name is not None:
                 child_namespace = exact_name
             for child in children:
@@ -448,11 +462,48 @@ def _cohere_v2_wire_namespace_identity(
 ) -> Optional[tuple[str, str]]:
     matches = [
         (candidate_name, candidate_namespace)
-        for candidate_name, candidate_namespace in namespace_by_name
+        for (candidate_name, candidate_namespace), wire_name in namespace_by_name.items()
         if candidate_namespace is not None
-        and f"{candidate_namespace}__{candidate_name}" == item_name
+        and wire_name == item_name
     ]
     return matches[0] if len(matches) == 1 else None
+
+
+def _restored_namespace_for_tool_call(
+    *,
+    lookup_name: str,
+    lookup_namespace: Optional[str],
+    item_namespace: Any,
+    namespace_by_name: dict[tuple[str, Optional[str]], Optional[str]],
+    wire_identity: Optional[tuple[str, str]],
+    cohere_v2_wire_names: bool,
+) -> Optional[str]:
+    if cohere_v2_wire_names:
+        if wire_identity is not None:
+            return wire_identity[1]
+        if (lookup_name, lookup_namespace) in namespace_by_name:
+            return lookup_namespace
+        return None
+
+    namespace = namespace_by_name.get((lookup_name, lookup_namespace))
+    if namespace is None and isinstance(item_namespace, str) and item_namespace:
+        namespace = namespace_by_name.get((lookup_name, None))
+    explicit_bare_identity = (
+        lookup_namespace is None
+        and (lookup_name, None) in namespace_by_name
+        and namespace_by_name[(lookup_name, None)] is None
+    )
+    if namespace is None and not isinstance(item_namespace, str) and not explicit_bare_identity:
+        namespace = namespace_by_name.get((lookup_name, None))
+        if namespace is None:
+            namespace_candidates = [
+                candidate_namespace
+                for candidate_name, candidate_namespace in namespace_by_name
+                if candidate_name == lookup_name
+            ]
+            if len(namespace_candidates) == 1:
+                namespace = namespace_candidates[0]
+    return namespace
 
 
 def _restore_adapted_namespace_tool_call_item(
@@ -487,24 +538,14 @@ def _restore_adapted_namespace_tool_call_item(
         wire_namespace = qualified_namespace
 
     lookup_namespace = wire_namespace if item_namespace is None else item_namespace
-    namespace = namespace_by_name.get((lookup_name, lookup_namespace))
-    if namespace is None and isinstance(item_namespace, str) and item_namespace:
-        namespace = namespace_by_name.get((lookup_name, None))
-    explicit_bare_identity = (
-        lookup_namespace is None
-        and (lookup_name, None) in namespace_by_name
-        and namespace_by_name[(lookup_name, None)] is None
+    namespace = _restored_namespace_for_tool_call(
+        lookup_name=lookup_name,
+        lookup_namespace=lookup_namespace,
+        item_namespace=item_namespace,
+        namespace_by_name=namespace_by_name,
+        wire_identity=wire_identity,
+        cohere_v2_wire_names=cohere_v2_wire_names,
     )
-    if namespace is None and not isinstance(item_namespace, str) and not explicit_bare_identity:
-        namespace = namespace_by_name.get((lookup_name, None))
-        if namespace is None:
-            namespace_candidates = [
-                candidate_namespace
-                for candidate_name, candidate_namespace in namespace_by_name
-                if candidate_name == lookup_name
-            ]
-            if len(namespace_candidates) == 1:
-                namespace = namespace_candidates[0]
     if namespace is not None and item_namespace is None:
         restored_item = dict(item)
         restored_item["namespace"] = namespace
@@ -549,6 +590,9 @@ def _namespace_schema_for_restored_tool_call(
     item_namespace: Any,
     schema_by_name: Optional[dict[tuple[str, Optional[str]], dict[str, Any]]],
     cohere_v2_wire_names: bool = False,
+    namespace_by_name: Optional[
+        dict[tuple[str, Optional[str]], Optional[str]]
+    ] = None,
 ) -> Optional[dict[str, Any]]:
     """Resolve the schema for a restored call from wire or advertised identity."""
     if schema_by_name is None or item_name is None:
@@ -556,14 +600,13 @@ def _namespace_schema_for_restored_tool_call(
     lookup_name = item_name
     wire_namespace: Optional[str] = None
     if cohere_v2_wire_names and item_namespace is None:
-        wire_matches = [
-            (candidate_name, candidate_namespace)
-            for candidate_name, candidate_namespace in schema_by_name
-            if candidate_namespace is not None
-            and f"{candidate_namespace}__{candidate_name}" == item_name
-        ]
-        if len(wire_matches) == 1:
-            lookup_name, wire_namespace = wire_matches[0]
+        wire_identity = (
+            _cohere_v2_wire_namespace_identity(item_name, namespace_by_name)
+            if namespace_by_name is not None
+            else None
+        )
+        if wire_identity is not None:
+            lookup_name, wire_namespace = wire_identity
     qualified_namespace, separator, basename = item_name.rpartition(".")
     if wire_namespace is None and separator and basename:
         lookup_name = basename
@@ -1167,6 +1210,7 @@ def _restore_adapted_namespace_tool_calls_in_stream_event_payload(
             item_namespace=item_namespace,
             schema_by_name=schema_by_name,
             cohere_v2_wire_names=cohere_v2_wire_names,
+            namespace_by_name=namespace_by_name,
         )
         if schema is not None:
             repaired_arguments, repaired_fields = (
