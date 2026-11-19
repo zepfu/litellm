@@ -1732,6 +1732,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
         candidate_loop as _aawm_alias_candidate_loop,
     )
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_state import (
+        _get_codex_auto_agent_active_cooldown_state,
         _set_codex_auto_agent_session_affinity,
     )
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_build import (
@@ -2017,6 +2018,19 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
             state["cooldown_seconds"] = 0.0
             if state.get("cooldown_state_source") != "normalized_quota_observation":
                 state["cooldown_state_source"] = "direct_concrete_bypass"
+    if ordinary_quota_exempt:
+        for state in states:
+            if state.get("skip_reason") is not None:
+                continue
+            seconds, source = await _get_codex_auto_agent_active_cooldown_state(
+                direct_usage_limit_cooldown_key(state["cooldown_key"])
+            )
+            if seconds > 0:
+                state.update(
+                    skip_reason="quota_exhausted",
+                    cooldown_seconds=seconds,
+                    cooldown_state_source=source,
+                )
     skipped = _selection._build_auto_agent_skipped_candidates_from_states(states)
     diagnostic_skipped = _redact_codex_oauth_account_diagnostics(skipped)
 
@@ -2364,6 +2378,11 @@ def _direct_codex_error_detail(exc: Exception) -> dict[str, Any]:
         if isinstance(parsed, dict):
             return parsed
     return {}
+
+
+def direct_usage_limit_cooldown_key(candidate_key: str) -> str:
+    """Keep a provider-confirmed refusal scoped to the selected model and account lane."""
+    return f"usage_limit_reached:{candidate_key}"
 
 
 def is_direct_codex_usage_limit_error(exc: Exception) -> bool:

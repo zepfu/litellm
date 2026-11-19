@@ -3570,14 +3570,17 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
     )
     cooldown_key = str(selection.get("cooldown_key") or "").strip()
     if cooldown_key and cooldown_seconds > 0:
+        cooldown_keys = (cooldown_key,)
+        if is_usage_limit and provider_returned and selection.get("ordinary_quota_applicable") is False:
+            cooldown_keys += (_aawm_codex_oauth.direct_usage_limit_cooldown_key(cooldown_key),)
         _publish_codex_cooldown_memory(
-            keys=(cooldown_key,),
+            keys=cooldown_keys,
             seconds=cooldown_seconds,
             allow_ttl_shrink=True,
         )
         try:
             await _persist_codex_cooldown_durable(
-                keys=(cooldown_key,),
+                keys=cooldown_keys,
                 seconds=cooldown_seconds,
                 allow_ttl_shrink=True,
             )

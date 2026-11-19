@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -5556,7 +5557,7 @@ aliases:
         detail={
             "error": {"type": "usage_limit_reached", "code": "usage_limit_reached"},
             "failover_disposition": "usage_limit_reached",
-            "retry_after_seconds": 17,
+            "quota": {"resets_in_seconds": 3600},
         },
     )
     refusal._aawm_provider_returned = True
@@ -5573,6 +5574,8 @@ aliases:
         captured.update(kwargs)
         captured_sends.append(dict(kwargs.get("extra_headers") or {}))
         if provider_refusal:
+            if calls == 2:
+                refusal.detail["quota"]["resets_in_seconds"] = 600
             raise refusal
         return Response(content=b"ok", status_code=200)
 
@@ -5627,6 +5630,36 @@ aliases:
                         user_api_key_dict=object(),
                     )
                 assert raised.value is refusal
+
+                async def fresh_account(model_name: str) -> str:
+                    auth, _, _ = await codex_oauth.select_and_bind_direct_codex_oauth_inventory(
+                        _direct_request(session_id="fresh-admission"),
+                        request_body={"model": model_name},
+                    )
+                    return auth.account_label
+
+                with pytest.raises(HTTPException) as fresh_refusal:
+                    await fresh_account(model)
+                assert fresh_refusal.value.status_code == 429
+                assert fresh_refusal.value.detail["attempted_provider_call"] is False
+                assert await fresh_account("gpt-5.3-codex") == "account1"
+                now = datetime.now(timezone.utc)
+                alias_routing_state.record_normalized_quota_observations([
+                    _quota_observation(
+                        account_hash="hash-account-2",
+                        observed_at=now,
+                        reset_at=now + timedelta(days=2),
+                        quota_period="seven_day",
+                        window_minutes=10080,
+                        exhausted=True,
+                    )
+                ])
+                # Only account2's provider refusal has expired. Its ordinary
+                # weekly zero does not bar the exempt helper.
+                monotonic = time.monotonic
+                with monkeypatch.context() as clock:
+                    clock.setattr(time, "monotonic", lambda: monotonic() + 1200)
+                    assert await fresh_account(model) == "account2"
             else:
                 response = await lpe.openai_proxy_route(
                     endpoint="v1/responses",

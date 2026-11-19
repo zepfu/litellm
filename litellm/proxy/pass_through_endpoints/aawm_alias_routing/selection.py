@@ -4677,6 +4677,8 @@ def _attach_codex_oauth_quota_windows(
     family_windows: Sequence[dict[str, Any]],
     quota_family: str,
 ) -> dict[str, Any]:
+    if state.get("ordinary_quota_applicable") is False:
+        family_windows = [window for window in family_windows if not _codex_oauth_window_is_weekly(window)]
     family_observation = _build_family_quota_observation(
         observation,
         family_windows=family_windows,
