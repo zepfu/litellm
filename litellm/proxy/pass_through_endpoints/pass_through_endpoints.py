@@ -3666,6 +3666,14 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
 
         if capacity_recovery_owner is None:
             return
+        # The inventory-bound caller decides generic failures using the bound
+        # continuation and its one same-account retry. Observing them here
+        # would cache a decision without that context, including on 429/529.
+        if (
+            isinstance(exc, ResponsesStreamPreCommitFailure)
+            and exc.error_class == "upstream_transient_internal"
+        ):
+            return
         status_code = _extract_exception_status_code(exc)
         failure_class, _failure_classification, retryable = (
             _classify_passthrough_hidden_retry_failure(exc)

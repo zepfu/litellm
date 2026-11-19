@@ -492,7 +492,13 @@ async def test_direct_codex_generic_precommit_failure(
     monkeypatch.setattr(durable, "_dual_cache_override", lambda: cache)
     body = {"model": MODEL, "stream": True, "input": "Hello"}
 
+    body_sent = False
+
     async def receive():
+        nonlocal body_sent
+        if body_sent:
+            await asyncio.Event().wait()
+        body_sent = True
         return {"type": "http.request", "body": json.dumps(body).encode()}
 
     request = Request(
@@ -537,6 +543,8 @@ async def test_direct_codex_generic_precommit_failure(
                 },
             },
         }
+        if outcome == "repeated_failure":
+            event["response"]["error"]["status_code"] = 529
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
@@ -561,7 +569,8 @@ async def test_direct_codex_generic_precommit_failure(
         if outcome in {"repeated_failure", "deadline"}:
             with pytest.raises(ProxyException) as failure:
                 await asyncio.wait_for(run(), timeout=5)
-            assert failure.value.code == "503"
+            expected_status = "529" if outcome == "repeated_failure" else "503"
+            assert failure.value.code == expected_status
         elif outcome == "cancelled":
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(run(), timeout=5)
