@@ -41602,6 +41602,9 @@
         "supports_function_calling": true,
         "supports_tool_choice": true,
         "supports_reasoning": true,
+        "unsupported_hosted_tools": [
+            "tool_search"
+        ],
         "source": "https://openrouter.ai/nvidia/nemotron-3-ultra-550b-a55b"
     },
     "openrouter/free": {
