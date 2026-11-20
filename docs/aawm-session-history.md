@@ -1943,28 +1943,22 @@ origin and defaults to `sota-openai`. `sota-alibaba` uses
 `alibaba_token_plan/qwen3.7-max`. Public `sota-zai` prefers Z.AI Coding
 Plan `zai_coding_plan/glm-5.3` first; Alibaba Token Plan `glm-5.3` is the
 last-resort leaf on the same alias.
+`sota-meta` uses native Muse Code `muse-wonder-1.0-contributor`.
 
-`basic` is the config-driven low-cost alias: native Cohere
-`cohere/north-mini-code-1-0`, then OpenRouter Cohere
-`openrouter/cohere/north-mini-code:free`, then the OpenCode Zen `big-pickle`
-leaf, then `alias_reference: basic-other`.
-`basic-other` admits Alibaba DeepSeek Flash during `22:00-08:00 UTC+8`, then
-uses Z.AI Flash and Cursor Composer before mutually exclusive priority-zero
-Luna/Haiku tails.
+`basic` first references `basic-other`, then falls back to low-effort
+`gpt-6-luna`. The helper includes native Muse Code `muse-ember-1.0` and
+Alibaba DeepSeek V4.1 Flash, which is eligible during `22:00-08:00 UTC+8`.
 
-`work` first references `work-other`, then for Claude origins only keeps the
-native Anthropic Sonnet tail, and finally uses `gpt-6-luna`. During
-`22:00-08:00 UTC+8`, `work-other` orders `sota-deepseek`, Z.AI Flash,
-`sota-moonshot`, then `sota-xai`; outside that window new selection begins
-with Z.AI Flash. `expert` references `expert-other` before the final
+`work` first references `work-other`, then falls back to high-effort
+`gpt-6-luna`. The helper orders `sota-zai` (`23:00-09:00 UTC+8`),
+`sota-deepseek` (`22:00-08:00 UTC+8`), `sota-moonshot`, `sota-meta`, and
+`sota-xai`. `expert` references `expert-other` before the final
 OpenAI/Codex `gpt-6.1-terra` fallback. `expert-other` admits Alibaba Qwen Max
 during the same window, then uses Cursor Grok and native xAI.
 
-`auto-review` references `auto-review-other`, then uses low-effort Luna and
-priority-zero OpenRouter DeepSeek. Its helper admits Alibaba DeepSeek Flash
-during the same window before low-effort Z.AI Flash and Cursor Composer.
-`codex-auto-review` remains a public alias reference to `auto-review`, so both
-public names share one concrete candidate graph.
+`auto-review` references `auto-review-other`, then falls back to low-effort
+`gpt-6-luna`. The helper uses Z.AI GLM 5.3 Flash (`23:00-09:00 UTC+8`) and
+Alibaba DeepSeek V4.1 Flash (`22:00-08:00 UTC+8`) at low reasoning effort.
 
 OpenAI GPT-6.1 Sol and Terra pricing in `model_prices_and_context_window.json`
 follows the official API list: Sol is $2/$0.10/$2.50/$5/$10 and Terra is

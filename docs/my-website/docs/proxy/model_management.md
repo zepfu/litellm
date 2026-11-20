@@ -97,27 +97,28 @@ Config-driven alias routing uses:
 - `sota-alibaba`: `alibaba_token_plan/qwen3.8-max` → `alibaba_token_plan/qwen3.7-max`
 - `sota-zai`: `zai_coding_plan/glm-5.3` (priority 110), then last-resort
   `alibaba_token_plan/glm-5.3` (priority 100)
+- `sota-meta` uses native Muse Code `muse-wonder-1.0-contributor`.
 - `provider-openai`: egress-validation order `gpt-6-luna` (priority 100) →
   `gpt-6.1-terra` (priority 90) → `gpt-6.1-sol` (priority 80) → `gpt-6-astra`
   (priority 0), all with `reasoning_effort: low`
-- `basic`: Cohere `cohere/north-mini-code-1-0` (90) → OpenRouter `openrouter/cohere/north-mini-code:free` (80) → OpenCode Zen `big-pickle` (50) → `basic-other`
+- `basic` uses `basic-other` (110), then low-effort `gpt-6-luna` (0).
 - `basic-other`: Z.AI `glm-5.3-flash` (170, `23:00-09:00 UTC+8`),
-  Cohere (160), Nous (150), NVIDIA (140), OpenRouter (130), OpenCode Go
-  `muse-spark-1.3-contributor` (110), then
+  Cohere (160), Nous (150), OpenRouter (130), native Muse Code
+  `muse-ember-1.0` (110), then
   Alibaba `deepseek-v4.1-flash` (100, `22:00-08:00 UTC+8`).
-- `work`: nested `work-other` alias reference (priority 110) → Claude-only native
-  Sonnet tail → `gpt-6-luna` (priority 0) with `reasoning_effort: high`
-- `work-other`: Z.AI `glm-5.3-flash` (120, `23:00-09:00 UTC+8`),
+- `work` uses `work-other` (110), then high-effort `gpt-6-luna` (0).
+- `work-other`: `sota-zai` (120, `23:00-09:00 UTC+8`),
   `sota-deepseek` (110, `22:00-08:00 UTC+8`), `sota-moonshot` (90),
-  Muse `muse-spark-1.3-contributor` (85), then `sota-xai` (80).
+  `sota-meta` (85), then `sota-xai` (80).
   Each timed candidate is omitted from new selection outside its own window.
 - `expert`: `expert-other` (priority 100) → OpenAI/Codex `gpt-6.2-astra`
   (`codex_responses`, priority 0) with authoritative `reasoning_effort: low`
 - `expert-other`: during `22:00-08:00 UTC+8`, Alibaba `alibaba_token_plan/qwen3.8-max` (100) is admitted before native xAI `xai/grok-4.7` (0)
-- `auto-review`: `auto-review-other` (100) → Luna at low effort (90) → priority-zero OpenRouter DeepSeek at low effort; `codex-auto-review` is a public alias reference to this graph
-- `auto-review-other`: Z.AI `glm-5.3-flash` (110, `23:00-09:00 UTC+8`),
-  then Alibaba `deepseek-v4.1-flash` (100, `22:00-08:00 UTC+8`),
-  with low effort throughout.
+- `auto-review` uses `auto-review-other` (100), then low-effort
+  `gpt-6-luna` (90).
+- `auto-review-other` uses Z.AI `glm-5.3-flash` (110, `23:00-09:00 UTC+8`),
+  then Alibaba `deepseek-v4.1-flash` (100, `22:00-08:00 UTC+8`), both at low
+  effort.
 
 Config-driven AAWM aliases and candidates come only from the compiled YAML
 snapshot. Missing or failed config fails closed; there is no built-in candidate

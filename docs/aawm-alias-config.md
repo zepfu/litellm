@@ -220,22 +220,18 @@ OpenAI `gpt-6-luna` (priority 0, `reasoning_effort: low`).
 `basic-other` orders Z.AI Coding Plan `zai_coding_plan/glm-5.3-flash`
 (priority 170, admitted only from `23:00-09:00 UTC+8`), Cohere (160),
 Nous Solar Mini 4 (150), OpenRouter (130),
-OpenCode Go `muse-spark-1.3-contributor` (110), then Alibaba Token Plan
+Meta Muse Code `muse-ember-1.0` (110), then Alibaba Token Plan
 `alibaba_token_plan/deepseek-v4.1-flash` (100, `22:00-08:00 UTC+8`).
 These candidates have no configured reasoning-effort override.
-The helper has no OpenAI or Anthropic
-tail; Luna is configured only on `basic`.
 
 Alibaba candidates in `basic-other`, `work-other`, `expert-other`, and
 `auto-review-other` are gated
 by `start_time: "22:00:00"`, `end_time: "08:00:00"`,
-`utc_offset: "+08:00"`. Z.AI candidates in `basic-other`, `work-other`,
-and `auto-review-other` use `start_time: "23:00:00"`,
-`end_time: "09:00:00"`, `utc_offset: "+08:00"`.
-Dedicated Z.AI aliases are unchanged and have no daily schedule.
-Both windows recur every day, include the start, and exclude the end;
-there is no weekday distinction. The `work-other` Alibaba gate is on its
-`sota-deepseek` reference, so direct `sota-deepseek` use is unchanged.
+`utc_offset: "+08:00"`. The Z.AI Flash candidates in `basic-other` and
+`auto-review-other` and the `sota-zai` reference in `work-other` use
+`start_time: "23:00:00"`, `end_time: "09:00:00"`, `utc_offset: "+08:00"`.
+Both windows recur daily, include the start, and exclude the end. Direct
+`sota-zai` and `sota-deepseek` requests are eligible all day.
 
 `sota-xai` follows native xAI/OIDC (`xai/grok-4.7`, priority 100), then
 managed xAI/OAuth (`oa_xai/grok-4.7`, priority 90). Cursor Grok stays on
@@ -428,19 +424,17 @@ The `work` alias is compiled from `work.yaml`. Candidate order is:
 It is a valid exact-name route, a valid `alias_reference` target, and an
 Ohmypi orchestration child.
 
-Its candidates are Z.AI Coding Plan `zai_coding_plan/glm-5.3-flash`
+Its candidates are `alias_reference: sota-zai`
 (priority 120, admitted only from `23:00-09:00 UTC+8`),
 `alias_reference: sota-deepseek` (priority 110, scheduled
 for the daily half-open window `22:00-08:00 UTC+8`),
 `alias_reference: sota-moonshot`
-(priority 90), Muse `muse-spark-1.3-contributor` (`provider: muse_code`,
-`route_family: muse_code`, priority 85, no reasoning-effort override),
+(priority 90), `alias_reference: sota-meta` (priority 85),
 and `alias_reference: sota-xai` (priority 80).
 `sota-xai` currently expands in this order: native xAI/OIDC `xai/grok-4.7`,
 then managed xAI/OAuth `oa_xai/grok-4.7`. Cursor Grok remains on
-`sota-cursor`. Luna remains the final OpenAI fallback
-on `work`, not `work-other`. Closing the
-window prevents new affinity and does not evict an existing session owner.
+`sota-cursor`. Closing a schedule window prevents new affinity. Existing
+session owners keep their affinity.
 
 Alpha's Kimi-backed aliases require a current native-contract descriptor at
 `/run/aawm/kimi-descriptor/native-contract.json`. The host file is
@@ -469,13 +463,10 @@ xAI/OAuth, Cursor Grok, or Anthropic candidates.
 `auto-review` first references `auto-review-other` (priority 100), then uses
 OpenAI `gpt-6-luna` (priority 90, `reasoning_effort: low`).
 
-`auto-review-other` orders Z.AI Coding Plan
-`zai_coding_plan/glm-5.3-flash` (priority 110, `23:00-09:00 UTC+8`),
+`auto-review-other` orders Z.AI Coding Plan `zai_coding_plan/glm-5.3-flash`
+(priority 110, `23:00-09:00 UTC+8`),
 then Alibaba Token Plan `alibaba_token_plan/deepseek-v4.1-flash`
-(priority 100, `22:00-08:00 UTC+8`), both at low effort.
-`codex-auto-review` remains a public name but contains only
-`alias_reference: auto-review`; both public aliases are defined in
-`auto-review.yaml`.
+(priority 100, `22:00-08:00 UTC+8`). Both use low reasoning effort.
 
 ## Maintained `sota-openai` alias behavior
 
@@ -580,6 +571,12 @@ sees only the Alibaba leaf. This public alias has no schedule and remains
 selectable at all times. Do not invent `aawm-sota-zai` or `sota-zcode`.
 Do not add this alias to `sota.yaml` TUI dispatch.
 
+## Maintained `sota-meta` alias behavior
+
+`sota-meta` routes to `muse-wonder-1.0-contributor` through the native Muse
+Code gateway with the configured Muse credentials and the caller's requested
+reasoning effort. `work-other` shares this route through an alias reference.
+
 ## Codex passthrough alias catalog (CFG-023)
 
 Non-Codex-native `GET /openai_passthrough/v1/models` lists compiled YAML
@@ -588,9 +585,8 @@ registers the AAWM access-log replacement so leftover uvicorn
 `INFO: … "GET /openai_passthrough/v1/models"` lines are suppressed
 the same way as alias Responses POSTs. Usage is
 `POST /openai_passthrough/v1/responses`. Generic `/v1/chat/completions` is
-not an alias ingress. The current snapshot contains 27 aliases, including
-`basic-other`, `expert-other`, `auto-review-other`, `auto-review`, and
-`codex-auto-review`. The public name is `sota-zai`. Non-Codex-native GET
+not an alias ingress. The snapshot includes `basic-other`, `work-other`,
+`auto-review-other`, `sota-zai`, and `sota-meta`. Non-Codex-native GET
 also lists served concrete provider ids with mode/context/cost from the
 bundled cost map or `aawm_reference_pricing`. Provenance is explicit and
 is not invoice cost. Cursor Grok is distinct from `oa_xai/grok-4.6`.

@@ -120,9 +120,6 @@ two expected Codex OAuth account hashes. Confirm all bind sources exist with
 the expected file or directory types before activation. Live testing of the
 current temporary role aliases requires the credentials for the candidates
 being exercised.
-Live `auto-review` / `codex-auto-review` testing requires `ZAI_KEY` and
-`AAWM_OPENROUTER_API_KEY`; alpha receives only the provider credentials present
-when its container is created.
 
 ```bash
 docker compose --env-file .env \
@@ -155,19 +152,20 @@ wait for both health endpoints before testing.
 
 The current alpha alias YAML exposes these test paths:
 
-- `basic` orders native Cohere `cohere/north-mini-code-1-0`, then OpenRouter
-  Cohere `openrouter/cohere/north-mini-code:free`, then OpenCode Zen
-  `big-pickle`, then `basic-other`. The helper adds a nightly Alibaba
-  promotion, Z.AI Coding Plan, Cursor Composer, and mutually exclusive
-  Luna/Haiku tails.
-- `work` references `work-other`, then keeps its Claude-only native Sonnet
-  leaves and OpenAI `gpt-6-luna`. `work-other` orders the nightly DeepSeek
-  promotion, Z.AI Coding Plan, Moonshot, then xAI.
+- `basic` references `basic-other`, then low-effort `gpt-6-luna`. The helper
+  includes native Muse Code `muse-ember-1.0` and scheduled Alibaba DeepSeek
+  V4.1 Flash.
+- `work` references `work-other`, then high-effort `gpt-6-luna`. The helper
+  orders scheduled `sota-zai` and `sota-deepseek`, then `sota-moonshot`,
+  `sota-meta`, and `sota-xai`.
 - `expert` references `expert-other` before OpenAI `gpt-6.2-astra`;
   `expert-other` orders nightly Alibaba Qwen Max, Cursor Grok, then native xAI.
-- `auto-review` references `auto-review-other`, then Luna and OpenRouter
-  DeepSeek. `codex-auto-review` references that same public graph.
+- `auto-review` references `auto-review-other`, then low-effort
+  `gpt-6-luna`. The helper orders scheduled Z.AI GLM 5.3 Flash and Alibaba
+  DeepSeek V4.1 Flash, both at low effort.
 - `sota-openai` uses OpenAI `gpt-6.2-astra`.
+- `sota-zai` uses GLM-5.3 through Z.AI Coding Plan, then Alibaba Token Plan.
+  `sota-meta` uses native Muse Code `muse-wonder-1.0-contributor`.
 - `provider-openai` includes `gpt-6.1-sol` after Luna and Terra, retaining
   Astra as the last candidate. Codex can also select the
   concrete `gpt-6.1-sol` model through alpha's Responses passthrough.
@@ -327,12 +325,8 @@ Leave that variable unset on `litellm-dev` and production. When unset,
   LiteLLM must not run those tools. Namespace tool bodies are forwarded
   unmodified.
 - Approvals are local Muse/MSP, not Meta HTTP.
-- Harness v2 Muse TUI source may exist under `scripts/harnessv2/`.
-  Codex Spark 1.3 overlays:
-  `scripts/harnessv2/config/overlays/codex_muse_spark_contributor.yaml`
-  (minimal-token `muse-spark-1.3-contributor`) and
-  `scripts/harnessv2/config/overlays/codex_luna_muse_spark.yaml`
-  (`gpt-5.6-luna` spawning that child with parallel tools).
+- The Harness v2 Spark 1.3 contributor smoke test uses
+  `scripts/harnessv2/config/overlays/codex_muse_spark_contributor.yaml`.
 - Body limits and stream timeouts remain alpha-config knobs and must
   not be added to `litellm-dev-config.yaml`. Do not add Muse spark
   aliases to `litellm-alpha-config.yaml`.
