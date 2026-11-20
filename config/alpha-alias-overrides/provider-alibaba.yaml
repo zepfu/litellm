@@ -15,6 +15,12 @@ aliases:
           end: "2026-11-25T15:59:59.999999Z"
 
       - provider: alibaba_token_plan
+        model: alibaba_token_plan/qwen4-max
+        route_family: codex_alibaba_token_plan_chat_completions_adapter
+        priority: 105
+        reasoning_effort: max
+
+      - provider: alibaba_token_plan
         model: alibaba_token_plan/qwen3.8-max
         route_family: codex_alibaba_token_plan_chat_completions_adapter
         priority: 100
