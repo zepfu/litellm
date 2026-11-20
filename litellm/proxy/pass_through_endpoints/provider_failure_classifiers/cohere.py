@@ -37,6 +37,14 @@ _MONTHLY_ALLOWANCE_EXHAUSTION_RE = re.compile(
     r"(?:\s+(?:your|the|our|their|its|my|his|her|a|an|this|that))?"
     r"\s+monthly(?:\s+trial)?\s+(?:quota|capacity|limit)"
 )
+# Cohere's native trial-key refusal states its fixed 1,000-calls-per-month
+# allowance instead of saying that the monthly quota is exhausted. Keep this
+# match tied to that provider-specific 429 wording.
+_COHERE_MONTHLY_TRIAL_KEY_LIMIT_RE = re.compile(
+    r"\btrial\s+key\b.{0,40}"
+    r"\blimited\s+to\s+1000\s+api\s+calls?\s*/\s*month\b",
+    re.IGNORECASE,
+)
 _COHERE_MODEL_TOKEN = r"""['"]?(?P<model>[^\s,'";]+)['"]?"""
 _COHERE_MODEL_UNAVAILABLE_MESSAGE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
@@ -357,8 +365,11 @@ def _cohere_text_has_monthly_quota_exhaustion(text: str) -> bool:
     """
 
     if "monthly" not in text:
-        return False
-    return _MONTHLY_ALLOWANCE_EXHAUSTION_RE.search(text) is not None
+        return _COHERE_MONTHLY_TRIAL_KEY_LIMIT_RE.search(text) is not None
+    return (
+        _MONTHLY_ALLOWANCE_EXHAUSTION_RE.search(text) is not None
+        or _COHERE_MONTHLY_TRIAL_KEY_LIMIT_RE.search(text) is not None
+    )
 
 
 def classify_cohere_failure(

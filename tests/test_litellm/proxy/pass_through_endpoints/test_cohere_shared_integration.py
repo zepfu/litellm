@@ -9,6 +9,9 @@ import httpx
 import pytest
 from starlette.requests import Request
 
+from litellm.exceptions import RateLimitError
+from litellm.litellm_core_utils.exception_mapping_utils import exception_type
+from litellm.llms.cohere.common_utils import CohereError
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
     codex_candidate_calls,
 )
@@ -238,7 +241,9 @@ def test_cohere_failure_classifier_covers_shared_failure_vocabulary(
     assert classification.name == name
     assert classification.failure_kind == name
     assert classification.failure_class == failure_class
-    assert classification.cooldown_scope == "candidate"
+    assert classification.cooldown_scope == (
+        "credential" if name == "cohere_monthly_trial_exhausted" else "candidate"
+    )
     assert classification.advance_fresh_candidate is True
     assert classification.suppress_traceback is True
 
@@ -403,14 +408,53 @@ def test_registry_retains_cohere_failure_classification_metadata() -> None:
         url=_COHERE_CHAT_URL,
         custom_llm_provider="cohere",
         status_code=429,
-        exc=Exception("monthly trial exhausted"),
+        exc=Exception("monthly trial quota exhausted"),
     )
 
     assert len(results) == 1
     classification = results[0]
     assert classification.failure_kind == "cohere_monthly_trial_exhausted"
     assert classification.failure_class == "quota_exhausted"
-    assert classification.cooldown_scope == "candidate"
+    assert classification.cooldown_scope == "credential"
+    assert classification.advance_fresh_candidate is True
+
+
+def test_cohere_trial_limit_429_keeps_public_quota_classification() -> None:
+    # Alpha retained only this canonical body prefix. Use it as the documented
+    # 429 fixture without reconstructing the truncated historical response.
+    message = (
+        "You are using a Trial key, which is limited to 1000 API calls / month."
+    )
+    provider_error = CohereError(status_code=429, message=message)
+    provider_response = provider_error.response
+
+    with pytest.raises(RateLimitError) as mapped_error:
+        exception_type(
+            model=_COHERE_MODEL,
+            original_exception=provider_error,
+            custom_llm_provider="cohere",
+        )
+
+    assert mapped_error.value.status_code == 429
+    assert mapped_error.value.response is provider_response
+    assert mapped_error.value.response.status_code == 429
+    assert message in mapped_error.value.message
+
+    classification = classify_cohere_failure(
+        url=_COHERE_CHAT_URL,
+        custom_llm_provider="cohere",
+        status_code=mapped_error.value.status_code,
+        exc=mapped_error.value,
+        attempted_provider_call=True,
+        provider_returned=True,
+        route_family=_COHERE_ROUTE_FAMILY,
+        selected_upstream_model=_COHERE_UPSTREAM_MODEL,
+    )
+
+    assert classification is not None
+    assert classification.failure_kind == "cohere_monthly_trial_exhausted"
+    assert classification.failure_class == "quota_exhausted"
+    assert classification.cooldown_scope == "credential"
     assert classification.advance_fresh_candidate is True
 
 
