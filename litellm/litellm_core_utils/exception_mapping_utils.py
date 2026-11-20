@@ -1597,21 +1597,19 @@ def exception_type(  # type: ignore  # noqa: PLR0915
                     original_exception, (asyncio.CancelledError, GeneratorExit)
                 ):
                     raise original_exception
-                if _cohere_provider_status_code(original_exception) == 499:
+                cohere_status_code = _cohere_provider_status_code(original_exception)
+                if cohere_status_code == 499:
                     exception_mapping_worked = True
                     _raise_cohere_provider_http_499(
                         original_exception=original_exception,
                         error_str=error_str,
                         model=model,
                     )
-                cohere_provider_status_code = _cohere_provider_status_code(
-                    original_exception
-                )
-                if cohere_provider_status_code == 429:
+                if cohere_status_code == 429:
                     exception_mapping_worked = True
                     provider_response = getattr(original_exception, "response", None)
                     rate_limit_error = RateLimitError(
-                        message=f"CohereException - {original_exception.message}",
+                        message=f"CohereException - {error_str}",
                         llm_provider="cohere",
                         model=model,
                         response=provider_response,
@@ -1654,8 +1652,8 @@ def exception_type(  # type: ignore  # noqa: PLR0915
                         llm_provider="cohere",
                         response=getattr(original_exception, "response", None),
                     )
-                elif cohere_provider_status_code is not None:
-                    if cohere_provider_status_code == 400:
+                elif hasattr(original_exception, "status_code"):
+                    if original_exception.status_code == 400:
                         exception_mapping_worked = True
                         raise BadRequestError(
                             message=f"CohereException - {original_exception.message}",
@@ -1663,14 +1661,14 @@ def exception_type(  # type: ignore  # noqa: PLR0915
                             model=model,
                             response=getattr(original_exception, "response", None),
                         )
-                    elif cohere_provider_status_code == 408:
+                    elif original_exception.status_code == 408:
                         exception_mapping_worked = True
                         raise Timeout(
                             message=f"CohereException - {original_exception.message}",
                             llm_provider="cohere",
                             model=model,
                         )
-                    elif cohere_provider_status_code == 500:
+                    elif original_exception.status_code == 500:
                         exception_mapping_worked = True
                         raise InternalServerError(
                             message=f"CohereException - {original_exception.message}",
@@ -1678,19 +1676,6 @@ def exception_type(  # type: ignore  # noqa: PLR0915
                             model=model,
                             response=getattr(original_exception, "response", None),
                         )
-                    else:
-                        exception_mapping_worked = True
-                        provider_response = getattr(original_exception, "response", None)
-                        api_error = APIError(
-                            status_code=cohere_provider_status_code,
-                            message=f"CohereException - {original_exception.message}",
-                            llm_provider="cohere",
-                            model=model,
-                            request=getattr(original_exception, "request", None),
-                        )
-                        if provider_response is not None:
-                            api_error.response = provider_response
-                        raise api_error
                 elif (
                     "CohereConnectionError" in exception_type
                 ):  # cohere seems to fire these errors when we load test it (1k+ messages / min)
