@@ -419,14 +419,24 @@ def test_registry_retains_cohere_failure_classification_metadata() -> None:
     assert classification.advance_fresh_candidate is True
 
 
-def test_cohere_trial_limit_429_keeps_public_quota_classification() -> None:
+@pytest.mark.parametrize("exception_cls", [CohereError, httpx.HTTPStatusError])
+def test_cohere_trial_limit_429_keeps_public_quota_classification(
+    exception_cls: type,
+) -> None:
     # Alpha retained only this canonical body prefix. Use it as the documented
     # 429 fixture without reconstructing the truncated historical response.
     message = (
         "You are using a Trial key, which is limited to 1000 API calls / month."
     )
-    provider_error = CohereError(status_code=429, message=message)
-    provider_response = provider_error.response
+    if exception_cls is CohereError:
+        provider_error = CohereError(status_code=429, message=message)
+        provider_response = provider_error.response
+    else:
+        request = httpx.Request("POST", _COHERE_CHAT_URL)
+        provider_response = httpx.Response(429, request=request)
+        provider_error = httpx.HTTPStatusError(
+            message, request=request, response=provider_response
+        )
 
     with pytest.raises(RateLimitError) as mapped_error:
         exception_type(

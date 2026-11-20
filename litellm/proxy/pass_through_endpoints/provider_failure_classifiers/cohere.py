@@ -364,8 +364,6 @@ def _cohere_text_has_monthly_quota_exhaustion(text: str) -> bool:
     credential-scoped.
     """
 
-    if "monthly" not in text:
-        return _COHERE_MONTHLY_TRIAL_KEY_LIMIT_RE.search(text) is not None
     return (
         _MONTHLY_ALLOWANCE_EXHAUSTION_RE.search(text) is not None
         or _COHERE_MONTHLY_TRIAL_KEY_LIMIT_RE.search(text) is not None
