@@ -1,0 +1,10 @@
+# Single-leaf sota-meta alias for the live native Muse Code catalog.
+defaults: {}
+
+aliases:
+  - name: sota-meta
+    candidates:
+      - provider: muse_code
+        model: muse-wonder-1.0-contributor
+        route_family: muse_code
+        priority: 85
