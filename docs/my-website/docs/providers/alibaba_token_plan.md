@@ -16,6 +16,7 @@ alias routes remain separate.
 
 ## Supported models
 
+- `alibaba_token_plan/qwen4-max`
 - `alibaba_token_plan/qwen4-max-preview`
 - `alibaba_token_plan/qwen3.8-max`
 - `alibaba_token_plan/qwen3.7-plus`
@@ -45,6 +46,7 @@ body. Source: the QwenCloud OpenAI chat API reference.
 
 | Model | Configured effort | Serialized field |
 | --- | --- | --- |
+| `qwen4-max` | Provider default `high` | Native `reasoning_effort` accepts `low`, `high`, and `xhigh` |
 | `qwen4-max-preview` | `max` on alpha | `reasoning_effort=xhigh`; native values are `low`, `medium`, and `xhigh` |
 | `qwen3.8-max` | `max` | `reasoning_effort=xhigh` (`max` and `high` map to `xhigh`; `none` sets `enable_thinking=false`) |
 | `qwen3.7-max`, `qwen3.7-plus` | `max` when set | `enable_thinking=true`. `reasoning_effort` is not a supported wire field |
@@ -141,6 +143,11 @@ may report the canonical name `qwen4.0-max-preview` in responses. The announced
 preview ends after November 25, 2026 at 24:00 (UTC+8), after which the model
 is retired.
 
+Stable `qwen4-max` has a 1M-token context. Without thinking it supports up to
+991,808 input tokens and 131,072 output tokens. With thinking enabled the
+limits are 983,616 input tokens and 262,144 output tokens.
+[Qwen4-Max model reference](https://www.alibabacloud.com/help/en/model-studio/qwen4-max)
+
 Codex Responses ingress uses
 `codex_alibaba_token_plan_chat_completions_adapter`. Anthropic Messages ingress
 uses `anthropic_alibaba_token_plan_chat_completions_adapter`. Both preserve the
@@ -193,6 +200,10 @@ missing attribution remains unpriced. Reference totals are metadata only and do
 not populate `response_cost` or `session_history.response_cost_usd`.
 Sources: [Model pricing](https://www.alibabacloud.com/help/en/model-studio/model-pricing)
 and [context cache](https://www.alibabacloud.com/help/en/model-studio/context-cache).
+
+The stable `qwen4-max` route uses its own Singapore International standard
+rates for reference pricing. The Token Plan subscription invoice remains
+unknown. The preview uses those same rates as a comparison with production.
 
 Qwen4-Max-Preview is available only through Token Plan, with no published
 pay-as-you-go tariff; the preview ends before November 25, 2026 at 16:00 UTC
