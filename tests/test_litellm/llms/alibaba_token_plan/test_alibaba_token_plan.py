@@ -49,19 +49,22 @@ def test_catalog_constant_is_metadata_only() -> None:
 
 
 @pytest.mark.parametrize(
-    ("model", "effort", "expected_wire_effort"),
+    ("model", "effort_params", "expected_wire_effort"),
     (
-        ("qwen4-max-preview", "max", "xhigh"),
-        ("qwen4-max", "high", "high"),
+        ("qwen4-max-preview", {"reasoning_effort": "max"}, "xhigh"),
+        ("qwen4-max", {"reasoning_effort": "high"}, "high"),
+        ("qwen4-max", {"reasoning_effort": "medium"}, "high"),
+        ("qwen4-max", {"reasoning": {"effort": "medium"}}, "high"),
+        ("qwen4-max", {"reasoning": {"effort": "minimal"}}, "low"),
     ),
 )
 def test_should_map_qwen4_alias_effort_and_combined_output_budget(
-    model: str, effort: str, expected_wire_effort: str
+    model: str, effort_params: dict, expected_wire_effort: str
 ) -> None:
     body = AlibabaTokenPlanChatConfig().transform_request(
         model=model,
         messages=[{"role": "user", "content": "Hello"}],
-        optional_params={"reasoning_effort": effort, "max_tokens": 1024},
+        optional_params={**effort_params, "max_tokens": 1024},
         litellm_params={},
         headers={},
     )

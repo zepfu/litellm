@@ -92,6 +92,7 @@
                     "value_map": {
                         "minimal": "low",
                         "low": "low",
+                        "medium": "high",
                         "high": "high",
                         "xhigh": "xhigh",
                         "max": "xhigh"
