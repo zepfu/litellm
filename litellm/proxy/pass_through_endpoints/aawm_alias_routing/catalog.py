@@ -28,6 +28,7 @@ SERVED_CONCRETE_MODELS: Tuple[Tuple[str, str, str], ...] = (
     ("kimi_code/k3", "kimi_code/k3", "kimi_code"),
     ("cohere/north-mini-code-1-0", "cohere/north-mini-code-1-0", "cohere"),
     ("alibaba_token_plan/glm-5.3", "alibaba_token_plan/glm-5.3", "alibaba_token_plan"),
+    ("alibaba_token_plan/qwen4-max", "alibaba_token_plan/qwen4-max", "alibaba_token_plan"),
     (
         "alibaba_token_plan/qwen3.8-max",
         "alibaba_token_plan/qwen3.8-max",

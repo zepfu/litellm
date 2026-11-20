@@ -39,6 +39,116 @@
         "supports_web_search": true,
         "vector_store_cost_per_gb_per_day": 0.0
     },
+    "alibaba_token_plan/qwen4-max": {
+        "comment": "Alibaba Token Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
+        "litellm_provider": "alibaba_token_plan",
+        "mode": "chat",
+        "provider_specific_entry": {
+            "alibaba_token_plan": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "priced",
+                    "kind": "provider_catalog_reference_tariff",
+                    "billing_mode": "alibaba_token_plan_subscription",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "dashscope",
+                        "model": "qwen4-max"
+                    },
+                    "cache_mode": "provider_cache_read_write",
+                    "equivalence_status": "direct_reference",
+                    "equivalence_evidence": "Qwen4-Max standard Singapore international PAYG list rates are a direct provider-catalog comparison reference for the stable model. This is not Alibaba Token Plan subscription invoice pricing. Promotional and off-peak discounts are excluded. The official list establishes explicit and implicit cache-hit rates, 5-minute and 1-hour cache-creation rates, and output rates; the 1-hour cache-creation rate is retained as metadata, while the shared reference-cost contract prices only the 5-minute cache-creation rate. Usage without cache-kind attribution remains unpriced.",
+                    "source": {
+                        "kind": "official_provider_direct_list_rate_catalog",
+                        "label": "Alibaba Cloud Model Studio Qwen4-Max standard Singapore international list rates",
+                        "urls": [
+                            "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
+                            "https://www.alibabacloud.com/help/en/model-studio/qwen4-max"
+                        ],
+                        "version": "2026-11-20",
+                        "verified_on": "2026-11-20"
+                    },
+                    "rates": {
+                        "input_usd_per_million_tokens": 1.5,
+                        "implicit_cache_read_usd_per_million_tokens": 0.075,
+                        "explicit_cache_read_usd_per_million_tokens": 0.075,
+                        "cache_write_usd_per_million_tokens": 1.875,
+                        "cache_write_1h_usd_per_million_tokens": 3.0,
+                        "output_usd_per_million_tokens": 4.5
+                    }
+                },
+                "reasoning_effort_wire": {
+                    "policy": "map_reasoning_effort",
+                    "wire_field": "reasoning_effort",
+                    "native_values": [
+                        "low",
+                        "high",
+                        "xhigh"
+                    ],
+                    "value_map": {
+                        "minimal": "low",
+                        "low": "low",
+                        "high": "high",
+                        "xhigh": "xhigh",
+                        "max": "xhigh"
+                    },
+                    "source": "https://www.alibabacloud.com/help/en/model-studio/qwen4-max"
+                }
+            }
+        },
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ],
+            "multi_agent_v1": [
+                "close_agent",
+                "resume_agent",
+                "send_input",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
+        "source": "https://www.alibabacloud.com/help/en/model-studio/qwen4-max",
+        "supports_function_calling": true,
+        "supports_parallel_function_calling": true,
+        "supports_reasoning": true,
+        "supports_tool_choice": true,
+        "unsupported_hosted_tools": [
+            "custom",
+            "image_generation",
+            "namespace",
+            "tool_search",
+            "web_search"
+        ],
+        "unsupported_input_item_types": [
+            "custom_tool_call",
+            "custom_tool_call_output"
+        ],
+        "supports_minimal_reasoning_effort": false,
+        "supports_none_reasoning_effort": false,
+        "supports_low_reasoning_effort": true,
+        "supports_high_reasoning_effort": true,
+        "supports_xhigh_reasoning_effort": true,
+        "supports_max_reasoning_effort": false,
+        "default_reasoning_effort": "high",
+        "max_tokens": 262144,
+        "max_input_tokens": 983616,
+        "max_output_tokens": 262144,
+        "supports_prompt_caching": true,
+        "supports_vision": true,
+        "supports_response_schema": true,
+        "supports_video_input": true,
+        "supports_web_search": true
+    },
     "alibaba_token_plan/qwen4-max-preview": {
         "comment": "Alibaba Token Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",
         "custom_tool_function_adapters": [

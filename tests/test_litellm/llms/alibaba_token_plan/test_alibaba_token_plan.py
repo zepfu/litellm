@@ -35,6 +35,7 @@ def test_catalog_constant_is_metadata_only() -> None:
     """ALIBABA_TOKEN_PLAN_MODEL_IDS is retained as catalog metadata only;
     admission and credential discovery are structural, not enumerated."""
     assert ALIBABA_TOKEN_PLAN_MODEL_IDS == {
+        "qwen4-max",
         "qwen4-max-preview",
         "qwen3.8-max",
         "qwen3.8-max-preview",
@@ -47,16 +48,25 @@ def test_catalog_constant_is_metadata_only() -> None:
     }
 
 
-def test_should_map_qwen4_alias_effort_and_combined_output_budget() -> None:
+@pytest.mark.parametrize(
+    ("model", "effort", "expected_wire_effort"),
+    (
+        ("qwen4-max-preview", "max", "xhigh"),
+        ("qwen4-max", "high", "high"),
+    ),
+)
+def test_should_map_qwen4_alias_effort_and_combined_output_budget(
+    model: str, effort: str, expected_wire_effort: str
+) -> None:
     body = AlibabaTokenPlanChatConfig().transform_request(
-        model="qwen4-max-preview",
+        model=model,
         messages=[{"role": "user", "content": "Hello"}],
-        optional_params={"reasoning_effort": "max", "max_tokens": 1024},
+        optional_params={"reasoning_effort": effort, "max_tokens": 1024},
         litellm_params={},
         headers={},
     )
-    assert body["model"] == "qwen4-max-preview"
-    assert body["reasoning_effort"] == "xhigh"
+    assert body["model"] == model
+    assert body["reasoning_effort"] == expected_wire_effort
     assert body["max_tokens"] == 1024
 
 
