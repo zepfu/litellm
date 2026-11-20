@@ -25,7 +25,6 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select imp
 )
 
 
-_ENVIRONMENTS = ("alpha", "production")
 _WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 
@@ -259,7 +258,7 @@ def _route_projection(row: _ReportRow) -> str:
 
 
 def _row_item(snapshot: RoutingSnapshot, row: _ReportRow, index: int) -> str:
-    order = "last resort" if row.priority == 0 else f"priority {row.priority}"
+    order = "priority zero (last resort)" if row.priority == 0 else f"priority {row.priority}"
     target = _alias_link(snapshot, row.target_alias) if row.target_alias is not None else escape(row.label)
     kind = "missing alias reference" if row.kind == "alias reference" and not row.target_exists else row.kind
     conditions = _combined_reference_conditions(snapshot, row) if row.kind == "alias reference" else row.restrictions
