@@ -433,9 +433,11 @@ def test_cohere_trial_limit_429_keeps_public_quota_classification(
         provider_response = provider_error.response
     else:
         request = httpx.Request("POST", _COHERE_CHAT_URL)
-        provider_response = httpx.Response(429, request=request)
+        provider_response = httpx.Response(
+            429, request=request, json={"message": message}
+        )
         provider_error = httpx.HTTPStatusError(
-            message, request=request, response=provider_response
+            "Too Many Requests", request=request, response=provider_response
         )
 
     with pytest.raises(RateLimitError) as mapped_error:

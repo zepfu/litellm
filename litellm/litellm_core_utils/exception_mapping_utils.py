@@ -234,6 +234,22 @@ def extract_and_raise_litellm_exception(
                 )
 
 
+def _cohere_rate_limit_message(exc: Any, response: Any, fallback: str) -> str:
+    message = getattr(exc, "message", None)
+    if isinstance(message, str) and message.strip():
+        return message
+    if isinstance(response, httpx.Response):
+        try:
+            payload = response.json()
+        except (ValueError, httpx.ResponseNotRead):
+            return fallback
+        if isinstance(payload, dict):
+            provider_message = payload.get("message")
+            if isinstance(provider_message, str) and provider_message.strip():
+                return provider_message
+    return fallback
+
+
 def _cohere_provider_status_code(original_exception: Any) -> Any:
     status_code = getattr(original_exception, "status_code", None)
     if status_code is None:
@@ -1608,8 +1624,11 @@ def exception_type(  # type: ignore  # noqa: PLR0915
                 if cohere_status_code == 429:
                     exception_mapping_worked = True
                     provider_response = getattr(original_exception, "response", None)
+                    provider_message = _cohere_rate_limit_message(
+                        original_exception, provider_response, error_str
+                    )
                     rate_limit_error = RateLimitError(
-                        message=f"CohereException - {error_str}",
+                        message=f"CohereException - {provider_message}",
                         llm_provider="cohere",
                         model=model,
                         response=provider_response,
