@@ -11,7 +11,7 @@
 
 Alibaba Token Plan is a bounded provider integration for the Token Plan
 subscription endpoint. It is distinct from the general `dashscope/` provider:
-the endpoint, credential name, model allowlist, billing provenance, and AAWM
+the endpoint, credential name, model catalog, billing provenance, and AAWM
 alias routes remain separate.
 
 ## Supported models
@@ -58,10 +58,9 @@ body. Source: the QwenCloud OpenAI chat API reference.
 `qwen3.8-flash` has no configured effort, so the request omits both fields and
 leaves the provider thinking default in place.
 
-Other model IDs are rejected locally. The provider always resolves the public
-LiteLLM model identity to the unprefixed provider model before egress. A public
-AAWM alias such as `sota-alibaba` must never appear in an upstream request
-body.
+The adapter accepts a bare model ID or `alibaba_token_plan/<model-id>` and
+sends the bare model ID upstream. The catalog supplies model capabilities and
+reference pricing. The Token Plan endpoint determines account access.
 
 ## Credential and endpoint contract
 
