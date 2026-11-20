@@ -68,7 +68,26 @@ def test_should_prioritize_qwen4_only_in_alpha_overrides(tmp_path: Path) -> None
         assert candidates[0].schedule.start == preview_start
         assert candidates[0].schedule.end == preview_end
         assert candidates[0].reasoning_effort == "max"
-        assert candidates[1:] == original
+        assert (
+            isinstance(candidates[1], RoutingCandidate)
+            and (
+                candidates[1].provider,
+                candidates[1].model,
+                candidates[1].route_family,
+                candidates[1].priority,
+                candidates[1].reasoning_effort,
+                candidates[1].schedule,
+            )
+            == (
+                "alibaba_token_plan",
+                "alibaba_token_plan/qwen4-max",
+                "codex_alibaba_token_plan_chat_completions_adapter",
+                105,
+                "max",
+                None,
+            )
+            and candidates[2:] == original
+        )
 
     original_expert = canonical.aliases["expert-other"].candidates
     expert_candidates = alpha.aliases["expert-other"].candidates
