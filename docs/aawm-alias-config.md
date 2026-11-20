@@ -844,6 +844,19 @@ and follows the same generic snapshot lookup failure as every other absent
 name. No identity-specific recognition, rejection, redirect, or compatibility
 path applies.
 
+Generate a standalone comparison report for the alpha and production trees with:
+
+```
+./.venv/bin/python scripts/aawm_alias_report.py --output /tmp/aawm-alias-report.html
+```
+
+The command compiles explicitly supplied directories and reads their readiness
+endpoints. Copy each deployed alias-config directory before passing it with
+`--alpha-config-dir` and `--production-config-dir`; use the alpha Compose
+overlays for alpha and the exact production container files for production.
+Override the readiness URL options as needed. The report marks runtime
+readiness as unavailable rather than treating a compiled tree as verified.
+
 ## Cohere source identity (COHERE-001)
 
 The AAWM direct Codex Cohere alias route is a **direct, native provider lane**,
