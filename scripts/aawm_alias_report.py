@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,8 @@ from urllib.request import urlopen
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (  # noqa: E402
     compile_directory,
@@ -36,7 +39,6 @@ class AliasSnapshot:
 
     snapshot: RoutingSnapshot
     readiness_hash: str | None
-    readiness_error: str | None
 
 
 def _fetch_readiness_hash(url: str, timeout_seconds: float) -> str | None:
@@ -47,6 +49,8 @@ def _fetch_readiness_hash(url: str, timeout_seconds: float) -> str | None:
     except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
         return None
     if response.status != 200:
+        return None
+    if not isinstance(payload, dict):
         return None
     alias_status = payload.get("aawm_alias_config")
     if not isinstance(alias_status, dict):
@@ -82,7 +86,6 @@ def _load_alias_snapshot(config_dir: Path, readiness_url: str, timeout_seconds: 
     return AliasSnapshot(
         snapshot=snapshot,
         readiness_hash=readiness_hash,
-        readiness_error=None if readiness_hash is not None else "unavailable",
     )
 
 

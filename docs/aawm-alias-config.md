@@ -844,10 +844,10 @@ and follows the same generic snapshot lookup failure as every other absent
 name. No identity-specific recognition, rejection, redirect, or compatibility
 path applies.
 
-Generate a standalone comparison report for the alpha and production trees with:
+Generate a standalone comparison report for the alpha and production trees.
 
 ```
-./.venv/bin/python scripts/aawm_alias_report.py --output /tmp/aawm-alias-report.html
+LITELLM_LOCAL_MODEL_COST_MAP=True ./.venv/bin/python scripts/aawm_alias_report.py --output /tmp/aawm-alias-report.html
 ```
 
 The command compiles the effective alias trees from `litellm-alpha` and
