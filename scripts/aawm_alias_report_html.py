@@ -20,6 +20,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot imp
     ScheduleWindow,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
+    _ANTHROPIC_CREDENTIAL_ROUTE_FAMILIES,
     _order_snapshot_entries_by_priority,
 )
 
@@ -250,7 +251,9 @@ def _dispatch_definition(snapshot: RoutingSnapshot, alias: RoutingAlias | None) 
 def _route_projection(row: _ReportRow) -> str:
     if row.kind != "model":
         return "Linked alias definition"
-    codex_target = row.route_family or "unavailable"
+    codex_target = (
+        "unavailable" if row.route_family in _ANTHROPIC_CREDENTIAL_ROUTE_FAMILIES else row.route_family or "unavailable"
+    )
     anthropic_target = row.anthropic_route_family or "unavailable"
     return f"Codex: {codex_target}; Anthropic: {anthropic_target}"
 
