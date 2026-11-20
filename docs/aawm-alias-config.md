@@ -850,12 +850,12 @@ Generate a standalone comparison report for the alpha and production trees with:
 ./.venv/bin/python scripts/aawm_alias_report.py --output /tmp/aawm-alias-report.html
 ```
 
-The command compiles explicitly supplied directories and reads their readiness
-endpoints. Copy each deployed alias-config directory before passing it with
-`--alpha-config-dir` and `--production-config-dir`; use the alpha Compose
-overlays for alpha and the exact production container files for production.
-Override the readiness URL options as needed. The report marks runtime
-readiness as unavailable rather than treating a compiled tree as verified.
+The command compiles the effective alias trees from `litellm-alpha` and
+`aawm-litellm` using bounded `docker cp`, then reads their readiness endpoints.
+Pass `--alpha-config-dir` or `--production-config-dir` to compile an existing
+offline directory instead of Docker for that side. Override the readiness URL
+options as needed. The report marks runtime readiness as unavailable rather
+than treating a compiled tree as verified.
 
 ## Cohere source identity (COHERE-001)
 

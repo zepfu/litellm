@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -23,6 +25,9 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot imp
 from scripts.aawm_alias_report_html import render_report  # noqa: E402
 
 _DEFAULT_TIMEOUT_SECONDS = 5.0
+_CONTAINER_CONFIG_PATH = "/app/litellm/proxy/aawm_alias_config"
+_ALPHA_CONTAINER = "litellm-alpha"
+_PRODUCTION_CONTAINER = "aawm-litellm"
 
 
 @dataclass(frozen=True)
@@ -52,6 +57,25 @@ def _fetch_readiness_hash(url: str, timeout_seconds: float) -> str | None:
     return config_hash if isinstance(config_hash, str) else None
 
 
+def _copy_container_config_directory(container: str, temporary_root: Path) -> Path:
+    """Copy one deployed config tree, including its effective container mounts."""
+    destination = temporary_root / container
+    destination.mkdir(mode=0o700)
+    result = subprocess.run(
+        ["docker", "cp", f"{container}:{_CONTAINER_CONFIG_PATH}", str(destination)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"docker cp failed for {container}: {result.stderr.strip()}")
+    config_dir = destination / Path(_CONTAINER_CONFIG_PATH).name
+    if not config_dir.is_dir():
+        raise RuntimeError(f"docker cp did not create {config_dir}")
+    return config_dir
+
+
 def _load_alias_snapshot(config_dir: Path, readiness_url: str, timeout_seconds: float) -> AliasSnapshot:
     snapshot = compile_directory(config_dir)
     readiness_hash = _fetch_readiness_hash(url=readiness_url, timeout_seconds=timeout_seconds)
@@ -73,14 +97,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--alpha-config-dir",
         type=Path,
-        required=True,
-        help="Alpha alias-config directory, including its active Compose overlays.",
+        help="Alpha alias-config directory; omit to copy it from litellm-alpha.",
     )
     parser.add_argument(
         "--production-config-dir",
         type=Path,
-        required=True,
-        help="Production alias-config directory copied from its deployed container.",
+        help="Production alias-config directory; omit to copy it from aawm-litellm.",
     )
     parser.add_argument(
         "--alpha-readiness-url",
@@ -100,26 +122,35 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = _parser().parse_args()
-    alpha = _load_alias_snapshot(
-        config_dir=args.alpha_config_dir,
-        readiness_url=args.alpha_readiness_url,
-        timeout_seconds=args.timeout_seconds,
-    )
-    production = _load_alias_snapshot(
-        config_dir=args.production_config_dir,
-        readiness_url=args.production_readiness_url,
-        timeout_seconds=args.timeout_seconds,
-    )
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(
-        render_report(
-            alpha=alpha.snapshot,
-            production=production.snapshot,
-            alpha_readiness_hash=alpha.readiness_hash,
-            production_readiness_hash=production.readiness_hash,
-        ),
-        encoding="utf-8",
-    )
+    with tempfile.TemporaryDirectory(prefix="aawm-alias-report-inputs-") as temporary_root:
+        alpha_config_dir = args.alpha_config_dir or _copy_container_config_directory(
+            _ALPHA_CONTAINER,
+            Path(temporary_root),
+        )
+        production_config_dir = args.production_config_dir or _copy_container_config_directory(
+            _PRODUCTION_CONTAINER,
+            Path(temporary_root),
+        )
+        alpha = _load_alias_snapshot(
+            config_dir=alpha_config_dir,
+            readiness_url=args.alpha_readiness_url,
+            timeout_seconds=args.timeout_seconds,
+        )
+        production = _load_alias_snapshot(
+            config_dir=production_config_dir,
+            readiness_url=args.production_readiness_url,
+            timeout_seconds=args.timeout_seconds,
+        )
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            render_report(
+                alpha=alpha.snapshot,
+                production=production.snapshot,
+                alpha_readiness_hash=alpha.readiness_hash,
+                production_readiness_hash=production.readiness_hash,
+            ),
+            encoding="utf-8",
+        )
     return 0
 
 
