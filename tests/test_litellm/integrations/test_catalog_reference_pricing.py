@@ -155,7 +155,20 @@ def test_should_fail_closed_on_exact_provider_key_mismatch(catalog):
     )
 
 
-def test_should_price_qwen4_preview_against_standard_production_baseline(catalog):
+def test_should_distinguish_qwen4_stable_tariff_from_preview_baseline(catalog):
+    stable_reference = aawm_agent_identity.resolve_aawm_reference_pricing(
+        provider="alibaba_token_plan",
+        model="qwen4-max",
+        prompt_tokens=100_000,
+        completion_tokens=1_000,
+        usage_obj={"cache_read_input_tokens": 0},
+    )
+    assert stable_reference["actual_invoice_cost_known"] is False
+    assert stable_reference["reference_cost_kind"] == "provider_catalog_reference_tariff"
+    assert stable_reference["reference_cost_basis_model"] == "qwen4-max"
+    assert stable_reference["reference_cost_equivalence_status"] == "direct_reference"
+    assert stable_reference["reference_cost_total_usd"] == pytest.approx(0.1545)
+
     result = aawm_agent_identity.resolve_aawm_reference_pricing(
         provider="alibaba_token_plan",
         model="qwen4-max-preview",

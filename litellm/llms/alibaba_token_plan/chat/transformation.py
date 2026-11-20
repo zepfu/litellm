@@ -53,6 +53,7 @@ _SettingsFileGeneration = tuple[int, int, int, int, int]
 # validated structurally, never against this static enumeration.
 ALIBABA_TOKEN_PLAN_MODEL_IDS = frozenset(
     {
+        "qwen4-max",
         "qwen4-max-preview",
         "qwen3.8-max-preview",
         "qwen3.8-max",

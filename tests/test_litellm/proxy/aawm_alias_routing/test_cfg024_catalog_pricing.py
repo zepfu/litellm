@@ -21,6 +21,7 @@ SERVED_CONCRETE_MODELS = (
     "oa_xai/grok-4.7",
     "kimi_code/k3",
     "cohere/north-mini-code-1-0",
+    "alibaba_token_plan/qwen4-max",
     "openrouter/qwen/qwen3.6-flash",
     "openrouter/qwen/qwen3.5-flash-02-23",
 )
