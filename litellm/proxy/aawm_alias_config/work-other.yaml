@@ -4,9 +4,7 @@ defaults: {}
 aliases:
   - name: work-other
     candidates:
-      - provider: zai_coding_plan
-        model: zai_coding_plan/glm-5.3-flash
-        route_family: codex_zai_coding_plan_chat_completions_adapter
+      - alias_reference: sota-zai
         priority: 120
         schedule:
           start_time: "23:00:00"
@@ -21,9 +19,7 @@ aliases:
           utc_offset: "+08:00"
       - alias_reference: sota-moonshot
         priority: 90
-      - provider: muse_code
-        model: muse-spark-1.3-contributor
-        route_family: muse_code
+      - alias_reference: sota-meta
         priority: 85
       - alias_reference: sota-xai
         priority: 80
