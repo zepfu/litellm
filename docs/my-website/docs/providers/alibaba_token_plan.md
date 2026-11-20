@@ -133,8 +133,10 @@ bounded to that full preview window; its nightly helper schedule gates the
 reference while the leaf's absolute schedule preserves ordinary priority and
 the half-open expiry. Fallback candidates and schedules are preserved. `sota`
 inherits this order for Qwen clients, and `expert` references `expert-other`.
-Canonical alias files and dev/production deployments retain their current
-order. Only `docker-compose.alpha.yml` mounts the three Qwen overrides.
+The alpha `sota-alibaba` and `provider-alibaba` aliases select stable
+`qwen4-max` after the preview and before `qwen3.8-max`. When the preview
+expires, stable becomes their first candidate. Only
+`docker-compose.alpha.yml` mounts these Qwen overrides.
 
 The preview supports a 1M-token context and up to 393,216 output tokens.
 Its `max_tokens` budget includes both thinking and the final answer. Alibaba
