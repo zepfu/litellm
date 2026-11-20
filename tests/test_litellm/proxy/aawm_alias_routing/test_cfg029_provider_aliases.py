@@ -351,7 +351,7 @@ def test_opencode_basic_selects_supported_go_replacement() -> None:
         for entry in snapshot.aliases["basic-other"].candidates
         if isinstance(entry, RoutingCandidate)
     }
-    assert "muse-spark-1.3-contributor" in basic_other_models
+    assert "muse-ember-1.0" in basic_other_models
     assert "opencode/omen-alpha" not in basic_other_models
 
 
