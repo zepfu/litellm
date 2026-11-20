@@ -22,6 +22,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import snapshot_sel
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
     AliasReference,
     RoutingCandidate,
+    RoutingSnapshot,
 )
 
 
@@ -42,7 +43,9 @@ aliases:
 """
 
 
-def test_should_prioritize_qwen4_only_in_alpha_overrides(tmp_path: Path) -> None:
+def _compile_alpha_override_snapshots(
+    tmp_path: Path,
+) -> tuple[RoutingSnapshot, RoutingSnapshot]:
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
         DEFAULT_CONFIG_DIR,
         compile_directory,
@@ -54,7 +57,11 @@ def test_should_prioritize_qwen4_only_in_alpha_overrides(tmp_path: Path) -> None
     root = Path(__file__).resolve().parents[4]
     for override in (root / "config/alpha-alias-overrides").glob("*.yaml"):
         shutil.copyfile(override, alpha_dir / override.name)
-    alpha = compile_directory(alpha_dir)
+    return canonical, compile_directory(alpha_dir)
+
+
+def test_should_prioritize_qwen4_only_in_alpha_overrides(tmp_path: Path) -> None:
+    canonical, alpha = _compile_alpha_override_snapshots(tmp_path)
     preview_start = dt.datetime(2026, 11, 11, 2, tzinfo=dt.timezone.utc)
     preview_end = dt.datetime(2026, 11, 25, 15, 59, 59, 999999, tzinfo=dt.timezone.utc)
     for name in ("sota-alibaba", "provider-alibaba"):
