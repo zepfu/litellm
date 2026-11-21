@@ -573,7 +573,7 @@ Do not add this alias to `sota.yaml` TUI dispatch.
 
 `sota-meta` routes to `muse-wonder-1.0-contributor` through the native Muse
 Code gateway with the configured Muse credentials and the caller's requested
-reasoning effort. `work-other` shares this route through an alias reference.
+reasoning effort.
 
 ## Codex passthrough alias catalog (CFG-023)
 
