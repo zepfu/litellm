@@ -872,12 +872,11 @@ route.
   endpoint. Aliases that include Cohere candidates set the exact `model` string
   and `provider: cohere` in YAML; the selected route family is
   `codex_cohere_chat_completions_adapter` and the lane is `cohere_native`.
-- `provider-cohere` and `provider-openrouter` expose these lanes separately;
-  neither lane is in the current `basic` graph. Do not merge capacity, error,
-  or cooldown state across those lanes.
-- Direct Cohere is separate from OpenRouter. An OpenRouter candidate such as
-  `openrouter/cohere/north-mini-code:free` remains an OpenRouter request and must not be
-  recorded or interpreted as direct Cohere-native traffic.
+- `provider-cohere` exposes the direct Cohere lane. `provider-openrouter`
+  exposes `openrouter/nvidia/nemotron-3-ultra-550b-a55b:free` through
+  OpenRouter. Capacity, errors, and cooldowns are tracked per provider lane.
+- Historical requests to `openrouter/cohere/north-mini-code:free` also
+  belong to the OpenRouter lane.
 - The Cohere adapter removes transformer-added function-tool `strict` descriptors
   before Chat V2 egress while preserving nested JSON Schema fields, including a
   property named `strict`.
