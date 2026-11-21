@@ -28,11 +28,6 @@ aliases:
         route_family: codex_openrouter_completion_adapter
         priority: 130
 
-      - provider: muse_code
-        model: muse-ember-1.0
-        route_family: muse_code
-        priority: 110
-
       - provider: alibaba_token_plan
         model: alibaba_token_plan/deepseek-v4.1-flash
         route_family: codex_alibaba_token_plan_chat_completions_adapter

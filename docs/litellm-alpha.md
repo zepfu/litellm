@@ -153,8 +153,7 @@ wait for both health endpoints before testing.
 The current alpha alias YAML exposes these test paths:
 
 - `basic` references `basic-other`, then low-effort `gpt-6-luna`. The helper
-  includes native Muse Code `muse-ember-1.0` and scheduled Alibaba DeepSeek
-  V4.1 Flash.
+  includes scheduled Alibaba DeepSeek V4.1 Flash.
 - `work` references `work-other`, then high-effort `gpt-6-luna`. The helper
   orders scheduled `sota-zai` and `sota-deepseek`, then `sota-moonshot`,
   `sota-meta`, and `sota-xai`.

@@ -57,13 +57,12 @@ def test_basic_yaml_compiles() -> None:
     assert first.config_version == second.config_version
     assert first.config_epoch != second.config_epoch
 
-    basic_candidate = first.aliases["basic"].candidates[0]
-    assert basic_candidate.provider == "cohere"
-    assert basic_candidate.model == "cohere/north-mini-code-1-0"
-    assert basic_candidate.route_family == (
-        "codex_cohere_chat_completions_adapter"
-    )
-    assert basic_candidate.priority == 90
+    helper, fallback = first.aliases["basic"].candidates
+    assert helper.alias_name == "basic-other"
+    assert fallback.provider == "openai"
+    assert fallback.model == "gpt-6-luna"
+    assert fallback.route_family == "codex_responses"
+    assert fallback.reasoning_effort == "low"
 
 
 def test_standalone_alias_mappings() -> None:

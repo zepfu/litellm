@@ -1946,8 +1946,8 @@ last-resort leaf on the same alias.
 `sota-meta` uses native Muse Code `muse-wonder-1.0-contributor`.
 
 `basic` first references `basic-other`, then falls back to low-effort
-`gpt-6-luna`. The helper includes native Muse Code `muse-ember-1.0` and
-Alibaba DeepSeek V4.1 Flash, which is eligible during `22:00-08:00 UTC+8`.
+`gpt-6-luna`. The helper includes Alibaba DeepSeek V4.1 Flash, which is
+eligible during `22:00-08:00 UTC+8`.
 
 `work` first references `work-other`, then falls back to high-effort
 `gpt-6-luna`. The helper orders `sota-zai` (`23:00-09:00 UTC+8`),

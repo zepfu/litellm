@@ -219,8 +219,7 @@ OpenAI `gpt-6-luna` (priority 0, `reasoning_effort: low`).
 
 `basic-other` orders Z.AI Coding Plan `zai_coding_plan/glm-5.3-flash`
 (priority 170, admitted only from `23:00-09:00 UTC+8`), Cohere (160),
-Nous Solar Mini 4 (150), OpenRouter (130),
-Meta Muse Code `muse-ember-1.0` (110), then Alibaba Token Plan
+Nous Solar Mini 4 (150), OpenRouter (130), then Alibaba Token Plan
 `alibaba_token_plan/deepseek-v4.1-flash` (100, `22:00-08:00 UTC+8`).
 These candidates have no configured reasoning-effort override.
 

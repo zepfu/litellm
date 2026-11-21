@@ -103,9 +103,8 @@ Config-driven alias routing uses:
   (priority 0), all with `reasoning_effort: low`
 - `basic` uses `basic-other` (110), then low-effort `gpt-6-luna` (0).
 - `basic-other`: Z.AI `glm-5.3-flash` (170, `23:00-09:00 UTC+8`),
-  Cohere (160), Nous (150), OpenRouter (130), native Muse Code
-  `muse-ember-1.0` (110), then
-  Alibaba `deepseek-v4.1-flash` (100, `22:00-08:00 UTC+8`).
+  Cohere (160), Nous (150), OpenRouter (130), then Alibaba
+  `deepseek-v4.1-flash` (100, `22:00-08:00 UTC+8`).
 - `work` uses `work-other` (110), then high-effort `gpt-6-luna` (0).
 - `work-other`: `sota-zai` (120, `23:00-09:00 UTC+8`),
   `sota-deepseek` (110, `22:00-08:00 UTC+8`), `sota-moonshot` (90),
