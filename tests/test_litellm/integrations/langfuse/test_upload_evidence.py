@@ -11,8 +11,8 @@ from litellm.integrations.langfuse import langfuse as integration
 
 
 def test_sdk_ingestion_failure_and_recovery_share_batch_identity(caplog, monkeypatch):
-    langfuse = pytest.importorskip("langfuse")
-    if Version(langfuse.version.__version__).major != 2:
+    version = pytest.importorskip("langfuse.version")
+    if Version(version.__version__).major != 2:
         pytest.skip("requires Langfuse v2 ingestion")
     sent_batches = []
 
@@ -27,7 +27,7 @@ def test_sdk_ingestion_failure_and_recovery_share_batch_identity(caplog, monkeyp
     monkeypatch.setattr(litellm, "initialized_langfuse_clients", 0)
     monkeypatch.setattr(integration, "should_use_langfuse_mock", lambda: False)
     monkeypatch.delenv("UPSTREAM_LANGFUSE_SECRET_KEY", raising=False)
-    monkeypatch.delenv("LANGFUSE_PROJECT_ID", raising=False)
+    monkeypatch.setenv("LANGFUSE_PROJECT_ID", "prior-project")
     monkeypatch.delenv("LANGFUSE_DEBUG", raising=False)
     monkeypatch.setenv("LANGFUSE_FLUSH_INTERVAL", "1")
     with httpx.Client(transport=httpx.MockTransport(send)) as client:
