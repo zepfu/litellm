@@ -195,6 +195,11 @@ def _enrich_auto_agent_alias_terminal_event_from_attempts(
         value = last_attempt.get(key)
         if value is not None:
             event[key] = value
+    if last_attempt.get("attempted_provider_call") is True:
+        if event.get("attempt_number") is None:
+            event["attempt_number"] = event.get("attempt_count")
+        if event.get("attempt_record_index") is None:
+            event["attempt_record_index"] = len(normalized_attempts) - 1
     schema_rejection = normalize_schema_rejection(
         last_attempt,
         provider=last_attempt.get("provider"),

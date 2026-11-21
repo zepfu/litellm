@@ -326,6 +326,39 @@ def test_schema_rejection_preserves_specific_identity_across_attempt_and_audit(
     assert terminal_event[SCHEMA_REJECTION_KEY] == attempt[SCHEMA_REJECTION_KEY]
 
 
+def test_terminal_event_derives_identity_for_last_provider_attempt() -> None:
+    attempts = [
+        {"attempted_provider_call": False},
+        {"attempted_provider_call": True},
+    ]
+    terminal_event: dict[str, Any] = {}
+
+    audit_events._enrich_auto_agent_alias_terminal_event_from_attempts(
+        terminal_event,
+        attempts,
+    )
+
+    assert terminal_event["attempt_count"] == 1
+    assert terminal_event["attempt_number"] == 1
+    assert terminal_event["attempt_record_index"] == 1
+
+    recorded_event = {"attempt_number": 7, "attempt_record_index": 9}
+    audit_events._enrich_auto_agent_alias_terminal_event_from_attempts(
+        recorded_event,
+        attempts,
+    )
+    assert recorded_event["attempt_number"] == 7
+    assert recorded_event["attempt_record_index"] == 9
+
+    preflight_event: dict[str, Any] = {}
+    audit_events._enrich_auto_agent_alias_terminal_event_from_attempts(
+        preflight_event,
+        [{"attempted_provider_call": True}, {"attempted_provider_call": False}],
+    )
+    assert "attempt_number" not in preflight_event
+    assert "attempt_record_index" not in preflight_event
+
+
 @pytest.mark.parametrize(
     ("provider", "route_family"),
     (

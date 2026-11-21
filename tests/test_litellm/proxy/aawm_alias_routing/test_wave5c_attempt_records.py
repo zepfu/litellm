@@ -396,6 +396,26 @@ class TestRetryableAttemptRecord:
         assert synthetic_record["adapter_status_code"] == 500
         assert synthetic_record["failure_source"] == "provider_adapter"
 
+        subdomain_record: dict[str, Any] = {"attempted_provider_call": True}
+        subdomain_exc = Exception("adapter failure")
+        subdomain_exc._status_code = 500  # type: ignore[attr-defined]
+        subdomain_exc.llm_provider = "cohere"  # type: ignore[attr-defined]
+        subdomain_exc.response = httpx.Response(  # type: ignore[attr-defined]
+            502,
+            request=httpx.Request("POST", "https://www.litellm.ai/v1/chat"),
+        )
+        attempt_records._update_codex_auto_agent_retryable_attempt_record(
+            attempt_record=subdomain_record,
+            exc=subdomain_exc,
+            error_class="provider_terminal_error",
+            cooldown_seconds=0.0,
+            alias_model="codex-auto-agent",
+            cooldown_scope="none",
+            candidate={"provider": "cohere"},
+        )
+        assert subdomain_record["provider_status_code"] is None
+        assert subdomain_record["adapter_status_code"] == 500
+
         unbound_record: dict[str, Any] = {"attempted_provider_call": True}
         unbound_exc = Exception("adapter failure")
         unbound_exc.response = httpx.Response(502)  # type: ignore[attr-defined]
@@ -411,6 +431,96 @@ class TestRetryableAttemptRecord:
 
         assert unbound_record["provider_status_code"] is None
         assert unbound_record["failure_source"] == "adapter"
+
+    def test_recovers_native_status_from_chained_http_status_error(self) -> None:
+        from litellm.llms.cohere.chat.transformation import CohereError
+
+        provider_response = httpx.Response(
+            429,
+            request=httpx.Request("POST", "https://api.cohere.ai/v2/chat"),
+        )
+        provider_error = httpx.HTTPStatusError(
+            "provider rate limit",
+            request=provider_response.request,
+            response=provider_response,
+        )
+        adapter_error = CohereError(status_code=500, message="mapped failure")
+        adapter_error._status_code = 500  # type: ignore[attr-defined]
+        adapter_error.__cause__ = provider_error
+        record: dict[str, Any] = {"attempted_provider_call": True}
+
+        attempt_records._update_codex_auto_agent_retryable_attempt_record(
+            attempt_record=record,
+            exc=adapter_error,
+            error_class="provider_terminal_error",
+            cooldown_seconds=0.0,
+            alias_model="codex-auto-agent",
+            cooldown_scope="none",
+            candidate={"provider": "cohere"},
+        )
+
+        assert record["provider_status_code"] == 429
+        assert record["adapter_status_code"] == 500
+        assert record["failure_source"] == "provider_response"
+
+    def test_typed_adapter_responses_do_not_masquerade_as_provider_http(self) -> None:
+        from litellm.llms.cohere.chat.transformation import CohereError
+        from litellm.llms.openrouter.common_utils import OpenRouterException
+
+        cases = (
+            (CohereError(status_code=429, message="adapter error"), "cohere"),
+            (
+                OpenRouterException(status_code=502, message="adapter error"),
+                "openrouter",
+            ),
+        )
+        for adapter_error, provider in cases:
+            adapter_error._status_code = adapter_error.status_code  # type: ignore[attr-defined]
+            record: dict[str, Any] = {"attempted_provider_call": True}
+            attempt_records._update_codex_auto_agent_retryable_attempt_record(
+                attempt_record=record,
+                exc=adapter_error,
+                error_class="provider_terminal_error",
+                cooldown_seconds=0.0,
+                alias_model="codex-auto-agent",
+                cooldown_scope="none",
+                candidate={"provider": provider},
+            )
+
+            assert record["provider_status_code"] is None
+            assert record["adapter_status_code"] == adapter_error.status_code
+            assert record["failure_source"] == "adapter"
+
+    def test_explicitly_unattempted_call_ignores_chained_provider_response(self) -> None:
+        provider_response = httpx.Response(
+            502,
+            request=httpx.Request("POST", "https://api.cohere.ai/v2/chat"),
+        )
+        exc = httpx.HTTPStatusError(
+            "provider failure",
+            request=provider_response.request,
+            response=provider_response,
+        )
+        record: dict[str, Any] = {
+            "attempted_provider_call": False,
+            "provider_returned": True,
+        }
+
+        attempt_records._update_codex_auto_agent_retryable_attempt_record(
+            attempt_record=record,
+            exc=exc,
+            error_class="provider_terminal_error",
+            cooldown_seconds=0.0,
+            alias_model="codex-auto-agent",
+            cooldown_scope="none",
+            candidate={"provider": "cohere"},
+        )
+
+        assert record["provider_status_code"] is None
+        assert record["adapter_status_code"] is None
+        assert record["failure_source"] == "proxy"
+        assert record["failure_origin"] == "unknown"
+        assert record["provider_failure_class"] == "unknown"
 
     def test_no_cooldown_scope_none(self) -> None:
         record: dict[str, Any] = {}

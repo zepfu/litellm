@@ -18,6 +18,7 @@ from contextvars import ContextVar, Token
 from typing import Any, Callable, Mapping, Optional
 from uuid import uuid4
 
+import httpx
 from fastapi import Request
 
 from . import opencode_go_preflight as _opencode_go_preflight
@@ -1022,42 +1023,32 @@ def _provider_failure_provenance(
         getattr(error_provider_value, "value", error_provider_value) or ""
     ).strip().lower()
 
-    response = getattr(exc, "response", None)
-    response_status = getattr(response, "status_code", None)
-    provider_status_code: Optional[int] = None
-    adapter_status_code: Optional[int] = None
-    response_host = ""
-    if response is not None:
-        try:
-            request = response.request
-        except (AttributeError, RuntimeError):
-            request = None
-        response_url = getattr(request, "url", None)
-        response_host = str(getattr(response_url, "host", "") or "").lower()
+    provider_status_code = None
+    adapter_status_code = None
+    explicitly_unattempted = (
+        attempted_provider_call_known and not attempted_provider_call
+    )
+    if not explicitly_unattempted:
+        provider_status_code = _observed_provider_http_status(exc)
+
+    observed_adapter_status = _extract_exception_status_code(exc)
     if (
-        isinstance(response_status, int)
-        and not isinstance(response_status, bool)
-        and 100 <= response_status <= 599
-        and response_host
-        and response_host != "litellm.ai"
+        isinstance(observed_adapter_status, int)
+        and not isinstance(observed_adapter_status, bool)
+        and 100 <= observed_adapter_status <= 599
+        and not explicitly_unattempted
+        and (provider_status_code is not None or provider_returned or attempted_provider_call)
     ):
-        provider_status_code = response_status
+        adapter_status_code = observed_adapter_status
+
+    if provider_status_code is not None:
         failure_source = "provider_response"
-    elif provider_returned or (
-        attempted_provider_call and provider and error_provider == provider
+    elif not explicitly_unattempted and (
+        provider_returned
+        or (attempted_provider_call and provider and error_provider == provider)
     ):
-        observed_status = _extract_exception_status_code(exc)
-        if (
-            isinstance(observed_status, int)
-            and not isinstance(observed_status, bool)
-            and 100 <= observed_status <= 599
-        ):
-            adapter_status_code = observed_status
-        else:
-            adapter_status_code = None
         failure_source = "provider_adapter"
     elif attempted_provider_call:
-        adapter_status_code = None
         failure_source = "adapter"
     elif attempted_provider_call_known:
         adapter_status_code = None
@@ -1066,7 +1057,11 @@ def _provider_failure_provenance(
         adapter_status_code = None
         failure_source = "unknown"
 
-    if provider_status_code is not None or adapter_status_code is not None or provider_returned:
+    if (
+        provider_status_code is not None
+        or (failure_source == "provider_adapter" and adapter_status_code is not None)
+        or (provider_returned and not explicitly_unattempted)
+    ):
         event = _classify_failure(
             status_code=provider_status_code or adapter_status_code,
             provider=provider or None,
@@ -1086,6 +1081,69 @@ def _provider_failure_provenance(
         "provider_failure_class": provider_failure_class,
         "failure_source": failure_source,
     }
+
+
+_LITELLM_RESPONSE_HOST = "litellm.ai"
+_MAX_PROVIDER_EXCEPTION_CHAIN = 12
+
+
+def _provider_response_status_code(response: Any) -> Optional[int]:
+    if not isinstance(response, httpx.Response):
+        return None
+    status_code = response.status_code
+    if (
+        not isinstance(status_code, int)
+        or isinstance(status_code, bool)
+        or not 100 <= status_code <= 599
+    ):
+        return None
+    try:
+        request = response.request
+    except (AttributeError, RuntimeError):
+        return None
+    host = str(getattr(getattr(request, "url", None), "host", "") or "").lower()
+    if not host or host == _LITELLM_RESPONSE_HOST or host.endswith(
+        f".{_LITELLM_RESPONSE_HOST}"
+    ):
+        return None
+    return status_code
+
+
+def _iter_exception_chain(exc: Any):
+    """Yield the bounded linear cause/context chain without revisiting errors."""
+    seen: set[int] = set()
+    current = exc
+    while current is not None and len(seen) < _MAX_PROVIDER_EXCEPTION_CHAIN:
+        if id(current) in seen:
+            break
+        seen.add(id(current))
+        yield current
+        cause = getattr(current, "__cause__", None)
+        context = getattr(current, "__context__", None)
+        current = cause if cause is not None else context
+
+
+def _observed_provider_http_status(exc: Any) -> Optional[int]:
+    """Return a real upstream HTTP status, excluding adapter-synthesized errors."""
+    for chained_exc in _iter_exception_chain(exc):
+        if isinstance(chained_exc, httpx.HTTPStatusError):
+            status_code = _provider_response_status_code(chained_exc.response)
+            if status_code is not None:
+                return status_code
+
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+
+    # Cohere's typed errors synthesize an httpx.Response using the provider's
+    # hostname. Its status is adapter metadata; the original HTTPStatusError,
+    # when one exists, is retained in the exception cause/context above.
+    if (
+        type(exc).__name__ == "CohereError"
+        and type(exc).__module__.startswith("litellm.llms.cohere.")
+    ):
+        return None
+    return _provider_response_status_code(response)
 
 
 # ---------------------------------------------------------------------------
