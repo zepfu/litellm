@@ -785,7 +785,7 @@ Each terminal-agent row is one append-only JSON object. Top-level fields include
   terminal rows leave these empty/null; they are not traceback dumps)
 - `fingerprint` for stable grouping of repeated failure classes
 - `failure_kind` and `error_code`
-- `status_code` (HTTP/upstream status when known)
+- `status_code` (HTTP status reported for the terminal outcome, when known)
 - correlation identity: `agent_id`, `session_id`, `litellm_call_id`
 - terminal semantics:
   - `terminal_outcome` — why the attempt ended (for example
@@ -831,6 +831,12 @@ Useful `context` identity and attempt fields (when available):
   `error_status_code`
 - failure classification: `failure_kind`, `failure_class`, `error_code`,
   `event_type`, `candidate_status`, `failure_phase`, `attempted_provider_call`
+- provider failure provenance: `provider_status_code` for an observed HTTP
+  response from the provider, `adapter_status_code` for the status carried by
+  the adapter before alias terminalization, and `failure_source`,
+  `failure_origin` and `provider_failure_class` for attribution and
+  classification. Join to the alias audit by `litellm_call_id` and the
+  recorded attempt number or index.
 - agent/session correlation: `repository`, `tenant_id`, `agent_name`,
   `agent_id`, `agent_role`, `agent_profile`, `thread_source`, `session_id`,
   `thread_id`, `trace_id`, `litellm_call_id`, `dispatch_id`,
