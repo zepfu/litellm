@@ -565,42 +565,24 @@ aliases:
 
 
 def test_canonical_work_other_compiles_scheduled_deepseek_without_alibaba() -> None:
-    """CFG-041: work-other orders scheduled DeepSeek, Z.AI, Moonshot, then xAI."""
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
-        AliasReference,
-        RoutingCandidate,
-    )
+    """Work orders scheduled Z.AI and DeepSeek before Moonshot and xAI."""
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
         DEFAULT_CONFIG_DIR,
         compile_directory,
     )
 
     snapshot = compile_directory(DEFAULT_CONFIG_DIR)
-    alias = snapshot.aliases["work-other"]
-    identities = [
-        (
-            ("REF", entry.alias_name, None, entry.priority)
-            if isinstance(entry, AliasReference)
-            else (entry.provider, entry.model, entry.route_family, entry.priority)
-        )
-        for entry in alias.candidates
+    zai, deepseek, moonshot, xai = snapshot.aliases["work-other"].candidates
+    assert [(entry.alias_name, entry.priority) for entry in (zai, deepseek, moonshot, xai)] == [
+        ("sota-zai", 120),
+        ("sota-deepseek", 110),
+        ("sota-moonshot", 90),
+        ("sota-xai", 80),
     ]
-    assert identities == [
-        ("REF", "sota-deepseek", None, 110),
-        (
-            "zai_coding_plan",
-            "zai_coding_plan/glm-5.3-flash",
-            "codex_zai_coding_plan_chat_completions_adapter",
-            100,
-        ),
-        ("REF", "sota-moonshot", None, 90),
-        ("REF", "sota-xai", None, 80),
-    ]
-    deepseek = alias.candidates[0]
-    assert isinstance(deepseek, AliasReference)
+    assert zai.schedule is not None
+    assert zai.schedule.kind == "daily"
     assert deepseek.schedule is not None
     assert deepseek.schedule.kind == "daily"
-    assert isinstance(alias.candidates[1], RoutingCandidate)
     owner = snapshot.aliases["sota-deepseek"].candidates[0]
     assert owner.schedule is None
 

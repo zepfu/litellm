@@ -108,7 +108,7 @@ Config-driven alias routing uses:
 - `work` uses `work-other` (110), then high-effort `gpt-6-luna` (0).
 - `work-other`: `sota-zai` (120, `23:00-09:00 UTC+8`),
   `sota-deepseek` (110, `22:00-08:00 UTC+8`), `sota-moonshot` (90),
-  `sota-meta` (85), then `sota-xai` (80).
+  then `sota-xai` (80).
   Each timed candidate is omitted from new selection outside its own window.
 - `expert`: `expert-other` (priority 100) → OpenAI/Codex `gpt-6.2-astra`
   (`codex_responses`, priority 0) with authoritative `reasoning_effort: low`

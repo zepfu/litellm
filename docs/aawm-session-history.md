@@ -1951,8 +1951,7 @@ eligible during `22:00-08:00 UTC+8`.
 
 `work` first references `work-other`, then falls back to high-effort
 `gpt-6-luna`. The helper orders `sota-zai` (`23:00-09:00 UTC+8`),
-`sota-deepseek` (`22:00-08:00 UTC+8`), `sota-moonshot`, `sota-meta`, and
-`sota-xai`. `expert` references `expert-other` before the final
+`sota-deepseek` (`22:00-08:00 UTC+8`), `sota-moonshot`, and `sota-xai`. `expert` references `expert-other` before the final
 OpenAI/Codex `gpt-6.1-terra` fallback. `expert-other` admits Alibaba Qwen Max
 during the same window, then uses Cursor Grok and native xAI.
 

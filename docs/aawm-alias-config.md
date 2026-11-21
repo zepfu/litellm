@@ -427,9 +427,8 @@ Its candidates are `alias_reference: sota-zai`
 (priority 120, admitted only from `23:00-09:00 UTC+8`),
 `alias_reference: sota-deepseek` (priority 110, scheduled
 for the daily half-open window `22:00-08:00 UTC+8`),
-`alias_reference: sota-moonshot`
-(priority 90), `alias_reference: sota-meta` (priority 85),
-and `alias_reference: sota-xai` (priority 80).
+`alias_reference: sota-moonshot` (priority 90), and
+`alias_reference: sota-xai` (priority 80).
 `sota-xai` currently expands in this order: native xAI/OIDC `xai/grok-4.7`,
 then managed xAI/OAuth `oa_xai/grok-4.7`. Cursor Grok remains on
 `sota-cursor`. Closing a schedule window prevents new affinity. Existing

@@ -155,8 +155,8 @@ The current alpha alias YAML exposes these test paths:
 - `basic` references `basic-other`, then low-effort `gpt-6-luna`. The helper
   includes scheduled Alibaba DeepSeek V4.1 Flash.
 - `work` references `work-other`, then high-effort `gpt-6-luna`. The helper
-  orders scheduled `sota-zai` and `sota-deepseek`, then `sota-moonshot`,
-  `sota-meta`, and `sota-xai`.
+  orders scheduled `sota-zai` and `sota-deepseek`, then `sota-moonshot` and
+  `sota-xai`.
 - `expert` references `expert-other` before OpenAI `gpt-6.2-astra`;
   `expert-other` orders nightly Alibaba Qwen Max, Cursor Grok, then native xAI.
 - `auto-review` references `auto-review-other`, then low-effort

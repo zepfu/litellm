@@ -19,7 +19,5 @@ aliases:
           utc_offset: "+08:00"
       - alias_reference: sota-moonshot
         priority: 90
-      - alias_reference: sota-meta
-        priority: 85
       - alias_reference: sota-xai
         priority: 80
