@@ -1001,6 +1001,12 @@ reference pricing `unpriced`, streaming usage and tool logging still complete.
 The logging call omits a computed `response_cost` and retains the unpriced
 reason and provenance. An unavailable tariff is not a published zero price.
 
+Z.AI Coding Plan GLM 5.3 uses standard Model API references of
+`$1.40/$0.26/$4.40` per million input, cache-read and output tokens. GLM 5.3
+Flash uses `$0.15/$0.03/$0.50` in the same order. Coding Plan charges
+subscription credits. Its off-peak credit multiplier and the Model API's
+temporary cached-input storage offer are separate from token reference cost.
+
 ### Direct Cohere provenance
 
 The AAWM direct Codex Cohere alias route is separate from OpenRouter traffic,

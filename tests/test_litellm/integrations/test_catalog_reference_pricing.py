@@ -117,6 +117,30 @@ def test_should_resolve_kimi_k3_1_pro_subscription_reference_with_cache_write_me
     assert result["reference_cost_total_usd"] == pytest.approx(11.28)
 
 
+@pytest.mark.parametrize(
+    ("model", "expected_reference"),
+    [("glm-5.3", 5.344), ("glm-5.3-flash", 0.602)],
+)
+def test_should_persist_zai_coding_plan_payg_reference_as_estimate(
+    catalog, model, expected_reference
+):
+    result = aawm_agent_identity.resolve_aawm_reference_pricing(
+        provider="zai_coding_plan",
+        model=model,
+        prompt_tokens=1_000_000,
+        completion_tokens=1_000_000,
+        usage_obj={"cache_read_input_tokens": 400_000},
+    )
+
+    assert result is not None
+    assert result["reference_cost_status"] == "priced"
+    assert result["actual_invoice_cost_known"] is False
+    assert result["reference_cost_model"] == f"zai_coding_plan/{model}"
+    assert result["reference_cost_basis_provider"] == "zai"
+    assert result["reference_cost_basis_model"] == model
+    assert result["reference_cost_total_usd"] == pytest.approx(expected_reference)
+
+
 def test_should_resolve_direct_cohere_north_mini_code_rpm_and_catalog_parity(
     monkeypatch: pytest.MonkeyPatch,
 ):

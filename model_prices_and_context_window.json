@@ -1132,28 +1132,31 @@
             "zai_coding_plan": {
                 "aawm_reference_pricing": {
                     "schema_version": 1,
-                    "status": "unpriced",
+                    "status": "priced",
                     "kind": "provider_subscription_reference",
                     "billing_mode": "zai_coding_plan_subscription",
                     "actual_invoice_cost_known": false,
                     "currency": "USD",
                     "basis": {
-                        "provider": "zai_coding_plan",
-                        "model": "zai_coding_plan/glm-5.3-flash"
+                        "provider": "zai",
+                        "model": "glm-5.3-flash"
                     },
-                    "cache_mode": "none",
-                    "equivalence_status": "not_applicable",
-                    "equivalence_evidence": "Coding Plan subscription credit package is not ordinary list-rate invoice pricing.",
+                    "cache_mode": "provider_cache_read",
+                    "equivalence_status": "not_exact",
+                    "equivalence_evidence": "Z.AI Model API standard list rates are a comparison for the corresponding Coding Plan model. Coding Plan usage consumes subscription credits.",
                     "source": {
-                        "kind": "official_provider_catalog",
-                        "label": "Z.AI GLM-5.3-Flash",
+                        "kind": "official_provider_direct_list_rate_catalog",
+                        "label": "Z.AI Model API standard list rates",
                         "urls": [
-                            "https://docs.z.ai/guides/llm/glm-5.3-flash"
+                            "https://docs.z.ai/guides/overview/pricing.md"
                         ],
-                        "version": "2026-08-26",
-                        "verified_on": "2026-08-26"
+                        "verified_on": "2026-11-21"
                     },
-                    "unpriced_reason": "public_per_token_rate_unavailable"
+                    "rates": {
+                        "input_usd_per_million_tokens": 0.15,
+                        "cache_read_usd_per_million_tokens": 0.03,
+                        "output_usd_per_million_tokens": 0.5
+                    }
                 }
             }
         },
@@ -1187,28 +1190,31 @@
             "zai_coding_plan": {
                 "aawm_reference_pricing": {
                     "schema_version": 1,
-                    "status": "unpriced",
+                    "status": "priced",
                     "kind": "provider_subscription_reference",
                     "billing_mode": "zai_coding_plan_subscription",
                     "actual_invoice_cost_known": false,
                     "currency": "USD",
                     "basis": {
-                        "provider": "zai_coding_plan",
-                        "model": "zai_coding_plan/glm-5.3"
+                        "provider": "zai",
+                        "model": "glm-5.3"
                     },
-                    "cache_mode": "none",
-                    "equivalence_status": "not_applicable",
-                    "equivalence_evidence": "Coding Plan subscription credit package is not ordinary list-rate invoice pricing.",
+                    "cache_mode": "provider_cache_read",
+                    "equivalence_status": "not_exact",
+                    "equivalence_evidence": "Z.AI Model API standard list rates are a comparison for the corresponding Coding Plan model. Coding Plan usage consumes subscription credits.",
                     "source": {
-                        "kind": "official_provider_catalog",
-                        "label": "Z.AI Coding Plan",
+                        "kind": "official_provider_direct_list_rate_catalog",
+                        "label": "Z.AI Model API standard list rates",
                         "urls": [
-                            "https://docs.z.ai/devpack/quick-start"
+                            "https://docs.z.ai/guides/overview/pricing.md"
                         ],
-                        "version": "2026-08-20",
-                        "verified_on": "2026-08-20"
+                        "verified_on": "2026-11-21"
                     },
-                    "unpriced_reason": "public_per_token_rate_unavailable"
+                    "rates": {
+                        "input_usd_per_million_tokens": 1.4,
+                        "cache_read_usd_per_million_tokens": 0.26,
+                        "output_usd_per_million_tokens": 4.4
+                    }
                 }
             }
         },
