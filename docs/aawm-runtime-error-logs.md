@@ -61,6 +61,12 @@ The generic LiteLLM ERROR sink (`AawmErrorLogFileHandler` in
 - **Langfuse SDK support-string diagnostics** attach to the `langfuse` logger
   independent of callback registration order and whether JSON logging came from
   the `JSON_LOGS` environment variable or `litellm_settings.json_logs`.
+  For Langfuse v2, search intake for `langfuse_upload_batch_id` to identify a
+  failed ingestion attempt. The record contains a digest of the SDK event IDs,
+  up to five event IDs, the batch size, outcome and observed status codes.
+  Check runtime logs for `accepted_after_failure` with the same batch ID to
+  verify that a later SDK retry was accepted. A failed attempt alone leaves
+  final delivery unknown.
 
 For example, the dev proxy writes `/app/.analysis/dev-error.jsonl` inside the
 container, mounted to this repo's `.analysis/dev-error.jsonl`. The matching

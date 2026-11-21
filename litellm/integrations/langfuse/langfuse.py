@@ -2001,6 +2001,13 @@ class LangFuseLogger:
             parameters["sdk_integration"] = "litellm"
         self.Langfuse: Langfuse = self.safe_init_langfuse_client(parameters)
 
+        if not self.is_mock_mode and Version(self.langfuse_sdk_version).major == 2:
+            from litellm.integrations.langfuse.upload_evidence import (
+                observe_langfuse_uploads,
+            )
+
+            observe_langfuse_uploads(self.Langfuse)
+
         # set the current langfuse project id in the environ
         # this is used by Alerting to link to the correct project
         if self.is_mock_mode:
