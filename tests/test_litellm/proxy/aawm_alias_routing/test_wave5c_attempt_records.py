@@ -334,6 +334,7 @@ class TestRetryableAttemptRecord:
         exc.response = httpx.Response(  # type: ignore[attr-defined]
             502,
             request=httpx.Request("POST", "https://api.cohere.com/v2/chat"),
+            extensions={"http_version": b"HTTP/2"},
         )
 
         attempt_records._update_codex_auto_agent_retryable_attempt_record(
@@ -380,6 +381,7 @@ class TestRetryableAttemptRecord:
         synthetic_exc.response = httpx.Response(  # type: ignore[attr-defined]
             502,
             request=httpx.Request("POST", "https://litellm.ai"),
+            extensions={"http_version": b"HTTP/2"},
         )
 
         attempt_records._update_codex_auto_agent_retryable_attempt_record(
@@ -403,6 +405,7 @@ class TestRetryableAttemptRecord:
         subdomain_exc.response = httpx.Response(  # type: ignore[attr-defined]
             502,
             request=httpx.Request("POST", "https://www.litellm.ai/v1/chat"),
+            extensions={"http_version": b"HTTP/2"},
         )
         attempt_records._update_codex_auto_agent_retryable_attempt_record(
             attempt_record=subdomain_record,
@@ -490,6 +493,32 @@ class TestRetryableAttemptRecord:
             assert record["provider_status_code"] is None
             assert record["adapter_status_code"] == adapter_error.status_code
             assert record["failure_source"] == "adapter"
+
+    def test_wrapped_local_stream_failure_has_no_native_http_status(self) -> None:
+        from litellm.exceptions import MidStreamFallbackError
+
+        exc = MidStreamFallbackError(
+            message="local stream timeout",
+            model="cohere/north-mini-code-1-0",
+            llm_provider="cohere",
+        )
+        exc._status_code = exc.status_code  # type: ignore[attr-defined]
+        record: dict[str, Any] = {"attempted_provider_call": True}
+
+        attempt_records._update_codex_auto_agent_retryable_attempt_record(
+            attempt_record=record,
+            exc=exc,
+            error_class="provider_terminal_error",
+            cooldown_seconds=0.0,
+            alias_model="codex-auto-agent",
+            cooldown_scope="none",
+            candidate={"provider": "cohere"},
+        )
+
+        assert record["provider_status_code"] is None
+        assert record["adapter_status_code"] == 503
+        assert record["failure_source"] == "provider_adapter"
+        assert record["failure_origin"] == "unknown"
 
     def test_explicitly_unattempted_call_ignores_chained_provider_response(self) -> None:
         provider_response = httpx.Response(

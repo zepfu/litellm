@@ -1059,7 +1059,6 @@ def _provider_failure_provenance(
 
     if (
         provider_status_code is not None
-        or (failure_source == "provider_adapter" and adapter_status_code is not None)
         or (provider_returned and not explicitly_unattempted)
     ):
         event = _classify_failure(
@@ -1131,19 +1130,17 @@ def _observed_provider_http_status(exc: Any) -> Optional[int]:
             if status_code is not None:
                 return status_code
 
+    # Typed wrappers can construct responses with real provider hostnames.
+    # A bare attached response needs independent HTTP transport metadata.
     response = getattr(exc, "response", None)
-    if response is None:
-        return None
-
-    # Cohere's typed errors synthesize an httpx.Response using the provider's
-    # hostname. Its status is adapter metadata; the original HTTPStatusError,
-    # when one exists, is retained in the exception cause/context above.
-    if (
-        type(exc).__name__ == "CohereError"
-        and type(exc).__module__.startswith("litellm.llms.cohere.")
+    if isinstance(response, httpx.Response) and response.extensions.get("http_version") in (
+        b"HTTP/1.0",
+        b"HTTP/1.1",
+        b"HTTP/2",
+        b"HTTP/3",
     ):
-        return None
-    return _provider_response_status_code(response)
+        return _provider_response_status_code(response)
+    return None
 
 
 # ---------------------------------------------------------------------------
