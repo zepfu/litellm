@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import pytest
+import httpx
 from fastapi import Request
 
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import attempt_records
@@ -65,6 +66,7 @@ def _make_request() -> Request:
 @dataclass
 class _FakeClassificationEvent:
     origin: str = "upstream"
+    class_name: str = "unknown"
 
 
 @dataclass
@@ -208,7 +210,14 @@ def _configure_attempt_records():  # noqa: PLR0915
         raise Exception("model not found")
 
     def _classify_failure(**kwargs: Any) -> _FakeClassificationEvent:
-        return _FakeClassificationEvent(origin="upstream")
+        status_code = kwargs.get("status_code")
+        if isinstance(status_code, int) and status_code >= 500:
+            return _FakeClassificationEvent("upstream", "provider_5xx")
+        if isinstance(status_code, int) and status_code == 429:
+            return _FakeClassificationEvent("upstream", "rate_limit")
+        if kwargs.get("provider_returned") is True:
+            return _FakeClassificationEvent("upstream", "stream_failure")
+        return _FakeClassificationEvent()
 
     def _gate_record(
         *,
@@ -317,6 +326,91 @@ class TestRetryableAttemptRecord:
         assert record["failure_phase"] == "provider_attempt"
         assert record["attempted_provider_call"] is True
         assert record["source_error"] == "error:429"
+
+    def test_records_observed_provider_response_status_and_classification(self) -> None:
+        record: dict[str, Any] = {"attempted_provider_call": True}
+        exc = Exception("upstream failure")
+        exc._status_code = 502  # type: ignore[attr-defined]
+        exc.response = httpx.Response(  # type: ignore[attr-defined]
+            502,
+            request=httpx.Request("POST", "https://api.cohere.com/v2/chat"),
+        )
+
+        attempt_records._update_codex_auto_agent_retryable_attempt_record(
+            attempt_record=record,
+            exc=exc,
+            error_class="provider_terminal_error",
+            cooldown_seconds=0.0,
+            alias_model="codex-auto-agent",
+            cooldown_scope="none",
+            candidate={"provider": "cohere"},
+        )
+
+        assert record["provider_status_code"] == 502
+        assert record["failure_origin"] == "upstream"
+        assert record["provider_failure_class"] == "provider_5xx"
+        assert record["failure_source"] == "provider_response"
+
+    def test_does_not_promote_unattributed_exception_status_to_provider_status(self) -> None:
+        record: dict[str, Any] = {"attempted_provider_call": True}
+        exc = Exception("local adapter failure")
+        exc._status_code = 500  # type: ignore[attr-defined]
+        exc.llm_provider = "openai"  # type: ignore[attr-defined]
+
+        attempt_records._update_codex_auto_agent_retryable_attempt_record(
+            attempt_record=record,
+            exc=exc,
+            error_class="provider_terminal_error",
+            cooldown_seconds=0.0,
+            alias_model="codex-auto-agent",
+            cooldown_scope="none",
+            candidate={"provider": "cohere"},
+        )
+
+        assert "provider_status_code" not in record or record["provider_status_code"] is None
+        assert record["failure_origin"] == "unknown"
+        assert record["provider_failure_class"] == "unknown"
+        assert record["failure_source"] == "adapter"
+
+    def test_synthetic_or_unbound_response_is_not_recorded_as_native_status(self) -> None:
+        synthetic_record: dict[str, Any] = {"attempted_provider_call": True}
+        synthetic_exc = Exception("adapter failure")
+        synthetic_exc._status_code = 500  # type: ignore[attr-defined]
+        synthetic_exc.llm_provider = "cohere"  # type: ignore[attr-defined]
+        synthetic_exc.response = httpx.Response(  # type: ignore[attr-defined]
+            502,
+            request=httpx.Request("POST", "https://litellm.ai"),
+        )
+
+        attempt_records._update_codex_auto_agent_retryable_attempt_record(
+            attempt_record=synthetic_record,
+            exc=synthetic_exc,
+            error_class="provider_terminal_error",
+            cooldown_seconds=0.0,
+            alias_model="codex-auto-agent",
+            cooldown_scope="none",
+            candidate={"provider": "cohere"},
+        )
+
+        assert synthetic_record["provider_status_code"] is None
+        assert synthetic_record["adapter_status_code"] == 500
+        assert synthetic_record["failure_source"] == "provider_adapter"
+
+        unbound_record: dict[str, Any] = {"attempted_provider_call": True}
+        unbound_exc = Exception("adapter failure")
+        unbound_exc.response = httpx.Response(502)  # type: ignore[attr-defined]
+        attempt_records._update_codex_auto_agent_retryable_attempt_record(
+            attempt_record=unbound_record,
+            exc=unbound_exc,
+            error_class="provider_terminal_error",
+            cooldown_seconds=0.0,
+            alias_model="codex-auto-agent",
+            cooldown_scope="none",
+            candidate={"provider": "cohere"},
+        )
+
+        assert unbound_record["provider_status_code"] is None
+        assert unbound_record["failure_source"] == "adapter"
 
     def test_no_cooldown_scope_none(self) -> None:
         record: dict[str, Any] = {}

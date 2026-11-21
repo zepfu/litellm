@@ -184,6 +184,13 @@ def _enrich_auto_agent_alias_terminal_event_from_attempts(
         "source_error",
         "error_type",
         "error_code",
+        "provider_status_code",
+        "adapter_status_code",
+        "failure_origin",
+        "provider_failure_class",
+        "failure_source",
+        "attempt_number",
+        "attempt_record_index",
     ):
         value = last_attempt.get(key)
         if value is not None:

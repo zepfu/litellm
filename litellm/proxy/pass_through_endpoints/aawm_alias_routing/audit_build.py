@@ -339,6 +339,34 @@ def _build_auto_agent_alias_audit_event(  # noqa: PLR0915
         "error_status_code": _auto_agent_alias_int(error_status_code),
         "error_type": error_type,
         "error_code": str(error_code) if error_code is not None else None,
+        "provider_status_code": (
+            _auto_agent_alias_int(candidate.get("provider_status_code"))
+            if not isinstance(candidate.get("provider_status_code"), bool)
+            else None
+        ),
+        "adapter_status_code": (
+            _auto_agent_alias_int(candidate.get("adapter_status_code"))
+            if not isinstance(candidate.get("adapter_status_code"), bool)
+            else None
+        ),
+        "failure_origin": (
+            candidate.get("failure_origin")
+            if candidate.get("failure_origin") in {"upstream", "client", "unknown"}
+            else None
+        ),
+        "provider_failure_class": (
+            candidate.get("provider_failure_class")
+            if isinstance(candidate.get("provider_failure_class"), str)
+            and len(candidate["provider_failure_class"]) <= 64
+            and candidate["provider_failure_class"].replace("_", "").isalnum()
+            else None
+        ),
+        "failure_source": (
+            candidate.get("failure_source")
+            if candidate.get("failure_source")
+            in {"provider_response", "provider_adapter", "adapter", "proxy", "unknown"}
+            else None
+        ),
         "source_error": _clean_codex_auth_value(source_error),
         "retry_after_seconds": _auto_agent_alias_float(retry_after_seconds),
         "failure_phase": failure_phase,

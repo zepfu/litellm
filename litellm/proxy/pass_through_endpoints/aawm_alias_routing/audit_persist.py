@@ -285,6 +285,8 @@ def _build_terminal_error_log_fields(
         ("event_type", ("event_type",)),
         ("provider_terminal_event_type", ("provider_terminal_event_type",)),
         ("failure_origin", ("failure_origin", "aawm_failure_origin")),
+        ("provider_failure_class", ("provider_failure_class",)),
+        ("failure_source", ("failure_source",)),
         ("cancellation_origin", ("cancellation_origin",)),
         ("replay_rejected_field", ("replay_rejected_field",)),
         ("replay_rejection_reason", ("replay_rejection_reason",)),
@@ -319,13 +321,26 @@ def _build_terminal_error_log_fields(
     )
     if upstream_status_code is not None:
         fields["upstream_status_code"] = upstream_status_code
-
-    attempt_count = _terminal_error_safe_integer(
-        context.get("attempt_count"),
-        maximum=10_000,
+    provider_status_code = _terminal_error_safe_integer(
+        context.get("provider_status_code"),
+        maximum=999,
     )
-    if attempt_count is not None:
-        fields["attempt_count"] = attempt_count
+    if provider_status_code is not None:
+        fields["provider_status_code"] = provider_status_code
+    adapter_status_code = _terminal_error_safe_integer(
+        context.get("adapter_status_code"),
+        maximum=999,
+    )
+    if adapter_status_code is not None:
+        fields["adapter_status_code"] = adapter_status_code
+
+    for key in ("attempt_count", "attempt_number", "attempt_record_index"):
+        attempt_value = _terminal_error_safe_integer(
+            context.get(key),
+            maximum=10_000,
+        )
+        if attempt_value is not None:
+            fields[key] = attempt_value
 
     for key in (
         "attempted_provider_call",
@@ -442,7 +457,14 @@ def _format_auto_agent_alias_route_default_warning_fields(
         sanitized = re.sub(r"[^A-Za-z0-9_.:/-]+", "_", str(value).strip())
         return sanitized[:64] or "<missing>"
 
-    int_keys = ("error_status_code", "attempt_count")
+    int_keys = (
+        "error_status_code",
+        "provider_status_code",
+        "adapter_status_code",
+        "attempt_count",
+        "attempt_number",
+        "attempt_record_index",
+    )
     bool_keys = ("redispatch_required", "agent_session_killed", "attempted_provider_call")
     label_keys = (
         "event_type",
@@ -451,6 +473,8 @@ def _format_auto_agent_alias_route_default_warning_fields(
         "candidate_status",
         "failure_phase",
         "failure_class",
+        "provider_failure_class",
+        "failure_source",
         "error_type",
         "error_code",
         "terminal_outcome",

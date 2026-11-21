@@ -126,6 +126,58 @@ def test_build_agent_terminal_error_record_sanitizes_cursor_replay_rejection(
         assert forbidden not in serialized
 
 
+def test_build_agent_terminal_error_record_keeps_failure_provenance() -> None:
+    record = rel.build_agent_terminal_error_record(
+        error_context={
+            "failure_kind": "agent_alias_no_candidate",
+            "provider": "cohere",
+            "provider_status_code": 502,
+            "adapter_status_code": 500,
+            "failure_origin": "upstream",
+            "provider_failure_class": "provider_5xx",
+            "failure_source": "provider_response",
+            "attempt_number": 2,
+            "attempt_record_index": 3,
+            "attempts": [
+                {
+                    "provider": "cohere",
+                    "provider_status_code": 502,
+                    "adapter_status_code": 500,
+                    "failure_origin": "upstream",
+                    "provider_failure_class": "provider_5xx",
+                    "failure_source": "provider_response",
+                    "attempt_number": 2,
+                    "attempt_record_index": 3,
+                }
+            ],
+        },
+        terminal_outcome="agent_session_terminated",
+        fallback_result="no_candidate_available",
+        redispatch_required=False,
+        agent_session_killed=True,
+    )
+
+    assert record["context"]["provider_status_code"] == 502
+    assert record["context"]["adapter_status_code"] == 500
+    assert record["context"]["failure_origin"] == "upstream"
+    assert record["context"]["provider_failure_class"] == "provider_5xx"
+    assert record["context"]["failure_source"] == "provider_response"
+    assert record["context"]["attempt_number"] == 2
+    assert record["context"]["attempt_record_index"] == 3
+    assert record["context"]["attempts"] == [
+        {
+            "provider": "cohere",
+            "provider_status_code": 502,
+            "adapter_status_code": 500,
+            "failure_origin": "upstream",
+            "provider_failure_class": "provider_5xx",
+            "failure_source": "provider_response",
+            "attempt_number": 2,
+            "attempt_record_index": 3,
+        }
+    ]
+
+
 def _append_to_sink(
     sink: str,
     payload: dict[str, object] | list[dict[str, object]],

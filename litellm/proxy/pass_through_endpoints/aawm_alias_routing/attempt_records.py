@@ -692,18 +692,22 @@ def _update_codex_auto_agent_retryable_attempt_record(  # noqa: PLR0915
     is_deterministically_ineligible = (
         error_class == "candidate_deterministically_ineligible"
     )
+    attempted_provider_call_known = isinstance(attempted_provider_call, bool)
     if not isinstance(attempted_provider_call, bool):
         attempted_provider_call = getattr(exc, "attempted_provider_call", None)
+        attempted_provider_call_known = isinstance(attempted_provider_call, bool)
     if not isinstance(attempted_provider_call, bool):
         provider_returned = getattr(exc, "_aawm_provider_returned", None)
         if provider_returned is True:
             attempted_provider_call = True
+            attempted_provider_call_known = True
     if not isinstance(attempted_provider_call, bool):
         existing_attempted_provider_call = attempt_record.get(
             "attempted_provider_call"
         )
         if isinstance(existing_attempted_provider_call, bool):
             attempted_provider_call = existing_attempted_provider_call
+            attempted_provider_call_known = True
     if not isinstance(attempted_provider_call, bool):
         attempted_provider_call = False
     if not isinstance(provider_returned, bool):
@@ -735,6 +739,27 @@ def _update_codex_auto_agent_retryable_attempt_record(  # noqa: PLR0915
         "provider_returned": provider_returned,
         "source_error": source_error,
     }
+    try:
+        update.update(
+            _provider_failure_provenance(
+                exc,
+                candidate=candidate,
+                attempted_provider_call=attempted_provider_call,
+                attempted_provider_call_known=attempted_provider_call_known,
+                provider_returned=provider_returned,
+                source_error=source_error,
+            )
+        )
+    except Exception:
+        update.update(
+            {
+                "provider_status_code": None,
+                "adapter_status_code": None,
+                "failure_origin": "unknown",
+                "provider_failure_class": "unknown",
+                "failure_source": "unknown",
+            }
+        )
     if candidate_status is not None:
         update["candidate_status"] = candidate_status
     if ineligibility_reason is not None:
@@ -978,6 +1003,89 @@ def _record_codex_failure_evidence(
         cooldown_key=cooldown_key,
         event=event,
     )
+
+
+def _provider_failure_provenance(
+    exc: Any,
+    *,
+    candidate: Optional[Mapping[str, Any]],
+    attempted_provider_call: bool,
+    attempted_provider_call_known: bool,
+    provider_returned: bool,
+    source_error: Optional[str],
+) -> dict[str, Any]:
+    """Build bounded provider-failure metadata from an observed adapter result."""
+    provider_value = candidate.get("provider") if isinstance(candidate, Mapping) else None
+    provider = str(getattr(provider_value, "value", provider_value) or "").strip().lower()
+    error_provider_value = getattr(exc, "llm_provider", None)
+    error_provider = str(
+        getattr(error_provider_value, "value", error_provider_value) or ""
+    ).strip().lower()
+
+    response = getattr(exc, "response", None)
+    response_status = getattr(response, "status_code", None)
+    provider_status_code: Optional[int] = None
+    adapter_status_code: Optional[int] = None
+    response_host = ""
+    if response is not None:
+        try:
+            request = response.request
+        except (AttributeError, RuntimeError):
+            request = None
+        response_url = getattr(request, "url", None)
+        response_host = str(getattr(response_url, "host", "") or "").lower()
+    if (
+        isinstance(response_status, int)
+        and not isinstance(response_status, bool)
+        and 100 <= response_status <= 599
+        and response_host
+        and response_host != "litellm.ai"
+    ):
+        provider_status_code = response_status
+        failure_source = "provider_response"
+    elif provider_returned or (
+        attempted_provider_call and provider and error_provider == provider
+    ):
+        observed_status = _extract_exception_status_code(exc)
+        if (
+            isinstance(observed_status, int)
+            and not isinstance(observed_status, bool)
+            and 100 <= observed_status <= 599
+        ):
+            adapter_status_code = observed_status
+        else:
+            adapter_status_code = None
+        failure_source = "provider_adapter"
+    elif attempted_provider_call:
+        adapter_status_code = None
+        failure_source = "adapter"
+    elif attempted_provider_call_known:
+        adapter_status_code = None
+        failure_source = "proxy"
+    else:
+        adapter_status_code = None
+        failure_source = "unknown"
+
+    if provider_status_code is not None or adapter_status_code is not None or provider_returned:
+        event = _classify_failure(
+            status_code=provider_status_code or adapter_status_code,
+            provider=provider or None,
+            message=source_error or "",
+            provider_returned=provider_returned,
+        )
+        failure_origin = event.origin
+        provider_failure_class = event.class_name
+    else:
+        failure_origin = "unknown"
+        provider_failure_class = "unknown"
+
+    return {
+        "provider_status_code": provider_status_code,
+        "adapter_status_code": adapter_status_code,
+        "failure_origin": failure_origin,
+        "provider_failure_class": provider_failure_class,
+        "failure_source": failure_source,
+    }
 
 
 # ---------------------------------------------------------------------------

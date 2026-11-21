@@ -278,6 +278,38 @@ class TestBuildAuditEventShape:
         assert event["retry_after_seconds"] == 5.5
         assert event["cooldown_until"] == "2026-01-01T00:00:00Z"
 
+    def test_provider_failure_provenance_is_bounded(self):
+        candidate = _minimal_candidate()
+        candidate.update(
+            {
+                "provider_status_code": 502,
+                "adapter_status_code": 500,
+                "failure_origin": "upstream",
+                "provider_failure_class": "provider_5xx",
+                "failure_source": "provider_response",
+            }
+        )
+        event = _build_auto_agent_alias_audit_event(
+            alias_family="codex",
+            alias_model="codex-auto",
+            request=_make_request(),
+            request_body={},
+            selection=_minimal_selection(),
+            candidate=candidate,
+            event_type="candidate_retryable_failure",
+            candidate_status="cooldown_set",
+            attempt_number=2,
+            attempt_record_index=3,
+        )
+
+        assert event["provider_status_code"] == 502
+        assert event["adapter_status_code"] == 500
+        assert event["failure_origin"] == "upstream"
+        assert event["provider_failure_class"] == "provider_5xx"
+        assert event["failure_source"] == "provider_response"
+        assert event["attempt_number"] == 2
+        assert event["attempt_record_index"] == 3
+
     def test_error_tokens_list_preserved(self):
         event = _build_auto_agent_alias_audit_event(
             alias_family="codex",

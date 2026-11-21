@@ -312,6 +312,13 @@ class TestEmitRouteEvent:
             "selected_route": "Bearer very-secret-token",
             "session_id": "session-secret-123",
             "source_error": "raw upstream secret detail",
+            "provider_status_code": 502,
+            "adapter_status_code": 500,
+            "failure_origin": "upstream",
+            "provider_failure_class": "provider_5xx",
+            "failure_source": "provider_response",
+            "attempt_number": 2,
+            "attempt_record_index": 3,
         }
         with patch.object(
             audit_persist.verbose_proxy_logger, "error"
@@ -333,6 +340,13 @@ class TestEmitRouteEvent:
         assert fields["selected_provider"] == "sk-[REDACTED]"
         assert fields["selected_route"] == "Bearer_[REDACTED]"
         assert fields["correlation_id"].startswith("sha256:")
+        assert fields["provider_status_code"] == 502
+        assert fields["adapter_status_code"] == 500
+        assert fields["failure_origin"] == "upstream"
+        assert fields["provider_failure_class"] == "provider_5xx"
+        assert fields["failure_source"] == "provider_response"
+        assert fields["attempt_number"] == 2
+        assert fields["attempt_record_index"] == 3
 
     def test_info_event_stays_suppressed_when_flags_off(
         self, _configure_audit_persist
