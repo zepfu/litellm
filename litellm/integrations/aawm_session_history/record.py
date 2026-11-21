@@ -858,7 +858,7 @@ def _build_session_history_record_from_langfuse_trace_observation(  # noqa: PLR0
             trace.get("totalCost"),
         )
     )
-    if str(provider or "").strip().lower() == "alibaba_token_plan":
+    if str(provider or "").strip().lower() in {"alibaba_token_plan", "zai_coding_plan"}:
         response_cost_usd = None
     if str(provider or "").strip().lower() == "openrouter":
         from litellm.llms.openrouter.common_utils import openrouter_cost_status
@@ -1388,7 +1388,7 @@ def _build_session_history_record(  # noqa: PLR0915
     response_cost_usd = None
     provider_reported_cost = False
     openrouter_known_free = False
-    if resolved_provider not in {"kimi_code", "alibaba_token_plan"}:
+    if resolved_provider not in {"kimi_code", "alibaba_token_plan", "zai_coding_plan"}:
         if resolved_provider == "openrouter":
             from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
                 is_openrouter_free_model,

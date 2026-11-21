@@ -124,21 +124,57 @@ def test_should_resolve_kimi_k3_1_pro_subscription_reference_with_cache_write_me
 def test_should_persist_zai_coding_plan_payg_reference_as_estimate(
     catalog, model, expected_reference
 ):
-    result = aawm_agent_identity.resolve_aawm_reference_pricing(
-        provider="zai_coding_plan",
-        model=model,
-        prompt_tokens=1_000_000,
-        completion_tokens=1_000_000,
-        usage_obj={"cache_read_input_tokens": 400_000},
+    route_model = f"zai_coding_plan/{model}"
+    record = aawm_agent_identity._build_session_history_record(
+        kwargs={
+            "litellm_call_id": "zai-reference-test",
+            "model": route_model,
+            "custom_llm_provider": "zai_coding_plan",
+            "call_type": "acompletion",
+            "response_cost": 0.0,
+            "litellm_params": {"metadata": {"session_id": "zai-reference-session"}},
+        },
+        result={
+            "id": "zai-usage",
+            "model": route_model,
+            "usage": {
+                "prompt_tokens": 1_000_000,
+                "completion_tokens": 1_000_000,
+                "prompt_tokens_details": {"cached_tokens": 400_000},
+            },
+        },
+        start_time="2026-11-21T03:00:00Z",
+        end_time="2026-11-21T03:00:01Z",
+        allow_runtime_identity=False,
     )
 
-    assert result is not None
+    assert record is not None
+    assert record["response_cost_usd"] is None
+    result = record["metadata"]
     assert result["reference_cost_status"] == "priced"
     assert result["actual_invoice_cost_known"] is False
-    assert result["reference_cost_model"] == f"zai_coding_plan/{model}"
+    assert result["reference_cost_model"] == route_model
     assert result["reference_cost_basis_provider"] == "zai"
     assert result["reference_cost_basis_model"] == model
     assert result["reference_cost_total_usd"] == pytest.approx(expected_reference)
+
+
+def test_should_keep_recovered_zai_coding_plan_invoice_cost_unknown():
+    record = aawm_agent_identity._build_session_history_record_from_langfuse_trace_observation(
+        {"id": "zai-trace", "sessionId": "zai-reference-session"},
+        {
+            "id": "zai-generation",
+            "type": "GENERATION",
+            "model": "zai_coding_plan/glm-5.3",
+            "metadata": {"custom_llm_provider": "zai_coding_plan"},
+            "usageDetails": {"input": 100, "output": 20},
+            "costDetails": {"total": 0.0},
+        },
+    )
+
+    assert record is not None
+    assert record["provider"] == "zai_coding_plan"
+    assert record["response_cost_usd"] is None
 
 
 def test_should_resolve_direct_cohere_north_mini_code_rpm_and_catalog_parity(
