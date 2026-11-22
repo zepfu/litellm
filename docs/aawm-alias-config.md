@@ -271,8 +271,11 @@ is the current toolset. AAWM materializes that declaration into the existing
 tool pipeline before schema normalization and alias construction, removes
 the protocol declarations, and preserves the order of all other input.
 Top-level `web_search` tools may accompany the declaration and are retained.
-Other simultaneous top-level tools and a non-list current declaration are
-rejected. Native completion adapters also receive the advertised tools.
+When a standard Responses child inherits Lite history, its top-level function
+or namespace catalog supplies the active tools. AAWM consumes the inherited
+declarations and validates the child's catalog through the normal tool pipeline.
+Unrecognized mixed tool catalogs and non-list declarations are rejected.
+Native completion adapters also receive the advertised tools.
 
 On recipient ingress, both `NEW_TASK` and `MESSAGE` encrypted-content slots
 must contain a complete valid frame. AAWM decodes its exact text and preserves

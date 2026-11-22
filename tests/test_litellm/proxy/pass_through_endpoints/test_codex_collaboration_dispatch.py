@@ -100,10 +100,43 @@ def test_should_normalize_latest_accumulated_declaration(declaration):
     assert repeated == result
 
 
-@pytest.mark.parametrize("conflict", ["unsupported_top_level_tool"])
-def test_should_reject_conflicting_top_level_tools(declaration, conflict):
-    body = {"input": [{"type": "message", "role": "user", "content": []}, declaration]}
-    body["tools"] = [{"type": "custom", "name": "unsupported"}]
+def test_should_use_current_standard_tools_after_forking_responses_lite(declaration):
+    message = {"type": "message", "role": "user", "content": []}
+    current_tools = [
+        {
+            "type": "function",
+            "name": "exec_command",
+            "parameters": {
+                "type": "object",
+                "properties": {"cmd": {"type": "string"}},
+                "required": ["cmd"],
+            },
+        }
+    ]
+    body = {"input": [declaration, message], "tools": current_tools}
+    original = deepcopy(body)
+
+    result = normalize_codex_collaboration_dispatch_body(body)
+
+    assert result == {"input": [message], "tools": current_tools}
+    assert body == original
+
+
+@pytest.mark.parametrize(
+    "tools",
+    [
+        [{"type": "custom", "name": "unsupported"}],
+        [
+            {"type": "function", "name": "exec_command", "parameters": {}},
+            {"type": "unknown"},
+        ],
+    ],
+)
+def test_should_reject_conflicting_top_level_tools(declaration, tools):
+    body = {
+        "input": [{"type": "message", "role": "user", "content": []}, declaration],
+        "tools": tools,
+    }
 
     with pytest.raises(HTTPException) as raised:
         normalize_codex_collaboration_dispatch_body(body)

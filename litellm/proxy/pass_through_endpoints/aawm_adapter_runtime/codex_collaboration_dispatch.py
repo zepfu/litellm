@@ -898,6 +898,24 @@ def _has_unsupported_hosted_tools(tools: Any) -> bool:
     )
 
 
+def _has_standard_responses_tool_catalog(tools: list[Any]) -> bool:
+    if any(
+        not isinstance(tool, dict)
+        or tool.get("type")
+        not in ("function", "namespace", "custom", "tool_search", "web_search")
+        for tool in tools
+    ):
+        return False
+    return any(
+        isinstance(tool.get("name"), str)
+        and (
+            (tool.get("type") == "function" and isinstance(tool.get("parameters"), dict))
+            or (tool.get("type") == "namespace" and isinstance(tool.get("tools"), list))
+        )
+        for tool in tools
+    )
+
+
 def _normalize_tool_schemas_without_error_mapping(
     body: dict[str, Any],
     *,
@@ -925,19 +943,22 @@ def _normalize_tool_schemas_without_error_mapping(
             declaration = input_items[declaration_index]
             tools = declaration.get("tools")
             hosted_tools = body.get("tools")
-            if (
-                not isinstance(tools, list)
-                or not isinstance(hosted_tools, (list, type(None)))
-                or (hosted_tools is not None and _has_unsupported_hosted_tools(hosted_tools))
+            if not isinstance(tools, list) or not isinstance(
+                hosted_tools, (list, type(None))
             ):
                 raise CodexCollaborationDispatchError(
                     "unsupported_collaboration_message_schema"
                 )
             normalized_body = dict(body)
-            declared_tools = tools
-            if hosted_tools is not None:
-                declared_tools = hosted_tools + tools
-            normalized_body["tools"] = declared_tools
+            if hosted_tools is not None and _has_unsupported_hosted_tools(hosted_tools):
+                # A stock full-history fork can inherit a Lite declaration and
+                # send the standard child's active tool catalog at top level.
+                if not _has_standard_responses_tool_catalog(hosted_tools):
+                    raise CodexCollaborationDispatchError(
+                        "unsupported_collaboration_message_schema"
+                    )
+            else:
+                normalized_body["tools"] = (hosted_tools or []) + tools
             declaration_indexes_set = set(declaration_indexes)
             normalized_body["input"] = [
                 item
