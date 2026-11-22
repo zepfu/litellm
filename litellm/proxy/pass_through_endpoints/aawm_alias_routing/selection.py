@@ -6071,13 +6071,6 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         request,
         body=request_body,
     )
-    request_mode, redispatch_ordinal = _resolve_codex_request_mode_and_ordinal(
-        has_continuation_state=has_continuation_state,
-        request_body=request_body,
-        server_validated_replay=server_validated_replay,
-    )
-    provider_owned_continuation = has_continuation_state and not server_validated_replay
-
     # Read-path ownership check before free selection. A nested Codex dispatch
     # may already have consulted this exact canonical identity; reuse only an
     # owned record from that consult, and reread durable storage for every
@@ -6104,8 +6097,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         else None
     )
     consult_reuse_eligible = (
-        request_mode == "fresh"
-        and not has_continuation_state
+        not has_continuation_state
         and not has_previous_response_id
         and not has_account_bound_state
         and not codex_oauth_continuation.declared
@@ -6156,6 +6148,61 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             ),
             request=request,
         )
+
+    stock_fork_affinity_checked = False
+    stock_fork_affinity = None
+    stock_fork_body_fingerprint = None
+    client_metadata = request_body.get("client_metadata")
+    if (
+        has_continuation_state
+        and isinstance(client_metadata, dict)
+        and client_metadata.get("thread_id") == session_owner_identity
+        and isinstance(client_metadata.get("x-codex-parent-thread-id"), str)
+        and client_metadata["x-codex-parent-thread-id"]
+        not in ("", session_owner_identity)
+        and not is_auto_review
+        and not server_validated_replay
+        and not codex_oauth_continuation.declared
+        and token_affinity is None
+        and session_owner_record is None
+        and _cache_key is not None
+        and session_key is not None
+        and not sa.request_has_effective_session_identity(request)
+        and not sa.request_session_owner_already_guarded(request)
+        and sa.get_request_session_owner_lease(request) is None
+        and _extract_codex_request_redispatch_ordinal(request_body) is None
+        and replay_safe
+        and _normalize_tui_family(client_product_label) == "codex"
+    ):
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
+            portable_stock_fork_context,
+        )
+
+        # Consult legacy affinity before classifying the exact carried body.
+        # The normal candidate loop still claims the durable owner before send
+        # and keeps the conservative raw history classification for retries.
+        stock_fork_affinity = await _get_codex_session_affinity(session_key)
+        stock_fork_affinity_checked = True
+        if stock_fork_affinity is None:
+            plain_context = portable_stock_fork_context(request_body)
+            if (
+                plain_context is not None
+                and not _has_continuation_state(plain_context)
+                and not _has_account_bound_state(plain_context)
+            ):
+                stock_fork_body_fingerprint = sa.session_owner_body_fingerprint(
+                    request_body
+                )
+                if stock_fork_body_fingerprint is not None:
+                    has_continuation_state = False
+                    has_account_bound_state = False
+
+    request_mode, redispatch_ordinal = _resolve_codex_request_mode_and_ordinal(
+        has_continuation_state=has_continuation_state,
+        request_body=request_body,
+        server_validated_replay=server_validated_replay,
+    )
+    provider_owned_continuation = has_continuation_state and not server_validated_replay
 
     affinity = None
     affinity_bypassed = False
@@ -6541,7 +6588,11 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
     elif sa.request_has_effective_session_identity(request):
         affinity_bypassed = True
     elif request_mode == "ordinary_continuation":
-        affinity = await _get_codex_session_affinity(session_key)
+        affinity = (
+            stock_fork_affinity
+            if stock_fork_affinity_checked
+            else await _get_codex_session_affinity(session_key)
+        )
     elif request_mode == "fresh_redispatch":
         existing_affinity = await _get_codex_session_affinity(session_key)
         if existing_affinity is not None:
@@ -7014,6 +7065,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                         "redispatch_ordinal": redispatch_ordinal,
                         "affinity_bypassed": affinity_bypassed,
                         "in_flight_session": in_flight_session,
+                        "_stock_fork_body_fingerprint": stock_fork_body_fingerprint,
                     },
                     selected_state=state,
                 ),
@@ -7094,6 +7146,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                         "redispatch_ordinal": redispatch_ordinal,
                         "affinity_bypassed": affinity_bypassed,
                         "in_flight_session": in_flight_session,
+                        "_stock_fork_body_fingerprint": stock_fork_body_fingerprint,
                     },
                     selected_state=state,
                 ),

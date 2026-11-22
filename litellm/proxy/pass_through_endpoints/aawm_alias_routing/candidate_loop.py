@@ -4128,6 +4128,25 @@ async def handle_alias_route(  # noqa: PLR0915
                             endpoint_contract=candidate.get("route_family"),
                             state_format=candidate.get("route_family"),
                         )
+                        stock_fork_fingerprint = selection.get(
+                            "_stock_fork_body_fingerprint"
+                        )
+                        if stock_fork_fingerprint is not None and (
+                            stock_fork_fingerprint
+                            != sa.session_owner_body_fingerprint(prepared_request_body)
+                            or session_owner_identity
+                            != sa.resolve_canonical_session_identity(
+                                request, prepared_request_body
+                            )
+                        ):
+                            sa.raise_session_owner_redispatch_required(
+                                request=request,
+                                session_identity=session_owner_identity,
+                                alias_model=alias_model,
+                                candidate=candidate,
+                                failure_phase="session_owner_stock_fork_context_changed",
+                                attempted_provider_call=False,
+                            )
                         # Tokenized pre-egress reservation (before upstream send).
                         guard = await sa.ensure_session_owner_guard_for_request(
                             request=request,

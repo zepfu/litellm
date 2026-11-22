@@ -1013,6 +1013,120 @@ def _parse_collaboration_envelope(text: str) -> Optional[tuple[str, str, str, in
     )
 
 
+def portable_stock_fork_context(
+    body: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Project a stock fork's local spawn exchange out of state detection.
+
+    The returned view is for classification only. Route the original body so
+    the provider sees the complete inherited conversation.
+    """
+    items = body.get("input")
+    if (
+        not isinstance(items, list)
+        or set(body) - {
+            "client_metadata", "include", "input", "instructions",
+            "litellm_metadata", "model", "parallel_tool_calls",
+            "prompt_cache_key", "reasoning", "store", "stream", "text",
+            "tool_choice", "tools",
+        }
+    ):
+        return None
+    plain_items = []
+    control_items = []
+    assignments = []
+    for item in items:
+        if not isinstance(item, dict):
+            return None
+        item_type = item.get("type")
+        if item_type == "message":
+            content = item.get("content")
+            if (
+                set(item) - {"type", "id", "role", "status", "phase", "content"}
+                or item.get("role") not in ("system", "developer", "user", "assistant")
+                or not isinstance(content, list)
+                or any(
+                    not isinstance(part, dict)
+                    or set(part) - {"type", "text", "annotations", "logprobs"}
+                    or part.get("type") not in ("input_text", "output_text")
+                    or not isinstance(part.get("text"), str)
+                    or part.get("annotations")
+                    or part.get("logprobs")
+                    for part in content
+                )
+            ):
+                return None
+            plain_items.append(item)
+        elif item_type in ("function_call", "function_call_output"):
+            control_items.append(item)
+        elif item_type == "agent_message":
+            assignments.append(item)
+        else:
+            return None
+
+    if (
+        len(control_items) != 2
+        or len(assignments) != 1
+        or items[-1] is not assignments[0]
+    ):
+        return None
+    spawn, output = control_items
+    assignment = assignments[0]
+    call_id = spawn.get("call_id")
+    if (
+        spawn.get("type") != "function_call"
+        or spawn.get("name") != "spawn_agent"
+        or not isinstance(spawn.get("namespace"), str)
+        or spawn["namespace"] not in _COLLABORATION_NAMESPACES
+        or spawn.get("status") != "completed"
+        or set(spawn) - {"type", "id", "name", "namespace", "status", "call_id", "arguments"}
+        or not isinstance(spawn.get("id"), str)
+        or not isinstance(output.get("id"), str)
+        or not isinstance(call_id, str)
+        or not call_id
+        or output.get("type") != "function_call_output"
+        or output.get("call_id") != call_id
+        or set(output) - {"type", "id", "call_id", "output"}
+        # Stock forks fill the unfinished parent spawn call with this local
+        # placeholder before the parent has received its tool result.
+        or output.get("output") != "aborted"
+        or not isinstance(assignment, _NormalizedCodexAgentMessage)
+        or set(assignment) != {"type", "id", "author", "recipient", "content"}
+    ):
+        return None
+
+    try:
+        visible_text = assignment["content"][0]["text"]
+        raw_args = spawn["arguments"]
+        if not isinstance(raw_args, str) or len(raw_args) > _MAX_FRAME_CHARS:
+            return None
+        args = json.loads(raw_args, object_pairs_hook=_duplicate_rejecting_object)
+        envelope = _parse_collaboration_envelope(visible_text)
+        if (
+            not isinstance(args, dict)
+            or not {"task_name", "fork_turns", "message"} <= args.keys()
+            or args.keys() - {"task_name", "fork_turns", "message", "agent_type"}
+            or not all(isinstance(value, str) for value in args.values())
+            or args["fork_turns"] != "all"
+            or envelope is None
+        ):
+            return None
+        kind, task, sender, offset = envelope
+        _validate_envelope_identity(assignment, task_name=task, sender=sender)
+        if (
+            kind != "NEW_TASK"
+            or "/" in args["task_name"]
+            or args["task_name"] in ("", ".", "..")
+            or task != f'{sender}/{args["task_name"]}'
+            or visible_text[offset:]
+            != parse_codex_collaboration_text_frame(args["message"])
+        ):
+            return None
+    except (IndexError, KeyError, TypeError, ValueError, RecursionError):
+        return None
+    return {**body, "input": [*plain_items, assignment]}
+
+
 def canonicalize_generated_codex_send_message_call_arguments(
     value: Any,
 ) -> str:

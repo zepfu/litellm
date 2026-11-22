@@ -795,6 +795,106 @@ class TestCodexSelectorFirstChoice:
         assert result["candidate"]["model"] == "gpt-4o"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "variant", ("portable", "opaque_history", "mismatched_output", "owner_conflict")
+    )
+    async def test_stock_fork_uses_initial_routing_only_for_portable_history(
+        self, monkeypatch, variant
+    ):
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
+            normalize_codex_collaboration_dispatch_body,
+        )
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            audit_build,
+            session_affinity,
+        )
+
+        request = _make_request()
+        _set_selection_candidates((_candidate(),))
+        _set_selection_runtime(
+            "_extract_client_product_label", lambda r, b: "Codex/0.171.0"
+        )
+        _set_selection_runtime(
+            "_resolve_codex_session_key", lambda r, b, *, alias_model: "child"
+        )
+        _set_selection_runtime(
+            "_has_continuation_state",
+            audit_build._codex_auto_agent_request_has_continuation_state,
+        )
+        _set_selection_runtime(
+            "_has_account_bound_state",
+            audit_build._aawm_auto_agent_audit_request_has_account_bound_state,
+        )
+        missing_or_busy = "reservation wait timed out" if variant == "owner_conflict" else None
+        monkeypatch.setattr(
+            session_affinity,
+            "get_session_owner_record",
+            AsyncMock(return_value=(None, "child-owner", missing_or_busy)),
+        )
+
+        frame = '{"cfg047":1,"encoding":"text","text":"Check pwd."}'
+        body = {
+            "model": "basic",
+            "client_metadata": {"thread_id": "child", "x-codex-parent-thread-id": "parent"},
+            "input": [
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_fork",
+                    "namespace": "collaboration",
+                    "name": "spawn_agent",
+                    "status": "completed",
+                    "arguments": json.dumps(
+                        {"fork_turns": "all", "task_name": "child", "message": frame}
+                    ),
+                },
+                {
+                    "type": "function_call_output",
+                    "id": "output_fork",
+                    "call_id": "call_fork" if variant != "mismatched_output" else "call_other",
+                    "output": "aborted",
+                },
+                {
+                    "type": "agent_message",
+                    "id": "new_task",
+                    "recipient": "/root/child",
+                    "author": "/root",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "Message Type: NEW_TASK\nTask name: /root/child\n"
+                                "Sender: /root\nPayload:\n"
+                            ),
+                        },
+                        {"type": "encrypted_content", "encrypted_content": frame},
+                    ],
+                },
+            ],
+        }
+        if variant == "opaque_history":
+            body["input"].insert(
+                0, {"type": "reasoning", "id": "rs_opaque", "encrypted_content": "gAAAA_provider"}
+            )
+        effective_body = normalize_codex_collaboration_dispatch_body(body)
+
+        if variant == "portable":
+            result = await selection._select_codex_auto_agent_candidate(
+                request=request, request_body=effective_body
+            )
+            assert result["request_mode"] == "fresh"
+            assert result["candidate"]["provider"] == "openai"
+            assert result["session_owner_identity"] == "child"
+            assert result["has_account_bound_state"] is False
+        else:
+            with pytest.raises(HTTPException) as exc:
+                await selection._select_codex_auto_agent_candidate(
+                    request=request, request_body=effective_body
+                )
+            assert exc.value.detail["error"]["code"] == "aawm_session_owner_redispatch_required"
+            assert exc.value.detail["attempted_provider_call"] is False
+
+    @pytest.mark.asyncio
     async def test_codex_continuation_without_owner_still_redispatches(self):
         request = _make_request()
         candidates = (_candidate("openai", "gpt-4o"),)

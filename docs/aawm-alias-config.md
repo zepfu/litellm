@@ -277,6 +277,14 @@ declarations and validates the child's catalog through the normal tool pipeline.
 Unrecognized mixed tool catalogs and non-list declarations are rejected.
 Native completion adapters also receive the advertised tools.
 
+A new stock child can carry the parent's completed collaboration spawn call
+and the client's matching `aborted` placeholder alongside its own readable
+assignment. When every inherited item is portable and the child's session has
+no owner or affinity, the alias router uses ordinary initial owner
+acquisition. The original input remains model context. Opaque reasoning,
+provider response references, and unrecognized tool history require the
+existing continuation checks.
+
 On recipient ingress, both `NEW_TASK` and `MESSAGE` encrypted-content slots
 must contain a complete valid frame. AAWM decodes its exact text and preserves
 the envelope's author, recipient, and task identity. Unknown, malformed, or

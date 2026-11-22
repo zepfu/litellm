@@ -8637,7 +8637,7 @@ _LEASE_TRANSITION_PROVIDERS = frozenset(
 _REQUEST_STATE_GUARDED_ATTR = "_aawm_session_owner_guarded"
 
 
-def _cursor_replay_body_fingerprint(body: Any) -> Optional[str]:
+def session_owner_body_fingerprint(body: Any) -> Optional[str]:
     """Return a stable digest for a JSON request body, without retaining values."""
 
     if not isinstance(body, dict):
@@ -8833,7 +8833,7 @@ def validate_cursor_replay_matches_body(
         or validation.get("body_id") != id(body)
     ):
         return False
-    fingerprint = _cursor_replay_body_fingerprint(body)
+    fingerprint = session_owner_body_fingerprint(body)
     return (
         fingerprint is not None
         and validation.get("body_fingerprint") == fingerprint
@@ -8860,7 +8860,7 @@ def set_validated_cursor_replay(
         {
             "body_ref": body,
             "body_id": id(body),
-            "body_fingerprint": _cursor_replay_body_fingerprint(body),
+            "body_fingerprint": session_owner_body_fingerprint(body),
             "stage": stage,
             "reason": reason,
         },
