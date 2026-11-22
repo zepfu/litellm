@@ -6668,6 +6668,9 @@ class PassThroughStreamingHandler:
                     or policy_failure_kind
                     or error_class
                 ),
+                "policy_failure_reason": (delivered_wire_disposition or {}).get(
+                    "policy_failure_reason"
+                ),
                 "failure_phase": failure_context["stream_failure_stage"],
                 "attempted_provider_call": True,
                 "redispatch_required": redispatch_required,

@@ -424,6 +424,11 @@ rejected lifecycle fields. Known `response.metadata` events retain their name
 for diagnosis and still commit the attempt. These fields contain fixed labels
 and safe field paths, without raw payloads or unknown event names.
 
+Generated Codex collaboration output rejections include
+`policy_failure_reason` in terminal error intake. The field contains a bounded
+label from local validation, such as `invalid_envelope`. The client continues
+to receive the existing policy error code and shape.
+
 `429` rate-limit responses are not hidden-retried. They should surface to the
 client with available retry/reset metadata so alias selection and quota
 observation can make the next decision without burning extra quota. Expected

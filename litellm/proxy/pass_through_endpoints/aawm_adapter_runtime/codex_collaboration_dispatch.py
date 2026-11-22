@@ -1219,6 +1219,7 @@ def raise_codex_send_message_output_rejected(reason: str) -> None:
             "failure_phase": SEND_MESSAGE_NORMALIZATION_FAILURE_PHASE,
             "policy_failure_code": CFG072_SEND_MESSAGE_OUTPUT_REJECTED_CODE,
             "policy_failure_kind": "generated_send_message_output_rejected",
+            "policy_failure_reason": reason,
         },
     )
     raise exc from None

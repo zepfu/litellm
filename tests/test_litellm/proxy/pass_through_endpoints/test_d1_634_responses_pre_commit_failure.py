@@ -6763,6 +6763,49 @@ def test_unsupported_raw_exception_still_returns_none():
 
 
 @pytest.mark.asyncio
+async def test_generated_collaboration_rejection_keeps_reason_in_operator_intake():
+    import logging
+
+    from litellm._logging import _build_aawm_error_log_context
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
+        CodexCollaborationDispatchError,
+        raise_codex_send_message_output_rejected,
+    )
+
+    trace = OpenAIResponsesWireTrace()
+    with pytest.raises(CodexCollaborationDispatchError) as rejected:
+        raise_codex_send_message_output_rejected("invalid_envelope")
+    wire_body, _, _ = _build_native_responses_wrapper_failure_body(
+        wire_trace=trace, wrapper_setup_failure=rejected.value
+    )
+    assert b'"code":"aawm_cfg072_send_message_output_rejected"' in wire_body
+    assert b"invalid_envelope" not in wire_body
+    metadata: dict[str, Any] = {}
+    logging_obj = MagicMock()
+    logging_obj.async_failure_handler = AsyncMock()
+    with patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_persist.verbose_proxy_logger"
+    ) as logger, patch("litellm.proxy.aawm_route_logging.record_aawm_route_rollup_failure"):
+        await PassThroughStreamingHandler._finalize_failed_responses_stream(
+            litellm_logging_obj=logging_obj,
+            kwargs={"litellm_params": {"metadata": metadata}},
+            metadata=metadata,
+            all_chunks=[],
+            request_body={"model": "gpt-6-luna"},
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+            terminal_event_type=None,
+            terminal_payload=None,
+            handler_branch_state=["initial"],
+            delivered_wire_disposition=trace.snapshot(),
+        )
+    record = logging.makeLogRecord(logger.error.call_args.kwargs["extra"])
+    context = _build_aawm_error_log_context(record)
+    assert context["policy_failure_reason"] == "invalid_envelope"
+    assert context["failure_class"] == "generated_send_message_output_rejected"
+
+
+@pytest.mark.asyncio
 async def test_cancelled_without_terminal_keeps_reconciled_capacity_error():
     metadata: dict[str, Any] = {}
     kwargs = {"litellm_params": {"metadata": metadata}}

@@ -229,6 +229,7 @@ class OpenAIResponsesWireTrace:
             "policy_failure_kind": self.metadata.get("policy_failure_kind"),
             "policy_failure_code": self.metadata.get("policy_failure_code"),
             "policy_failure_class": self.metadata.get("policy_failure_class"),
+            "policy_failure_reason": self.metadata.get("policy_failure_reason"),
             "validation_failure_code": self.metadata.get("validation_failure_code"),
         }
 
@@ -238,6 +239,7 @@ class OpenAIResponsesWireTrace:
         kind: Any = None,
         code: Any = None,
         classification: Any = None,
+        reason: Any = None,
     ) -> bool:
         """Freeze a bounded policy cause before delivered consumers run."""
 
@@ -245,6 +247,7 @@ class OpenAIResponsesWireTrace:
             "policy_failure_kind": _bounded_policy_value(kind),
             "policy_failure_code": _bounded_policy_value(code),
             "policy_failure_class": _bounded_policy_value(classification),
+            "policy_failure_reason": _bounded_policy_value(reason),
         }
         if not any(values.values()):
             return False
@@ -287,6 +290,7 @@ class OpenAIResponsesWireTrace:
 
     def record_policy_failure_from_exception(self, exc: BaseException) -> bool:
         marker = getattr(exc, "_aawm_policy_failure", None)
+        reason = marker.get("policy_failure_reason") if isinstance(marker, dict) else None
         if not isinstance(marker, dict):
             detail = getattr(exc, "detail", None)
             if isinstance(detail, dict):
@@ -313,6 +317,7 @@ class OpenAIResponsesWireTrace:
                 or marker.get("policy_failure_kind")
             ),
             code=marker_code,
+            reason=reason,
             classification=(
                 metadata.get("failure_class")
                 or metadata.get("policy_failure_class")

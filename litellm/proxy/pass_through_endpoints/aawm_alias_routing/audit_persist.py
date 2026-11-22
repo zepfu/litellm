@@ -272,6 +272,7 @@ def _build_terminal_error_log_fields(
         ("account_lane", ("account_lane", "selected_account_lane")),
         ("error_code", ("error_code", "code")),
         ("error_type", ("error_type",)),
+        ("policy_failure_reason", ("policy_failure_reason",)),
         (
             "failure_class",
             ("failure_class", "error_class", "failure_kind"),
