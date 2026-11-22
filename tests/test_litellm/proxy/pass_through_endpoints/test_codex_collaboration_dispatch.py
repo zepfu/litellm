@@ -102,6 +102,10 @@ def test_should_normalize_latest_accumulated_declaration(declaration):
 
 def test_should_use_current_standard_tools_after_forking_responses_lite(declaration):
     message = {"type": "message", "role": "user", "content": []}
+    collaboration = deepcopy(declaration["tools"][0])
+    declaration["tools"].append(
+        {"type": "function", "name": "parent_tool", "parameters": {"type": "object"}}
+    )
     current_tools = [
         {
             "type": "function",
@@ -111,14 +115,23 @@ def test_should_use_current_standard_tools_after_forking_responses_lite(declarat
                 "properties": {"cmd": {"type": "string"}},
                 "required": ["cmd"],
             },
-        }
+        },
+        collaboration,
     ]
     body = {"input": [declaration, message], "tools": current_tools}
     original = deepcopy(body)
 
     result = normalize_codex_collaboration_dispatch_body(body)
 
-    assert result == {"input": [message], "tools": current_tools}
+    assert result["input"] == [message]
+    assert [tool["name"] for tool in result["tools"]] == [
+        "exec_command",
+        "collaboration",
+    ]
+    assert result["tools"][0] == current_tools[0]
+    schema = result["tools"][1]["tools"][0]["parameters"]["properties"]["message"]
+    assert "encrypted" not in schema
+    assert '{"cfg047":1,"encoding":"text"' in schema["description"]
     assert body == original
 
 
