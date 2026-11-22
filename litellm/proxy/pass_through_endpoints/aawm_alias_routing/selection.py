@@ -6172,7 +6172,10 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         and sa.get_request_session_owner_lease(request) is None
         and _extract_codex_request_redispatch_ordinal(request_body) is None
         and replay_safe
-        and _normalize_tui_family(client_product_label) == "codex"
+        and (
+            _normalize_tui_family(client_product_label) == "codex"
+            or (client_product_label or "").partition("/")[0].casefold() == "codex_exec"
+        )
     ):
         from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
             portable_stock_fork_context,

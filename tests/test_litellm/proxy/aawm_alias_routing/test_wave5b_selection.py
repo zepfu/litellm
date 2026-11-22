@@ -812,7 +812,7 @@ class TestCodexSelectorFirstChoice:
         request = _make_request()
         _set_selection_candidates((_candidate(),))
         _set_selection_runtime(
-            "_extract_client_product_label", lambda r, b: "Codex/0.171.0"
+            "_extract_client_product_label", lambda r, b: "codex_exec/0.171.0"
         )
         _set_selection_runtime(
             "_resolve_codex_session_key", lambda r, b, *, alias_model: "child"
