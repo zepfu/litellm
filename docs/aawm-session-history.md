@@ -2197,6 +2197,11 @@ persisted in session-history metadata, diagnostics, or provider-auth telemetry.
 Malformed, conflicting, tampered, expired, or cross-scope declared state fails
 closed before provider egress rather than selecting a fresh account.
 
+Direct Codex OAuth history uses the resolved execution thread as its session ID
+when available. Routing audit and the first provider logging call share the
+request wait tracker's call ID. Later provider attempts retain their own call
+IDs for usage accounting.
+
 Grok native and `oa_xai/*` Responses candidates remove request fields, hosted
 tools, and unsupported `reasoning` input items that the selected Grok-family
 model declares unsupported. This does not strip the supported

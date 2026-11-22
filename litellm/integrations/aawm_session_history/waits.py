@@ -148,6 +148,12 @@ class RequestWaits:
         self.checkpoint(force=True)
 
 
+def get_request_wait_call_id() -> Optional[str]:
+    """Return the tracked request ID without claiming a provider logging call."""
+    tracker = _current.get()
+    return tracker.call_id if tracker is not None else None
+
+
 def claim_request_call_id(default: str) -> str:
     """Seed only the first logging call; later attempts keep distinct cost rows."""
     tracker = _current.get()

@@ -1719,6 +1719,10 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     Reuses the alias-path account context, quota, cooldown, and failover
     machinery. Returns ``(selected_auth, selection_state, metadata_body)``.
     """
+    from litellm.integrations.aawm_session_history.waits import get_request_wait_call_id
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_context import (
+        _AUTO_AGENT_REQUEST_CALL_ID_STATE_KEY,
+    )
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
         CODEX_AUTO_AGENT_NATIVE_PROVIDER,
     )
@@ -1813,6 +1817,10 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                 "codex_oauth_selection_strategy": routing.strategy,
             }
         )
+
+    tracked_call_id = get_request_wait_call_id()
+    if tracked_call_id is not None:
+        setattr(request.state, _AUTO_AGENT_REQUEST_CALL_ID_STATE_KEY, tracked_call_id)
 
     planned_portable_failover = interchangeable_accounts and bool(
         getattr(
@@ -2319,6 +2327,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
         ],
         extra_fields={
             "openai_passthrough_route_family": "codex_responses",
+            **({"canonical_thread_id": session_identity} if session_identity else {}),
             "codex_oauth_direct_inventory": True,
             "codex_oauth_ordinary_quota_applicable": not ordinary_quota_exempt,
             "codex_oauth_quota_balancing": selected_state.get(

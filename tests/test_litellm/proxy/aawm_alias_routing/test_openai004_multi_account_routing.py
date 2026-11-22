@@ -3594,6 +3594,51 @@ aliases:
 
 
 @pytest.mark.asyncio
+async def test_direct_responses_uses_the_history_call_and_session_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from litellm.integrations.aawm_agent_identity import _extract_session_id
+    from litellm.integrations.aawm_session_history import waits
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        audit_context,
+        session_affinity,
+    )
+
+    _patch_direct_inventory_auth(monkeypatch)
+    monkeypatch.setattr(
+        session_affinity,
+        "get_session_owner_record",
+        AsyncMock(return_value=(None, "owner-key", None)),
+    )
+    monkeypatch.setattr(waits.RequestWaits, "checkpoint", lambda *_args, **_kwargs: None)
+    request = _direct_request()
+    body = {"model": "gpt-5.6-sol", "client_metadata": {"thread_id": "codex-thread"}}
+    tracker = waits.RequestWaits("request-call", None)
+    token = waits._current.set(tracker)
+    try:
+        _, _, prepared_body = (
+            await codex_oauth.select_and_bind_direct_codex_oauth_inventory(
+                request, request_body=body
+            )
+        )
+        audit_call_id = audit_context._get_or_create_auto_agent_alias_request_call_id(
+            request, prepared_body
+        )
+        assert audit_call_id == waits.claim_request_call_id("first-provider-call")
+        assert waits.claim_request_call_id("retry-provider-call") == "retry-provider-call"
+        logging_kwargs = {
+            "litellm_params": {"metadata": prepared_body["litellm_metadata"]},
+            "call_type": "pass_through_endpoint",
+            "litellm_trace_id": "separate-trace-id",
+        }
+        assert _extract_session_id(logging_kwargs) == "codex-thread"
+    finally:
+        waits._current.reset(token)
+
+
+@pytest.mark.asyncio
 async def test_direct_responses_binds_enabled_inventory_and_strips_inbound_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
