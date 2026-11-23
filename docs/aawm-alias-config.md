@@ -286,7 +286,7 @@ provider response references, and unrecognized tool history require the
 existing continuation checks.
 
 Native Codex memory extraction and consolidation use an owner separate from
-foreground work on the same session. Extraction uses the tool-free, replay-safe
+foreground work on the same session. Extraction uses the fresh, tool-free
 Responses request with Codex's strict memory output schema. Consolidation uses
 the `x-openai-memgen-request` or native memory subagent header. Both ownership
 paths enforce account affinity, leases, and replay guards. Session history

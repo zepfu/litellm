@@ -409,6 +409,7 @@ _REQUEST_STATE_EFFECTIVE_SESSION_IDENTITY_ATTR = (
 _REQUEST_STATE_CODEX_MEMORY_CONSOLIDATION_BASE_SESSION_IDENTITY_ATTR = (
     "_aawm_codex_memory_consolidation_base_session_identity"
 )
+_REQUEST_STATE_CODEX_MEMORY_EXTRACTION_ATTR = "_aawm_codex_memory_extraction"
 _CODEX_MEMORY_CONSOLIDATION_SESSION_OWNER_IDENTITY_PREFIX = (
     "aawm-codex-memory-consolidation-owner-v1:"
 )
@@ -1312,8 +1313,6 @@ def _request_is_codex_memory_workload(
     """Recognize native consolidation headers or the fresh extraction contract."""
     if not _request_uses_codex_native_auth_markers(request):
         return False
-    if get_request_codex_memory_consolidation_base_session_identity(request) is not None:
-        return True
     headers = getattr(request, "headers", None)
     if headers is None:
         return False
@@ -1330,20 +1329,38 @@ def _request_is_codex_memory_workload(
             if str(value).strip().casefold() == "memory_consolidation":
                 return True
 
+    state = getattr(request, "state", None)
+    cached = getattr(state, _REQUEST_STATE_CODEX_MEMORY_EXTRACTION_ATTR, None)
+    if isinstance(cached, bool):
+        return cached
     # First-stage extraction inherits the foreground client identity. Codex
     # sends a fresh, tool-free Responses request with this strict output schema.
-    if not isinstance(request_body, Mapping) or request_body.get("tools"):
+    if not isinstance(request_body, dict) or request_body.get("tools"):
         return False
     text = request_body.get("text")
     output_format = text.get("format") if isinstance(text, Mapping) else None
-    return (
+    if not (
         isinstance(output_format, Mapping)
         and output_format.get("type") == "json_schema"
         and output_format.get("name") == "codex_output_schema"
         and output_format.get("strict") is True
         and output_format.get("schema") == _CODEX_MEMORY_EXTRACTION_SCHEMA
+    ):
+        return False
+
+    from .audit_build import _codex_auto_agent_request_has_continuation_state
+    from .codex_oauth import _codex_oauth_affinity_token_request_state
+
+    _, token_declared = _codex_oauth_affinity_token_request_state(body=request_body)
+    fresh = (
+        not token_declared
+        and not _codex_auto_agent_request_has_continuation_state(request_body)
         and classify_session_owner_replay_safety_body(request_body).safe
     )
+    # Keep the decision after OAuth consumes the internal affinity token.
+    if state is not None:
+        setattr(state, _REQUEST_STATE_CODEX_MEMORY_EXTRACTION_ATTR, fresh)
+    return fresh
 
 
 def derive_session_owner_codex_memory_effective_identity(

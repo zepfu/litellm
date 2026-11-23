@@ -5985,6 +5985,8 @@ def test_codex_memory_consolidation_is_idempotent() -> None:
 @pytest.mark.parametrize("memory_phase", ["extraction", "consolidation"])
 async def test_codex_memory_guard_isolation(memory_phase: str) -> None:
     """Memory can promote first and foreground Kimi can reserve independently."""
+    from types import SimpleNamespace
+
     redis = _FakeRedisCache()
     base_identity = "sess-cfg-084-guard-isolation"
 
@@ -6003,9 +6005,9 @@ async def test_codex_memory_guard_isolation(memory_phase: str) -> None:
         state_format="chat_completions",
     )
 
-    memory_request = type("Req", (), {})()
-    memory_request.state = type("State", (), {})()
-    memory_request.headers = {"chatgpt-account-id": "acct-cfg084"}
+    memory_request = SimpleNamespace(
+        state=SimpleNamespace(), headers={"chatgpt-account-id": "acct-cfg084"}
+    )
     memory_body: dict[str, Any] = {"session_id": base_identity}
     if memory_phase == "consolidation":
         memory_request.headers["x-openai-memgen-request"] = "true"
@@ -6027,10 +6029,23 @@ async def test_codex_memory_guard_isolation(memory_phase: str) -> None:
                 },
             },
         }
-        assert sa.resolve_canonical_session_identity(
-            request=memory_request,
-            request_body={**memory_body, "previous_response_id": "resp_owned"},
-        ) == base_identity
+        for continuation in (
+            {"previous_response_id": "resp_owned"},
+            {"input": [{"type": "function_call_output", "call_id": "call_1", "output": "done"}]},
+            {"aawm_codex_affinity_token": "declared-token"},
+            {"litellm_metadata": {"aawm_codex_affinity_token": "declared-token"}},
+        ):
+            foreground = SimpleNamespace(
+                state=SimpleNamespace(), headers=memory_request.headers
+            )
+            assert sa.resolve_canonical_session_identity(
+                request=foreground,
+                request_body={**memory_body, **continuation},
+            ) == base_identity
+            assert sa.resolve_canonical_session_identity(
+                request=foreground,
+                request_body=memory_body,
+            ) == base_identity
     memory_identity = sa.resolve_canonical_session_identity(
         request=memory_request,
         request_body=memory_body,
