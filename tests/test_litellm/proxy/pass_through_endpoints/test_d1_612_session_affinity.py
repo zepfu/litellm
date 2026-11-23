@@ -5903,3 +5903,177 @@ async def test_bind_deferred_stream_wraps_held_reservation() -> None:
         getattr(response, "_aawm_session_owner_deferred_finalizer_bound", False)
         is True
     )
+
+
+def test_codex_memory_consolidation_derives_separate_owner_identity() -> None:
+    """Memory consolidation gets a derived identity; foreground keeps the base."""
+    base_identity = "sess-cfg-084-test"
+
+    memory_request = type(
+        "Request",
+        (),
+        {"headers": {
+            "chatgpt-account-id": "acct-test",
+            "x-openai-memgen-request": "true",
+        }},
+    )()
+    derived = sa.resolve_canonical_session_identity(
+        request=memory_request,
+        request_body={"session_id": base_identity},
+    )
+    assert derived is not None
+    assert derived != base_identity
+    assert sa.is_session_owner_codex_memory_effective_identity(derived)
+
+    base_stored = (
+        sa.get_request_codex_memory_consolidation_base_session_identity(
+            memory_request,
+        )
+    )
+    assert base_stored == base_identity
+
+    normal_request = type(
+        "Request",
+        (),
+        {"headers": {}},
+    )()
+    normal = sa.resolve_canonical_session_identity(
+        request=normal_request,
+        request_body={"session_id": base_identity},
+    )
+    assert normal == base_identity
+    assert not sa.is_session_owner_codex_memory_effective_identity(normal)
+
+    assert sa.get_request_codex_memory_consolidation_base_session_identity(
+        normal_request,
+    ) is None
+
+
+def test_codex_memory_consolidation_is_idempotent() -> None:
+    """Re-resolving an already-derived memory identity is a no-op."""
+    base_identity = "sess-cfg-084-idempotent"
+
+    memory_request = type(
+        "Request",
+        (),
+        {
+            "headers": {
+                "chatgpt-account-id": "acct-idempotent",
+                "x-openai-memgen-request": "true",
+                "x-openai-subagent": "memory_consolidation",
+            },
+        },
+    )()
+
+    first = sa.resolve_canonical_session_identity(
+        request=memory_request,
+        session_identity=base_identity,
+    )
+    assert first is not None
+    assert sa.is_session_owner_codex_memory_effective_identity(first)
+
+    second = sa.resolve_canonical_session_identity(
+        request=memory_request,
+        session_identity=first,
+    )
+    assert second == first
+
+
+def test_codex_memory_consolidation_memgen_header_case_insensitive() -> None:
+    """The memgen-request header is matched case-insensitively."""
+    base_identity = "sess-cfg-084-case"
+
+    memory_request = type(
+        "Request",
+        (),
+        {"headers": {
+            "chatgpt-account-id": "acct-case",
+            "X-OpenAI-MemGen-Request": "True",
+        }},
+    )()
+    derived = sa.resolve_canonical_session_identity(
+        request=memory_request,
+        request_body={"session_id": base_identity},
+    )
+    assert derived is not None
+    assert sa.is_session_owner_codex_memory_effective_identity(derived)
+    assert derived != base_identity
+
+
+@pytest.mark.asyncio
+async def test_codex_memory_consolidation_guard_isolation() -> None:
+    """Memory and foreground owners occupy independent subspaces.
+
+    Memory Luna (x-openai-memgen-request: true) derives a separate
+    identity and promotes first.  Foreground Kimi (no memory headers)
+    retains the base identity and can independently reserve without
+    hitting account_bound_owner_unavailable.
+    """
+    redis = _FakeRedisCache()
+    base_identity = "sess-cfg-084-guard-isolation"
+
+    memory_attrs = _full_attrs(
+        provider="openai",
+        model="gpt-6-luna",
+        route_family="codex_oauth",
+        endpoint_contract="openai_responses",
+        state_format="openai_responses",
+    )
+    foreground_attrs = _full_attrs(
+        provider="openai",
+        model="provider-kimi_code",
+        route_family="codex_oauth",
+        endpoint_contract="openai_responses",
+        state_format="openai_responses",
+    )
+
+    memory_request = type("Req", (), {})()
+    memory_request.state = type("State", (), {})()
+    memory_request.headers = {
+        "chatgpt-account-id": "acct-cfg084",
+        "x-openai-memgen-request": "true",
+    }
+    memory_identity = sa.resolve_canonical_session_identity(
+        request=memory_request,
+        request_body={"session_id": base_identity},
+    )
+    assert memory_identity is not None
+    assert sa.is_session_owner_codex_memory_effective_identity(memory_identity)
+    assert memory_identity != base_identity
+
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        mem_guard = await sa.guard_session_owner_before_egress(
+            session_identity=memory_identity,
+            requested_attributes=memory_attrs,
+        )
+        assert mem_guard.decision is sa.SessionOwnerGuardDecision.UNOWNED_RESERVED
+        mem_promoted = await sa.promote_session_owner_reservation(
+            session_identity=memory_identity,
+            reservation_token=mem_guard.reservation_token,
+            attributes=memory_attrs,
+        )
+        assert mem_promoted.outcome is sa.SessionOwnerMutationOutcome.PROMOTED
+
+        foreground_request = type("Req", (), {})()
+        foreground_request.state = type("State", (), {})()
+        foreground_request.headers = {
+            "chatgpt-account-id": "acct-cfg084",
+        }
+        fg_identity = sa.resolve_canonical_session_identity(
+            request=foreground_request,
+            request_body={"session_id": base_identity},
+        )
+        assert fg_identity == base_identity
+        assert not sa.is_session_owner_codex_memory_effective_identity(fg_identity)
+
+        fg_guard = await sa.ensure_session_owner_guard_for_request(
+            request=foreground_request,
+            session_identity=fg_identity,
+            requested_attributes=foreground_attrs,
+            raise_on_redispatch=False,
+        )
+        assert fg_guard.decision is sa.SessionOwnerGuardDecision.UNOWNED_RESERVED, (
+            f"foreground guard: {fg_guard.decision}, reason: {fg_guard.mismatch_reason}"
+        )

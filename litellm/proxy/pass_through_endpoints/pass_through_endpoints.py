@@ -9861,7 +9861,13 @@ async def pass_through_request(  # noqa: PLR0915
             _parsed_body if isinstance(_parsed_body, dict) else None,
         )
         if canonical_session_identity is not None:
-            passthrough_metadata["codex_session_id"] = canonical_session_identity
+            codex_session_id = canonical_session_identity
+            base = _session_affinity_mod().get_request_codex_memory_consolidation_base_session_identity(
+                request,
+            )
+            if base is not None:
+                codex_session_id = base
+            passthrough_metadata["codex_session_id"] = codex_session_id
         output_guard_extra_metadata: Dict[str, Any] = {}
         if isinstance(passthrough_logging_metadata, dict):
             output_guard_extra_metadata.update(passthrough_logging_metadata)

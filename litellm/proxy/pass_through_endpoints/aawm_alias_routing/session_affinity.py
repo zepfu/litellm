@@ -406,6 +406,19 @@ _RETAINED_SESSION_CLOSED_MARKER = "_aawm_session_owner_retained_closed"
 _REQUEST_STATE_EFFECTIVE_SESSION_IDENTITY_ATTR = (
     "_aawm_session_owner_effective_identity"
 )
+_REQUEST_STATE_CODEX_MEMORY_CONSOLIDATION_BASE_SESSION_IDENTITY_ATTR = (
+    "_aawm_codex_memory_consolidation_base_session_identity"
+)
+_CODEX_MEMORY_CONSOLIDATION_SESSION_OWNER_IDENTITY_PREFIX = (
+    "aawm-codex-memory-consolidation-owner-v1:"
+)
+_CODEX_MEMORY_CONSOLIDATION_SESSION_OWNER_IDENTITY_DOMAIN_SEPARATOR = (
+    "aawm-codex-memory-consolidation-v1\x00"
+)
+_CODEX_MEMGEN_REQUEST_HEADER = "x-openai-memgen-request"
+_CODEX_MEMORY_CONSOLIDATION_SUBAGENT_HEADER = (
+    "x-openai-subagent"
+)
 _CODEX_AUTO_REVIEW_SESSION_IDENTITY_SUFFIX = ":codex-auto-review"
 _CODEX_AUTO_REVIEW_SESSION_OWNER_IDENTITY_PREFIX = (
     "aawm-codex-auto-review-owner-v1:"
@@ -726,6 +739,58 @@ def get_request_codex_auto_review_parent_session_identity(
 
 def request_has_effective_session_identity(request: Any) -> bool:
     return get_request_effective_session_identity(request) is not None
+
+
+def get_request_codex_memory_consolidation_base_session_identity(
+    request: Any,
+) -> Optional[str]:
+    """Return the base session identity preserved during memory derivation."""
+
+    if request is None:
+        return None
+    state = getattr(request, "state", None)
+    if state is None:
+        return None
+    try:
+        state_values = object.__getattribute__(state, "_state")
+    except AttributeError:
+        state_values = None
+    if isinstance(state_values, Mapping):
+        return _clean_optional_str(
+            state_values.get(
+                _REQUEST_STATE_CODEX_MEMORY_CONSOLIDATION_BASE_SESSION_IDENTITY_ATTR
+            )
+        )
+    try:
+        value = object.__getattribute__(
+            state,
+            _REQUEST_STATE_CODEX_MEMORY_CONSOLIDATION_BASE_SESSION_IDENTITY_ATTR,
+        )
+    except AttributeError:
+        return None
+    return _clean_optional_str(value)
+
+
+
+def _set_request_codex_memory_consolidation_base_session_identity(
+    request: Any,
+    identity: str,
+) -> None:
+    """Store the base session identity before memory derivation."""
+
+    if request is None:
+        return
+    state = getattr(request, "state", None)
+    if state is None:
+        return
+    try:
+        setattr(
+            state,
+            _REQUEST_STATE_CODEX_MEMORY_CONSOLIDATION_BASE_SESSION_IDENTITY_ATTR,
+            identity,
+        )
+    except AttributeError:
+        return
 
 
 def record_session_owner_continuity_receipt(
@@ -1231,6 +1296,82 @@ def _strip_legacy_affinity_prefixes(raw: str) -> str:
     return cleaned
 
 
+def _request_is_codex_memory_consolidation(request: Any) -> bool:
+    """Return whether *request* is a native Codex memory-consolidation call.
+
+    Stock Codex v0.171.0 emits x-openai-memgen-request: true on
+    Internal(MemoryConsolidation) and may additionally emit
+    x-openai-subagent: memory_consolidation.  Both are trusted native
+    signals; prompt-text heuristics are not required.
+
+    The native-Codex auth gate keeps this partition scoped to Codex
+    Responses; OpenCode, Anthropic, and xAI callers never set these
+    headers and pass through unchanged.
+    """
+    if request is None:
+        return False
+    if not _request_uses_codex_native_auth_markers(request):
+        return False
+    headers = getattr(request, "headers", None)
+    if headers is None:
+        return False
+    try:
+        header_items = headers.items()  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        return False
+    for name, value in header_items:
+        key = str(name).strip().casefold()
+        if key == _CODEX_MEMGEN_REQUEST_HEADER:
+            if str(value).strip().casefold() == "true":
+                return True
+        if key == _CODEX_MEMORY_CONSOLIDATION_SUBAGENT_HEADER:
+            if str(value).strip().casefold() == "memory_consolidation":
+                return True
+    return False
+
+
+def derive_session_owner_codex_memory_effective_identity(
+    base_session_identity: Optional[str],
+) -> Optional[str]:
+    """Derive a deterministic memory-scoped ownership identity.
+
+    Memory consolidation runs on the same Codex session as foreground work
+    but must not block ordinary provider selection.  One durable session
+    identity yields two independent ownership subspaces — the base identity
+    for the foreground and this derived identity for the background memory
+    writer.
+
+    Distinct from the first-generation redispatch identity and the
+    native→managed xAI migration identity.
+    """
+    base = _clean_optional_str(base_session_identity)
+    if base is None:
+        return None
+    digest = hashlib.sha256(
+        (
+            _CODEX_MEMORY_CONSOLIDATION_SESSION_OWNER_IDENTITY_DOMAIN_SEPARATOR
+            + base
+        ).encode("utf-8")
+    ).hexdigest()
+    return (
+        f"{_CODEX_MEMORY_CONSOLIDATION_SESSION_OWNER_IDENTITY_PREFIX}{digest}"
+    )
+
+
+def is_session_owner_codex_memory_effective_identity(
+    session_identity: Optional[str],
+) -> bool:
+    """Return whether an identity is the memory-consolidation derived id."""
+
+    identity = _clean_optional_str(session_identity)
+    return bool(
+        identity
+        and identity.startswith(
+            _CODEX_MEMORY_CONSOLIDATION_SESSION_OWNER_IDENTITY_PREFIX
+        )
+    )
+
+
 def resolve_canonical_session_identity(
     request: Any = None,
     request_body: Optional[Mapping[str, Any]] = None,
@@ -1249,6 +1390,23 @@ def resolve_canonical_session_identity(
         if cleaned is None:
             return None
         canonical = _strip_legacy_affinity_prefixes(cleaned)
+        if _request_is_codex_memory_consolidation(request):
+            if not is_session_owner_codex_memory_effective_identity(canonical):
+                derived = derive_session_owner_codex_memory_effective_identity(
+                    canonical,
+                )
+                _set_request_codex_memory_consolidation_base_session_identity(
+                    request,
+                    canonical,
+                )
+                record_session_owner_continuity_receipt(
+                    request,
+                    phase="identity_resolve",
+                    source=source,
+                    session_identity=derived,
+                    outcome="resolved",
+                )
+                return derived
         record_session_owner_continuity_receipt(
             request,
             phase="identity_resolve",
