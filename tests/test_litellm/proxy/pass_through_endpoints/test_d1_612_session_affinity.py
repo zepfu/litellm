@@ -6058,3 +6058,103 @@ async def test_codex_memory_consolidation_guard_isolation() -> None:
         assert fg_guard.decision is sa.SessionOwnerGuardDecision.UNOWNED_RESERVED, (
             f"foreground guard: {fg_guard.decision}, reason: {fg_guard.mismatch_reason}"
         )
+
+
+def test_codex_memory_consolidation_respects_request_effective_identity() -> None:
+    """Memory derivation skips an already-authoritative effective identity.
+
+    When selection activates a redispatch effective identity on a request
+    that also carries memory-consolidation headers, _resolved must not
+    derive memory(redispatch(memory(base))).  The request_effective identity
+    is authoritative and passes through unchanged.
+    """
+    base_identity = "sess-cfg-084-eff-identity"
+
+    memory_request = type("Req", (), {})()
+    memory_request.state = type("State", (), {})()
+    memory_request.headers = {
+        "chatgpt-account-id": "acct-eff",
+        "x-openai-memgen-request": "true",
+    }
+
+    # First resolution: memory consolidation derives
+    first = sa.resolve_canonical_session_identity(
+        request=memory_request,
+        session_identity=base_identity,
+    )
+    assert first is not None
+    assert sa.is_session_owner_codex_memory_effective_identity(first)
+
+    # Activate a redispatch effective identity on the same request
+    redispatch = sa.activate_session_owner_redispatch_effective_identity(
+        request=memory_request,
+        base_session_identity=first,
+    )
+    assert redispatch is not None
+    assert sa.is_session_owner_redispatch_effective_identity(redispatch)
+
+    # Second resolution with request_effective set: must return the
+    # authoritative effective identity unchanged, not derive again
+    second = sa.resolve_canonical_session_identity(
+        request=memory_request,
+        request_body={"session_id": "ignored-body"},
+    )
+    assert second == redispatch
+    assert sa.is_session_owner_redispatch_effective_identity(second)
+    assert not sa.is_session_owner_codex_memory_effective_identity(second)
+
+
+@pytest.mark.asyncio
+async def test_retire_session_owner_cas_deletes_memory_owner_together() -> None:
+    """Retirement deletes memory owner and memory redispatch identities.
+
+    When a base identity retires, session_owner_retirement_identities must
+    include derive_session_owner_codex_memory_effective_identity(base) and
+    derive_session_owner_effective_identity(memory_identity).
+    """
+    redis = _FakeRedisCache()
+    attrs = _full_attrs()
+    owner_id = sa.build_session_owner_id(attributes=attrs)
+    base_identity = "sess-retire-memory"
+
+    memory_identity = sa.derive_session_owner_codex_memory_effective_identity(
+        base_identity,
+    )
+    assert memory_identity is not None
+    memory_redispatch = sa.derive_session_owner_effective_identity(memory_identity)
+    assert memory_redispatch is not None
+
+    await _promote_owned_session(
+        redis, session_identity=base_identity, attributes=attrs
+    )
+    await _promote_owned_session(
+        redis, session_identity=memory_identity, attributes=attrs
+    )
+    await _promote_owned_session(
+        redis, session_identity=memory_redispatch, attributes=attrs
+    )
+
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        retired = await sa.retire_session_owner(
+            session_identity=base_identity,
+            expected_owner_id=owner_id,
+            trigger=sa.SessionOwnerRetirementTrigger.CLIENT_SESSION_ENDED,
+        )
+        base_record, _, base_error = await sa.get_session_owner_record(
+            session_identity=base_identity
+        )
+        mem_record, _, mem_error = await sa.get_session_owner_record(
+            session_identity=memory_identity
+        )
+        mem_redispatch_record, _, mem_redispatch_error = (
+            await sa.get_session_owner_record(
+                session_identity=memory_redispatch,
+            )
+        )
+
+    assert retired.outcome is sa.SessionOwnerMutationOutcome.RETIRED
+    assert base_error is None and base_record is None
+    assert mem_error is None and mem_record is None
+    assert mem_redispatch_error is None and mem_redispatch_record is None

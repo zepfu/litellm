@@ -1390,23 +1390,26 @@ def resolve_canonical_session_identity(
         if cleaned is None:
             return None
         canonical = _strip_legacy_affinity_prefixes(cleaned)
-        if _request_is_codex_memory_consolidation(request):
-            if not is_session_owner_codex_memory_effective_identity(canonical):
-                derived = derive_session_owner_codex_memory_effective_identity(
-                    canonical,
-                )
-                _set_request_codex_memory_consolidation_base_session_identity(
-                    request,
-                    canonical,
-                )
-                record_session_owner_continuity_receipt(
-                    request,
-                    phase="identity_resolve",
-                    source=source,
-                    session_identity=derived,
-                    outcome="resolved",
-                )
-                return derived
+        if (
+            _request_is_codex_memory_consolidation(request)
+            and source != "request_effective"
+            and not is_session_owner_codex_memory_effective_identity(canonical)
+        ):
+            derived = derive_session_owner_codex_memory_effective_identity(
+                canonical,
+            )
+            _set_request_codex_memory_consolidation_base_session_identity(
+                request,
+                canonical,
+            )
+            record_session_owner_continuity_receipt(
+                request,
+                phase="identity_resolve",
+                source=source,
+                session_identity=derived,
+                outcome="resolved",
+            )
+            return derived
         record_session_owner_continuity_receipt(
             request,
             phase="identity_resolve",
@@ -5022,9 +5025,12 @@ def session_owner_retirement_identities(
         return ()
     cleaned = _strip_legacy_affinity_prefixes(cleaned)
     identities = [cleaned]
+    memory_identity = derive_session_owner_codex_memory_effective_identity(cleaned)
     for derived in (
         derive_session_owner_effective_identity(cleaned),
         derive_session_owner_xai_migration_effective_identity(cleaned),
+        memory_identity,
+        derive_session_owner_effective_identity(memory_identity),
     ):
         if derived and derived not in identities:
             identities.append(derived)
