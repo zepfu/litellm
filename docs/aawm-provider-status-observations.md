@@ -1538,6 +1538,15 @@ counter fields; broad command-text regex matches are retained only as bounded
 example context because shell heredocs and generated notes can mention
 `git commit` without executing it.
 
+Wait-accounting checkpoints are not completed provider usage. A row is treated
+as a checkpoint for repository/provider coverage only when `call_type` and
+`end_time` are null, `metadata` contains `wait_accounting`, and every token,
+cache, tool, and cost value is zero or null. These rows are omitted only from
+`missing_provider`, `missing_repository_for_agent_context`, and
+`large_null_repository_cluster`; other session-history checks remain unchanged.
+Finalized usage, legacy rows, and explicitly unresolved repository rows retain
+their existing handling.
+
 The `missing_repository_for_agent_context` class is limited to rows where a
 repository should be derivable from trusted agent or AAWM alias context. Generic
 native Grok shell/pager passthrough rows (`provider=xai`, `client_name=grok-build`,

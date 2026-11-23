@@ -978,6 +978,7 @@ WITH recent_session_history AS (
     SELECT
         id,
         created_at,
+        end_time,
         COALESCE(end_time, start_time, created_at) AS observed_at,
         litellm_call_id,
         session_id,
@@ -1032,6 +1033,24 @@ base AS (
         COALESCE(ta.activity_git_push_count, 0) AS activity_git_push_count,
         COALESCE(ta.activity_git_commit_command, FALSE) AS activity_git_commit_command,
         COALESCE(ta.activity_git_push_command, FALSE) AS activity_git_push_command,
+        COALESCE(
+            sh.call_type IS NULL
+            AND sh.end_time IS NULL
+            AND COALESCE(sh.metadata ? 'wait_accounting', FALSE)
+            AND COALESCE(sh.input_tokens, 0) = 0
+            AND COALESCE(sh.output_tokens, 0) = 0
+            AND COALESCE(sh.total_tokens, 0) = 0
+            AND COALESCE(sh.cache_read_input_tokens, 0) = 0
+            AND COALESCE(sh.cache_creation_input_tokens, 0) = 0
+            AND COALESCE(sh.response_cost_usd, 0) = 0
+            AND COALESCE(sh.tool_call_count, 0) = 0
+            AND COALESCE(sh.git_commit_count, 0) = 0
+            AND COALESCE(sh.git_push_count, 0) = 0
+            AND COALESCE(ta.tool_activity_count, 0) = 0
+            AND COALESCE(ta.activity_git_commit_count, 0) = 0
+            AND COALESCE(ta.activity_git_push_count, 0) = 0,
+            FALSE
+        ) AS checkpoint_only,
         jsonb_strip_nulls(
             jsonb_build_object(
                 'row_id', sh.id,
@@ -1088,6 +1107,7 @@ null_repository_clusters AS (
       AND COALESCE(metadata->>'session_history_reporting_excluded', 'false') <> 'true'
       AND COALESCE(metadata->>'session_history_repository_status', '') <> 'unresolved'
       AND COALESCE(metadata->>'session_history_repository_unresolved', 'false') <> 'true'
+      AND NOT checkpoint_only
     GROUP BY
         provider,
         model,
@@ -1113,6 +1133,7 @@ anomalies AS (
     FROM base
     WHERE NULLIF(BTRIM(COALESCE(provider, '')), '') IS NULL
       AND COALESCE(metadata->>'session_history_reporting_excluded', 'false') <> 'true'
+      AND NOT checkpoint_only
 
     UNION ALL
 
@@ -1158,6 +1179,7 @@ anomalies AS (
       AND COALESCE(metadata->>'session_history_reporting_excluded', 'false') <> 'true'
       AND COALESCE(metadata->>'session_history_repository_status', '') <> 'unresolved'
       AND COALESCE(metadata->>'session_history_repository_unresolved', 'false') <> 'true'
+      AND NOT checkpoint_only
       AND NOT (
           COALESCE(metadata->>'tenant_id_source', '') = 'repository_untrusted'
           AND COALESCE(
