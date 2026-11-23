@@ -5917,6 +5917,7 @@ def test_codex_memory_consolidation_derives_separate_owner_identity() -> None:
             "x-openai-memgen-request": "true",
         }},
     )()
+    memory_request.state = type("State", (), {})()
     derived = sa.resolve_canonical_session_identity(
         request=memory_request,
         request_body={"session_id": base_identity},
@@ -5937,6 +5938,7 @@ def test_codex_memory_consolidation_derives_separate_owner_identity() -> None:
         (),
         {"headers": {}},
     )()
+    normal_request.state = type("State", (), {})()
     normal = sa.resolve_canonical_session_identity(
         request=normal_request,
         request_body={"session_id": base_identity},
@@ -5964,6 +5966,7 @@ def test_codex_memory_consolidation_is_idempotent() -> None:
             },
         },
     )()
+    memory_request.state = type("State", (), {})()
 
     first = sa.resolve_canonical_session_identity(
         request=memory_request,
@@ -5991,6 +5994,7 @@ def test_codex_memory_consolidation_memgen_header_case_insensitive() -> None:
             "X-OpenAI-MemGen-Request": "True",
         }},
     )()
+    memory_request.state = type("State", (), {})()
     derived = sa.resolve_canonical_session_identity(
         request=memory_request,
         request_body={"session_id": base_identity},
