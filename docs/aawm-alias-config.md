@@ -285,6 +285,17 @@ acquisition. The original input remains model context. Opaque reasoning,
 provider response references, and unrecognized tool history require the
 existing continuation checks.
 
+Native Codex memory consolidation (Codex v0.171.0+,
+`x-openai-memgen-request: true`) runs in the same session as foreground work
+but must not block ordinary provider selection. The session owner domain
+derives a deterministic memory-scoped identity via SHA-256 with a dedicated
+`v1` domain separator, producing an independent ownership subspace under the
+same durable session identity. The base identity remains available for
+foreground ownership; the derived identity isolates the background memory
+writer. Both subspaces respect account affinity, leases, and replay guards.
+The base session identity is preserved on request state for passthrough
+telemetry.
+
 On recipient ingress, both `NEW_TASK` and `MESSAGE` encrypted-content slots
 must contain a complete valid frame. AAWM decodes its exact text and preserves
 the envelope's author, recipient, and task identity. Unknown, malformed, or

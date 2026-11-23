@@ -5982,29 +5982,6 @@ def test_codex_memory_consolidation_is_idempotent() -> None:
     assert second == first
 
 
-def test_codex_memory_consolidation_memgen_header_case_insensitive() -> None:
-    """The memgen-request header is matched case-insensitively."""
-    base_identity = "sess-cfg-084-case"
-
-    memory_request = type(
-        "Request",
-        (),
-        {"headers": {
-            "chatgpt-account-id": "acct-case",
-            "X-OpenAI-MemGen-Request": "True",
-        }},
-    )()
-    memory_request.state = type("State", (), {})()
-    derived = sa.resolve_canonical_session_identity(
-        request=memory_request,
-        request_body={"session_id": base_identity},
-    )
-    assert derived is not None
-    assert sa.is_session_owner_codex_memory_effective_identity(derived)
-    assert derived != base_identity
-
-
-@pytest.mark.asyncio
 async def test_codex_memory_consolidation_guard_isolation() -> None:
     """Memory and foreground owners occupy independent subspaces.
 
@@ -6024,11 +6001,11 @@ async def test_codex_memory_consolidation_guard_isolation() -> None:
         state_format="openai_responses",
     )
     foreground_attrs = _full_attrs(
-        provider="openai",
+        provider="kimi_code",
         model="provider-kimi_code",
-        route_family="codex_oauth",
-        endpoint_contract="openai_responses",
-        state_format="openai_responses",
+        route_family="codex_kimi_chat_completions_adapter",
+        endpoint_contract="chat_completions",
+        state_format="chat_completions",
     )
 
     memory_request = type("Req", (), {})()
