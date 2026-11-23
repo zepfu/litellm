@@ -6102,6 +6102,14 @@ def test_codex_memory_consolidation_respects_request_effective_identity() -> Non
     assert second == redispatch
     assert sa.is_session_owner_redispatch_effective_identity(second)
     assert not sa.is_session_owner_codex_memory_effective_identity(second)
+    assert sa.resolve_canonical_session_identity(
+        request=memory_request,
+        session_identity=redispatch,
+    ) == redispatch
+    assert (
+        sa.get_request_codex_memory_consolidation_base_session_identity(memory_request)
+        == base_identity
+    )
 
 
 @pytest.mark.asyncio

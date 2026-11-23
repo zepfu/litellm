@@ -1392,7 +1392,7 @@ def resolve_canonical_session_identity(
         canonical = _strip_legacy_affinity_prefixes(cleaned)
         if (
             _request_is_codex_memory_consolidation(request)
-            and source != "request_effective"
+            and canonical != get_request_effective_session_identity(request)
             and not is_session_owner_codex_memory_effective_identity(canonical)
         ):
             derived = derive_session_owner_codex_memory_effective_identity(
