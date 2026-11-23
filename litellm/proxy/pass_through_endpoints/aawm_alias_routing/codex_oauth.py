@@ -2318,6 +2318,10 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
         ),
     }
 
+    canonical_thread_id = (
+        _sa.get_request_codex_memory_consolidation_base_session_identity(request)
+        or session_identity
+    )
     metadata_body = _merge_litellm_metadata(
         body,
         tags_to_add=[
@@ -2327,7 +2331,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
         ],
         extra_fields={
             "openai_passthrough_route_family": "codex_responses",
-            **({"canonical_thread_id": session_identity} if session_identity else {}),
+            **({"canonical_thread_id": canonical_thread_id} if canonical_thread_id else {}),
             "codex_oauth_direct_inventory": True,
             "codex_oauth_ordinary_quota_applicable": not ordinary_quota_exempt,
             "codex_oauth_quota_balancing": selected_state.get(

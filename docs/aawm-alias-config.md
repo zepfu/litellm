@@ -285,16 +285,12 @@ acquisition. The original input remains model context. Opaque reasoning,
 provider response references, and unrecognized tool history require the
 existing continuation checks.
 
-Native Codex memory consolidation (Codex v0.171.0+,
-`x-openai-memgen-request: true`) runs in the same session as foreground work
-but must not block ordinary provider selection. The session owner domain
-derives a deterministic memory-scoped identity via SHA-256 with a dedicated
-`v1` domain separator, producing an independent ownership subspace under the
-same durable session identity. The base identity remains available for
-foreground ownership; the derived identity isolates the background memory
-writer. Both subspaces respect account affinity, leases, and replay guards.
-The base session identity is preserved on request state for passthrough
-telemetry.
+Native Codex memory extraction and consolidation use an owner separate from
+foreground work on the same session. Extraction uses the tool-free, replay-safe
+Responses request with Codex's strict memory output schema. Consolidation uses
+the `x-openai-memgen-request` or native memory subagent header. Both ownership
+paths enforce account affinity, leases, and replay guards. Session history
+records the original thread ID for the memory requests and foreground work.
 
 On recipient ingress, both `NEW_TASK` and `MESSAGE` encrypted-content slots
 must contain a complete valid frame. AAWM decodes its exact text and preserves

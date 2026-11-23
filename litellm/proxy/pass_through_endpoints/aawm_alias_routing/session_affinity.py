@@ -419,6 +419,16 @@ _CODEX_MEMGEN_REQUEST_HEADER = "x-openai-memgen-request"
 _CODEX_MEMORY_CONSOLIDATION_SUBAGENT_HEADER = (
     "x-openai-subagent"
 )
+_CODEX_MEMORY_EXTRACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "rollout_summary": {"type": "string"},
+        "rollout_slug": {"type": ["string", "null"]},
+        "raw_memory": {"type": "string"},
+    },
+    "required": ["rollout_summary", "rollout_slug", "raw_memory"],
+    "additionalProperties": False,
+}
 _CODEX_AUTO_REVIEW_SESSION_IDENTITY_SUFFIX = ":codex-auto-review"
 _CODEX_AUTO_REVIEW_SESSION_OWNER_IDENTITY_PREFIX = (
     "aawm-codex-auto-review-owner-v1:"
@@ -1296,22 +1306,14 @@ def _strip_legacy_affinity_prefixes(raw: str) -> str:
     return cleaned
 
 
-def _request_is_codex_memory_consolidation(request: Any) -> bool:
-    """Return whether *request* is a native Codex memory-consolidation call.
-
-    Stock Codex v0.171.0 emits x-openai-memgen-request: true on
-    Internal(MemoryConsolidation) and may additionally emit
-    x-openai-subagent: memory_consolidation.  Both are trusted native
-    signals; prompt-text heuristics are not required.
-
-    The native-Codex auth gate keeps this partition scoped to Codex
-    Responses; OpenCode, Anthropic, and xAI callers never set these
-    headers and pass through unchanged.
-    """
-    if request is None:
-        return False
+def _request_is_codex_memory_workload(
+    request: Any, request_body: Optional[Mapping[str, Any]]
+) -> bool:
+    """Recognize native consolidation headers or the fresh extraction contract."""
     if not _request_uses_codex_native_auth_markers(request):
         return False
+    if get_request_codex_memory_consolidation_base_session_identity(request) is not None:
+        return True
     headers = getattr(request, "headers", None)
     if headers is None:
         return False
@@ -1327,7 +1329,21 @@ def _request_is_codex_memory_consolidation(request: Any) -> bool:
         if key == _CODEX_MEMORY_CONSOLIDATION_SUBAGENT_HEADER:
             if str(value).strip().casefold() == "memory_consolidation":
                 return True
-    return False
+
+    # First-stage extraction inherits the foreground client identity. Codex
+    # sends a fresh, tool-free Responses request with this strict output schema.
+    if not isinstance(request_body, Mapping) or request_body.get("tools"):
+        return False
+    text = request_body.get("text")
+    output_format = text.get("format") if isinstance(text, Mapping) else None
+    return (
+        isinstance(output_format, Mapping)
+        and output_format.get("type") == "json_schema"
+        and output_format.get("name") == "codex_output_schema"
+        and output_format.get("strict") is True
+        and output_format.get("schema") == _CODEX_MEMORY_EXTRACTION_SCHEMA
+        and classify_session_owner_replay_safety_body(request_body).safe
+    )
 
 
 def derive_session_owner_codex_memory_effective_identity(
@@ -1391,7 +1407,7 @@ def resolve_canonical_session_identity(
             return None
         canonical = _strip_legacy_affinity_prefixes(cleaned)
         if (
-            _request_is_codex_memory_consolidation(request)
+            _request_is_codex_memory_workload(request, request_body)
             and canonical != get_request_effective_session_identity(request)
             and not is_session_owner_codex_memory_effective_identity(canonical)
         ):

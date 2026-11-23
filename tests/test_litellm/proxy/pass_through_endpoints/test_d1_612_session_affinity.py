@@ -5982,14 +5982,9 @@ def test_codex_memory_consolidation_is_idempotent() -> None:
     assert second == first
 
 
-async def test_codex_memory_consolidation_guard_isolation() -> None:
-    """Memory and foreground owners occupy independent subspaces.
-
-    Memory Luna (x-openai-memgen-request: true) derives a separate
-    identity and promotes first.  Foreground Kimi (no memory headers)
-    retains the base identity and can independently reserve without
-    hitting account_bound_owner_unavailable.
-    """
+@pytest.mark.parametrize("memory_phase", ["extraction", "consolidation"])
+async def test_codex_memory_guard_isolation(memory_phase: str) -> None:
+    """Memory can promote first and foreground Kimi can reserve independently."""
     redis = _FakeRedisCache()
     base_identity = "sess-cfg-084-guard-isolation"
 
@@ -6010,13 +6005,35 @@ async def test_codex_memory_consolidation_guard_isolation() -> None:
 
     memory_request = type("Req", (), {})()
     memory_request.state = type("State", (), {})()
-    memory_request.headers = {
-        "chatgpt-account-id": "acct-cfg084",
-        "x-openai-memgen-request": "true",
-    }
+    memory_request.headers = {"chatgpt-account-id": "acct-cfg084"}
+    memory_body: dict[str, Any] = {"session_id": base_identity}
+    if memory_phase == "consolidation":
+        memory_request.headers["x-openai-memgen-request"] = "true"
+    else:
+        memory_body["text"] = {
+            "format": {
+                "type": "json_schema",
+                "name": "codex_output_schema",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "rollout_summary": {"type": "string"},
+                        "rollout_slug": {"type": ["string", "null"]},
+                        "raw_memory": {"type": "string"},
+                    },
+                    "required": ["rollout_summary", "rollout_slug", "raw_memory"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+        assert sa.resolve_canonical_session_identity(
+            request=memory_request,
+            request_body={**memory_body, "previous_response_id": "resp_owned"},
+        ) == base_identity
     memory_identity = sa.resolve_canonical_session_identity(
         request=memory_request,
-        request_body={"session_id": base_identity},
+        request_body=memory_body,
     )
     assert memory_identity is not None
     assert sa.is_session_owner_codex_memory_effective_identity(memory_identity)
