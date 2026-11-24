@@ -177,7 +177,7 @@ def test_zai_coding_plan_candidates_are_off_peak_only_except_public_sota() -> No
                     now_utc=now_utc,
                 )
             ]
-            assert sota_models[0] == "zai_coding_plan/glm-5.3"
+            assert sota_models[0] == "zai_coding_plan/glm-5.4"
     finally:
         snapshot_select.set_active_routing_snapshot(previous)
 
