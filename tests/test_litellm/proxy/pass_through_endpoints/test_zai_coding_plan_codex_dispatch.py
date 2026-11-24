@@ -56,6 +56,9 @@ def _request() -> MagicMock:
 async def test_direct_coding_plan_uses_native_adapter_with_codex_inventory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from litellm.integrations.aawm_agent_identity.provider_normalize import (
+        _normalize_session_history_provider,
+    )
     from litellm.proxy._types import UserAPIKeyAuth
     from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as host
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import codex_oauth
@@ -97,6 +100,11 @@ async def test_direct_coding_plan_uses_native_adapter_with_codex_inventory(
     assert response is native_response
     native.assert_awaited_once()
     assert native.await_args.kwargs["adapter_model"] == body["model"]
+    metadata = native.await_args.kwargs["prepared_request_body"]["litellm_metadata"]
+    assert metadata["passthrough_route_family"] == _CODEX_ZAI_ROUTE_FAMILY
+    assert _normalize_session_history_provider("openai", body["model"], metadata) == (
+        "zai_coding_plan"
+    )
 
 
 @pytest.mark.parametrize("model", [_ADAPTER_MODEL, "zai_coding_plan/glm-5.4"])

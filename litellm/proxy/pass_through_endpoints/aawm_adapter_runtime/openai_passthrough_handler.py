@@ -215,9 +215,6 @@ class OpenAIPassThroughHandlerRuntime:
     resolve_codex_kimi_chat_completions_adapter_model_fn: Callable[
         ..., Optional[str]
     ] = _identity_codex_adapter_model_resolver
-    resolve_codex_zai_coding_plan_adapter_model_fn: Callable[
-        ..., Optional[str]
-    ] = _identity_codex_adapter_model_resolver
 
 
 # ---------------------------------------------------------------------------
@@ -477,8 +474,13 @@ class BaseOpenAIPassThroughHandler:
         extra_headers: Optional[dict] = None,
         credential_family: Optional[litellm.LlmProviders] = None,
         forward_headers: bool = False,
+        direct_zai_coding_plan_request: bool = False,
     ):
         rt = BaseOpenAIPassThroughHandler._get_runtime()
+        direct_zai_coding_plan_request = (
+            direct_zai_coding_plan_request
+            and custom_llm_provider == litellm.LlmProviders.OPENAI
+        )
 
         encoded_endpoint = (
             BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(
@@ -567,15 +569,10 @@ class BaseOpenAIPassThroughHandler:
             except Exception:
                 verbose_proxy_logger.exception("prompt_replacement: OpenAI body hook failed")
             # --- end prompt-replacement hook ---
-            direct_zai_coding_plan_model = (
-                rt.resolve_codex_zai_coding_plan_adapter_model_fn(
-                    prepared_request_body, endpoint=endpoint
-                )
-            )
             is_codex_responses_request = (
                 (rt.request_uses_codex_native_auth_fn(request) and is_responses_endpoint)
                 or bound_codex_oauth_identity is not None
-                or direct_zai_coding_plan_model is not None
+                or direct_zai_coding_plan_request
             )
             codex_auto_agent_alias_model = (
                 rt.resolve_codex_auto_agent_alias_model_fn(
@@ -587,7 +584,7 @@ class BaseOpenAIPassThroughHandler:
             if (
                 is_codex_responses_request
                 and codex_auto_agent_alias_model is None
-                and direct_zai_coding_plan_model is None
+                and not direct_zai_coding_plan_request
             ):
                 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
                     _load_bound_codex_oauth_auth,
@@ -624,6 +621,13 @@ class BaseOpenAIPassThroughHandler:
                     prepared_request_body
                 )
             if is_codex_responses_request:
+                route_family = "codex_responses"
+                if direct_zai_coding_plan_request:
+                    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.adapter_config import (
+                        CODEX_ZAI_CODING_PLAN,
+                    )
+
+                    route_family = CODEX_ZAI_CODING_PLAN.route_family
                 codex_route_host_attribution = (
                     await rt.resolve_auto_agent_alias_route_host_attribution_fn(request)
                 )
@@ -649,7 +653,7 @@ class BaseOpenAIPassThroughHandler:
                 prepared_request_body = (
                     rt.add_route_family_logging_metadata_fn(
                         prepared_request_body,
-                        "codex_responses",
+                        route_family,
                     )
                 )
             if (
@@ -831,7 +835,7 @@ class BaseOpenAIPassThroughHandler:
                         raise
                     if dispatched_response is not None:
                         return dispatched_response
-                    if direct_zai_coding_plan_model is not None:
+                    if direct_zai_coding_plan_request:
                         raise HTTPException(
                             status_code=502,
                             detail="Z.AI Coding Plan adapter did not handle the direct request.",
@@ -1529,11 +1533,6 @@ def build_runtime_from_host() -> OpenAIPassThroughHandlerRuntime:
             _host,
             "llm_passthrough_endpoints",
             "_resolve_codex_kimi_chat_completions_adapter_model",
-        ),
-        resolve_codex_zai_coding_plan_adapter_model_fn=_late_bound_callback(
-            _host,
-            "llm_passthrough_endpoints",
-            "_resolve_codex_zai_coding_plan_adapter_model",
         ),
         add_route_family_logging_metadata_fn=_late_bound_callback(
             _host,

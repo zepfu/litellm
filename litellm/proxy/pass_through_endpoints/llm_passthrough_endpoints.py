@@ -6767,9 +6767,10 @@ async def openai_proxy_route(  # noqa: PLR0915
         is_grok_native_oauth_request = _is_openai_responses_endpoint(endpoint) and _is_grok_native_oauth_request_body(
             request_body
         )
-        direct_zai_coding_plan_model = _resolve_codex_zai_coding_plan_adapter_model(
-            request_body, endpoint=endpoint
-        )
+        if httpx.URL(endpoint).path.strip("/") in ("responses", "v1/responses"):
+            direct_zai_coding_plan_model = _resolve_codex_zai_coding_plan_adapter_model(
+                request_body, endpoint=endpoint
+            )
         resolved_codex_auto_agent_alias = _resolve_codex_auto_agent_alias_model(
             request_body,
             endpoint,
@@ -6788,14 +6789,16 @@ async def openai_proxy_route(  # noqa: PLR0915
         request=request,
         endpoint=endpoint,
     )
-    use_direct_codex_oauth_inventory = (
-        direct_zai_coding_plan_model is None
-        and _should_use_direct_codex_oauth_inventory(
-            request,
-            endpoint=endpoint,
-            request_body=request_body,
-        )
+    use_direct_codex_oauth_inventory = _should_use_direct_codex_oauth_inventory(
+        request,
+        endpoint=endpoint,
+        request_body=request_body,
     )
+    direct_zai_coding_plan_request = direct_zai_coding_plan_model is not None and (
+        use_direct_codex_oauth_inventory or _request_uses_codex_native_auth(request)
+    )
+    if direct_zai_coding_plan_request:
+        use_direct_codex_oauth_inventory = False
     openai_api_key: Optional[str] = None
     forward_headers = False
     extra_headers: Optional[dict[str, str]] = None
@@ -6804,7 +6807,7 @@ async def openai_proxy_route(  # noqa: PLR0915
         base_target_url = os.getenv("LITELLM_XAI_OAUTH_API_BASE") or XAI_API_BASE
     elif is_grok_native_oauth_request:
         base_target_url = _get_grok_passthrough_target_base()
-    elif is_codex_auto_agent_alias_request or direct_zai_coding_plan_model is not None:
+    elif is_codex_auto_agent_alias_request or direct_zai_coding_plan_request:
         base_target_url = os.getenv("CHATGPT_API_BASE") or CHATGPT_API_BASE
     elif use_direct_codex_oauth_inventory:
         # OPENAI-006: bind inventory before handler fallthrough so D1-612 and
@@ -6856,6 +6859,7 @@ async def openai_proxy_route(  # noqa: PLR0915
                 custom_llm_provider=litellm.LlmProviders.OPENAI,
                 extra_headers=extra_headers,
                 forward_headers=forward_headers,
+                direct_zai_coding_plan_request=direct_zai_coding_plan_request,
             )
             if use_direct_codex_oauth_inventory:
                 _aawm_dev_fault_plan.note_direct_openai_managed_success(
