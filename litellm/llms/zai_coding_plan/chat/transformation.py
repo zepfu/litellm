@@ -23,7 +23,7 @@ ZAI_CODING_PLAN_CHAT_COMPLETIONS_URL = f"{ZAI_CODING_PLAN_API_BASE}/chat/complet
 ZAI_CODING_PLAN_PROVIDER_NAME = "zai_coding_plan"
 ZAI_CODING_PLAN_USER_AGENT_PREFIX = "litellm-zai-coding-plan"
 ZAI_CODING_PLAN_MODEL_IDS = frozenset(
-    {"glm-5.3", "glm-5.3-flash", "glm-5-turbo", "glm-4.7"}
+    {"glm-5.4", "glm-5.3", "glm-5.3-flash", "glm-5-turbo", "glm-4.7"}
 )
 ZAI_CODING_PLAN_REASONING_EFFORT_MAP = {
     "minimal": "low",

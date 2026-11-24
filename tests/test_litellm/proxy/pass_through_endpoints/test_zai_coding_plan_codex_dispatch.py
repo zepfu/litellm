@@ -52,27 +52,30 @@ def _request() -> MagicMock:
     return request
 
 
-def test_should_resolve_prefixed_direct_coding_plan_models_on_responses() -> None:
+@pytest.mark.parametrize("model", [_ADAPTER_MODEL, "zai_coding_plan/glm-5.4"])
+def test_should_resolve_prefixed_direct_coding_plan_models_on_responses(
+    model: str,
+) -> None:
     assert (
         _resolve_codex_zai_coding_plan_adapter_model(
-            {"model": _ADAPTER_MODEL},
+            {"model": model},
             "/v1/responses",
         )
-        == _ADAPTER_MODEL
+        == model
     )
     assert (
         _resolve_codex_zai_coding_plan_adapter_model(
-            {"model": _ADAPTER_MODEL},
+            {"model": model},
             "v1/responses",
         )
-        == _ADAPTER_MODEL
+        == model
     )
     assert (
         model_resolution._resolve_codex_zai_coding_plan_adapter_model(
-            {"model": _ADAPTER_MODEL},
+            {"model": model},
             "/v1/responses",
         )
-        == _ADAPTER_MODEL
+        == model
     )
     assert (
         _resolve_codex_zai_coding_plan_adapter_model(

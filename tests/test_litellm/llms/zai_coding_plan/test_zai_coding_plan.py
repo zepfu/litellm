@@ -35,6 +35,7 @@ def test_should_register_zai_coding_plan_provider_and_config() -> None:
 
 def test_should_keep_supported_model_ids_as_the_documented_coding_plan_set() -> None:
     assert ZAI_CODING_PLAN_MODEL_IDS == {
+        "glm-5.4",
         "glm-5.3",
         "glm-5.3-flash",
         "glm-5-turbo",
@@ -45,10 +46,12 @@ def test_should_keep_supported_model_ids_as_the_documented_coding_plan_set() -> 
 @pytest.mark.parametrize(
     "model",
     (
+        "zai_coding_plan/glm-5.4",
         "zai_coding_plan/glm-5.3",
         "zai_coding_plan/glm-5.3-flash",
         "zai_coding_plan/glm-5-turbo",
         "zai_coding_plan/glm-4.7",
+        "glm-5.4",
         "glm-5.3",
         "glm-5.3-flash",
         "glm-5-turbo",
