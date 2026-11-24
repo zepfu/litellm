@@ -61,7 +61,10 @@ async def test_direct_coding_plan_uses_native_adapter_with_codex_inventory(
     )
     from litellm.proxy._types import UserAPIKeyAuth
     from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as host
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import codex_oauth
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        codex_oauth,
+        session_affinity,
+    )
 
     body = {"model": "zai_coding_plan/glm-5.4", "input": "hello"}
     monkeypatch.setenv("LITELLM_CODEX_OAUTH_INVENTORY", "{}")
@@ -83,12 +86,19 @@ async def test_direct_coding_plan_uses_native_adapter_with_codex_inventory(
     native_response = Response(content=b"native Z.AI")
     native = AsyncMock(return_value=native_response)
     monkeypatch.setattr(host, "_handle_codex_zai_coding_plan_adapter_route", native)
+    monkeypatch.setattr(
+        session_affinity,
+        "get_session_owner_record",
+        AsyncMock(return_value=(None, "stock-thread", None)),
+    )
+    guard = AsyncMock()
+    monkeypatch.setattr(session_affinity, "ensure_session_owner_guard_for_request", guard)
     request = Request(
         {
             "type": "http",
             "method": "POST",
             "path": "/openai_passthrough/responses",
-            "headers": [],
+            "headers": [(b"x-codex-thread-id", b"stock-thread")],
             "query_string": b"",
         }
     )
@@ -102,6 +112,8 @@ async def test_direct_coding_plan_uses_native_adapter_with_codex_inventory(
     assert native.await_args.kwargs["adapter_model"] == body["model"]
     metadata = native.await_args.kwargs["prepared_request_body"]["litellm_metadata"]
     assert metadata["passthrough_route_family"] == _CODEX_ZAI_ROUTE_FAMILY
+    assert metadata["canonical_thread_id"] == "stock-thread"
+    assert guard.await_args.kwargs["session_identity"] == "stock-thread"
     assert _normalize_session_history_provider("openai", body["model"], metadata) == (
         "zai_coding_plan"
     )

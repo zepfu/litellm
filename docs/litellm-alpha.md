@@ -163,7 +163,8 @@ The current alpha alias YAML exposes these test paths:
   `gpt-6-luna`. The helper orders scheduled Z.AI GLM 5.3 Flash and Alibaba
   DeepSeek V4.1 Flash, both at low effort.
 - `sota-openai` uses OpenAI `gpt-6.2-astra`.
-- `sota-zai` uses GLM-5.3 through Z.AI Coding Plan, then Alibaba Token Plan.
+- `sota-zai` uses GLM-5.4 through Z.AI Coding Plan, then GLM-5.3 through
+  Z.AI Coding Plan and Alibaba Token Plan.
   `sota-meta` uses native Muse Code `muse-wonder-1.0-contributor`.
 - `provider-openai` includes `gpt-6.1-sol` after Luna and Terra, retaining
   Astra as the last candidate. Codex can also select the

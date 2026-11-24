@@ -83,7 +83,7 @@ def test_priority_descending_selection(snapshot_fixture) -> None:
 
 
 def test_canonical_sota_zai_prefers_coding_plan_on_codex_ingress() -> None:
-    """Codex ingress sees Coding Plan glm-5.3 first; Anthropic keeps Alibaba only."""
+    """Codex prefers Coding Plan GLM-5.4. Anthropic sees the Alibaba leaf."""
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
         DEFAULT_CONFIG_DIR,
         compile_directory,
@@ -97,10 +97,11 @@ def test_canonical_sota_zai_prefers_coding_plan_on_codex_ingress() -> None:
             snapshot.aliases["sota-zai"].candidates
         )
         assert [candidate.model for candidate in ordered] == [
+            "zai_coding_plan/glm-5.4",
             "zai_coding_plan/glm-5.3",
             "alibaba_token_plan/glm-5.3",
         ]
-        assert [candidate.priority for candidate in ordered] == [110, 100]
+        assert [candidate.priority for candidate in ordered] == [110, 105, 100]
         codex = snapshot_select._select_snapshot_candidates(
             "sota-zai",
             ingress="codex",
@@ -110,6 +111,7 @@ def test_canonical_sota_zai_prefers_coding_plan_on_codex_ingress() -> None:
             ingress="anthropic",
         )
         assert [candidate["model"] for candidate in codex] == [
+            "zai_coding_plan/glm-5.4",
             "zai_coding_plan/glm-5.3",
             "alibaba_token_plan/glm-5.3",
         ]

@@ -992,10 +992,23 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
         endpoint=endpoint,
     )
     if zai_coding_plan_adapter_model is not None:
+        from litellm.proxy.pass_through_endpoints.aawm_request_policy.observability_metadata import (
+            _merge_litellm_metadata,
+        )
+
         prepared_request_body = _prepare_request_body_for_passthrough_observability(
             request=request,
             request_body=prepared_request_body,
         )
+        canonical_thread_id = (
+            _sa.get_request_codex_memory_consolidation_base_session_identity(request)
+            or _sid
+        )
+        if canonical_thread_id is not None:
+            prepared_request_body = _merge_litellm_metadata(
+                prepared_request_body,
+                extra_fields={"canonical_thread_id": canonical_thread_id},
+            )
         if prepared_request_body is not request_body:
             _safe_set_request_parsed_body(request, prepared_request_body)
 

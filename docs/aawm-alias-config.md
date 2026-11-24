@@ -578,11 +578,12 @@ OpenAI/Codex credential domain on both ingresses.
 
 The public `sota-zai` alias is compiled from `sota-zai.yaml`. Codex
 `POST /openai_passthrough/v1/responses` prefers Z.AI Coding Plan
-`zai_coding_plan/glm-5.3` on
-`codex_zai_coding_plan_chat_completions_adapter` (priority 110). Alibaba
+`zai_coding_plan/glm-5.4` on
+`codex_zai_coding_plan_chat_completions_adapter` (priority 110), followed by
+`zai_coding_plan/glm-5.3` (priority 105). Alibaba
 Token Plan `alibaba_token_plan/glm-5.3` stays as the last-resort leaf on
-the same alias (priority 100). Coding Plan is Codex-only: do not set
-`anthropic_route_family` on that candidate. Anthropic ingress therefore
+the same alias (priority 100). Coding Plan is Codex-only. Keep
+`anthropic_route_family` absent on those candidates. Anthropic ingress
 sees only the Alibaba leaf. This public alias has no schedule and remains
 selectable at all times. Do not invent `aawm-sota-zai` or `sota-zcode`.
 Do not add this alias to `sota.yaml` TUI dispatch.

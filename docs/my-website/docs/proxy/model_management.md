@@ -95,7 +95,8 @@ Config-driven alias routing uses:
 - Cursor Agent Composer 2.5 standard (`cursor_agent/composer-2.5`): CLI slug `composer-2.5`, not Fast and not xAI `grok-composer-2.5-fast`; public list $0.50/$0.20/$2.50 per million input/cache-read/output, reference-only with invoice cost unknown
 - Cursor Grok 4.7 (`cursor_agent/cursor-grok-4.7-high`): CLI slug `cursor-grok-4.7-high`, distinct from `oa_xai/grok-4.6` and `xai/grok-4.6`; standard 256K context is $2/$0.50/$6 per million input/cache-read/output, and the documented 500K long-context tier is $4/$1/$12; reference-only with invoice cost unknown, with no cache-write price published and no temporary launch discount baked in
 - `sota-alibaba`: `alibaba_token_plan/qwen3.8-max` → `alibaba_token_plan/qwen3.7-max`
-- `sota-zai`: `zai_coding_plan/glm-5.3` (priority 110), then last-resort
+- `sota-zai`: `zai_coding_plan/glm-5.4` (priority 110), then
+  `zai_coding_plan/glm-5.3` (105) and last-resort
   `alibaba_token_plan/glm-5.3` (priority 100)
 - `sota-meta` uses native Muse Code `muse-wonder-1.0-contributor`.
 - `provider-openai`: egress-validation order `gpt-6-luna` (priority 100) →
