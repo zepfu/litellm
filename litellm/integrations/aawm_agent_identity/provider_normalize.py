@@ -155,6 +155,8 @@ def _session_history_provider_from_route_family(route_family: Any) -> Optional[s
         return "local_biomed"
     if "gemini" in route_lower or "google" in route_lower:
         return "gemini"
+    if route_lower == "codex_zai_coding_plan_chat_completions_adapter":
+        return "zai_coding_plan"
     if "codex" in route_lower or "openai" in route_lower:
         return "openai"
     if "anthropic" in route_lower:

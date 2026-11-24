@@ -32,6 +32,7 @@ from typing import (
 )
 
 import httpx
+from fastapi import HTTPException
 
 import litellm
 from litellm._logging import verbose_proxy_logger
@@ -212,6 +213,9 @@ class OpenAIPassThroughHandlerRuntime:
     ] = _identity_codex_tool_adapter
     # -- Direct Codex Kimi model resolution -------------------------------
     resolve_codex_kimi_chat_completions_adapter_model_fn: Callable[
+        ..., Optional[str]
+    ] = _identity_codex_adapter_model_resolver
+    resolve_codex_zai_coding_plan_adapter_model_fn: Callable[
         ..., Optional[str]
     ] = _identity_codex_adapter_model_resolver
 
@@ -563,10 +567,16 @@ class BaseOpenAIPassThroughHandler:
             except Exception:
                 verbose_proxy_logger.exception("prompt_replacement: OpenAI body hook failed")
             # --- end prompt-replacement hook ---
+            direct_zai_coding_plan_model = (
+                rt.resolve_codex_zai_coding_plan_adapter_model_fn(
+                    prepared_request_body, endpoint=endpoint
+                )
+            )
             is_codex_responses_request = (
-                rt.request_uses_codex_native_auth_fn(request)
-                and is_responses_endpoint
-            ) or bound_codex_oauth_identity is not None
+                (rt.request_uses_codex_native_auth_fn(request) and is_responses_endpoint)
+                or bound_codex_oauth_identity is not None
+                or direct_zai_coding_plan_model is not None
+            )
             codex_auto_agent_alias_model = (
                 rt.resolve_codex_auto_agent_alias_model_fn(
                     prepared_request_body,
@@ -574,7 +584,11 @@ class BaseOpenAIPassThroughHandler:
                     request=request,
                 )
             )
-            if is_codex_responses_request and codex_auto_agent_alias_model is None:
+            if (
+                is_codex_responses_request
+                and codex_auto_agent_alias_model is None
+                and direct_zai_coding_plan_model is None
+            ):
                 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
                     _load_bound_codex_oauth_auth,
                 )
@@ -817,6 +831,11 @@ class BaseOpenAIPassThroughHandler:
                         raise
                     if dispatched_response is not None:
                         return dispatched_response
+                    if direct_zai_coding_plan_model is not None:
+                        raise HTTPException(
+                            status_code=502,
+                            detail="Z.AI Coding Plan adapter did not handle the direct request.",
+                        )
                     if direct_go_model is not None:
                         # The dispatcher did not consume a supported Go claim.
                         # Send the canonical bare model to the existing adapter
@@ -1510,6 +1529,11 @@ def build_runtime_from_host() -> OpenAIPassThroughHandlerRuntime:
             _host,
             "llm_passthrough_endpoints",
             "_resolve_codex_kimi_chat_completions_adapter_model",
+        ),
+        resolve_codex_zai_coding_plan_adapter_model_fn=_late_bound_callback(
+            _host,
+            "llm_passthrough_endpoints",
+            "_resolve_codex_zai_coding_plan_adapter_model",
         ),
         add_route_family_logging_metadata_fn=_late_bound_callback(
             _host,

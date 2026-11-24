@@ -6755,6 +6755,7 @@ async def openai_proxy_route(  # noqa: PLR0915
     request_body: dict[str, Any] = {}
     is_oa_xai_request = False
     is_grok_native_oauth_request = False
+    direct_zai_coding_plan_model: Optional[str] = None
     is_codex_auto_agent_alias_request = False
     if request.method == "POST":
         request_body = await get_request_body(request)
@@ -6765,6 +6766,9 @@ async def openai_proxy_route(  # noqa: PLR0915
         is_oa_xai_request = _is_oa_xai_request_body(request_body)
         is_grok_native_oauth_request = _is_openai_responses_endpoint(endpoint) and _is_grok_native_oauth_request_body(
             request_body
+        )
+        direct_zai_coding_plan_model = _resolve_codex_zai_coding_plan_adapter_model(
+            request_body, endpoint=endpoint
         )
         resolved_codex_auto_agent_alias = _resolve_codex_auto_agent_alias_model(
             request_body,
@@ -6784,10 +6788,13 @@ async def openai_proxy_route(  # noqa: PLR0915
         request=request,
         endpoint=endpoint,
     )
-    use_direct_codex_oauth_inventory = _should_use_direct_codex_oauth_inventory(
-        request,
-        endpoint=endpoint,
-        request_body=request_body,
+    use_direct_codex_oauth_inventory = (
+        direct_zai_coding_plan_model is None
+        and _should_use_direct_codex_oauth_inventory(
+            request,
+            endpoint=endpoint,
+            request_body=request_body,
+        )
     )
     openai_api_key: Optional[str] = None
     forward_headers = False
@@ -6797,7 +6804,7 @@ async def openai_proxy_route(  # noqa: PLR0915
         base_target_url = os.getenv("LITELLM_XAI_OAUTH_API_BASE") or XAI_API_BASE
     elif is_grok_native_oauth_request:
         base_target_url = _get_grok_passthrough_target_base()
-    elif is_codex_auto_agent_alias_request:
+    elif is_codex_auto_agent_alias_request or direct_zai_coding_plan_model is not None:
         base_target_url = os.getenv("CHATGPT_API_BASE") or CHATGPT_API_BASE
     elif use_direct_codex_oauth_inventory:
         # OPENAI-006: bind inventory before handler fallthrough so D1-612 and

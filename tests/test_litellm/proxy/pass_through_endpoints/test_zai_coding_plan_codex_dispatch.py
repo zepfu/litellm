@@ -52,6 +52,53 @@ def _request() -> MagicMock:
     return request
 
 
+@pytest.mark.asyncio
+async def test_direct_coding_plan_uses_native_adapter_with_codex_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as host
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import codex_oauth
+
+    body = {"model": "zai_coding_plan/glm-5.4", "input": "hello"}
+    monkeypatch.setenv("LITELLM_CODEX_OAUTH_INVENTORY", "{}")
+    monkeypatch.setattr(host, "get_request_body", AsyncMock(return_value=body))
+    monkeypatch.setattr(
+        host,
+        "_aresolve_auto_agent_alias_route_host_attribution",
+        AsyncMock(return_value={}),
+    )
+    for operation in (
+        "select_and_bind_direct_codex_oauth_inventory",
+        "_load_bound_codex_oauth_auth",
+    ):
+        monkeypatch.setattr(
+            codex_oauth,
+            operation,
+            AsyncMock(side_effect=AssertionError("Direct Z.AI cannot select OpenAI auth")),
+        )
+    native_response = Response(content=b"native Z.AI")
+    native = AsyncMock(return_value=native_response)
+    monkeypatch.setattr(host, "_handle_codex_zai_coding_plan_adapter_route", native)
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/openai_passthrough/responses",
+            "headers": [],
+            "query_string": b"",
+        }
+    )
+
+    response = await host.openai_proxy_route(
+        "responses", request, Response(), UserAPIKeyAuth()
+    )
+
+    assert response is native_response
+    native.assert_awaited_once()
+    assert native.await_args.kwargs["adapter_model"] == body["model"]
+
+
 @pytest.mark.parametrize("model", [_ADAPTER_MODEL, "zai_coding_plan/glm-5.4"])
 def test_should_resolve_prefixed_direct_coding_plan_models_on_responses(
     model: str,
