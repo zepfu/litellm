@@ -50,7 +50,9 @@ class RequestWaits:
         self._last_checkpoint_at = float("-inf")
         self._checkpoint_handle: Optional[asyncio.TimerHandle] = None
 
-    def checkpoint(self, *, force: bool = False) -> None:
+    def checkpoint(
+        self, *, force: bool = False, response_status_code: Optional[int] = None
+    ) -> None:
         self.sequence += 1
         now = time.monotonic()
         remaining = _CHECKPOINT_INTERVAL_SECONDS - (now - self._last_checkpoint_at)
@@ -80,6 +82,8 @@ class RequestWaits:
             },
             "counts": dict(self.counts),
         }
+        if response_status_code is not None:
+            snapshot["response_status_code"] = response_status_code
         try:
             from litellm.integrations.aawm_session_history.writer import (
                 _enqueue_session_history_record,
@@ -141,11 +145,11 @@ class RequestWaits:
             )
             self.checkpoint()
 
-    def finish(self, status: str) -> None:
+    def finish(self, status: str, *, response_status_code: Optional[int] = None) -> None:
         for key in list(self.active):
             self.end(key)
         self.status = status
-        self.checkpoint(force=True)
+        self.checkpoint(force=True, response_status_code=response_status_code)
 
 
 def get_request_wait_call_id() -> Optional[str]:
@@ -342,6 +346,7 @@ class SessionHistoryWaitMiddleware:
             raise
         finally:
             tracker.finish(
-                "disconnected" if disconnected and not response_complete else status
+                "disconnected" if disconnected and not response_complete else status,
+                response_status_code=response_status or None,
             )
             _current.reset(token)

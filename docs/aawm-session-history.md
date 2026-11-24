@@ -79,9 +79,10 @@ The object contains `version`, increasing `sequence`, `status`, UTC
 `started_at`/`updated_at`, `current_waits` (`type` and UTC `started_at`), cumulative
 closed `durations_ms`, and invocation `counts`. Status is `running`, `completed`,
 `failed`, `cancelled`, or `disconnected`; `completed` means the ASGI response
-finished, not that provider content succeeded. A running row with an open wait after
-process loss records the last persisted state; it does not prove the process is
-still alive. For each open wait, calculate elapsed time from its start to the
+finished, and provider content has its own outcome. A terminal snapshot includes
+`response_status_code` when ASGI sent response headers. A running row with an
+open wait after process loss records the last persisted state. For each open
+wait, calculate elapsed time from its start to the
 observation time and add it to that type's closed duration. Multiple waits can
 be active concurrently, and nested spans overlap: do not sum type durations as
 total request latency. An empty `current_waits` means no instrumented await was
