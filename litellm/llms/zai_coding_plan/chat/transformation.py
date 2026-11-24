@@ -103,10 +103,10 @@ class ZAICodingPlanChatConfig(OpenAIGPTConfig):
                 "Coding Plan routes require a nonempty model ID."
             )
         if normalized not in ZAI_CODING_PLAN_MODEL_IDS:
+            admitted_models = ", ".join(sorted(ZAI_CODING_PLAN_MODEL_IDS))
             raise ValueError(
                 f"Unsupported Z.AI Coding Plan model {model!r}. "
-                "Admitted models are glm-5.3, glm-5.3-flash, "
-                "glm-5-turbo, and glm-4.7."
+                f"Admitted models are {admitted_models}."
             )
         return normalized
 
