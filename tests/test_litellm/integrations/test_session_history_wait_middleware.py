@@ -1,12 +1,20 @@
 import pytest
 
 from litellm.integrations.aawm_session_history import writer
-from litellm.integrations.aawm_session_history.waits import SessionHistoryWaitMiddleware
+from litellm.integrations.aawm_session_history.waits import (
+    SessionHistoryWaitMiddleware,
+    record_candidate_selection_failure,
+)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status_code", [422, None])
-async def test_terminal_wait_checkpoint_retains_sent_status(monkeypatch, status_code):
+@pytest.mark.parametrize(
+    ("status_code", "selector_failed"),
+    [(422, False), (None, False), (500, True), (200, True)],
+)
+async def test_terminal_wait_checkpoint_retains_sent_status(
+    monkeypatch, status_code, selector_failed
+):
     checkpoints = []
     sent_messages = []
     monkeypatch.setattr(writer, "_build_session_history_dsn", lambda: "test-dsn")
@@ -22,6 +30,11 @@ async def test_terminal_wait_checkpoint_retains_sent_status(monkeypatch, status_
         await receive()
         if status_code is None:
             raise RuntimeError("Failed before headers")
+        if selector_failed:
+            try:
+                raise ValueError("selection diagnostic with sensitive text")
+            except ValueError as error:
+                record_candidate_selection_failure(error)
         await send({"type": "http.response.start", "status": status_code, "headers": []})
         await send({"type": "http.response.body", "body": b"{}"})
 
@@ -43,8 +56,12 @@ async def test_terminal_wait_checkpoint_retains_sent_status(monkeypatch, status_
     checkpoint = checkpoints[-1]
     assert checkpoint["litellm_call_id"] == "test-call"
     wait = checkpoint["metadata"]["wait_accounting"]
-    assert wait["status"] == "failed"
+    assert wait["status"] == ("completed" if status_code == 200 else "failed")
     if status_code is None:
         assert "response_status_code" not in wait
     else:
         assert wait["response_status_code"] == status_code
+    if selector_failed and status_code == 500:
+        assert wait["candidate_selection_failure"] == {"exception_type": "ValueError"}
+    else:
+        assert "candidate_selection_failure" not in wait

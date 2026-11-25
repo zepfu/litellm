@@ -42,6 +42,9 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence
 import httpx
 from fastapi import HTTPException
 
+from litellm.integrations.aawm_session_history.waits import (
+    record_candidate_selection_failure,
+)
 from litellm.llms.cohere.cancellation import COHERE_CANCELLATION_FAILURE_CLASS
 from litellm.llms.cohere.common_utils import CohereError
 from litellm.llms.zai_coding_plan.chat.transformation import (
@@ -3521,6 +3524,7 @@ async def handle_alias_route(  # noqa: PLR0915
                                         _emit_auto_agent_alias_pre_attempt_terminal_event
                                     ),
                                 )
+                                record_candidate_selection_failure(redispatch_exc)
                                 raise
             if (
                 exc.status_code == status.HTTP_409_CONFLICT
@@ -3545,6 +3549,7 @@ async def handle_alias_route(  # noqa: PLR0915
                 request,
                 False,
             )
+            record_candidate_selection_failure(exc)
             selection_error_codes = _redispatch_error_codes(exc, selection_detail)
             if (
                 exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS
@@ -3617,6 +3622,7 @@ async def handle_alias_route(  # noqa: PLR0915
                     _emit_auto_agent_alias_pre_attempt_terminal_event
                 ),
             )
+            record_candidate_selection_failure(exc)
             raise
         candidate = selection["candidate"]
         _session_affinity_mod().set_competing_reservation_log_deferred(

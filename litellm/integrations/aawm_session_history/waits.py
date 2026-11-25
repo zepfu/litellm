@@ -47,6 +47,7 @@ class RequestWaits:
         self.active: dict[str, tuple[str, datetime, float]] = {}
         self.durations: dict[str, float] = {}
         self.counts: dict[str, int] = {}
+        self.candidate_selection_failure: Optional[dict[str, Any]] = None
         self._last_checkpoint_at = float("-inf")
         self._checkpoint_handle: Optional[asyncio.TimerHandle] = None
 
@@ -84,6 +85,8 @@ class RequestWaits:
         }
         if response_status_code is not None:
             snapshot["response_status_code"] = response_status_code
+        if self.status == "failed" and self.candidate_selection_failure is not None:
+            snapshot["candidate_selection_failure"] = self.candidate_selection_failure
         try:
             from litellm.integrations.aawm_session_history.writer import (
                 _enqueue_session_history_record,
@@ -150,6 +153,26 @@ class RequestWaits:
             self.end(key)
         self.status = status
         self.checkpoint(force=True, response_status_code=response_status_code)
+
+
+def record_candidate_selection_failure(error: Exception) -> None:
+    """Keep terminal selection evidence without exception text or wire data."""
+    tracker = _current.get()
+    if tracker is None or tracker.status != "running":
+        return
+
+    failure: dict[str, Any] = {"exception_type": type(error).__name__[:96]}
+    frame = error.__traceback__
+    while frame is not None:
+        module = frame.tb_frame.f_globals.get("__name__")
+        if isinstance(module, str) and module.startswith("litellm."):
+            failure.update(
+                module=module[:160],
+                function=frame.tb_frame.f_code.co_name[:96],
+                line=frame.tb_lineno,
+            )
+        frame = frame.tb_next
+    tracker.candidate_selection_failure = failure
 
 
 def get_request_wait_call_id() -> Optional[str]:
