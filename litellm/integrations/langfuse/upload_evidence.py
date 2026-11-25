@@ -6,7 +6,7 @@ import hashlib
 import logging
 import re
 from threading import local
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -29,6 +29,35 @@ def _batch_evidence(batch: list[dict[str, Any]]) -> dict[str, Any] | None:
     }
 
 
+def _observe_terminal_batch(
+    upload_batch: Callable[[list[dict[str, Any]]], None], worker: local
+) -> Callable[[list[dict[str, Any]]], None]:
+    def observed_upload(batch: list[dict[str, Any]]) -> None:
+        worker.batch_post_entered = False
+        try:
+            return upload_batch(batch)
+        except Exception as error:
+            try:
+                evidence = _batch_evidence(batch) or {"langfuse_upload_batch_size": len(batch)}
+                _logger.error(
+                    "Langfuse SDK ingestion ended with a terminal batch failure",
+                    extra={
+                        **evidence,
+                        "langfuse_upload_outcome": "terminal_sdk_error",
+                        "langfuse_upload_exception_type": type(error).__name__[:96],
+                        "langfuse_upload_post_entered": worker.batch_post_entered,
+                    },
+                )
+            except Exception:
+                # Keep the SDK's terminal exception and queue acknowledgement.
+                pass
+            raise
+        finally:
+            worker.batch_post_entered = False
+
+    return observed_upload
+
+
 def observe_langfuse_uploads(sdk: Any) -> None:
     """Wrap only this SDK instance's ingestion call and preserve its retry policy."""
     # The v2 SDK starts consumers at construction and supplies this callable
@@ -36,14 +65,15 @@ def observe_langfuse_uploads(sdk: Any) -> None:
     try:
         from langfuse.request import APIError, APIErrors
 
-        client = sdk.task_manager._client
-        batch_post = client.batch_post
+        manager = sdk.task_manager
+        batch_post = manager._client.batch_post
     except (AttributeError, ImportError):
         _logger.warning("Langfuse SDK ingestion evidence is unavailable for this client")
         return
     worker = local()
 
     def observed_batch_post(*args: Any, **kwargs: Any) -> httpx.Response:
+        worker.batch_post_entered = True
         try:
             response = batch_post(*args, **kwargs)
         except Exception as error:
@@ -104,4 +134,9 @@ def observe_langfuse_uploads(sdk: Any) -> None:
                 pass
         return response
 
-    client.batch_post = observed_batch_post
+    manager._client.batch_post = observed_batch_post
+
+    for consumer in getattr(manager, "_ingestion_consumers", ()):
+        upload_batch = getattr(consumer, "_upload_batch", None)
+        if callable(upload_batch):
+            consumer._upload_batch = _observe_terminal_batch(upload_batch, worker)

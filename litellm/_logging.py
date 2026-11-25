@@ -406,6 +406,8 @@ _AAWM_ERROR_LOG_DEFAULT_CONTEXT_FIELDS = (
     "langfuse_upload_batch_size",
     "langfuse_upload_event_ids",
     "langfuse_upload_outcome",
+    "langfuse_upload_exception_type",
+    "langfuse_upload_post_entered",
     "langfuse_upload_statuses",
     "aiohttp_owner_kind",
     "aiohttp_creation_site",

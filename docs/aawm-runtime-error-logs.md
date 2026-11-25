@@ -65,8 +65,11 @@ The generic LiteLLM ERROR sink (`AawmErrorLogFileHandler` in
   failed ingestion attempt. The record contains a digest of the SDK event IDs,
   up to five event IDs, the batch size, outcome and observed status codes.
   Check runtime logs for `accepted_after_failure` with the same batch ID to
-  verify that a later SDK retry was accepted. A failed attempt alone leaves
-  final delivery unknown.
+  verify that a later SDK retry was accepted. A `terminal_sdk_error` record
+  identifies a batch that raised out of the consumer's upload method. It
+  records the exception class and whether the SDK entered `batch_post`.
+  Batch IDs are available for events with recognized identifiers. Correlate
+  the batch with downstream evidence to determine remote delivery.
 
 For example, the dev proxy writes `/app/.analysis/dev-error.jsonl` inside the
 container, mounted to this repo's `.analysis/dev-error.jsonl`. The matching

@@ -55,3 +55,47 @@ def test_sdk_ingestion_failure_and_recovery_share_batch_identity(caplog, monkeyp
     assert failure.langfuse_upload_event_ids == sent_batches[0]
     assert failure.langfuse_upload_batch_size == len(sent_batches[0])
     assert "private-" not in repr([vars(failure), vars(recovery)])
+
+
+def test_sdk_terminal_failure_before_http_retains_batch_evidence(caplog, monkeypatch):
+    version = pytest.importorskip("langfuse.version")
+    if Version(version.__version__).major != 2:
+        pytest.skip("requires Langfuse v2 ingestion")
+    from langfuse._task_manager import ingestion_consumer
+
+    paths = []
+
+    def send(request):
+        paths.append(request.url.path)
+        return httpx.Response(200, json={"data": [{"id": "probe", "name": "Probe"}]})
+
+    def fail_before_post(**_):
+        raise RuntimeError("private-pre-upload-marker")
+
+    monkeypatch.setattr(litellm, "initialized_langfuse_clients", 0)
+    monkeypatch.setattr(integration, "should_use_langfuse_mock", lambda: False)
+    monkeypatch.delenv("UPSTREAM_LANGFUSE_SECRET_KEY", raising=False)
+    monkeypatch.setattr(ingestion_consumer, "IngestionMetadata", fail_before_post)
+    with httpx.Client(transport=httpx.MockTransport(send)) as client:
+        monkeypatch.setattr(integration, "_get_httpx_client", lambda: SimpleNamespace(client=client))
+        logger = integration.LangFuseLogger(
+            langfuse_public_key="pk-lf-probe",
+            langfuse_secret="sk-lf-private-marker",
+            langfuse_host="https://langfuse.invalid",
+        )
+        try:
+            logger.Langfuse.trace(id=str(uuid4()), input="private-input-marker")
+            logger.Langfuse.flush()
+        finally:
+            logger.Langfuse.shutdown()
+
+    assert "/api/public/ingestion" not in paths
+    record, = [
+        row for row in caplog.records
+        if getattr(row, "langfuse_upload_outcome", None) == "terminal_sdk_error"
+    ]
+    assert record.langfuse_upload_batch_size == len(record.langfuse_upload_event_ids) == 1
+    assert len(record.langfuse_upload_batch_id) == 64
+    assert record.langfuse_upload_exception_type == "RuntimeError"
+    assert record.langfuse_upload_post_entered is False
+    assert "private-" not in repr(vars(record))
