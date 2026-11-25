@@ -125,9 +125,10 @@ The AAWM proxy configuration may expose:
 Alpha mounts overrides from `config/alpha-alias-overrides/` that place
 `qwen4-max-preview` first in `sota-alibaba`, `provider-alibaba`, and
 `expert-other`, with configured effort `max`. Qwen4 is admitted only during
-the official preview availability window, from 10:00 on November 11 through
-24:00 on November 25, 2026 (UTC+8); `provider-alibaba` and `sota-alibaba`
-use an inclusive internal absolute end at the last representable microsecond
+the official preview window, from November 11 at 10:00 until November 25
+at 10:00, 2026 (UTC+8), when Alibaba retires the model.
+`provider-alibaba` and `sota-alibaba` use an inclusive internal absolute end
+at the last representable microsecond
 before the exclusive expiry. `expert-other` references a same-file Qwen4 leaf
 bounded to that full preview window; its nightly helper schedule gates the
 reference while the leaf's absolute schedule preserves ordinary priority and
@@ -140,9 +141,7 @@ expires, stable becomes their first candidate. Only
 
 The preview supports a 1M-token context and up to 393,216 output tokens.
 Its `max_tokens` budget includes both thinking and the final answer. Alibaba
-may report the canonical name `qwen4.0-max-preview` in responses. The announced
-preview ends after November 25, 2026 at 24:00 (UTC+8), after which the model
-is retired.
+may report the canonical name `qwen4.0-max-preview` in responses.
 
 Stable `qwen4-max` has a 1M-token context. Without thinking it supports up to
 991,808 input tokens and 131,072 output tokens. With thinking enabled the
@@ -207,8 +206,7 @@ rates for reference pricing. The Token Plan subscription invoice remains
 unknown. The preview uses those same rates as a comparison with production.
 
 Qwen4-Max-Preview is available only through Token Plan, with no published
-pay-as-you-go tariff; the preview ends before November 25, 2026 at 16:00 UTC
-and the model is retired afterward. It uses the production Qwen4-Max standard
+pay-as-you-go tariff. It uses the production Qwen4-Max standard
 Singapore international PAYG list rates as a comparison baseline: `$1.50` per
 million input tokens, `$4.50` per million output tokens, `$0.075` per million
 cache hits, `$1.875` per million 5-minute cache-creation tokens, and `$3` per

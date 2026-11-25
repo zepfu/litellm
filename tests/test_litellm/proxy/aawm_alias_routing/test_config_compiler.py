@@ -63,7 +63,8 @@ def _compile_alpha_override_snapshots(
 def test_should_prioritize_qwen4_only_in_alpha_overrides(tmp_path: Path) -> None:
     canonical, alpha = _compile_alpha_override_snapshots(tmp_path)
     preview_start = dt.datetime(2026, 11, 11, 2, tzinfo=dt.timezone.utc)
-    preview_end = dt.datetime(2026, 11, 25, 15, 59, 59, 999999, tzinfo=dt.timezone.utc)
+    preview_expiry = dt.datetime(2026, 11, 25, 2, tzinfo=dt.timezone.utc)
+    preview_end = preview_expiry - dt.timedelta(microseconds=1)
     for name in ("sota-alibaba", "provider-alibaba"):
         original = canonical.aliases[name].candidates
         candidates = alpha.aliases[name].candidates
@@ -117,49 +118,46 @@ def test_should_prioritize_qwen4_only_in_alpha_overrides(tmp_path: Path) -> None
     assert preview_reference.schedule.start == preview_start
     assert preview_reference.schedule.end == preview_end
 
-    previous_snapshot = snapshot_select.get_active_routing_snapshot()
-    snapshot_select.set_active_routing_snapshot(alpha)
-    try:
-
-        def selected_models(now: dt.datetime) -> list[str]:
-            selected = snapshot_select._select_snapshot_candidates(
-                "expert-other",
-                ingress="codex",
-                now_utc=now,
-            )
-            return [candidate["model"] for candidate in selected]
-
-        assert selected_models(
-            dt.datetime(2026, 11, 18, 4, tzinfo=dt.timezone.utc)
-        ) == ["xai/grok-4.7"]
-        assert selected_models(
-            dt.datetime(2026, 11, 25, 16, tzinfo=dt.timezone.utc)
-        ) == ["alibaba_token_plan/qwen3.8-max", "xai/grok-4.7"]
-        assert selected_models(
-            dt.datetime(2026, 11, 25, 15, 59, 59, 999999, tzinfo=dt.timezone.utc)
-        ) == [
-            "alibaba_token_plan/qwen4-max-preview",
-            "alibaba_token_plan/qwen3.8-max",
-            "xai/grok-4.7",
-        ]
-        assert selected_models(
-            dt.datetime(2026, 11, 11, 14, tzinfo=dt.timezone.utc)
-        ) == [
-            "alibaba_token_plan/qwen4-max-preview",
-            "alibaba_token_plan/qwen3.8-max",
-            "xai/grok-4.7",
-        ]
-        assert selected_models(
-            dt.datetime(2026, 12, 1, 15, tzinfo=dt.timezone.utc)
-        ) == [
-            "alibaba_token_plan/qwen3.8-max",
-            "xai/grok-4.7",
-        ]
-    finally:
-        snapshot_select.set_active_routing_snapshot(previous_snapshot)
-
     assert alpha.aliases["expert"].candidates == canonical.aliases["expert"].candidates
     assert alpha.aliases["sota"].dispatch == canonical.aliases["sota"].dispatch
+
+
+def test_should_expire_alpha_qwen4_preview_at_provider_cutoff(tmp_path: Path) -> None:
+    _, alpha = _compile_alpha_override_snapshots(tmp_path)
+    preview_expiry = dt.datetime(2026, 11, 25, 2, tzinfo=dt.timezone.utc)
+    preview_end = preview_expiry - dt.timedelta(microseconds=1)
+
+    def selected_models(alias: str, now: dt.datetime) -> list[str]:
+        selected = snapshot_select._resolve_snapshot_alias_candidates(
+            alias,
+            ingress="codex",
+            client_product_label="codex",
+            now_utc=now,
+            snapshot=alpha,
+        )
+        return [candidate["model"] for candidate in selected]
+
+    preview = "alibaba_token_plan/qwen4-max-preview"
+    stable = "alibaba_token_plan/qwen4-max"
+    for name in ("sota-alibaba", "provider-alibaba"):
+        before = selected_models(name, preview_end)
+        assert before[:2] == [preview, stable]
+        assert selected_models(name, preview_expiry) == before[1:]
+
+    expert = "expert-other"
+    ordinary_night = ["alibaba_token_plan/qwen3.8-max", "xai/grok-4.7"]
+    last_night_end = dt.datetime(2026, 11, 25, tzinfo=dt.timezone.utc)
+    assert selected_models(
+        expert, last_night_end - dt.timedelta(microseconds=1)
+    ) == [preview, *ordinary_night]
+    assert selected_models(expert, last_night_end) == ["xai/grok-4.7"]
+    assert selected_models(expert, preview_expiry) == ["xai/grok-4.7"]
+    assert selected_models(
+        expert, dt.datetime(2026, 11, 11, 14, tzinfo=dt.timezone.utc)
+    ) == [preview, *ordinary_night]
+    assert selected_models(
+        expert, dt.datetime(2026, 11, 25, 14, tzinfo=dt.timezone.utc)
+    ) == ordinary_night
 
 
 def test_compile_produces_snapshot_with_epoch_hash_version() -> None:

@@ -34,4 +34,4 @@ aliases:
         reasoning_effort: max
         schedule:
           start: "2026-11-11T02:00:00Z"
-          end: "2026-11-25T15:59:59.999999Z"
+          end: "2026-11-25T01:59:59.999999Z"

@@ -468,8 +468,7 @@ The `expert` alias first references `expert-other` (priority 110), then falls
 back to OpenAI/Codex `gpt-6.2-astra` (`codex_responses`, priority 0,
 `reasoning_effort: low`). `expert-other` orders scheduled Alibaba Token Plan
 `alibaba_token_plan/qwen4-max-preview` (priority 110, `22:00-08:00 UTC+8`,
-absolute-bounded to the official preview window ending before November 25,
-2026 at 16:00 UTC), then
+available until November 25, 2026 at 02:00 UTC), then
 `alibaba_token_plan/qwen3.8-max` (priority 100, `22:00-08:00 UTC+8`) and
 native xAI/OIDC `xai/grok-4.7` (priority 0). It does not include managed
 xAI/OAuth, Cursor Grok, or Anthropic candidates.
