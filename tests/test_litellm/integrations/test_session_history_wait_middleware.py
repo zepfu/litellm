@@ -70,9 +70,10 @@ async def test_terminal_wait_checkpoint_retains_sent_status(monkeypatch, status_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider_returned", [False, True])
-async def test_codex_alias_http500_retains_only_local_failure_origin(monkeypatch, provider_returned):
+async def test_codex_alias_http500_retains_only_local_failure_origin(monkeypatch, tmp_path, provider_returned):
     from litellm.proxy._types import ProxyException, UserAPIKeyAuth
     from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as routes
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import candidate_loop, config_startup
 
     checkpoints = []
     sent_messages = []
@@ -83,13 +84,19 @@ async def test_codex_alias_http500_retains_only_local_failure_origin(monkeypatch
     monkeypatch.setattr(routes, "_resolve_codex_auto_agent_alias_model", lambda *a, **kw: "work")
     monkeypatch.setattr(routes, "_should_use_direct_codex_oauth_inventory", lambda *a, **kw: False)
 
+    def fail_preflight():
+        try:
+            config_startup.compile_directory(tmp_path / "missing")
+        except config_startup.ConfigDirectoryError as error:
+            raise RuntimeError("local preflight failed") from error
+
     async def fail_after_selection(**kwargs):
         try:
-            raise ValueError("omitted from history")
-        except ValueError as origin:
-            error = ProxyException(message="alias failure", type="internal_server_error", param=None, code=500)
+            fail_preflight()
+        except RuntimeError as wrapped:
+            error = candidate_loop._proxy_exception_for_unclassified_probe_failure(wrapped)
             error._aawm_provider_returned = provider_returned
-            raise error from origin
+            raise error
 
     monkeypatch.setattr(
         routes.BaseOpenAIPassThroughHandler,
@@ -121,4 +128,8 @@ async def test_codex_alias_http500_retains_only_local_failure_origin(monkeypatch
     if provider_returned:
         assert "terminal_alias_failure" not in wait
     else:
-        assert wait["terminal_alias_failure"] == {"exception_type": "ValueError"}
+        failure = wait["terminal_alias_failure"]
+        assert set(failure) == {"exception_type", "module", "function", "line"}
+        assert failure["exception_type"] == "ConfigDirectoryError"
+        assert failure["module"] == config_startup.__name__
+        assert failure["function"] and failure["line"] > 0

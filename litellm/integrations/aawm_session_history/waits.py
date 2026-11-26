@@ -190,7 +190,12 @@ def record_terminal_alias_failure(error: Exception) -> None:
         and tracker.candidate_selection_failure is None
         and tracker.terminal_alias_failure is None
     ):
-        tracker.terminal_alias_failure = _failure_origin(error.__cause__ or error)
+        origin = getattr(error, "_aawm_alias_failure_origin", error)
+        for _ in range(8):
+            if origin.__cause__ is None:
+                break
+            origin = origin.__cause__
+        tracker.terminal_alias_failure = _failure_origin(origin)
 
 
 def get_request_wait_call_id() -> Optional[str]:
