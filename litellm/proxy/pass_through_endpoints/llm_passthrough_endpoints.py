@@ -49,7 +49,10 @@ from typing_extensions import TypeGuard  # noqa: F401 - Wave 6F facade host bind
 globals()["status"] = fastapi_status
 
 import litellm
-from litellm.integrations.aawm_session_history.waits import wait_for
+from litellm.integrations.aawm_session_history.waits import (
+    record_terminal_alias_failure,
+    wait_for,
+)
 from litellm import get_llm_provider
 from litellm._logging import verbose_proxy_logger
 from litellm.constants import (
@@ -6922,6 +6925,13 @@ async def openai_proxy_route(  # noqa: PLR0915
             provider_status_code = (
                 _aawm_error_signals._extract_adapter_exception_status_code(exc)
             )
+            if (
+                is_codex_auto_agent_alias_request
+                and provider_status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+                and not attempted_provider_call
+                and not provider_returned
+            ):
+                record_terminal_alias_failure(exc)
             is_provider_error_status = (
                 provider_status_code == status.HTTP_429_TOO_MANY_REQUESTS
                 or (

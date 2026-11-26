@@ -48,6 +48,7 @@ class RequestWaits:
         self.durations: dict[str, float] = {}
         self.counts: dict[str, int] = {}
         self.candidate_selection_failure: Optional[dict[str, Any]] = None
+        self.terminal_alias_failure: Optional[dict[str, Any]] = None
         self._last_checkpoint_at = float("-inf")
         self._checkpoint_handle: Optional[asyncio.TimerHandle] = None
 
@@ -85,8 +86,11 @@ class RequestWaits:
         }
         if response_status_code is not None:
             snapshot["response_status_code"] = response_status_code
-        if self.status == "failed" and self.candidate_selection_failure is not None:
-            snapshot["candidate_selection_failure"] = self.candidate_selection_failure
+        if self.status == "failed":
+            if self.candidate_selection_failure is not None:
+                snapshot["candidate_selection_failure"] = self.candidate_selection_failure
+            elif response_status_code == 500 and self.terminal_alias_failure is not None:
+                snapshot["terminal_alias_failure"] = self.terminal_alias_failure
         try:
             from litellm.integrations.aawm_session_history.writer import (
                 _enqueue_session_history_record,
@@ -155,12 +159,7 @@ class RequestWaits:
         self.checkpoint(force=True, response_status_code=response_status_code)
 
 
-def record_candidate_selection_failure(error: Exception) -> None:
-    """Keep terminal selection evidence without exception text or wire data."""
-    tracker = _current.get()
-    if tracker is None or tracker.status != "running":
-        return
-
+def _failure_origin(error: BaseException) -> dict[str, Any]:
     failure: dict[str, Any] = {"exception_type": type(error).__name__[:96]}
     frame = error.__traceback__
     while frame is not None:
@@ -172,7 +171,26 @@ def record_candidate_selection_failure(error: Exception) -> None:
                 line=frame.tb_lineno,
             )
         frame = frame.tb_next
-    tracker.candidate_selection_failure = failure
+    return failure
+
+
+def record_candidate_selection_failure(error: Exception) -> None:
+    """Keep terminal selection evidence without exception text or wire data."""
+    tracker = _current.get()
+    if tracker is not None and tracker.status == "running":
+        tracker.candidate_selection_failure = _failure_origin(error)
+
+
+def record_terminal_alias_failure(error: Exception) -> None:
+    """Remember the origin of a local alias error outside selection."""
+    tracker = _current.get()
+    if (
+        tracker is not None
+        and tracker.status == "running"
+        and tracker.candidate_selection_failure is None
+        and tracker.terminal_alias_failure is None
+    ):
+        tracker.terminal_alias_failure = _failure_origin(error.__cause__ or error)
 
 
 def get_request_wait_call_id() -> Optional[str]:

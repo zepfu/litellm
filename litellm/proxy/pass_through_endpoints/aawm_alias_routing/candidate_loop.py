@@ -44,6 +44,7 @@ from fastapi import HTTPException
 
 from litellm.integrations.aawm_session_history.waits import (
     record_candidate_selection_failure,
+    record_terminal_alias_failure,
 )
 from litellm.llms.cohere.cancellation import COHERE_CANCELLATION_FAILURE_CLASS
 from litellm.llms.cohere.common_utils import CohereError
@@ -6130,6 +6131,8 @@ async def handle_alias_route(  # noqa: PLR0915
                             status_code=capacity_error_status_code,
                         )
                 if error_class is None:
+                    if alias_family == "codex_auto_agent" and not attempted_provider_call:
+                        record_terminal_alias_failure(failure_exc)
                     raise _proxy_exception_for_unclassified_probe_failure(failure_exc)
                 if attempted_provider_call:
                     failed_provider_candidate_keys.add(cooldown_key)

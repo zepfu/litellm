@@ -82,8 +82,10 @@ closed `durations_ms`, and invocation `counts`. Status is `running`, `completed`
 finished, and provider content has its own outcome. A terminal snapshot includes
 `response_status_code` when ASGI sent response headers. If alias selection
 fails, the terminal checkpoint includes the exception class and the deepest
-LiteLLM source location in `candidate_selection_failure`. A running row with an
-open wait after process loss records the last persisted state. For each open
+LiteLLM source location in `candidate_selection_failure`. A local Codex alias
+HTTP 500 outside selection records the same fields in `terminal_alias_failure`
+when the selection recorder has no diagnostic. A running row with an open wait
+after process loss records the last persisted state. For each open
 wait, calculate elapsed time from its start to the
 observation time and add it to that type's closed duration. Multiple waits can
 be active concurrently, and nested spans overlap: do not sum type durations as
