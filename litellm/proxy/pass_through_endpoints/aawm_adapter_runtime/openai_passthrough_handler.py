@@ -1178,19 +1178,24 @@ class BaseOpenAIPassThroughHandler:
                 requested_attributes,
             )
         session_owner_lease = _sa.get_request_session_owner_lease(request)
-        defer_managed_xai_promotion = (
-            managed_xai_oauth_request
-            and canonical_managed_oa_xai_request_body is not None
+        xai_validation_body = (
+            request_body
+            if grok_native_oauth_request
+            else canonical_managed_oa_xai_request_body
+        )
+        defer_xai_promotion = (
+            xai_validation_body is not None
+            and (managed_xai_oauth_request or grok_native_oauth_request)
             and rt.is_openai_responses_endpoint_fn(endpoint)
         )
-        managed_xai_response = None
+        xai_response = None
 
-        async def _fail_managed_xai_response(
+        async def _fail_xai_response(
             cause: Optional[BaseException],
             *,
             phase: str = "failed",
         ) -> None:
-            if not defer_managed_xai_promotion:
+            if not defer_xai_promotion:
                 return
             if isinstance(cause, asyncio.CancelledError):
                 phase = "cancelled"
@@ -1200,7 +1205,7 @@ class BaseOpenAIPassThroughHandler:
                 phase = "disconnected"
             elif isinstance(cause, (TimeoutError, httpx.TimeoutException)):
                 phase = "timed_out"
-            await finalize_deferred_failure(managed_xai_response, phase=phase)
+            await finalize_deferred_failure(xai_response, phase=phase)
 
         try:
             if grok_native_oauth_request and isinstance(extra_headers, dict):
@@ -1285,7 +1290,7 @@ class BaseOpenAIPassThroughHandler:
                     ),
                     egress_selected_openai_headers=selected_openai_headers,
                     managed_xai_oauth_request=managed_xai_oauth_request,
-                    defer_session_owner_promotion=defer_managed_xai_promotion,
+                    defer_session_owner_promotion=defer_xai_promotion,
                     blocked_pass_through_prefixed_headers=list(
                         _OPENAI_PROTECTED_PASSTHROUGH_HEADERS
                     ) + (
@@ -1340,13 +1345,13 @@ class BaseOpenAIPassThroughHandler:
                     user_api_key_dict,
                     custom_body=endpoint_custom_body,
                 )
-            managed_xai_response = response
+            xai_response = response
             status_code = getattr(response, "status_code", None)
             if (
                 isinstance(status_code, int)
                 and 200 <= status_code < 300
-                and canonical_managed_oa_xai_request_body is not None
-                and rt.is_openai_responses_endpoint_fn(endpoint)
+                and xai_validation_body is not None
+                and defer_xai_promotion
             ):
                 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
                     _aawm_run_with_session_owner_lease_renewal,
@@ -1363,34 +1368,44 @@ class BaseOpenAIPassThroughHandler:
                         response,
                         adapter_model=str(
                             provider_bound_body.get("model")
-                            or canonical_managed_oa_xai_request_body.get("model")
+                            or xai_validation_body.get("model")
                             or "unknown-model"
                         ),
-                        adapter="direct_managed_xai_responses",
-                        adapter_label="xAI OAuth",
-                        request_body=canonical_managed_oa_xai_request_body,
+                        adapter=(
+                            "direct_grok_native_responses"
+                            if grok_native_oauth_request
+                            else "direct_managed_xai_responses"
+                        ),
+                        adapter_label=(
+                            "Grok native" if grok_native_oauth_request else "xAI OAuth"
+                        ),
+                        request_body=xai_validation_body,
                     ),
                 )
         except BaseException as exc:
             try:
                 await _sa.finalize_session_owner_lease_on_failure(session_owner_lease)
             finally:
-                await _fail_managed_xai_response(exc)
+                await _fail_xai_response(exc)
             raise
 
         status_code = getattr(response, "status_code", None)
         if isinstance(status_code, int) and 200 <= status_code < 300:
-            if defer_managed_xai_promotion:
-                async def _complete_managed_xai_success() -> None:
+            if defer_xai_promotion:
+                async def _complete_xai_success() -> None:
                     await finalize_deferred_success(response)
 
                 if _sa.bind_deferred_session_owner_lease_to_streaming_response(
                     response,
                     request=request,
                     lease=session_owner_lease,
-                    failure_phase="session_owner_direct_managed_xai_stream_promote",
-                    on_success=_complete_managed_xai_success,
-                    on_failure=lambda cause: _fail_managed_xai_response(
+                    failure_phase=(
+                        "session_owner_direct_grok_native_stream_promote"
+                        if grok_native_oauth_request
+                        else "session_owner_direct_managed_xai_stream_promote"
+                    ),
+                    on_success=_complete_xai_success,
+                    on_failure=lambda cause: _fail_xai_response(
                         cause,
                         phase="disconnected" if cause is None else "failed",
                     ),
@@ -1406,26 +1421,26 @@ class BaseOpenAIPassThroughHandler:
                     ),
                 )
             except BaseException as exc:
-                if defer_managed_xai_promotion:
+                if defer_xai_promotion:
                     try:
                         await _sa.finalize_session_owner_lease_on_failure(
                             session_owner_lease
                         )
                     finally:
-                        await _fail_managed_xai_response(exc)
+                        await _fail_xai_response(exc)
                 raise
             if promote_result is not None and promote_result.outcome in {
                 _sa.SessionOwnerMutationOutcome.CONFLICT,
                 _sa.SessionOwnerMutationOutcome.ERROR,
                 _sa.SessionOwnerMutationOutcome.NOT_HELD,
             }:
-                if defer_managed_xai_promotion:
+                if defer_xai_promotion:
                     try:
                         await _sa.finalize_session_owner_lease_on_failure(
                             session_owner_lease
                         )
                     finally:
-                        await _fail_managed_xai_response(None)
+                        await _fail_xai_response(None)
                 _sa.raise_session_owner_redispatch_required(
                     session_identity=(
                         session_owner_lease.session_identity
@@ -1436,13 +1451,13 @@ class BaseOpenAIPassThroughHandler:
                     failure_phase="session_owner_direct_openai_promote",
                     request=request,
                 )
-            if defer_managed_xai_promotion:
-                await _complete_managed_xai_success()
+            if defer_xai_promotion:
+                await _complete_xai_success()
         else:
             try:
                 await _sa.finalize_session_owner_lease_on_failure(session_owner_lease)
             finally:
-                await _fail_managed_xai_response(None)
+                await _fail_xai_response(None)
         return response
 
 

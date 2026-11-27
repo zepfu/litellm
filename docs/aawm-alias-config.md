@@ -252,7 +252,8 @@ into provider-bound function tools and sanitized before egress. Provider
 function calls and results are restored to stock Codex collaboration and
 `multi_agent_v1` tool calls and results with continuation IDs preserved.
 Direct Grok-native Responses requests from Codex use the configured Grok OIDC
-credential and native session ownership.
+credential. The proxy promotes the reserved session owner after response
+validation confirms successful completion.
 
 Codex 0.149 may advertise the same collaboration children as
 `functions.collaboration` with child `wait` instead of the catalog keys
