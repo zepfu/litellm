@@ -11599,7 +11599,7 @@ async def pass_through_request(  # noqa: PLR0915
 
             wire_trace = (
                 OpenAIResponsesWireTrace()
-                if is_native_openai_responses_route
+                if is_native_openai_responses_route or is_xai_responses_wire_owned_route
                 else None
             )
             stream_bookkeeping_state: Optional[Dict[str, Any]] = (
@@ -11862,6 +11862,9 @@ async def pass_through_request(  # noqa: PLR0915
                     headers=response_headers,
                     status_code=response.status_code,
                 )
+                if wire_trace is not None:
+                    # The xAI adapter wraps this iterator and adopts its terminal bookkeeping.
+                    stream_response.wire_trace = wire_trace
             setattr(stream_response, "_aawm_upstream_response", response)
             if cfg072_output_gate is not None:
                 setattr(
@@ -12219,7 +12222,7 @@ async def pass_through_request(  # noqa: PLR0915
         if _is_streaming_response(response) is True:
             wire_trace = (
                 OpenAIResponsesWireTrace()
-                if is_native_openai_responses_route
+                if is_native_openai_responses_route or is_xai_responses_wire_owned_route
                 else None
             )
             stream_bookkeeping_state: Optional[Dict[str, Any]] = (
@@ -12481,6 +12484,8 @@ async def pass_through_request(  # noqa: PLR0915
                     headers=response_headers,
                     status_code=response.status_code,
                 )
+                if wire_trace is not None:
+                    stream_response.wire_trace = wire_trace
             setattr(stream_response, "_aawm_upstream_response", response)
             if cfg072_output_gate is not None:
                 setattr(
