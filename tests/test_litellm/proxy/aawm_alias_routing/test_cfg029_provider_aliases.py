@@ -213,42 +213,17 @@ def test_compile_directory_exposes_closed_aliases_for_configured_providers() -> 
 _NVIDIA_CLOSED_SET = (
     (
         "nvidia",
-        "nvidia/openai/gpt-oss-20b",
+        "nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b",
         "codex_nvidia_completion_adapter",
         100,
-    ),
-    (
-        "nvidia",
-        "nvidia/deepseek-ai/deepseek-v4-flash-0731",
-        "codex_nvidia_completion_adapter",
-        90,
-    ),
-    (
-        "nvidia",
-        "nvidia/nvidia/nemotron-3-super-120b-a12b",
-        "codex_nvidia_completion_adapter",
-        80,
-    ),
-    (
-        "nvidia",
-        "nvidia/minimaxai/minimax-m3",
-        "codex_nvidia_completion_adapter",
-        70,
-    ),
-    (
-        "nvidia",
-        "nvidia/openai/gpt-oss-120b",
-        "codex_nvidia_completion_adapter",
-        60,
     ),
 )
 
 
-def test_provider_nvidia_keeps_closed_five_model_nim_set() -> None:
+def test_provider_nvidia_keeps_closed_nim_set() -> None:
     snapshot = compile_directory(DEFAULT_CONFIG_DIR)
     alias = snapshot.aliases["provider-nvidia"]
     assert alias.dispatch is None
-    assert len(alias.candidates) == 5
     identities = [
         (
             entry.provider,

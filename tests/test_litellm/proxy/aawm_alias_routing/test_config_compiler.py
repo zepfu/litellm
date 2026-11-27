@@ -669,7 +669,7 @@ def test_canonical_provider_openai_compiles_cheapest_first_at_low_effort() -> No
 
 
 def test_canonical_provider_nvidia_compiles_closed_nim_set_without_alias_reference() -> None:
-    """Live provider-nvidia is five NVIDIA NIM models on NVIDIA-credential families."""
+    """The deployed provider-nvidia candidate uses the NVIDIA NIM credential family."""
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
         AliasReference,
         RoutingCandidate,
@@ -691,33 +691,9 @@ def test_canonical_provider_nvidia_compiles_closed_nim_set_without_alias_referen
     assert identities == [
         (
             "nvidia",
-            "nvidia/openai/gpt-oss-20b",
+            "nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b",
             "codex_nvidia_completion_adapter",
             100,
-        ),
-        (
-            "nvidia",
-            "nvidia/deepseek-ai/deepseek-v4-flash-0731",
-            "codex_nvidia_completion_adapter",
-            90,
-        ),
-        (
-            "nvidia",
-            "nvidia/nvidia/nemotron-3-super-120b-a12b",
-            "codex_nvidia_completion_adapter",
-            80,
-        ),
-        (
-            "nvidia",
-            "nvidia/minimaxai/minimax-m3",
-            "codex_nvidia_completion_adapter",
-            70,
-        ),
-        (
-            "nvidia",
-            "nvidia/openai/gpt-oss-120b",
-            "codex_nvidia_completion_adapter",
-            60,
         ),
     ]
     for entry in alias.candidates:

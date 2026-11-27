@@ -177,6 +177,9 @@ NVIDIA NIM credentials only, carries no `alias_reference`, and does not
 substitute OpenRouter free Nemotron (`nvidia/nemotron-*:free` stays on
 `provider-openrouter`). Validation is provider-specific: only
 `provider-nvidia` is NVIDIA evidence.
+Its stock Codex route uses NVIDIA-hosted
+`nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b`. NVIDIA Build publishes a
+262,144-token hosted context and no exact hosted tariff.
 
 OpenCode Zen keeps both adapter forms (`anthropic_opencode_zen_responses_adapter`
 and `anthropic_opencode_zen_completion_adapter`). xAI keeps managed

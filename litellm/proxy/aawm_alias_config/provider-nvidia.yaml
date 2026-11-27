@@ -2,7 +2,7 @@
 # OpenRouter-namespace nvidia/nemotron-*:free stays on provider-openrouter.
 # Retired models removed: gpt-oss-20b (2026-11-18), gpt-oss-120b (2026-09-03),
 # deepseek-v4-flash-0731 (2026-09-21), nemotron-3-super-120b-a12b (2026-10-03),
-# minimax-m3 (2026-09-09). Qualified successor: nemotron-3.5-super-vl-120b-a12b.
+# minimax-m3 (2026-09-09).
 
 defaults: {}
 
@@ -13,18 +13,3 @@ aliases:
         model: nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b
         route_family: codex_nvidia_completion_adapter
         priority: 100
-
-      - provider: nvidia
-        model: nvidia/minimaxai/minimax-m3.1-flash
-        route_family: codex_nvidia_completion_adapter
-        priority: 90
-
-      - provider: nvidia
-        model: nvidia/nemotron-3.5-lightning-30b-a3b
-        route_family: codex_nvidia_completion_adapter
-        priority: 80
-
-      - provider: nvidia
-        model: nvidia/nemotron-3.5-bolt-e4b
-        route_family: codex_nvidia_completion_adapter
-        priority: 70
