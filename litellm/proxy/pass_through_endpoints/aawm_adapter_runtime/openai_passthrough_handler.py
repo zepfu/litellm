@@ -33,6 +33,7 @@ from typing import (
 
 import httpx
 from fastapi import HTTPException
+from starlette.responses import StreamingResponse
 
 import litellm
 from litellm._logging import verbose_proxy_logger
@@ -1291,6 +1292,7 @@ class BaseOpenAIPassThroughHandler:
                     egress_selected_openai_headers=selected_openai_headers,
                     managed_xai_oauth_request=managed_xai_oauth_request,
                     defer_session_owner_promotion=defer_xai_promotion,
+                    responses_wire_owned=grok_native_oauth_request,
                     blocked_pass_through_prefixed_headers=list(
                         _OPENAI_PROTECTED_PASSTHROUGH_HEADERS
                     ) + (
@@ -1362,15 +1364,31 @@ class BaseOpenAIPassThroughHandler:
                     if isinstance(endpoint_custom_body, dict)
                     else {}
                 )
+                adapter_model = str(
+                    provider_bound_body.get("model")
+                    or xai_validation_body.get("model")
+                    or "unknown-model"
+                )
+                if grok_native_oauth_request:
+                    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
+                        _bind_xai_responses_wire_stream,
+                        _maybe_wrap_xai_passthrough_responses_stream,
+                    )
+
+                    response = _maybe_wrap_xai_passthrough_responses_stream(
+                        response,
+                        request=request,
+                        request_body=xai_validation_body,
+                        route_family=GROK_NATIVE_OAUTH_ROUTE_FAMILY,
+                        resolved_model=adapter_model,
+                        egress_credential_family=GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
+                    )
+                    xai_response = response
                 response = await _aawm_run_with_session_owner_lease_renewal(
                     request=request,
                     operation=lambda: rt.validate_codex_auto_agent_responses_payload_fn(
                         response,
-                        adapter_model=str(
-                            provider_bound_body.get("model")
-                            or xai_validation_body.get("model")
-                            or "unknown-model"
-                        ),
+                        adapter_model=adapter_model,
                         adapter=(
                             "direct_grok_native_responses"
                             if grok_native_oauth_request
@@ -1382,11 +1400,31 @@ class BaseOpenAIPassThroughHandler:
                         request_body=xai_validation_body,
                     ),
                 )
+                if grok_native_oauth_request and isinstance(response, StreamingResponse):
+                    response = _bind_xai_responses_wire_stream(
+                        response, request=request, adapter_model=adapter_model
+                    )
         except BaseException as exc:
             try:
-                await _sa.finalize_session_owner_lease_on_failure(session_owner_lease)
+                if grok_native_oauth_request and xai_response is not None:
+                    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
+                        _abort_xai_responses_prefetch,
+                    )
+                    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+                        OpenAIResponsesWireDisposition,
+                    )
+
+                    await _abort_xai_responses_prefetch(
+                        xai_response,
+                        OpenAIResponsesWireDisposition.CANCELLED
+                        if isinstance(exc, asyncio.CancelledError)
+                        else OpenAIResponsesWireDisposition.FAILED,
+                    )
             finally:
-                await _fail_xai_response(exc)
+                try:
+                    await _sa.finalize_session_owner_lease_on_failure(session_owner_lease)
+                finally:
+                    await _fail_xai_response(exc)
             raise
 
         status_code = getattr(response, "status_code", None)

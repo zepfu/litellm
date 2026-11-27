@@ -13677,6 +13677,7 @@ def create_pass_through_route(
     blocked_pass_through_prefixed_headers: Optional[list[str]] = None,
     caller_managed_hidden_retry: bool = False,
     defer_session_owner_promotion: bool = False,
+    responses_wire_owned: bool = False,
 ):
     # check if target is an adapter.py or a url
     from litellm._uuid import uuid
@@ -13906,6 +13907,7 @@ def create_pass_through_route(
                 caller_managed_hidden_retry=bool(param_caller_managed_hidden_retry),
                 # Promotion belongs to the calling handler, not route metadata.
                 defer_session_owner_promotion=defer_session_owner_promotion,
+                responses_wire_owned=responses_wire_owned,
             )
 
     return endpoint_func
