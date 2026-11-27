@@ -827,7 +827,7 @@ async def test_should_use_full_codex_replay_without_prisma_session_database(
 
 
 @pytest.mark.asyncio
-async def test_should_order_multiple_kimi_tool_results_by_assistant_call_order(
+async def test_should_preserve_adjacent_kimi_tool_result_order(
     monkeypatch,
 ):
     assistant_message = {
@@ -863,8 +863,8 @@ async def test_should_order_multiple_kimi_tool_results_by_assistant_call_order(
             "messages": [
                 assistant_message,
                 second_result,
-                later_message,
                 first_result,
+                later_message,
             ],
             "custom_llm_provider": "kimi_code",
         }
@@ -891,8 +891,8 @@ async def test_should_order_multiple_kimi_tool_results_by_assistant_call_order(
             "role": "assistant",
             "tool_calls": assistant_message["tool_calls"],
         },
-        first_result,
         second_result,
+        first_result,
         later_message,
     ]
     assert messages[0]["tool_calls"] == assistant_message["tool_calls"]
@@ -928,7 +928,28 @@ async def test_should_order_multiple_kimi_tool_results_by_assistant_call_order(
                     ],
                 }
             ],
-            "missing tool results for tool_call_id\\(s\\): 'exec_command:0'",
+            "missing tool results for tool_call_id(s): 'exec_command:0'",
+        ),
+        (
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "exec_command:0",
+                            "type": "function",
+                            "function": {"name": "exec_command", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "user", "content": "A turn before the result."},
+                {
+                    "role": "tool",
+                    "tool_call_id": "exec_command:0",
+                    "content": "The pending result.",
+                },
+            ],
+            "cannot represent an intervening turn",
         ),
     ),
 )
@@ -945,7 +966,7 @@ async def test_should_reject_invalid_kimi_tool_result_history(monkeypatch, messa
         ),
     )
 
-    with pytest.raises(ValueError, match=error_match):
+    with pytest.raises(HTTPException) as exc_info:
         await prepare_codex_kimi_chat_completions_adapter_route(
             request=MagicMock(),
             adapter_model="kimi_code/k3-high",
@@ -955,6 +976,11 @@ async def test_should_reject_invalid_kimi_tool_result_history(monkeypatch, messa
                 "previous_response_id": "resp_invalid_tools",
             },
         )
+    error = exc_info.value
+    assert error.status_code == 400
+    assert error.attempted_provider_call is False
+    assert error.detail["error"]["code"] == "kimi_code_invalid_tool_result_history"
+    assert error_match in error.detail["error"]["message"]
 
 
 @pytest.mark.asyncio

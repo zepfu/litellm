@@ -98,7 +98,10 @@ headers are stripped, and the gateway supplies the managed Kimi credential
 instead of relaying caller authorization.
 
 Codex and Anthropic adapter continuations preserve assistant tool calls and
-their paired tool results. When replay contains an assistant tool-call message
+their paired tool results. Codex continuations keep tool results in their
+original order. If history contains an unrepresentable tool-result sequence,
+the adapter returns HTTP 400 with `kimi_code_invalid_tool_result_history`
+before provider egress. When replay contains an assistant tool-call message
 whose text content is blank, the adapter omits the `content` field instead of
 sending `null` or an empty value that Kimi rejects. A remaining Kimi 400/422
 request-shape rejection is returned once as a bounded client error; it is not

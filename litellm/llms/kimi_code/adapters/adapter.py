@@ -975,7 +975,22 @@ async def prepare_codex_kimi_chat_completions_adapter_route(
     messages = completion_kwargs.get("messages")
     if not isinstance(messages, list):
         raise ValueError("Kimi Code request history must contain a messages list.")
-    normalized_messages = _normalize_kimi_tool_result_adjacency(messages)
+    try:
+        normalized_messages = _normalize_kimi_tool_result_adjacency(messages)
+    except ValueError as exc:
+        error = HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "message": str(exc),
+                    "type": "invalid_request_error",
+                    "code": "kimi_code_invalid_tool_result_history",
+                    "param": "input",
+                }
+            },
+        )
+        setattr(error, "attempted_provider_call", False)
+        raise error from exc
     normalized_messages, sanitization_changes = _sanitize_kimi_chat_messages(
         normalized_messages
     )
