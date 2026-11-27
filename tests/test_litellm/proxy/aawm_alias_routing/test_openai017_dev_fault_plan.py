@@ -14,7 +14,9 @@ import pytest
 from fastapi import HTTPException, Request
 from starlette.responses import Response
 
+import litellm
 from litellm.litellm_core_utils.exception_mapping_utils import exception_type
+from litellm.llms.openai.openai import OpenAIChatCompletion
 from litellm.proxy import aawm_route_logging
 from litellm.proxy.common_utils.http_parsing_utils import (
     _safe_get_request_parsed_body,
@@ -1377,6 +1379,85 @@ async def _zero_cooldown(_key: str) -> tuple[float, str]:
     return 0.0, "local_fallback"
 
 
+def _nvidia_410_problem_detail(model: str) -> dict[str, Any]:
+    return {
+        "type": "about:blank",
+        "title": "Gone",
+        "status": 410,
+        "detail": (
+            f"The model '{model}' has reached its end of life "
+            "on 2026-10-15T08:00:00Z and is no longer available."
+        ),
+    }
+
+
+async def _nvidia_410_through_openai_wrapper(*, status_code: int) -> BaseException:
+    """Raise a mocked SDK failure through the real ``acompletion`` wrapper."""
+    problem = _nvidia_410_problem_detail("moonshotai/kimi-k3")
+    provider_response = httpx.Response(
+        status_code,
+        json=problem,
+        headers={"content-type": "application/problem+json"},
+        request=httpx.Request(
+            "POST", "https://integrate.api.nvidia.com/v1/chat/completions"
+        ),
+    )
+    sdk_error = openai.APIStatusError(
+        f"Error code: {status_code}", response=provider_response, body=problem
+    )
+
+    class _StubWithRawResponse:
+        create = AsyncMock(side_effect=sdk_error)
+
+    class _StubCompletions:
+        with_raw_response = _StubWithRawResponse()
+
+    class _StubChat:
+        completions = _StubCompletions()
+
+    class _StubAsyncOpenAI:
+        api_key = "fake-api-key"
+        _base_url = httpx.URL("https://integrate.api.nvidia.com/v1")
+        max_retries = 0
+        chat = _StubChat()
+
+    class _StubLogging:
+        litellm_params: dict[str, Any] = {"litellm_metadata": {}}
+        model_call_details: dict[str, Any] = {}
+
+        def pre_call(self, **kwargs: Any) -> None:
+            return None
+
+        def post_call(self, **kwargs: Any) -> None:
+            return None
+
+    class _StubProviderConfig:
+        async_transform_request = AsyncMock(
+            return_value={
+                "model": "moonshotai/kimi-k3",
+                "messages": [{"role": "user", "content": "hi"}],
+            }
+        )
+
+    try:
+        await OpenAIChatCompletion().acompletion(
+            messages=[{"role": "user", "content": "hi"}],
+            optional_params={},
+            litellm_params={"litellm_metadata": {}},
+            provider_config=_StubProviderConfig(),
+            model="moonshotai/kimi-k3",
+            model_response=litellm.ModelResponse(),
+            logging_obj=_StubLogging(),
+            timeout=30,
+            api_key="fake-api-key",
+            api_base="https://integrate.api.nvidia.com/v1",
+            client=_StubAsyncOpenAI(),
+        )
+    except Exception as exc:
+        return exc
+    raise AssertionError("expected the mocked NVIDIA SDK failure")
+
+
 @pytest.mark.asyncio
 async def test_alias_injection_is_managed_openai_only(
     monkeypatch: pytest.MonkeyPatch,
@@ -1606,6 +1687,52 @@ async def test_nvidia_retired_model_failure_reaches_next_alias_candidate(
     ]
     assert performed == selected
     assert classifications == ["candidate_unavailable"]
+
+
+@pytest.mark.parametrize("status_code", [410, 500], ids=["retired-410", "server-500"])
+@pytest.mark.asyncio
+async def test_nvidia_sdk_failure_through_openai_wrapper_keeps_provenance(
+    status_code: int,
+) -> None:
+    """A provider 410 wrapped by ``acompletion`` must still be trusted."""
+
+    wrapped = await _nvidia_410_through_openai_wrapper(status_code=status_code)
+    assert type(wrapped).__name__ == "OpenAIError"
+    assert isinstance(wrapped.__context__, openai.APIStatusError)
+
+    with pytest.raises(tuple(litellm.LITELLM_EXCEPTION_TYPES)) as exc_info:
+        exception_type(
+            model="moonshotai/kimi-k3",
+            original_exception=wrapped,
+            custom_llm_provider="nvidia_nim",
+        )
+    mapped = exc_info.value
+    assert mapped.status_code == status_code
+    assert type(mapped).__name__ == ("APIError" if status_code == 410 else "InternalServerError")
+    if status_code == 410:
+        assert mapped.body == _nvidia_410_problem_detail("moonshotai/kimi-k3")
+        assert getattr(mapped, "_aawm_provider_returned", None) is True
+    else:
+        assert getattr(mapped, "_aawm_provider_returned", None) is None
+
+
+@pytest.mark.asyncio
+async def test_nvidia_local_410_without_sdk_source_is_not_stamped() -> None:
+    """A locally raised 410 has no SDK source and must not gain provenance."""
+
+    class _LocalGone(Exception):
+        status_code = 410
+        llm_provider = "nvidia_nim"
+        body = {"error": {"message": "locally retired"}}
+
+    with pytest.raises(litellm.APIError) as exc_info:
+        exception_type(
+            model="moonshotai/kimi-k3",
+            original_exception=_LocalGone("locally retired"),
+            custom_llm_provider="nvidia_nim",
+        )
+    assert exc_info.value.status_code == 410
+    assert getattr(exc_info.value, "_aawm_provider_returned", None) is None
 
 
 @pytest.mark.asyncio

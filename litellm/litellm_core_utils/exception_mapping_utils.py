@@ -300,6 +300,35 @@ def _raise_cohere_provider_http_499(
     raise raised_exception
 
 
+def _aawm_nvidia_410_provider_error_source(
+    original_exception: BaseException,
+) -> Optional[BaseException]:
+    """Return the SDK 410 source for a provider-returned NVIDIA failure.
+
+    ``OpenAIChatCompletion.acompletion`` wraps provider SDK failures in the
+    internal ``OpenAIError`` before ``exception_type`` maps them. Follow the
+    wrapper's implicit context chain so a trusted NVIDIA 410 keeps its provider
+    body and provenance, while locally raised errors without an SDK cause are
+    never stamped.
+    """
+
+    source: Optional[BaseException] = original_exception
+    seen: set[int] = set()
+    while source is not None and id(source) not in seen:
+        seen.add(id(source))
+        if isinstance(source, APIStatusError):
+            if (
+                getattr(getattr(source, "response", None), "status_code", None)
+                == 410
+            ):
+                return source
+            return None
+        if type(source).__name__ != "OpenAIError":
+            return None
+        source = getattr(source, "__context__", None)
+    return None
+
+
 def exception_type(  # type: ignore  # noqa: PLR0915
     model,
     original_exception,
@@ -2572,13 +2601,14 @@ def exception_type(  # type: ignore  # noqa: PLR0915
 
         # don't let an error with mapping interrupt the user from receiving an error from the llm api calls
         if exception_mapping_worked:
-            if (
-                custom_llm_provider == "nvidia_nim"
-                and isinstance(original_exception, APIStatusError)
-                and original_exception.response.status_code == 410
+            nvidia_410_source = (
+                _aawm_nvidia_410_provider_error_source(original_exception)
+                if custom_llm_provider == "nvidia_nim"
                 and getattr(e, "status_code", None) == 410
-            ):
-                setattr(e, "body", original_exception.body)
+                else None
+            )
+            if nvidia_410_source is not None:
+                setattr(e, "body", nvidia_410_source.body)
                 setattr(e, "_aawm_provider_returned", True)
             setattr(e, "litellm_response_headers", litellm_response_headers)
             raise e
