@@ -36700,6 +36700,34 @@
         "mode": "responses",
         "output_cost_per_token": 1.5e-05,
         "source": "https://cursor.com/changelog/composer-2-5",
+        "provider_specific_entry": {
+            "xai": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "unpriced",
+                    "kind": "provider_subscription_reference",
+                    "billing_mode": "grok_native_subscription",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "xai",
+                        "model": "xai/grok-composer-2.5-fast"
+                    },
+                    "equivalence_status": "not_applicable",
+                    "equivalence_evidence": "xAI lists no standard tariff for Grok-native Composer. The configured Cursor comparator applies to Cursor's Composer 2.5 Fast.",
+                    "source": {
+                        "kind": "official_provider_catalog",
+                        "label": "xAI public model catalog and pricing",
+                        "urls": [
+                            "https://docs.x.ai/developers/models",
+                            "https://docs.x.ai/developers/pricing"
+                        ],
+                        "verified_on": "2026-11-27"
+                    },
+                    "unpriced_reason": "public_per_token_rate_unavailable"
+                }
+            }
+        },
         "custom_tool_function_adapters": [
             "apply_patch"
         ],
