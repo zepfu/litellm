@@ -2179,7 +2179,8 @@ _NVIDIA_MODEL_DOES_NOT_EXIST_RE = re.compile(
 )
 _NVIDIA_MODEL_RETIRED_RE = re.compile(
     r"\AThe model '([^']+)' has reached its end of life on\s*"
-    r"\d{4}-\d{2}-\d{2}(?:\b.*)?\Z",
+    r"\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))?"
+    r"(?:\b.*)?\Z",
     re.IGNORECASE,
 )
 
@@ -2262,7 +2263,14 @@ def _is_nvidia_completion_adapter_model_unavailable_response(
                 _collect_messages(error.get("message"))
             elif isinstance(error, (str, bytes)):
                 _collect_messages(error)
-            _collect_messages(payload.get("message"))
+            _collect_messages(
+                [
+                    payload.get("message"),
+                    payload.get("detail")
+                    if status_code == 410 and payload.get("status") == status_code
+                    else None,
+                ]
+            )
             return
         if isinstance(payload, list):
             for item in payload:

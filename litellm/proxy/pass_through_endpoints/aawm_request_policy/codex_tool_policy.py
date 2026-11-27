@@ -783,6 +783,9 @@ def get_codex_tool_policy_model_cost_candidates(
         f"opencode/{split_model_name}",
         f"opencode/{split_model_name.lower()}",
     ]
+    if model_name.startswith("nvidia/"):
+        candidates.append(f"nvidia_nim/{model_name}")
+
     grok_native_model = callbacks.normalize_grok_native_oauth_model(model_name)
     if grok_native_model is not None:
         candidates.extend(

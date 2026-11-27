@@ -30559,6 +30559,68 @@
             }
         }
     },
+    "nvidia_nim/nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b": {
+        "aliases": [
+            "nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b",
+            "nvidia_nim/nvidia/nemotron-3.5-super-vl-120b-a12b"
+        ],
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
+        "litellm_provider": "nvidia_nim",
+        "max_input_tokens": 262144,
+        "max_output_tokens": 131072,
+        "max_tokens": 131072,
+        "mode": "chat",
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
+        "provider_specific_entry": {
+            "nvidia_nim": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "unpriced",
+                    "kind": "hosted_route_reference",
+                    "billing_mode": "nvidia_nim_hosted_route",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "nvidia_nim",
+                        "model": "nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b"
+                    },
+                    "cache_mode": "none",
+                    "equivalence_status": "not_exact",
+                    "equivalence_evidence": "NVIDIA Build does not publish an exact undiscounted hosted tariff for this route.",
+                    "source": {
+                        "kind": "official_provider_model_catalog",
+                        "label": "NVIDIA Build hosted model card",
+                        "urls": [
+                            "https://build.nvidia.com/nvidia/nemotron-3.5-super-vl-120b-a12b"
+                        ],
+                        "version": "2026-11-27",
+                        "verified_on": "2026-11-27"
+                    },
+                    "unpriced_reason": "exact_tariff_unavailable"
+                }
+            }
+        },
+        "source": "https://build.nvidia.com/nvidia/nemotron-3.5-super-vl-120b-a12b",
+        "supports_function_calling": true,
+        "unsupported_hosted_tools": [
+            "custom",
+            "image_generation",
+            "namespace",
+            "tool_search",
+            "web_search"
+        ]
+    },
 "nvidia_nim/nvidia/minimaxai/minimax-m3": {
         "litellm_provider": "nvidia_nim",
         "mode": "chat",

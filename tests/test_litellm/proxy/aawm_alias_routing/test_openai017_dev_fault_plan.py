@@ -8,10 +8,13 @@ from collections.abc import Callable
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
+import openai
 import pytest
 from fastapi import HTTPException, Request
 from starlette.responses import Response
 
+from litellm.litellm_core_utils.exception_mapping_utils import exception_type
 from litellm.proxy import aawm_route_logging
 from litellm.proxy.common_utils.http_parsing_utils import (
     _safe_get_request_parsed_body,
@@ -33,6 +36,9 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.interfaces import (
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
     AliasRoutingStateManager,
+)
+from litellm.proxy.pass_through_endpoints.providers.nvidia.runtime import (
+    _perform_nvidia_completion_adapter_operation,
 )
 
 _MODEL = "gpt-openai017-test"
@@ -1479,9 +1485,13 @@ async def test_alias_injection_is_managed_openai_only(
     assert classifications == ["usage_limit_reached"]
 
 
+@pytest.mark.parametrize(
+    "problem_detail", [False, True], ids=["error-message", "problem-detail"]
+)
 @pytest.mark.asyncio
 async def test_nvidia_retired_model_failure_reaches_next_alias_candidate(
     monkeypatch: pytest.MonkeyPatch,
+    problem_detail: bool,
 ) -> None:
     _enable_gate(monkeypatch)
     _patch_candidate_loop_runtime(monkeypatch)
@@ -1516,7 +1526,33 @@ async def test_nvidia_retired_model_failure_reaches_next_alias_candidate(
             }
         }
 
-    retired_error = _NvidiaRetiredModelError("provider model retired")
+    async def _retired_operation() -> Response:
+        model = "moonshotai/kimi-k3"
+        problem = {
+            "type": "about:blank",
+            "title": "Gone",
+            "status": 410,
+            "detail": (
+                f"The model '{model}' has reached its end of life "
+                "on 2026-10-15T08:00:00Z and is no longer available."
+            ),
+        }
+        provider_response = httpx.Response(
+            410,
+            json=problem,
+            headers={"content-type": "application/problem+json"},
+            request=httpx.Request(
+                "POST", "https://integrate.api.nvidia.com/v1/chat/completions"
+            ),
+        )
+        sdk_error = openai.APIStatusError(
+            f"Error code: 410 - {problem}",
+            response=provider_response,
+            body=problem,
+        )
+        raise exception_type(
+            model=model, original_exception=sdk_error, custom_llm_provider="nvidia_nim"
+        )
 
     async def _select_candidate(**kwargs: Any) -> dict[str, Any]:
         candidate = candidates.pop(0)
@@ -1535,7 +1571,11 @@ async def test_nvidia_retired_model_failure_reaches_next_alias_candidate(
         model = kwargs["candidate"]["model"]
         performed.append(model)
         if model == retired_candidate["model"]:
-            raise retired_error
+            if problem_detail:
+                return await _perform_nvidia_completion_adapter_operation(
+                    adapter_model=model, operation=_retired_operation
+                )
+            raise _NvidiaRetiredModelError("provider model retired")
         return Response(content=b"ok", status_code=200)
 
     response = await candidate_loop.handle_alias_route(

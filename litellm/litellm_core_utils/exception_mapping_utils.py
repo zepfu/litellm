@@ -5,6 +5,7 @@ import traceback
 from typing import Any, Optional
 
 import httpx
+from openai import APIStatusError
 
 import litellm
 from litellm._logging import verbose_logger
@@ -2571,6 +2572,14 @@ def exception_type(  # type: ignore  # noqa: PLR0915
 
         # don't let an error with mapping interrupt the user from receiving an error from the llm api calls
         if exception_mapping_worked:
+            if (
+                custom_llm_provider == "nvidia_nim"
+                and isinstance(original_exception, APIStatusError)
+                and original_exception.response.status_code == 410
+                and getattr(e, "status_code", None) == 410
+            ):
+                setattr(e, "body", original_exception.body)
+                setattr(e, "_aawm_provider_returned", True)
             setattr(e, "litellm_response_headers", litellm_response_headers)
             raise e
         else:

@@ -580,6 +580,9 @@ def _nvidia_terminal_http_exception(
     )
     setattr(http_exc, "attempted_provider_call", True)
     setattr(http_exc, "nvidia_same_provider_retries_exhausted", True)
+    if status_code == 410 and getattr(exc, "_aawm_provider_returned", False) is True:
+        setattr(http_exc, "body", getattr(exc, "body", None))
+        setattr(http_exc, "_aawm_provider_returned", True)
     _stamp_nvidia_attempt_accounting(
         http_exc,
         logical_candidate_count=logical_candidate_count,
