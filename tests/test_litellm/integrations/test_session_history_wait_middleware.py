@@ -7,6 +7,7 @@ from litellm.integrations.aawm_session_history import writer
 from litellm.integrations.aawm_session_history.waits import (
     SessionHistoryWaitMiddleware,
     record_candidate_selection_failure,
+    record_responses_terminal_delivery,
 )
 
 
@@ -66,6 +67,38 @@ async def test_terminal_wait_checkpoint_retains_sent_status(monkeypatch, status_
         assert wait["candidate_selection_failure"] == {"exception_type": "ValueError"}
     else:
         assert "candidate_selection_failure" not in wait
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("disposition", "committed", "expected"),
+    [
+        ("completed", True, "completed"),
+        ("completed", False, "disconnected"),
+        ("failed", True, "disconnected"),
+    ],
+)
+async def test_disconnect_after_delivered_responses_terminal(
+    monkeypatch, disposition, committed, expected
+):
+    checkpoints = []
+    monkeypatch.setattr(writer, "_build_session_history_dsn", lambda: "test-dsn")
+    monkeypatch.setattr(writer, "_enqueue_session_history_record", checkpoints.append)
+
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await receive()
+        await record_responses_terminal_delivery(
+            {"disposition": disposition, "terminal_wire_committed": committed}
+        )
+
+    await SessionHistoryWaitMiddleware(app)(
+        {"type": "http", "method": "POST", "path": "/openai_passthrough/responses", "headers": []},
+        AsyncMock(return_value={"type": "http.disconnect"}),
+        AsyncMock(),
+    )
+
+    assert checkpoints[-1]["metadata"]["wait_accounting"]["status"] == expected
 
 
 @pytest.mark.asyncio

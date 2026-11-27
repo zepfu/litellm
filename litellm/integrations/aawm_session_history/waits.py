@@ -43,6 +43,7 @@ class RequestWaits:
         self.started_at = _now()
         self.sequence = 0
         self.status = "running"
+        self.successful_responses_terminal = False
         self.claimed = False
         self.active: dict[str, tuple[str, datetime, float]] = {}
         self.durations: dict[str, float] = {}
@@ -219,6 +220,17 @@ def enrich_request_waits(identity: Mapping[str, Any]) -> None:
         tracker.enrich(identity)
 
 
+async def record_responses_terminal_delivery(snapshot: Mapping[str, Any]) -> None:
+    """Use the shared wire coordinator's delivered snapshot for wait accounting."""
+    tracker = _current.get()
+    if (
+        tracker is not None
+        and snapshot.get("disposition") == "completed"
+        and snapshot.get("terminal_wire_committed") is True
+    ):
+        tracker.successful_responses_terminal = True
+
+
 @contextmanager
 def wait_state(kind: str) -> Iterator[None]:
     tracker = _current.get()
@@ -391,8 +403,14 @@ class SessionHistoryWaitMiddleware:
             status = "cancelled"
             raise
         finally:
+            if disconnected and not response_complete:
+                status = (
+                    "completed"
+                    if tracker.successful_responses_terminal and 200 <= response_status < 300
+                    else "disconnected"
+                )
             tracker.finish(
-                "disconnected" if disconnected and not response_complete else status,
+                status,
                 response_status_code=response_status or None,
             )
             _current.reset(token)

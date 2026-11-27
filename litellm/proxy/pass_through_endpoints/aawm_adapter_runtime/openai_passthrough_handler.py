@@ -37,6 +37,9 @@ from starlette.responses import StreamingResponse
 
 import litellm
 from litellm._logging import verbose_proxy_logger
+from litellm.integrations.aawm_session_history.waits import (
+    record_responses_terminal_delivery,
+)
 from litellm.llms.xai.route_descriptors import (
     GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
     GROK_NATIVE_OAUTH_ROUTE_FAMILY,
@@ -1404,6 +1407,11 @@ class BaseOpenAIPassThroughHandler:
                     response = _bind_xai_responses_wire_stream(
                         response, request=request, adapter_model=adapter_model
                     )
+                    wire_trace = getattr(response, "wire_trace", None)
+                    if wire_trace is not None:
+                        wire_trace.register_post_finalization_callback(
+                            record_responses_terminal_delivery
+                        )
         except BaseException as exc:
             try:
                 if grok_native_oauth_request and xai_response is not None:

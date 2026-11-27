@@ -9868,6 +9868,8 @@ async def pass_through_request(  # noqa: PLR0915
             if base is not None:
                 codex_session_id = base
             passthrough_metadata["codex_session_id"] = codex_session_id
+            if is_xai_responses_wire_owned_route:
+                passthrough_metadata["canonical_thread_id"] = codex_session_id
         output_guard_extra_metadata: Dict[str, Any] = {}
         if isinstance(passthrough_logging_metadata, dict):
             output_guard_extra_metadata.update(passthrough_logging_metadata)
