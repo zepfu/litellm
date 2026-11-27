@@ -1,5 +1,8 @@
+import asyncio
+import json
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from fastapi import Request, Response
 
@@ -8,6 +11,10 @@ from litellm.integrations.aawm_session_history.waits import (
     SessionHistoryWaitMiddleware,
     record_candidate_selection_failure,
     record_responses_terminal_delivery,
+)
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+    OpenAIResponsesStreamingResponse,
+    wrap_openai_responses_stream,
 )
 
 
@@ -71,7 +78,7 @@ async def test_terminal_wait_checkpoint_retains_sent_status(monkeypatch, status_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("disposition", "committed", "expected"),
+    ("response_status", "disconnect_after_terminal", "expected"),
     [
         ("completed", True, "completed"),
         ("completed", False, "disconnected"),
@@ -79,25 +86,52 @@ async def test_terminal_wait_checkpoint_retains_sent_status(monkeypatch, status_
     ],
 )
 async def test_disconnect_after_delivered_responses_terminal(
-    monkeypatch, disposition, committed, expected
+    monkeypatch, response_status, disconnect_after_terminal, expected
 ):
     checkpoints = []
+    completed_sends = []
+    disconnect = asyncio.Event()
+    pending_send = asyncio.Event()
     monkeypatch.setattr(writer, "_build_session_history_dsn", lambda: "test-dsn")
     monkeypatch.setattr(writer, "_enqueue_session_history_record", checkpoints.append)
 
-    async def app(scope, receive, send):
-        await send({"type": "http.response.start", "status": 200, "headers": []})
-        await receive()
-        await record_responses_terminal_delivery(
-            {"disposition": disposition, "terminal_wire_committed": committed}
-        )
+    event_type = f"response.{response_status}"
+    payload = {"type": event_type, "response": {"status": response_status}}
+    terminal_frame = f"event: {event_type}\ndata: {json.dumps(payload)}\n\n".encode()
 
-    await SessionHistoryWaitMiddleware(app)(
-        {"type": "http", "method": "POST", "path": "/openai_passthrough/responses", "headers": []},
-        AsyncMock(return_value={"type": "http.disconnect"}),
-        AsyncMock(),
+    async def source():
+        yield terminal_frame
+
+    async def app(scope, receive, send):
+        chunks, trace = wrap_openai_responses_stream(
+            source(), upstream_response=httpx.Response(200)
+        )
+        trace.register_post_finalization_callback(record_responses_terminal_delivery)
+        await OpenAIResponsesStreamingResponse(chunks, wire_trace=trace)(scope, receive, send)
+
+    async def receive():
+        await disconnect.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if message["type"] != "http.response.body":
+            return
+        disconnect.set()
+        if disconnect_after_terminal and message["body"] == terminal_frame:
+            completed_sends.append(message["body"])
+            return
+        await pending_send.wait()
+
+    await asyncio.wait_for(
+        SessionHistoryWaitMiddleware(app)(
+            {"type": "http", "method": "POST", "path": "/openai_passthrough/responses", "headers": []},
+            receive,
+            send,
+        ),
+        timeout=2,
     )
 
+    assert completed_sends == ([terminal_frame] if disconnect_after_terminal else [])
     assert checkpoints[-1]["metadata"]["wait_accounting"]["status"] == expected
 
 

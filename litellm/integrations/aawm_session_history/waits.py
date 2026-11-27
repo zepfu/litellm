@@ -225,7 +225,7 @@ async def record_responses_terminal_delivery(snapshot: Mapping[str, Any]) -> Non
     tracker = _current.get()
     if (
         tracker is not None
-        and snapshot.get("disposition") == "completed"
+        and snapshot.get("terminal_event_type") in {"response.completed", "response.done"}
         and snapshot.get("terminal_wire_committed") is True
     ):
         tracker.successful_responses_terminal = True
