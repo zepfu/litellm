@@ -271,10 +271,12 @@ copies without the earlier request's local identity map.
 Stock Codex Responses Lite sends its toolset in developer `additional_tools`
 input items. AAWM applies identified incremental updates in input order.
 Updated definitions replace tools with the same name in their namespace, and
-stock withdrawal notices remove the named tools or namespaces. Unmarked
-accumulated declarations use the latest catalog. AAWM materializes the active
-tools before schema normalization and alias construction, consumes the
-declarations, and preserves the order of the remaining input.
+stock withdrawal notices remove the named tools or namespaces. The last
+accumulated declaration before the first catalog notice supplies the baseline.
+Subsequent declarations apply to that catalog, including stock additions that
+carry no new notice. AAWM materializes the active tools before schema
+normalization and alias construction, consumes the declarations, and preserves
+the order of the remaining input.
 Top-level `web_search` tools may accompany the declaration and are retained.
 When a standard Responses child inherits Lite history, its top-level function
 or namespace catalog supplies the active tools. AAWM consumes the inherited

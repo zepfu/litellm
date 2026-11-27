@@ -145,13 +145,17 @@ def test_should_keep_execution_tools_after_single_collaboration_tool_update(decl
     superseded["tools"].append(
         {"type": "function", "name": "old_tool", "parameters": {}}
     )
-    body = {"input": [superseded, declaration, notice, delta]}
+    builtin_tool = {"type": "tool_search", "execution": "client", "parameters": {}}
+    builtin_delta = {
+        "type": "additional_tools", "role": "developer", "tools": [builtin_tool]
+    }
+    body = {"input": [superseded, declaration, notice, delta, builtin_delta]}
     original = deepcopy(body)
 
     result = normalize_codex_collaboration_dispatch_body(body)
 
     assert result["input"] == [notice]
-    collaboration, functions, clock = result["tools"]
+    collaboration, functions, clock, builtin = result["tools"]
     assert [tool["name"] for tool in collaboration["tools"]] == [
         "spawn_agent", "wait_agent"
     ]
@@ -160,39 +164,39 @@ def test_should_keep_execution_tools_after_single_collaboration_tool_update(decl
     assert '{"cfg047":1,"encoding":"text"' in properties["message"]["description"]
     assert functions == declaration["tools"][1]
     assert clock == declaration["tools"][2]
+    assert builtin == builtin_tool
     assert normalize_codex_collaboration_dispatch_body(result) == result
     assert body == original
 
 
 def test_should_apply_stock_catalog_withdrawals_before_later_declarations(declaration):
-    exec_tool = {"type": "function", "name": "exec", "parameters": {}}
+    exec_tool = {"type": "custom", "name": "exec", "format": {"type": "text"}}
     wait_tool = {"type": "function", "name": "wait", "parameters": {}}
     functions = {"type": "namespace", "name": "functions", "tools": [exec_tool, wait_tool]}
     declaration["tools"].append(functions)
+    declaration["tools"][0]["tools"].append(
+        {"type": "function", "name": "wait_agent", "parameters": {}}
+    )
     notice = _catalog_notice(
         "tools.removed_definition",
         "The following namespaces are no longer available. Do not call tools in "
-        "them unless those tools are declared in a later update:\n- collaboration\n\n"
-        "The following tools are no longer available. Do not call them:\n- functions.exec",
+        "them unless those tools are declared in a later update:\n- functions\n\n"
+        "The following tools are no longer available. Do not call them:\n- collaboration.wait_agent",
     )
     reinstated = {
         "type": "additional_tools",
         "role": "developer",
-        "tools": [deepcopy(declaration["tools"][0])],
+        "tools": [{**functions, "tools": [exec_tool]}],
     }
-    declaration["tools"][0]["tools"].append(
-        {"type": "function", "name": "wait_agent", "parameters": {}}
-    )
-    update = _catalog_notice("tools.incremental_update", "This is an incremental update.")
-
     result = normalize_codex_collaboration_dispatch_body(
-        {"input": [declaration, notice, update, reinstated]}
+        {"input": [declaration, notice, reinstated]}
     )
 
-    assert result["input"] == [notice, update]
-    assert result["tools"][0] == {**functions, "tools": [wait_tool]}
-    assert result["tools"][1]["name"] == "collaboration"
-    assert [tool["name"] for tool in result["tools"][1]["tools"]] == ["spawn_agent"]
+    assert result["input"] == [notice]
+    collaboration, restored_functions = result["tools"]
+    assert collaboration["name"] == "collaboration"
+    assert [tool["name"] for tool in collaboration["tools"]] == ["spawn_agent"]
+    assert restored_functions == {**functions, "tools": [exec_tool]}
 
 
 def test_should_use_current_standard_tools_after_forking_responses_lite(declaration):

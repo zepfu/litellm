@@ -997,12 +997,13 @@ def _responses_lite_catalog(
         return latest_tools
 
     catalog: dict[str, dict[str, Any]] = {}
+    incremental = False
     for index, item in enumerate(items):
         if index in declaration_indexes:
             tools = item.get("tools")
             if not isinstance(tools, list):
                 raise CodexCollaborationDispatchError("unsupported_collaboration_message_schema")
-            if notices.get(index - 1) != "update":
+            if not incremental:
                 catalog.clear()
             for tool in tools:
                 key = _codex_tool_key(tool)
@@ -1021,8 +1022,12 @@ def _responses_lite_catalog(
                         )
                         tool = {**tool, "tools": list(merged.values())}
                 catalog[key] = tool
-        elif notices.get(index) == "withdrawal":
-            _apply_codex_tool_withdrawal(catalog, item)
+        elif index in notices:
+            # Stock Codex can append built-in deltas and exec restores without
+            # a new update notice once it starts emitting incremental history.
+            incremental = True
+            if notices[index] == "withdrawal":
+                _apply_codex_tool_withdrawal(catalog, item)
     return list(catalog.values())
 
 
