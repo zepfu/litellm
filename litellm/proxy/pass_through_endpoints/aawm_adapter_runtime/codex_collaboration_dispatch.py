@@ -1002,6 +1002,8 @@ def _responses_lite_catalog(
             tools = item.get("tools")
             if not isinstance(tools, list):
                 raise CodexCollaborationDispatchError("unsupported_collaboration_message_schema")
+            if notices.get(index - 1) != "update":
+                catalog.clear()
             for tool in tools:
                 key = _codex_tool_key(tool)
                 previous = catalog.get(key)

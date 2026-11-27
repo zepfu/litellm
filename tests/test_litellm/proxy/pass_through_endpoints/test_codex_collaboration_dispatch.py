@@ -141,7 +141,11 @@ def test_should_keep_execution_tools_after_single_collaboration_tool_update(decl
         "available for direct calls unless explicitly marked unavailable. If a tool "
         "is redefined here, its latest definition replaces the earlier one.",
     )
-    body = {"input": [declaration, notice, delta]}
+    superseded = deepcopy(declaration)
+    superseded["tools"].append(
+        {"type": "function", "name": "old_tool", "parameters": {}}
+    )
+    body = {"input": [superseded, declaration, notice, delta]}
     original = deepcopy(body)
 
     result = normalize_codex_collaboration_dispatch_body(body)
@@ -179,12 +183,13 @@ def test_should_apply_stock_catalog_withdrawals_before_later_declarations(declar
     declaration["tools"][0]["tools"].append(
         {"type": "function", "name": "wait_agent", "parameters": {}}
     )
+    update = _catalog_notice("tools.incremental_update", "This is an incremental update.")
 
     result = normalize_codex_collaboration_dispatch_body(
-        {"input": [declaration, notice, reinstated]}
+        {"input": [declaration, notice, update, reinstated]}
     )
 
-    assert result["input"] == [notice]
+    assert result["input"] == [notice, update]
     assert result["tools"][0] == {**functions, "tools": [wait_tool]}
     assert result["tools"][1]["name"] == "collaboration"
     assert [tool["name"] for tool in result["tools"][1]["tools"]] == ["spawn_agent"]
