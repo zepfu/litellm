@@ -100,6 +100,96 @@ def test_should_normalize_latest_accumulated_declaration(declaration):
     assert repeated == result
 
 
+def _catalog_notice(kind, text):
+    return {
+        "type": "message",
+        "role": "developer",
+        "content": [{"type": "input_text", "text": text}],
+        "internal_chat_message_metadata_passthrough": {
+            "content_item_kinds": [kind],
+        },
+    }
+
+
+def test_should_keep_execution_tools_after_single_collaboration_tool_update(declaration):
+    delta = deepcopy(declaration)
+    spawn = delta["tools"][0]["tools"][0]
+    spawn["parameters"]["properties"]["task_name"]["description"] = "Updated guidance."
+    declaration["tools"][0]["tools"].append(
+        {"type": "function", "name": "wait_agent", "parameters": {}}
+    )
+    declaration["tools"].extend(
+        [
+            {
+                "type": "namespace",
+                "name": "functions",
+                "tools": [
+                    {"type": "function", "name": name, "parameters": {}}
+                    for name in ("exec", "wait")
+                ],
+            },
+            {
+                "type": "namespace",
+                "name": "clock",
+                "tools": [{"type": "function", "name": "sleep", "parameters": {}}],
+            },
+        ]
+    )
+    notice = _catalog_notice(
+        "tools.incremental_update",
+        "This is an incremental tools update. Previously declared tools remain "
+        "available for direct calls unless explicitly marked unavailable. If a tool "
+        "is redefined here, its latest definition replaces the earlier one.",
+    )
+    body = {"input": [declaration, notice, delta]}
+    original = deepcopy(body)
+
+    result = normalize_codex_collaboration_dispatch_body(body)
+
+    assert result["input"] == [notice]
+    collaboration, functions, clock = result["tools"]
+    assert [tool["name"] for tool in collaboration["tools"]] == [
+        "spawn_agent", "wait_agent"
+    ]
+    properties = collaboration["tools"][0]["parameters"]["properties"]
+    assert properties["task_name"]["description"] == "Updated guidance."
+    assert '{"cfg047":1,"encoding":"text"' in properties["message"]["description"]
+    assert functions == declaration["tools"][1]
+    assert clock == declaration["tools"][2]
+    assert normalize_codex_collaboration_dispatch_body(result) == result
+    assert body == original
+
+
+def test_should_apply_stock_catalog_withdrawals_before_later_declarations(declaration):
+    exec_tool = {"type": "function", "name": "exec", "parameters": {}}
+    wait_tool = {"type": "function", "name": "wait", "parameters": {}}
+    functions = {"type": "namespace", "name": "functions", "tools": [exec_tool, wait_tool]}
+    declaration["tools"].append(functions)
+    notice = _catalog_notice(
+        "tools.removed_definition",
+        "The following namespaces are no longer available. Do not call tools in "
+        "them unless those tools are declared in a later update:\n- collaboration\n\n"
+        "The following tools are no longer available. Do not call them:\n- functions.exec",
+    )
+    reinstated = {
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": [deepcopy(declaration["tools"][0])],
+    }
+    declaration["tools"][0]["tools"].append(
+        {"type": "function", "name": "wait_agent", "parameters": {}}
+    )
+
+    result = normalize_codex_collaboration_dispatch_body(
+        {"input": [declaration, notice, reinstated]}
+    )
+
+    assert result["input"] == [notice]
+    assert result["tools"][0] == {**functions, "tools": [wait_tool]}
+    assert result["tools"][1]["name"] == "collaboration"
+    assert [tool["name"] for tool in result["tools"][1]["tools"]] == ["spawn_agent"]
+
+
 def test_should_use_current_standard_tools_after_forking_responses_lite(declaration):
     message = {"type": "message", "role": "user", "content": []}
     collaboration = deepcopy(declaration["tools"][0])

@@ -916,6 +916,114 @@ def _has_standard_responses_tool_catalog(tools: list[Any]) -> bool:
     )
 
 
+def _codex_catalog_notice_kind(item: dict[str, Any]) -> Optional[str]:
+    if item.get("type") != "message" or item.get("role") != "developer":
+        return None
+    metadata = item.get("internal_chat_message_metadata_passthrough")
+    if not isinstance(metadata, dict):
+        return None
+    kinds = metadata.get("content_item_kinds")
+    if kinds == ["tools.incremental_update"]:
+        return "update"
+    if kinds == ["tools.removed_definition"]:
+        return "withdrawal"
+    return None
+
+
+def _codex_tool_key(tool: Any) -> str:
+    key = tool.get("name", tool.get("type")) if isinstance(tool, dict) else None
+    if not isinstance(key, str) or not key:
+        raise CodexCollaborationDispatchError("unsupported_collaboration_message_schema")
+    return key
+
+
+def _apply_codex_tool_withdrawal(
+    catalog: dict[str, dict[str, Any]], item: dict[str, Any]
+) -> None:
+    content = item.get("content")
+    if not isinstance(content, list) or len(content) != 1:
+        return
+    part = content[0]
+    notice = part.get("text") if isinstance(part, dict) else None
+    if not isinstance(notice, str) or part.get("type") != "input_text":
+        return
+    # The stock client uses separate sections for whole namespaces and tools.
+    # Granular functions.exec definition notices share the metadata kind.
+    for section in notice.strip().split("\n\n"):
+        if not section:
+            continue
+        header, *lines = section.splitlines()
+        if header == (
+            "The following namespaces are no longer available. Do not call tools "
+            "in them unless those tools are declared in a later update:"
+        ):
+            for line in lines:
+                if not line.startswith("- "):
+                    continue
+                key = line[2:]
+                if catalog.get(key, {}).get("type") == "namespace":
+                    catalog.pop(key)
+        elif header == "The following tools are no longer available. Do not call them:":
+            for line in lines:
+                if not line.startswith("- "):
+                    continue
+                key = line[2:]
+                namespace, separator, name = key.rpartition(".")
+                if not separator:
+                    if catalog.get(key, {}).get("type") != "namespace":
+                        catalog.pop(key, None)
+                    continue
+                tool = catalog.get(namespace)
+                if tool is not None and tool.get("type") == "namespace":
+                    members = [
+                        member for member in tool["tools"]
+                        if _codex_tool_key(member) != name
+                    ]
+                    if members:
+                        catalog[namespace] = {**tool, "tools": members}
+                    else:
+                        catalog.pop(namespace)
+
+
+def _responses_lite_catalog(
+    items: list[Any], declaration_indexes: set[int], latest_tools: list[Any]
+) -> list[Any]:
+    notices = {
+        index: kind
+        for index, item in enumerate(items)
+        if isinstance(item, dict) and (kind := _codex_catalog_notice_kind(item))
+    }
+    if not notices:
+        return latest_tools
+
+    catalog: dict[str, dict[str, Any]] = {}
+    for index, item in enumerate(items):
+        if index in declaration_indexes:
+            tools = item.get("tools")
+            if not isinstance(tools, list):
+                raise CodexCollaborationDispatchError("unsupported_collaboration_message_schema")
+            for tool in tools:
+                key = _codex_tool_key(tool)
+                previous = catalog.get(key)
+                if tool.get("type") == "namespace":
+                    members = tool.get("tools")
+                    if not isinstance(members, list):
+                        raise CodexCollaborationDispatchError("unsupported_collaboration_message_schema")
+                    if previous is not None and previous.get("type") == "namespace":
+                        merged = {
+                            _codex_tool_key(member): member
+                            for member in previous["tools"]
+                        }
+                        merged.update(
+                            (_codex_tool_key(member), member) for member in members
+                        )
+                        tool = {**tool, "tools": list(merged.values())}
+                catalog[key] = tool
+        elif notices.get(index) == "withdrawal":
+            _apply_codex_tool_withdrawal(catalog, item)
+    return list(catalog.values())
+
+
 def _normalize_tool_schemas_without_error_mapping(
     body: dict[str, Any],
     *,
@@ -925,10 +1033,7 @@ def _normalize_tool_schemas_without_error_mapping(
 ) -> dict[str, Any]:
     normalized_body = body
     changed = False
-    # Stock Codex Responses Lite retains prior developer declarations and can
-    # put the accumulated catalog after initial history. The final declaration
-    # is authoritative; materialize it before the existing schema, alias,
-    # adapter and restoration paths inspect it.
+    # Materialize Responses Lite declarations before schema and alias handling.
     input_items = body.get("input")
     if isinstance(input_items, list) and input_items:
         declaration_indexes = [
@@ -950,6 +1055,7 @@ def _normalize_tool_schemas_without_error_mapping(
                     "unsupported_collaboration_message_schema"
                 )
             normalized_body = dict(body)
+            declaration_indexes_set = set(declaration_indexes)
             if hosted_tools is not None and _has_unsupported_hosted_tools(hosted_tools):
                 # A stock full-history fork can inherit a Lite declaration and
                 # send the standard child's active tool catalog at top level.
@@ -958,8 +1064,9 @@ def _normalize_tool_schemas_without_error_mapping(
                         "unsupported_collaboration_message_schema"
                     )
             else:
-                normalized_body["tools"] = (hosted_tools or []) + tools
-            declaration_indexes_set = set(declaration_indexes)
+                normalized_body["tools"] = (hosted_tools or []) + _responses_lite_catalog(
+                    input_items, declaration_indexes_set, tools
+                )
             normalized_body["input"] = [
                 item
                 for index, item in enumerate(input_items)
