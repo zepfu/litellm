@@ -581,10 +581,14 @@ class BaseOpenAIPassThroughHandler:
                     request=request,
                 )
             )
+            is_grok_native_model = rt.is_grok_native_oauth_request_body_fn(
+                prepared_request_body
+            )
             if (
                 is_codex_responses_request
                 and codex_auto_agent_alias_model is None
                 and not direct_zai_coding_plan_request
+                and not (is_responses_endpoint and is_grok_native_model)
             ):
                 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
                     _load_bound_codex_oauth_auth,
@@ -659,7 +663,7 @@ class BaseOpenAIPassThroughHandler:
             if (
                 is_codex_responses_request
                 or is_managed_oa_xai_request
-                or rt.is_grok_native_oauth_request_body_fn(prepared_request_body)
+                or is_grok_native_model
             ):
                 normalized_request_body = (
                     normalize_codex_collaboration_dispatch_body(
@@ -714,9 +718,7 @@ class BaseOpenAIPassThroughHandler:
                 ) = rt.drop_unsupported_codex_input_items_fn(
                     prepared_request_body
                 )
-                if is_managed_oa_xai_request or rt.is_grok_native_oauth_request_body_fn(
-                    prepared_request_body
-                ):
+                if is_managed_oa_xai_request or is_grok_native_model:
                     (
                         prepared_request_body,
                         _codex_removed_empty_tool_choice,

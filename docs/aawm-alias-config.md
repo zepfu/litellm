@@ -250,8 +250,9 @@ For this managed `oa_xai`/`sota-xai` flow, Grok 4.7 adapts both the
 `collaboration` and `multi_agent_v1` namespaces. Those children are flattened
 into provider-bound function tools and sanitized before egress. Provider
 function calls and results are restored to stock Codex collaboration and
-`multi_agent_v1` tool calls and results with continuation IDs preserved. Native
-Grok remains a separate, unchanged flow.
+`multi_agent_v1` tool calls and results with continuation IDs preserved.
+Direct Grok-native Responses requests from Codex use the configured Grok OIDC
+credential and native session ownership.
 
 Codex 0.149 may advertise the same collaboration children as
 `functions.collaboration` with child `wait` instead of the catalog keys
