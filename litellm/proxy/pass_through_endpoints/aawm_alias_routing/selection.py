@@ -3528,14 +3528,55 @@ def _codex_oauth_quota_observation_from_row(
 
 
 async def _hydrate_codex_oauth_quota_observations(
-    contexts: Sequence[dict[str, Any]],
+    contexts: Sequence[dict[str, Any]], *, request: Request
 ) -> None:
     await _refresh_codex_oauth_quota_observations(contexts)
     _capture_codex_oauth_quota_evidence(contexts)
+    if os.getenv("AAWM_LITELLM_ENVIRONMENT") != "litellm-alpha":
+        return
+    observations = await asyncio.gather(
+        *(_refresh_alpha_codex_paid_credit_evidence(request, context) for context in contexts)
+    )
+    live_observations = [row for row in observations if row is not None]
+    if live_observations:
+        _capture_codex_oauth_quota_evidence(contexts, live_observations=live_observations)
+
+
+async def _refresh_alpha_codex_paid_credit_evidence(
+    request: Request, context: dict[str, Any]
+) -> Optional[dict[str, Any]]:
+    from .codex_oauth import poll_alpha_codex_weekly_paid_credits
+
+    weekly = context["quota_evidence"]["weekly"]
+    if (
+        context.get("auth_status") != "healthy"
+        or not weekly
+        or weekly.get("quota_family") != "overall"
+        or weekly.get("remaining_pct") != 0
+        or weekly.get("paid_credits")
+    ):
+        return None
+    candidate = context["candidate"]
+    try:
+        return await poll_alpha_codex_weekly_paid_credits(
+            request,
+            account_label=candidate["codex_oauth_account_label"],
+            account_hash=candidate["codex_oauth_account_hash"],
+        )
+    except HTTPException:
+        context.update(
+            auth_status="degraded",
+            skip_reason="auth_degraded",
+            failure_phase="pre_dispatch_auth",
+            attempted_provider_call=False,
+        )
+        return None
 
 
 def _capture_codex_oauth_quota_evidence(
     contexts: Sequence[dict[str, Any]],
+    *,
+    live_observations: Sequence[dict[str, Any]] = (),
 ) -> None:
     now = time.time()
     environment = _codex_oauth_expected_quota_environment()
@@ -3555,6 +3596,7 @@ def _capture_codex_oauth_quota_evidence(
             for key, observation in (alias_routing_state._normalized_quota_observations.items())
             if key[0] == _CODEX_AUTO_AGENT_NATIVE_PROVIDER and key[2] in account_hashes
         ]
+    observations.extend(live_observations)
     horizon = _codex_oauth_quota_validity_horizon_seconds()
     for context in contexts:
         candidate = context["candidate"]
@@ -5032,7 +5074,7 @@ async def _build_codex_auto_agent_affinity_candidate_state(
         candidate_template=candidate_template,
         affinity=affinity,
     )
-    await _aawm_selection._hydrate_codex_oauth_quota_observations(contexts)
+    await _aawm_selection._hydrate_codex_oauth_quota_observations(contexts, request=request)
     states: list[dict[str, Any]] = []
     for context in contexts:
         state = await _build_codex_auto_agent_candidate_state(
@@ -5099,7 +5141,7 @@ async def _build_anthropic_auto_agent_affinity_candidate_state(
         candidate_template=candidate_template,
         affinity=affinity,
     )
-    await _aawm_selection._hydrate_codex_oauth_quota_observations(contexts)
+    await _aawm_selection._hydrate_codex_oauth_quota_observations(contexts, request=request)
     context = contexts[0]
     state = await _build_anthropic_auto_agent_candidate_state(
         request,
@@ -5210,7 +5252,7 @@ async def _build_codex_auto_agent_candidate_states(
                 request,
                 candidate_template=candidate_template,
             )
-            await _aawm_selection._hydrate_codex_oauth_quota_observations(contexts)
+            await _aawm_selection._hydrate_codex_oauth_quota_observations(contexts, request=request)
             for context in contexts:
                 candidate_state_kwargs: dict[str, Any] = {
                     "candidate_template": context["candidate"],
@@ -5317,7 +5359,7 @@ async def _build_anthropic_auto_agent_candidate_states(
                 request,
                 candidate_template=candidate_template,
             )
-            await _aawm_selection._hydrate_codex_oauth_quota_observations(contexts)
+            await _aawm_selection._hydrate_codex_oauth_quota_observations(contexts, request=request)
             for context in contexts:
                 candidate_state_kwargs: dict[str, Any] = {
                     "candidate_template": context["candidate"],

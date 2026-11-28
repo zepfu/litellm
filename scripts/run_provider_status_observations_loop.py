@@ -101,6 +101,9 @@ from litellm.secret_managers.kimi_native_contract import (
     resolve_endpoint_url as _kimi_resolve_endpoint_url,
 )
 from litellm.secret_managers import grok_native_version_contract
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_quota_balance import (
+    paid_credit_fields,
+)
 from litellm.secret_managers.grok_oidc_auth_path import (
     DEFAULT_GROK_OIDC_AUTH_FILE,
     GROK_OIDC_AUTH_FILE_ENV_VARS,
@@ -8861,28 +8864,6 @@ def _normalize_codex_quota_rate_limit_source(
     return normalized
 
 
-def _codex_paid_credit_observation(response_body: Mapping[str, Any]) -> dict[str, Any]:
-    credits = response_body.get("credits")
-    spend_control = response_body.get("spend_control")
-    if not isinstance(credits, Mapping):
-        return {}
-    fields: dict[str, Any] = {
-        key: credits[key]
-        for key in ("has_credits", "unlimited", "overage_limit_reached")
-        if isinstance(credits.get(key), bool)
-    }
-    if _codex_quota_number(credits.get("balance")) is not None:
-        fields["balance"] = str(credits["balance"])
-    if isinstance(spend_control, Mapping):
-        if isinstance(spend_control.get("reached"), bool):
-            fields["spend_control_reached"] = spend_control["reached"]
-        if "individual_limit" in spend_control:
-            limit = spend_control["individual_limit"]
-            if limit is None or _codex_quota_number(limit) is not None:
-                fields["individual_limit"] = limit
-    return fields
-
-
 def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
     config: ProviderStatusLoopConfig,
     *,
@@ -8909,7 +8890,7 @@ def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
     quota_periods: Dict[str, Optional[str]] = {}
     period_states: Dict[str, str] = {}
     upstream_model_present = False
-    paid_credits = _codex_paid_credit_observation(response_body)
+    paid_credits = paid_credit_fields(response_body)
     for source in sources:
         rate_limits = _normalize_codex_quota_rate_limit_source(source)
         quota_family = str(rate_limits.get("_codex_quota_family") or "overall").strip().lower()

@@ -31,6 +31,67 @@ def _period(row: Mapping[str, Any]) -> Optional[str]:
     )
 
 
+def paid_credit_fields(usage: Mapping[str, Any]) -> dict[str, Any]:
+    credits = usage.get("credits")
+    if not isinstance(credits, Mapping):
+        return {}
+    fields = {
+        key: credits[key]
+        for key in ("has_credits", "unlimited", "overage_limit_reached")
+        if isinstance(credits.get(key), bool)
+    }
+    if _number(credits.get("balance")) is not None:
+        fields["balance"] = str(credits["balance"])
+    spend_control = usage.get("spend_control")
+    if isinstance(spend_control, Mapping):
+        if isinstance(spend_control.get("reached"), bool):
+            fields["spend_control_reached"] = spend_control["reached"]
+        if "individual_limit" in spend_control:
+            limit = spend_control["individual_limit"]
+            if limit is None or _number(limit) is not None:
+                fields["individual_limit"] = limit
+    return fields
+
+
+def alpha_weekly_paid_credit_observation(
+    usage: Mapping[str, Any], *, account_hash: str, observed_at: float
+) -> Optional[dict[str, Any]]:
+    """Normalize an account-bound live usage response for alpha's selector."""
+    credits = paid_credit_fields(usage)
+    rate_limit = usage.get("rate_limit")
+    if not credits or not isinstance(rate_limit, Mapping):
+        return None
+    weekly_seconds = _PERIOD_MINUTES["seven_day"] * 60
+    weeks = [
+        window
+        for key in ("primary_window", "secondary_window")
+        if isinstance(window := rate_limit.get(key), Mapping)
+        and _number(window.get("limit_window_seconds")) == weekly_seconds
+    ]
+    if len(weeks) != 1:
+        return None
+    used = _number(weeks[0].get("used_percent"))
+    reset = _number(weeks[0].get("reset_at"))
+    if (
+        used is None or not 0 <= used <= 100
+        or reset is None or not observed_at < reset <= observed_at + weekly_seconds
+    ):
+        return None
+    return {
+        "account_hash": account_hash,
+        "environment": "litellm-alpha",
+        "quota_family": "overall",
+        "quota_period": "seven_day",
+        "window_minutes": _PERIOD_MINUTES["seven_day"],
+        "remaining_pct": 100 - used,
+        "observed_at": observed_at,
+        "expected_reset_at": reset,
+        "source": POLL_SOURCE,
+        "status": "fresh",
+        "evidence": {"codex_paid_credits": credits},
+    }
+
+
 def _window(row: Mapping[str, Any], *, now: float, horizon: float) -> dict[str, Any]:
     period = _period(row)
     minutes = _number(row.get("window_minutes"))
@@ -213,6 +274,7 @@ def decision_account(state: Mapping[str, Any], *, eligible: bool) -> dict[str, A
     candidate = state["candidate"]
     evidence = state.get("codex_oauth_quota_evidence") or {}
     weekly = evidence.get("weekly")
+    paid_credits = evidence.get("paid_credits") or {}
     return {
         "account_label": candidate.get("codex_oauth_account_label"),
         "account_hash": candidate.get("codex_oauth_account_hash"),
@@ -222,7 +284,11 @@ def decision_account(state: Mapping[str, Any], *, eligible: bool) -> dict[str, A
         "quota_family": evidence.get("quota_family"),
         "environment": evidence.get("environment"),
         "evaluated_at": evidence.get("evaluated_at"),
-        "weekly": dict(weekly) if isinstance(weekly, dict) else None,
+        "weekly": (
+            {key: value for key, value in weekly.items() if key != "paid_credits"}
+            if isinstance(weekly, dict) else None
+        ),
+        "paid_credits_usable": paid_credits.get("usable"),
         "unusable_reason": evidence.get("unusable_reason", "missing_evidence"),
     }
 

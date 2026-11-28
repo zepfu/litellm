@@ -27,6 +27,7 @@ from typing import Any, Callable, Iterator, Mapping, Optional, Union
 import httpx
 from fastapi import HTTPException, Request
 
+from litellm.caching.in_memory_cache import InMemoryCache
 from litellm.llms.chatgpt.common_utils import (
     CHATGPT_API_BASE,
     get_chatgpt_default_headers,
@@ -51,6 +52,11 @@ from litellm.secret_managers.codex_oauth_inventory import (
 _ORIGINAL_LOAD_CODEX_OAUTH_INVENTORY = load_codex_oauth_inventory
 
 from .policy import canonicalize_openrouter_native_responses_route_family
+from .codex_quota_balance import alpha_weekly_paid_credit_observation
+
+_ALPHA_CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+_alpha_codex_usage_cache = InMemoryCache(max_size_in_memory=64, default_ttl=45)
+_alpha_codex_usage_lock = asyncio.Lock()
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -639,6 +645,52 @@ async def _load_local_codex_auth_selection(
     except CodexOAuthInventoryError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from None
     return await _load_codex_oauth_headers_for_record(request, record)
+
+
+async def poll_alpha_codex_weekly_paid_credits(
+    request: Request, *, account_label: str, account_hash: str
+) -> Optional[dict[str, Any]]:
+    """Read current usage without refreshing credentials or writing shared state."""
+    async with _alpha_codex_usage_lock:
+        auth = await _load_local_codex_auth_selection(request, account_label=account_label)
+        if auth.account_hash != account_hash:
+            return None
+        fingerprint = _codex_oauth_auth_fingerprint(auth)
+        cache_key = f"{account_hash}:{fingerprint}"
+        cached = _alpha_codex_usage_cache.get_cache(cache_key)
+        if cached is not None:
+            return cached or None
+        observation = None
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                response = await asyncio.wait_for(
+                    client.get(
+                        _ALPHA_CODEX_USAGE_URL,
+                        headers={
+                            name: auth.headers[name]
+                            for name in ("Authorization", "ChatGPT-Account-Id")
+                        },
+                    ),
+                    timeout=2.0,
+                )
+            if response.is_success:
+                usage = response.json()
+                if isinstance(usage, Mapping):
+                    observation = alpha_weekly_paid_credit_observation(
+                        usage, account_hash=account_hash, observed_at=time.time()
+                    )
+            elif response.status_code == 401:
+                rejection = response.json()
+                error = rejection.get("error") if isinstance(rejection, Mapping) else None
+                if isinstance(error, Mapping) and error.get("code") in CODEX_OAUTH_REJECTION_CODES:
+                    record_codex_oauth_rejection(fingerprint)
+                    raise HTTPException(status_code=401, detail="Codex usage rejected the selected credential.")
+        except (httpx.HTTPError, asyncio.TimeoutError, ValueError):
+            pass
+        _alpha_codex_usage_cache.set_cache(
+            cache_key, observation or {}, ttl=45 if observation else 5
+        )
+        return observation
 
 
 @track_wait("credential_resolution")
@@ -2010,7 +2062,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
             candidate_template=resolve_template,
             affinity=affinity,
         )
-    await _selection._hydrate_codex_oauth_quota_observations(contexts)
+    await _selection._hydrate_codex_oauth_quota_observations(contexts, request=request)
 
     states: list[dict[str, Any]] = []
     for context in contexts:

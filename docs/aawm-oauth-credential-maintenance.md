@@ -539,6 +539,10 @@ The live usage poll also stores paid-credit balance and restrictions separately
 from reset-credit inventory. A current observation with usable paid credits
 keeps the overall Codex account eligible when its weekly included allowance
 reaches zero. A provider refusal still applies to the attempted account.
+During alpha-only rollout, alpha reads the provider's usage endpoint when the
+shared poll shows no weekly allowance and omits paid-credit fields. Alpha
+caches that observation briefly and leaves credential refresh with the
+sidecar.
 
 When `LITELLM_CODEX_OAUTH_INVENTORY` is configured, all provider-status Codex
 refresh, passive-health, and reset-credit/quota work uses only those inventory

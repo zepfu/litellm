@@ -9095,36 +9095,54 @@ def test_codex_live_overall_weekly_window_prefers_singular_rate_limit() -> None:
     assert rows[0]["raw_provider_fields"]["reset_at"] == "2026-08-15T12:00:00Z"
 
 
-@pytest.mark.parametrize("spend_blocked", [False, True])
-def test_codex_weekly_admission_consumes_polled_paid_credit_state(spend_blocked, monkeypatch) -> None:
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import admission, selection
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("environment", "shared_credits", "spend_blocked"),
+    [
+        ("litellm-alpha", True, False),
+        ("litellm-alpha", True, True),
+        ("litellm-alpha", False, False),
+        ("litellm-alpha", False, True),
+        ("litellm-dev", False, False),
+    ],
+)
+async def test_codex_weekly_admission_consumes_polled_paid_credit_state(
+    environment, shared_credits, spend_blocked, monkeypatch
+) -> None:
+    from unittest.mock import AsyncMock
+
+    import httpx
+    from starlette.requests import Request
+    from litellm.caching.in_memory_cache import InMemoryCache
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import admission, codex_oauth, selection
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import AliasRoutingStateManager
 
     config = _codex_reset_credit_poll_config(apply=False)
     record = config.codex_oauth_inventory.records[0]
     now = datetime.now(timezone.utc)
     reset = now + timedelta(days=1)
+    usage = {
+        "rate_limit": {
+            "allowed": False,
+            "primary_window": {
+                "used_percent": 100,
+                "limit_window_seconds": 604800,
+                "reset_at": int(reset.timestamp()),
+            },
+        },
+        "credits": {
+            "has_credits": True,
+            "unlimited": False,
+            "balance": "28975.8714965000",
+            "overage_limit_reached": False,
+        },
+        "spend_control": {"reached": spend_blocked, "individual_limit": None},
+    }
     rows, _ = loop._build_codex_quota_rate_limit_observations(
         config,
         record=record,
         observed_at=now,
-        response_body={
-            "rate_limit": {
-                "allowed": False,
-                "primary_window": {
-                    "used_percent": 100,
-                    "limit_window_seconds": 604800,
-                    "reset_at": int(reset.timestamp()),
-                },
-            },
-            "credits": {
-                "has_credits": True,
-                "unlimited": False,
-                "balance": "28975.8714965000",
-                "overage_limit_reached": False,
-            },
-            "spend_control": {"reached": spend_blocked, "individual_limit": None},
-        },
+        response_body=usage if shared_credits else {"rate_limit": usage["rate_limit"]},
     )
     observation = selection._codex_oauth_quota_observation_from_row(
         {**rows[0], "expected_reset_at": reset}
@@ -9132,6 +9150,7 @@ def test_codex_weekly_admission_consumes_polled_paid_credit_state(spend_blocked,
     manager = AliasRoutingStateManager()
     manager.record_normalized_quota_observations([observation])
     context = {
+        "auth_status": "healthy",
         "candidate": {
             "provider": "openai",
             "model": "gpt-6.2-sol",
@@ -9139,17 +9158,42 @@ def test_codex_weekly_admission_consumes_polled_paid_credit_state(spend_blocked,
             "codex_oauth_account_hash": record.expected_account_hash,
         }
     }
+    usage_requests = []
+
+    def serve_usage(request):
+        usage_requests.append(request)
+        return httpx.Response(200, json=usage)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(serve_usage))
+    monkeypatch.setattr(codex_oauth.httpx, "AsyncClient", lambda **_: client)
+    monkeypatch.setattr(codex_oauth, "_alpha_codex_usage_cache", InMemoryCache())
+    monkeypatch.setattr(codex_oauth, "_load_local_codex_auth_selection", AsyncMock(
+        return_value=codex_oauth.CodexOAuthRequestAuth(
+            record.label, record.expected_account_hash, "test-lane",
+            {"Authorization": "Bearer test-token", "ChatGPT-Account-Id": "test-account"},
+        )
+    ))
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", environment)
+    monkeypatch.setattr(selection, "_get_codex_quota_observation_pool", None)
     monkeypatch.setattr(selection, "alias_routing_state", manager)
-    selection._capture_codex_oauth_quota_evidence([context])
+    request = Request({"type": "http"})
+    await selection._hydrate_codex_oauth_quota_observations([context], request=request)
+    await selection._hydrate_codex_oauth_quota_observations([context], request=request)
+    assert len(usage_requests) == (1 if environment == "litellm-alpha" and not shared_credits else 0)
+    if usage_requests:
+        assert usage_requests[0].method == "GET"
+        assert usage_requests[0].url.path == "/backend-api/wham/usage"
+    await client.aclose()
     admitted = selection._attach_normalized_quota_state(
         {**context, "codex_oauth_quota_evidence": context["quota_evidence"]}
     )
     assert admitted["quota_remaining_pct"] == 0
-    assert admitted.get("skip_reason") == ("quota_exhausted" if spend_blocked else None)
+    excluded = spend_blocked or environment == "litellm-dev"
+    assert admitted.get("skip_reason") == ("quota_exhausted" if excluded else None)
     lane_observation = admission.resolve_lane_quota_observation(
         candidate=context["candidate"], selection=admitted, state_manager=manager
     )
-    assert bool(admission._select_confirmed_exhaustion_observation(lane_observation)) is spend_blocked
+    assert bool(admission._select_confirmed_exhaustion_observation(lane_observation)) is excluded
 
 
 def test_codex_live_spark_windows_keep_durable_family_identity() -> None:
