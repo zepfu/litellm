@@ -1757,6 +1757,7 @@ def test_provider_quota_pre_commit_http_exception_is_failover_bound():
             "quota": {"resets_at": reset_at},
         },
         event_type="error",
+        codex_managed_route=True,
     )
 
     assert failure.error_code == "usage_limit_reached"
@@ -1815,6 +1816,7 @@ async def test_precommit_quota_reset_survives_proxy_exception_wrapper(monkeypatc
             "quota": {"resets_at": reset_at},
         },
         event_type="error",
+        codex_managed_route=True,
     )
     http_exception = failure.as_http_exception()
     body = {"model": "gpt-5.4", "input": "hello"}
@@ -1871,6 +1873,66 @@ async def test_precommit_quota_reset_survives_proxy_exception_wrapper(monkeypatc
     )
     assert "private provider quota text" not in str(raised.value.detail)
     assert raised.value.upstream_headers["Retry-After"] in {"899", "900"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("codex_managed_route", "expected_error_class"),
+    [
+        (False, "provider_terminal_error"),
+        (True, "usage_limit_reached"),
+    ],
+    ids=["generic-openai", "managed-codex"],
+)
+async def test_precommit_quota_classification_requires_managed_codex_route(
+    codex_managed_route, expected_error_class
+):
+    reset_at = int(time.time()) + 900
+    quota_event = _sse(
+        "response.failed",
+        {
+            "type": "response.failed",
+            "response": {
+                "id": "resp_quota_route",
+                "status": "failed",
+                "output": [],
+                "error": {
+                    "type": "rate_limit_error",
+                    "code": "insufficient_quota",
+                    "message": "private provider quota text",
+                    "quota": {"resets_at": reset_at},
+                },
+            },
+        },
+    )
+    response = httpx.Response(
+        200,
+        stream=_ClosableAsyncByteStream([quota_event]),
+    )
+
+    peeked_response, failure = (
+        await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+            response,
+            codex_managed_route=codex_managed_route,
+        )
+    )
+
+    assert failure is not None
+    assert failure.error_class == expected_error_class
+    if codex_managed_route:
+        http_exc = failure.as_http_exception()
+        assert http_exc.status_code == 429
+        assert http_exc.detail["terminal_reset"]["resets_at"] == reset_at
+    else:
+        http_exc = failure.as_http_exception()
+        assert http_exc.status_code == 502
+        assert "failover_disposition" not in http_exc.detail
+    if codex_managed_route:
+        assert "private provider quota text" not in str(failure.detail)
+    assert b"".join(
+        [chunk async for chunk in peeked_response.aiter_bytes()]
+    ) == quota_event
+    await peeked_response.aclose()
 
 
 @pytest.mark.asyncio

@@ -1900,6 +1900,7 @@ class PassThroughStreamingHandler:
         error_payload: Optional[Dict[str, Any]],
         *,
         openai_alpha_capacity_retry_enabled: bool = False,
+        codex_managed_route: bool = False,
     ) -> tuple[str, str, bool]:
         error_code, error_type, error_message = (
             PassThroughStreamingHandler._extract_responses_stream_error_fields(
@@ -1914,7 +1915,10 @@ class PassThroughStreamingHandler:
                 "transient_upstream",
                 True,
             )
-        if error_code in {"token_invalidated", "token_revoked"}:
+        if codex_managed_route and error_code in {
+            "token_invalidated",
+            "token_revoked",
+        }:
             return "token_invalidated", "token_invalidated", False
         if PassThroughStreamingHandler._is_responses_unpersisted_item_not_found_payload(
             error_payload
@@ -1949,7 +1953,7 @@ class PassThroughStreamingHandler:
             if isinstance(value, str) and value.strip():
                 tokens.add(value.strip().lower())
         joined = " ".join(sorted(tokens))
-        if any(
+        if codex_managed_route and any(
             marker in joined
             for marker in (
                 "usage_limit_reached",
@@ -2476,6 +2480,7 @@ class PassThroughStreamingHandler:
         pre_commit_retry_exhausted: bool = False,
         retry_after_seconds: float = RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS,
         openai_alpha_capacity_retry_enabled: bool = False,
+        codex_managed_route: bool = False,
         provider_returned: bool = True,
         failure_origin: Optional[str] = None,
     ) -> ResponsesStreamPreCommitFailure:
@@ -2483,6 +2488,7 @@ class PassThroughStreamingHandler:
             PassThroughStreamingHandler._classify_responses_pre_commit_error(
                 error_payload,
                 openai_alpha_capacity_retry_enabled=openai_alpha_capacity_retry_enabled,
+                codex_managed_route=codex_managed_route,
             )
         )
         extracted_code, extracted_type, extracted_message = (
@@ -2599,6 +2605,7 @@ class PassThroughStreamingHandler:
         event_pipeline: Optional[ResponsesEventPipeline] = None,
         request: Any = None,
         provider_bound_body: Optional[Dict[str, Any]] = None,
+        codex_managed_route: bool = False,
     ) -> tuple[httpx.Response, Optional[ResponsesStreamPreCommitFailure]]:
         """Hold safe-private Responses bytes until a commit or pre-SSE failure.
 
@@ -2677,6 +2684,7 @@ class PassThroughStreamingHandler:
                 openai_alpha_capacity_retry_enabled=(
                     openai_alpha_capacity_retry_enabled
                 ),
+                codex_managed_route=codex_managed_route,
             )
             failure.responses_diagnostic = {
                 "first_semantic_commitment": get_responses_first_semantic_commitment(request) if request is not None else None,
@@ -2797,6 +2805,7 @@ class PassThroughStreamingHandler:
                         openai_alpha_capacity_retry_enabled=(
                             openai_alpha_capacity_retry_enabled
                         ),
+                        codex_managed_route=codex_managed_route,
                     )
                     failure.responses_diagnostic = {
                         "first_semantic_commitment": get_responses_first_semantic_commitment(request) if request is not None else None,
@@ -2894,6 +2903,7 @@ class PassThroughStreamingHandler:
                         openai_alpha_capacity_retry_enabled=(
                             openai_alpha_capacity_retry_enabled
                         ),
+                        codex_managed_route=codex_managed_route,
                     )
                     failure.responses_diagnostic = {
                         "first_semantic_commitment": get_responses_first_semantic_commitment(request) if request is not None else None,
@@ -2957,6 +2967,7 @@ class PassThroughStreamingHandler:
                     openai_alpha_capacity_retry_enabled=(
                         openai_alpha_capacity_retry_enabled
                     ),
+                    codex_managed_route=codex_managed_route,
                 )
                 failure.responses_diagnostic = {
                     "first_semantic_commitment": get_responses_first_semantic_commitment(request) if request is not None else None,
@@ -2999,6 +3010,7 @@ class PassThroughStreamingHandler:
                         openai_alpha_capacity_retry_enabled=(
                             openai_alpha_capacity_retry_enabled
                         ),
+                        codex_managed_route=codex_managed_route,
                         provider_returned=False,
                         failure_origin="local_missing_terminal",
                     )

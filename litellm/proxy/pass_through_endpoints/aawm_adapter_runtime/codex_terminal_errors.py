@@ -360,6 +360,23 @@ def _is_confirmed_quota(detail: Mapping[str, Any], failures: list[dict[str, Any]
     )
 
 
+def _apply_additional_terminal_reset(
+    failures: list[dict[str, Any]],
+    terminal_detail: Mapping[str, Any],
+    *,
+    now_epoch: float,
+) -> None:
+    reset_at = codex_verified_reset_at(terminal_detail, now_epoch=now_epoch)
+    if reset_at is None:
+        return
+    for failure in failures:
+        if (
+            failure.get("cause") == "quota exhausted"
+            and not isinstance(failure.get("resets_at"), int)
+        ):
+            failure["resets_at"] = reset_at
+
+
 def _retry_after_seconds(exc: Any, *, now_epoch: float) -> int | None:
     response = getattr(exc, "response", None)
     for headers in (
@@ -399,12 +416,19 @@ def codex_terminal_json_response(
     *,
     account_failure_records: Iterable[Any] = (),
     codex_quota_route_confirmed: bool = False,
+    codex_terminal_route_confirmed: bool = False,
+    additional_terminal_detail: Mapping[str, Any] | None = None,
     now_epoch: float | None = None,
 ) -> JSONResponse | None:
     """Shape only recognized managed Codex terminal failures for stock Codex."""
     now = time.time() if now_epoch is None else float(now_epoch)
     status_code = _exception_status(exc)
     detail = _exception_detail(exc)
+    terminal_detail = (
+        additional_terminal_detail
+        if isinstance(additional_terminal_detail, Mapping)
+        else {}
+    )
     account_records = list(account_failure_records)
     failures = collect_codex_account_failures(
         account_records,
@@ -412,12 +436,21 @@ def codex_terminal_json_response(
         detail.get("skipped_candidates"),
         detail.get("candidates"),
         detail.get("attempts"),
+        terminal_detail.get("terminal_account_failures"),
+        terminal_detail.get("skipped_candidates"),
+        terminal_detail.get("candidates"),
+        terminal_detail.get("attempts"),
     )
+    _apply_additional_terminal_reset(failures, terminal_detail, now_epoch=now)
     causes = {str(item.get("cause")) for item in failures}
     has_auth_failure = bool(causes & {"sign-in required", "credential unavailable", "account unavailable"})
     is_mixed = has_auth_failure and len(causes) > 1
 
-    if is_mixed or has_auth_failure:
+    if (
+        (is_mixed or has_auth_failure)
+        and codex_terminal_route_confirmed
+        and status_code in {401, 403, 429, 503}
+    ):
         message_parts = []
         for failure in failures:
             label = failure.get("label")
@@ -451,6 +484,7 @@ def codex_terminal_json_response(
     if status_code == 429 and codex_quota_route_confirmed and _is_confirmed_quota(detail, failures):
         error = codex_usage_limit_error(
             detail,
+            terminal_detail,
             *failures,
             *[item for item in account_records if isinstance(item, Mapping)],
             now_epoch=now,
@@ -471,7 +505,11 @@ def codex_terminal_json_response(
     error = _error_mapping(detail)
     error_code = str(error.get("code") or "").strip().lower()
     error_type = str(error.get("type") or "").strip().lower()
-    if status_code == 429 and (error_code in _CODEX_THROTTLE_CODES or error_type in _CODEX_THROTTLE_CODES):
+    if (
+        status_code == 429
+        and codex_terminal_route_confirmed
+        and (error_code in _CODEX_THROTTLE_CODES or error_type in _CODEX_THROTTLE_CODES)
+    ):
         retry_after = _retry_after_seconds(exc, now_epoch=now)
         if retry_after is None:
             return None

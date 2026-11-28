@@ -177,11 +177,36 @@ def test_chatgpt_codex_quota_terminal_shape_uses_stock_codes_and_verified_reset(
     assert retry_after == reset_at - int(now_epoch)
     assert detail["error"]["type"] == "usage_limit_reached"
     assert detail["error"]["code"] == "usage_limit_reached"
+    assert detail["quota"]["resets_at"] == reset_at
+    assert 1 <= detail["quota"]["resets_in_seconds"] <= 900
     assert detail["terminal_reset"]["resets_at"] == reset_at
     assert "resets_at" not in detail["error"]
     assert detail["failover_disposition"] == "usage_limit_reached"
     assert "sensitive upstream account text" not in json.dumps(detail)
     assert "private-plan-detail" not in json.dumps(detail)
+
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
+        direct_codex_usage_limit_raw_reset_hint,
+        direct_codex_usage_limit_retry_after_seconds,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.error_signals import (
+        _extract_codex_auto_agent_usage_limit_raw_quota_resets,
+    )
+
+    quota_exception = HTTPException(status_code=429, detail=detail)
+    expected_reset_hints = {
+        "provider_resets_in_seconds": float(detail["quota"]["resets_in_seconds"]),
+        "provider_resets_at": float(reset_at),
+    }
+    assert direct_codex_usage_limit_raw_reset_hint(quota_exception) == (
+        expected_reset_hints
+    )
+    assert _extract_codex_auto_agent_usage_limit_raw_quota_resets(
+        quota_exception
+    ) == expected_reset_hints
+    assert direct_codex_usage_limit_retry_after_seconds(quota_exception) == (
+        float(detail["quota"]["resets_in_seconds"])
+    )
 
     expired = _build_chatgpt_codex_usage_limit_detail(
         error=error,

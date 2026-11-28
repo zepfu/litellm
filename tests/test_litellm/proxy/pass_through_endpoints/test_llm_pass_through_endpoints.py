@@ -220,6 +220,7 @@ def test_codex_terminal_auth_and_throttle_shapes_are_actionable_and_reliable():
             status_code=401,
             detail={"error": {"type": "authentication_error", "message": "private text"}},
         ),
+        codex_terminal_route_confirmed=True,
         account_failure_records=[
             {
                 "provider": "openai",
@@ -246,6 +247,7 @@ def test_codex_terminal_auth_and_throttle_shapes_are_actionable_and_reliable():
                 }
             },
         ),
+        codex_terminal_route_confirmed=True,
         account_failure_records=[
             {
                 "provider": "openai",
@@ -314,7 +316,8 @@ def test_codex_terminal_auth_and_throttle_shapes_are_actionable_and_reliable():
                 }
             },
             headers={"Retry-After": "17"},
-        )
+        ),
+        codex_terminal_route_confirmed=True,
     )
     assert throttle_response is not None
     assert throttle_response.status_code == 429
@@ -30545,6 +30548,7 @@ class TestOpenAIPassthroughRoute:
         for provider_exc in (first_exc, second_exc, terminal_exc):
             provider_exc.attempted_provider_call = True
             provider_exc._aawm_provider_returned = True
+        terminal_selection_reset_at = int(time.time()) + 1200
         exhausted_selection_exc = HTTPException(
             status_code=429,
             detail={
@@ -30554,7 +30558,7 @@ class TestOpenAIPassthroughRoute:
                 },
                 "failover_disposition": "usage_limit_reached",
                 "terminal_reset": {
-                    "resets_at": int(time.time()) + 1200,
+                    "resets_at": terminal_selection_reset_at,
                 },
             },
         )
@@ -30627,6 +30631,16 @@ class TestOpenAIPassthroughRoute:
         assert terminal_payload["error"]["resets_at"] > int(time.time())
         assert response.headers.get("Retry-After")
         assert "account3" not in response.body.decode("utf-8")
+        terminal_selection_failure = (
+            request.state.aawm_codex_oauth_terminal_selection_failure
+        )
+        assert terminal_selection_failure["selection_failure"] is True
+        assert terminal_selection_failure["selection_status_code"] == 429
+        assert terminal_selection_failure["attempted_provider_call"] is False
+        assert terminal_selection_failure["provider_returned"] is False
+        assert terminal_selection_failure["terminal_reset"]["resets_at"] == (
+            terminal_selection_reset_at
+        )
         assert calls[0]["endpoint"] == "v1/responses"
         assert calls[1]["endpoint"] == "v1/responses"
         assert calls[2]["endpoint"] == "v1/responses"
@@ -30697,6 +30711,21 @@ class TestOpenAIPassthroughRoute:
     async def test_openai094_alias_mixed_codex_oauth_failures_return_safe_503(self):
         body = {"model": "basic", "input": "hello"}
         request = self._openai006_request()
+        alias_outcome = llm_passthrough_endpoints._aawm_attempt_records._auto_agent_alias_request_outcome_state(
+            request
+        )
+        alias_outcome["attempts"] = [
+            {
+                "provider": "openai",
+                "route_family": "codex_responses",
+                "codex_oauth_account_label": "account-quota",
+                "codex_oauth_account_hash": "SECRET_QUOTA_HASH",
+                "error_class": "usage_limit_reached",
+                "attempted_provider_call": True,
+                "provider_returned": True,
+                "request_outcome": "failed",
+            }
+        ]
         request.state.aawm_alias_terminal_skipped_candidates = [
             {
                 "provider": "openai",
@@ -30770,11 +30799,80 @@ class TestOpenAIPassthroughRoute:
         assert "SECRET_QUOTA_HASH" not in wire
         assert "private upstream account details" not in wire
 
+    def test_openai094_alias_mixed_quota_and_local_auth_preserves_false_attempt(self):
+        request = self._openai006_request()
+        alias_outcome = llm_passthrough_endpoints._aawm_attempt_records._auto_agent_alias_request_outcome_state(
+            request
+        )
+        local_auth_attempt = {
+            "provider": "openai",
+            "route_family": "codex_responses",
+            "codex_oauth_account_label": "account-local-auth",
+            "codex_oauth_account_hash": "SECRET_LOCAL_AUTH_HASH",
+            "error_class": "auth_degraded",
+            "attempted_provider_call": False,
+            "provider_returned": False,
+            "request_outcome": "failed",
+        }
+        alias_outcome["attempts"] = [local_auth_attempt]
+        request.state.aawm_alias_terminal_skipped_candidates = [
+            {
+                "provider": "openai",
+                "route_family": "codex_responses",
+                "codex_oauth_account_label": "account-quota",
+                "codex_oauth_account_hash": "SECRET_QUOTA_HASH",
+                "error_class": "usage_limit_reached",
+            }
+        ]
+
+        response = llm_passthrough_endpoints._codex_responses_terminal_response(
+            request=request,
+            endpoint="v1/responses",
+            exc=HTTPException(
+                status_code=503,
+                detail={
+                    "error": {
+                        "type": "service_unavailable",
+                        "code": "aawm_codex_oauth_direct_inventory_unavailable",
+                        "message": "private local selection detail",
+                    }
+                },
+            ),
+            direct_codex=False,
+            codex_alias=True,
+        )
+
+        assert response is not None
+        assert response.status_code == 503
+        wire = response.body.decode("utf-8")
+        assert "account-local-auth" in wire
+        assert "account-quota" in wire
+        assert "SECRET_LOCAL_AUTH_HASH" not in wire
+        assert "SECRET_QUOTA_HASH" not in wire
+        assert "private local selection detail" not in wire
+        assert local_auth_attempt["attempted_provider_call"] is False
+        assert local_auth_attempt["provider_returned"] is False
+
     @pytest.mark.asyncio
     async def test_openai094_alias_quota_terminal_preserves_stock_codex_shape(self):
         reset_at = int(time.time()) + 300
         body = {"model": "basic", "input": "hello"}
         request = self._openai006_request()
+        alias_outcome = llm_passthrough_endpoints._aawm_attempt_records._auto_agent_alias_request_outcome_state(
+            request
+        )
+        alias_outcome["attempts"] = [
+            {
+                "provider": "openai",
+                "route_family": "codex_responses",
+                "codex_oauth_account_label": "account-quota",
+                "codex_oauth_account_hash": "SECRET_QUOTA_HASH",
+                "error_class": "usage_limit_reached",
+                "attempted_provider_call": True,
+                "provider_returned": True,
+                "request_outcome": "failed",
+            }
+        ]
         request.state.aawm_alias_terminal_skipped_candidates = [
             {
                 "provider": "openai",
@@ -30841,7 +30939,10 @@ class TestOpenAIPassthroughRoute:
         assert "SECRET_QUOTA_HASH" not in wire
         assert "private upstream account details" not in wire
 
-    def test_openai094_alias_non_codex_terminal_quota_is_not_shaped_as_codex(self):
+    @pytest.mark.parametrize("status_code", [400, 409, 429, 500, 503])
+    def test_openai094_alias_non_codex_terminal_quota_is_not_shaped_as_codex(
+        self, status_code
+    ):
         request = self._openai006_request()
         outcome = llm_passthrough_endpoints._aawm_attempt_records._auto_agent_alias_request_outcome_state(request)
         outcome["attempts"] = [
@@ -30871,7 +30972,7 @@ class TestOpenAIPassthroughRoute:
             },
         ]
         provider_error = HTTPException(
-            status_code=429,
+            status_code=status_code,
             detail={
                 "error": {
                     "type": "rate_limit_error",

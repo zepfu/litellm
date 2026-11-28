@@ -4177,8 +4177,8 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
     missing_request_state = object()
     pre_selection_bound_account: Any = missing_request_state
     pre_selection_parsed_body: Any = missing_request_state
+    request_state = getattr(request, "state", None)
     if retry_is_safe_continuation:
-        request_state = getattr(request, "state", None)
         if request_state is not None:
             try:
                 pre_selection_bound_account = copy.deepcopy(
@@ -4234,6 +4234,28 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
                     selection=selection,
                 )
                 raise
+            terminal_selection_detail: dict[str, Any] = {
+                "selection_failure": True,
+                "selection_status_code": selection_exc.status_code,
+                "attempted_provider_call": detail.get(
+                    "attempted_provider_call", False
+                ),
+                "provider_returned": detail.get("provider_returned", False),
+            }
+            selection_failures = detail.get("terminal_account_failures")
+            if isinstance(selection_failures, list):
+                terminal_selection_detail["terminal_account_failures"] = copy.deepcopy(
+                    selection_failures
+                )
+            terminal_reset = detail.get("terminal_reset")
+            if isinstance(terminal_reset, dict):
+                terminal_selection_detail["terminal_reset"] = copy.deepcopy(
+                    terminal_reset
+                )
+            if request_state is not None:
+                request_state.aawm_codex_oauth_terminal_selection_failure = (
+                    terminal_selection_detail
+                )
             return None
         raise
 
@@ -7282,6 +7304,175 @@ _CODEX_AUTO_AGENT_ROUTE_RUNTIME = (
 )
 
 
+def _managed_codex_terminal_attempt_route_flags(
+    exc: Exception,
+    terminal_attempt: dict[str, Any] | None,
+) -> tuple[bool, bool]:
+    if (
+        not isinstance(terminal_attempt, dict)
+        or terminal_attempt.get("request_outcome") != "failed"
+        or not _is_managed_codex_oauth_account_record(terminal_attempt)
+    ):
+        return False, False
+    failure = _codex_account_failure(terminal_attempt)
+    if failure is None:
+        return False, False
+    status_code = _aawm_error_signals._extract_adapter_exception_status_code(exc)
+    terminal_route_confirmed = status_code in {
+        status.HTTP_401_UNAUTHORIZED,
+        status.HTTP_403_FORBIDDEN,
+        status.HTTP_429_TOO_MANY_REQUESTS,
+        status.HTTP_503_SERVICE_UNAVAILABLE,
+    }
+    quota_route_confirmed = bool(
+        terminal_attempt.get("attempted_provider_call") is True
+        and terminal_attempt.get("provider_returned") is True
+        and failure.get("cause") == "quota exhausted"
+        and status_code == status.HTTP_429_TOO_MANY_REQUESTS
+    )
+    return quota_route_confirmed, terminal_route_confirmed
+
+
+def _direct_codex_terminal_route_flags(
+    exc: Exception,
+    *,
+    error_class: str | None,
+    terminal_detail: dict[str, Any] | None,
+) -> tuple[bool, bool]:
+    status_code = _aawm_error_signals._extract_adapter_exception_status_code(exc)
+    _error_type, error_code = (
+        _aawm_error_signals._extract_codex_auto_agent_error_type_and_code(exc)
+    )
+    normalized_error_class = str(error_class or "").strip().lower()
+    normalized_error_code = str(error_code or "").strip().lower()
+    terminal_error_classes = {
+        "usage_limit_reached",
+        "token_invalidated",
+        "rate_limited",
+        "credential_unavailable",
+        "auth_degraded",
+    }
+    terminal_error_codes = {
+        "usage_limit_reached",
+        "insufficient_quota",
+        "quota_exceeded",
+        "token_invalidated",
+        "token_revoked",
+        "authentication_error",
+        "authorization_error",
+        "credential_rejected",
+        "rate_limit_error",
+        "rate_limit_exceeded",
+        "rate_limited",
+        "too_many_requests",
+        "aawm_codex_oauth_direct_inventory_unavailable",
+        "aawm_codex_auto_agent_candidate_unavailable",
+    }
+    terminal_failures = (
+        terminal_detail.get("terminal_account_failures")
+        if isinstance(terminal_detail, dict)
+        else None
+    )
+    has_terminal_selection_failure = bool(
+        isinstance(terminal_failures, list)
+        and terminal_failures
+        and all(
+            isinstance(record, dict)
+            and _is_managed_codex_oauth_account_record(record)
+            and _codex_account_failure(record) is not None
+            for record in terminal_failures
+        )
+    )
+    terminal_route_confirmed = bool(
+        status_code
+        in {
+            status.HTTP_401_UNAUTHORIZED,
+            status.HTTP_403_FORBIDDEN,
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+        }
+        and (
+            normalized_error_class in terminal_error_classes
+            or normalized_error_code in terminal_error_codes
+            or has_terminal_selection_failure
+        )
+    )
+    # Direct inventory selection is an authoritative quota route; the terminal
+    # error and status still determine whether quota shaping applies.
+    return True, terminal_route_confirmed
+
+
+def _codex_alias_selection_route_flags(exc: Exception) -> tuple[bool, bool]:
+    status_code = _aawm_error_signals._extract_adapter_exception_status_code(exc)
+    _error_type, error_code = (
+        _aawm_error_signals._extract_codex_auto_agent_error_type_and_code(exc)
+    )
+    if (
+        str(error_code or "").strip().lower()
+        not in {
+            "aawm_codex_auto_agent_candidate_unavailable",
+            "aawm_codex_oauth_direct_inventory_unavailable",
+            "aawm_codex_auto_agent_affinity_unavailable",
+        }
+        or status_code
+        not in {
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+        }
+    ):
+        return False, False
+    detail = getattr(exc, "detail", None)
+    failures = (
+        detail.get("terminal_account_failures")
+        if isinstance(detail, dict)
+        else None
+    )
+    if not isinstance(failures, list) or not failures or not all(
+        isinstance(record, dict)
+        and _is_managed_codex_oauth_account_record(record)
+        and _codex_account_failure(record) is not None
+        for record in failures
+    ):
+        return False, False
+    quota_only = all(
+        (failure := _codex_account_failure(record)) is not None
+        and failure.get("cause") == "quota exhausted"
+        for record in failures
+    )
+    return status_code == status.HTTP_429_TOO_MANY_REQUESTS and quota_only, True
+
+
+def _codex_terminal_route_flags(
+    exc: Exception,
+    *,
+    direct_codex: bool,
+    codex_alias: bool,
+    terminal_attempt: dict[str, Any] | None,
+    error_class: str | None,
+    terminal_detail: dict[str, Any] | None,
+) -> tuple[bool, bool]:
+    if direct_codex:
+        return _direct_codex_terminal_route_flags(
+            exc,
+            error_class=error_class,
+            terminal_detail=terminal_detail,
+        )
+    if not codex_alias:
+        return False, False
+    quota_confirmed, terminal_confirmed = (
+        _managed_codex_terminal_attempt_route_flags(exc, terminal_attempt)
+    )
+    if terminal_attempt is None:
+        selection_quota_confirmed, selection_terminal_confirmed = (
+            _codex_alias_selection_route_flags(exc)
+        )
+        return (
+            selection_quota_confirmed,
+            terminal_confirmed or selection_terminal_confirmed,
+        )
+    return quota_confirmed, terminal_confirmed
+
+
 def _codex_responses_terminal_response(
     *,
     request: Request,
@@ -7298,7 +7489,14 @@ def _codex_responses_terminal_response(
         return None
 
     account_records: list[Any] = []
-    codex_quota_route_confirmed = direct_codex
+    terminal_detail = getattr(
+        request.state,
+        "aawm_codex_oauth_terminal_selection_failure",
+        None,
+    )
+    if not direct_codex or not isinstance(terminal_detail, dict):
+        terminal_detail = None
+    terminal_attempt: dict[str, Any] | None = None
     outcome = _aawm_attempt_records._auto_agent_alias_request_outcome_state(
         request
     )
@@ -7315,12 +7513,17 @@ def _codex_responses_terminal_response(
                 ),
                 None,
             )
-            codex_quota_route_confirmed = bool(
-                isinstance(terminal_attempt, dict)
-                and terminal_attempt.get("attempted_provider_call") is True
-                and terminal_attempt.get("provider_returned") is True
-                and _is_managed_codex_oauth_account_record(terminal_attempt)
-            )
+    (
+        codex_quota_route_confirmed,
+        codex_terminal_route_confirmed,
+    ) = _codex_terminal_route_flags(
+        exc,
+        direct_codex=direct_codex,
+        codex_alias=codex_alias,
+        terminal_attempt=terminal_attempt,
+        error_class=error_class,
+        terminal_detail=terminal_detail,
+    )
 
     if direct_codex:
         failover_context = getattr(
@@ -7395,25 +7598,13 @@ def _codex_responses_terminal_response(
     )
     if isinstance(skipped, list):
         account_records.extend(skipped)
-        if (
-            codex_alias
-            and not direct_codex
-            and not codex_quota_route_confirmed
-            and not attempts
-            and skipped
-        ):
-            codex_quota_route_confirmed = all(
-                isinstance(record, dict)
-                and _is_managed_codex_oauth_account_record(record)
-                and (failure := _codex_account_failure(record)) is not None
-                and failure.get("cause") == "quota exhausted"
-                for record in skipped
-            )
 
     return _codex_terminal_json_response(
         exc,
         account_failure_records=account_records,
         codex_quota_route_confirmed=codex_quota_route_confirmed,
+        codex_terminal_route_confirmed=codex_terminal_route_confirmed,
+        additional_terminal_detail=terminal_detail,
     )
 
 

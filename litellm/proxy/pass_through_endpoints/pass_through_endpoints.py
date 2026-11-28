@@ -1244,6 +1244,10 @@ def _build_chatgpt_codex_usage_limit_detail(
         "failover_disposition": "usage_limit_reached",
     }
     if reset_at is not None:
+        structured_detail["quota"] = {
+            "resets_at": reset_at,
+            "resets_in_seconds": max(1, reset_at - int(now_epoch)),
+        }
         structured_detail["terminal_reset"] = {"resets_at": reset_at}
     return structured_detail, retry_after_seconds
 
@@ -9536,6 +9540,13 @@ async def pass_through_request(  # noqa: PLR0915
             request=request,
             request_body=_parsed_body if isinstance(_parsed_body, Mapping) else None,
         )
+        codex_managed_responses_route = bool(
+            openai_bound_egress
+            and immutable_openai_binding.expected_target_family == "codex_oauth"
+            and immutable_openai_binding.route_family == "codex_responses"
+            and immutable_openai_binding.endpoint_contract == "codex_responses"
+            and immutable_openai_binding.expected_account_hash is not None
+        )
         if openai_bound_egress:
             if egress_credential_family is None:
                 egress_credential_family = (
@@ -10258,6 +10269,8 @@ async def pass_through_request(  # noqa: PLR0915
 
         def _classify_json_responses_precommit_failure(
             response_body: Any,
+            *,
+            codex_managed_route: bool = False,
         ) -> Optional[ResponsesStreamPreCommitFailure]:
             if not isinstance(response_body, dict):
                 return None
@@ -10291,6 +10304,7 @@ async def pass_through_request(  # noqa: PLR0915
                 error_payload=error_payload,
                 event_type="response.failed",
                 openai_alpha_capacity_retry_enabled=True,
+                codex_managed_route=codex_managed_route,
             )
             if (
                 not failure.retryable
@@ -11487,6 +11501,7 @@ async def pass_through_request(  # noqa: PLR0915
                             event_pipeline=responses_event_pipeline,
                             request=request,
                             provider_bound_body=provider_bound_body,
+                            codex_managed_route=codex_managed_responses_route,
                         )
                         if pre_commit_failure is not None:
                             retired_response = raw_response
@@ -12055,6 +12070,7 @@ async def pass_through_request(  # noqa: PLR0915
                             event_pipeline=responses_event_pipeline,
                             request=request,
                             provider_bound_body=provider_bound_body,
+                            codex_managed_route=codex_managed_responses_route,
                         )
                         pre_commit_peeked = True
                         if pre_commit_failure is not None:
@@ -12148,7 +12164,8 @@ async def pass_through_request(  # noqa: PLR0915
                     await wait_for("upstream_body_read", response.aread())
                     pre_commit_failure = (
                         _classify_json_responses_precommit_failure(
-                            get_response_body(response)
+                            get_response_body(response),
+                            codex_managed_route=codex_managed_responses_route,
                         )
                     )
                     if pre_commit_failure is not None:
