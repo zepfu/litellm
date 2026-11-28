@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import time
@@ -22,8 +23,6 @@ _CODEX_AUTH_CODES = frozenset(
         "authentication_error",
         "authorization_error",
         "credential_rejected",
-        "credential_unavailable",
-        "auth_degraded",
     }
 )
 _CODEX_THROTTLE_CODES = frozenset({"rate_limit_error", "rate_limit_exceeded", "rate_limited", "too_many_requests"})
@@ -327,7 +326,17 @@ def _exception_status(exc: Any) -> int | None:
 
 def _exception_detail(exc: Any) -> Mapping[str, Any]:
     detail = getattr(exc, "detail", None)
-    return detail if isinstance(detail, Mapping) else {}
+    if isinstance(detail, Mapping):
+        return detail
+    if isinstance(detail, bytes):
+        detail = detail.decode("utf-8", errors="replace")
+    if isinstance(detail, str):
+        try:
+            parsed = json.loads(detail)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, Mapping) else {}
+    return {}
 
 
 def _error_mapping(detail: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -349,28 +358,37 @@ def _is_confirmed_quota(detail: Mapping[str, Any], failures: list[dict[str, Any]
 
 
 def _retry_after_seconds(exc: Any, *, now_epoch: float) -> int | None:
-    headers = getattr(exc, "headers", None)
-    if not isinstance(headers, Mapping):
-        return None
-    raw = next(
-        (value for key, value in headers.items() if str(key).lower() == "retry-after"),
-        None,
-    )
-    if raw is None:
-        return None
-    try:
-        seconds = float(str(raw).strip())
-    except ValueError:
+    response = getattr(exc, "response", None)
+    for headers in (
+        getattr(exc, "upstream_headers", None),
+        getattr(exc, "headers", None),
+        getattr(response, "headers", None),
+    ):
+        if not isinstance(headers, Mapping):
+            continue
+        raw = next(
+            (
+                value
+                for key, value in headers.items()
+                if str(key).lower() == "retry-after"
+            ),
+            None,
+        )
+        if raw is None:
+            continue
         try:
-            reset = parsedate_to_datetime(str(raw))
-        except (TypeError, ValueError, OverflowError):
-            return None
-        if reset.tzinfo is None:
-            reset = reset.replace(tzinfo=timezone.utc)  # noqa: UP017 - Python 3.9 compatibility
-        seconds = reset.timestamp() - now_epoch
-    if not math.isfinite(seconds) or seconds <= 0:
-        return None
-    return max(1, int(seconds))
+            seconds = float(str(raw).strip())
+        except (TypeError, ValueError):
+            try:
+                reset = parsedate_to_datetime(str(raw))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if reset.tzinfo is None:
+                reset = reset.replace(tzinfo=timezone.utc)  # noqa: UP017 - Python 3.9 compatibility
+            seconds = reset.timestamp() - now_epoch
+        if math.isfinite(seconds) and seconds > 0:
+            return max(1, int(seconds))
+    return None
 
 
 def codex_terminal_json_response(

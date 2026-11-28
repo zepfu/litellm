@@ -236,6 +236,73 @@ def test_codex_terminal_auth_and_throttle_shapes_are_actionable_and_reliable():
     assert "sign-in is required" in auth_body["error"]["message"]
     assert "private text" not in auth_response.body.decode("utf-8")
 
+    unavailable_response = codex_terminal_json_response(
+        HTTPException(
+            status_code=429,
+            detail={
+                "error": {
+                    "type": "rate_limit_error",
+                    "code": "aawm_codex_auto_agent_candidate_unavailable",
+                }
+            },
+        ),
+        account_failure_records=[
+            {
+                "provider": "openai",
+                "route_family": "codex_responses",
+                "aawm_selected_account_provider": "codex_oauth",
+                "error_class": "auth_degraded",
+            }
+        ],
+    )
+    assert unavailable_response is not None
+    assert unavailable_response.status_code == 503
+    unavailable_body = json.loads(unavailable_response.body)
+    assert unavailable_body["error"]["accounts"] == [
+        {"cause": "credential unavailable"}
+    ]
+    assert "OAuth credentials are unavailable" in unavailable_body["error"]["message"]
+    assert "sign-in is required" not in unavailable_body["error"]["message"]
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/openai_passthrough/v1/responses",
+            "raw_path": b"/openai_passthrough/v1/responses",
+            "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+            "client": ("127.0.0.1", 1234),
+            "server": ("testserver", 80),
+        }
+    )
+    request.state.aawm_codex_oauth_selected_account = {
+        "account_label": "selected-account",
+        "account_hash": "SECRET_SELECTED_HASH",
+        "lane_key": "codex-oauth:selected-account:SECRET_SELECTED_HASH",
+    }
+    selected_account_response = llm_passthrough_endpoints._codex_responses_terminal_response(
+        request=request,
+        endpoint="v1/responses",
+        exc=HTTPException(
+            status_code=429,
+            detail={
+                "error": {
+                    "type": "rate_limit_error",
+                    "code": "aawm_codex_auto_agent_candidate_unavailable",
+                }
+            },
+        ),
+        direct_codex=True,
+        codex_alias=False,
+    )
+    assert selected_account_response is not None
+    assert selected_account_response.status_code == 503
+    selected_wire = selected_account_response.body.decode("utf-8")
+    assert "selected-account" in selected_wire
+    assert "SECRET_SELECTED_HASH" not in selected_wire
+
     throttle_response = codex_terminal_json_response(
         HTTPException(
             status_code=429,
@@ -29727,6 +29794,182 @@ class TestOpenAIPassthroughRoute:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
+        "model", ["gpt-brand-new-unknown-xyz", "gpt-4.1"]
+    )
+    async def test_openai094_configured_non_codex_model_keeps_generic_terminal_shape(
+        self, monkeypatch, model
+    ):
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            codex_oauth,
+        )
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            openai_proxy_route,
+        )
+
+        monkeypatch.setenv(
+            "LITELLM_CODEX_OAUTH_INVENTORY",
+            '{"schema_version":1,"accounts":[]}',
+        )
+        body = {"model": model, "input": "hello"}
+        request = self._openai006_request()
+        request.scope["headers"] = [
+            (b"content-type", b"application/json"),
+            (b"originator", b"codex"),
+            (b"session_id", b"session-1"),
+        ]
+        selected = codex_oauth.CodexOAuthRequestAuth(
+            account_label="account1",
+            account_hash="hash-account-1",
+            lane_key="codex-oauth:account1:hash-account-1",
+            headers={"Authorization": "Bearer server-token-account1"},
+        )
+        selection = {
+            "candidate": {
+                "provider": "openai",
+                "model": model,
+                "route_family": "codex_responses",
+                "codex_oauth_account_label": "account1",
+            },
+            "request_mode": "fresh",
+        }
+        provider_error = HTTPException(
+            status_code=429,
+            detail={
+                "error": {
+                    "type": "usage_limit_reached",
+                    "code": "usage_limit_reached",
+                },
+                "failover_disposition": "usage_limit_reached",
+            },
+        )
+        provider_error.attempted_provider_call = True
+        provider_error._aawm_provider_returned = True
+
+        async def _fake_base(**_kwargs):
+            raise provider_error
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_alias_model",
+            return_value=None,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_oa_xai_request_body",
+            return_value=False,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_grok_native_oauth_request_body",
+            return_value=False,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth.select_and_bind_direct_codex_oauth_inventory",
+            new=AsyncMock(return_value=(selected, selection, body)),
+        ) as mock_bind, patch.object(
+            llm_passthrough_endpoints.BaseOpenAIPassThroughHandler,
+            "_base_openai_pass_through_handler",
+            new=_fake_base,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._retry_direct_codex_oauth_after_account_failure",
+            new=AsyncMock(return_value=None),
+        ) as mock_retry, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._aawm_dev_fault_plan.note_direct_openai_managed_terminal_exhaustion"
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await openai_proxy_route(
+                    endpoint="v1/responses",
+                    request=request,
+                    fastapi_response=Response(),
+                    user_api_key_dict=object(),  # type: ignore[arg-type]
+                )
+
+        assert exc_info.value is provider_error
+        assert exc_info.value.status_code == 429
+        mock_bind.assert_awaited_once()
+        mock_retry.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_openai094_direct_throttle_preserves_transport_retry_after(
+        self, monkeypatch
+    ):
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            codex_oauth,
+        )
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            openai_proxy_route,
+        )
+
+        monkeypatch.setenv(
+            "LITELLM_CODEX_OAUTH_INVENTORY",
+            '{"schema_version":1,"accounts":[]}',
+        )
+        body = {"model": "gpt-5.6-sol", "input": "hello"}
+        request = self._openai006_request()
+        selected = codex_oauth.CodexOAuthRequestAuth(
+            account_label="account1",
+            account_hash="hash-account-1",
+            lane_key="codex-oauth:account1:hash-account-1",
+            headers={"Authorization": "Bearer account1"},
+        )
+        selection = {
+            "candidate": {
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+                "route_family": "codex_responses",
+                "codex_oauth_account_label": "account1",
+                "codex_oauth_account_hash": "hash-account-1",
+                "codex_oauth_lane_key": "codex-oauth:account1:hash-account-1",
+            },
+            "request_mode": "fresh",
+        }
+        throttle_error = ProxyException(
+            message="upstream returned HTTP 429",
+            type="None",
+            param=None,
+            code=429,
+        )
+        throttle_error.detail = (
+            b'{"error":{"type":"rate_limit_error",'
+            b'"code":"rate_limit_exceeded",'
+            b'"message":"private upstream throttle text"}}'
+        )
+        throttle_error.upstream_headers = {"Retry-After": "17"}
+        throttle_error.attempted_provider_call = True
+        throttle_error._aawm_provider_returned = True
+
+        async def _raise_throttle(**_kwargs):
+            raise throttle_error
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth.select_and_bind_direct_codex_oauth_inventory",
+            new=AsyncMock(return_value=(selected, selection, body)),
+        ), patch.object(
+            llm_passthrough_endpoints.BaseOpenAIPassThroughHandler,
+            "_base_openai_pass_through_handler",
+            new=_raise_throttle,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._retry_direct_codex_oauth_after_account_failure",
+            new=AsyncMock(return_value=None),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._aawm_dev_fault_plan.note_direct_openai_managed_terminal_exhaustion"
+        ):
+            response = await openai_proxy_route(
+                endpoint="v1/responses",
+                request=request,
+                fastapi_response=Response(),
+                user_api_key_dict=object(),  # type: ignore[arg-type]
+            )
+
+        assert response.status_code == 429
+        assert response.headers["Retry-After"] == "17"
+        assert "rate_limit_exceeded" in response.body.decode("utf-8")
+        assert "private upstream throttle text" not in response.body.decode(
+            "utf-8"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
         "provider_returned",
         [True, False],
         ids=["marked-provider", "unmarked-local"],
@@ -30302,13 +30545,17 @@ class TestOpenAIPassthroughRoute:
         for provider_exc in (first_exc, second_exc, terminal_exc):
             provider_exc.attempted_provider_call = True
             provider_exc._aawm_provider_returned = True
-        no_candidate_exc = HTTPException(
+        exhausted_selection_exc = HTTPException(
             status_code=429,
             detail={
                 "error": {
-                    "code": "aawm_codex_oauth_direct_inventory_unavailable",
-                    "message": "all accounts exhausted",
-                }
+                    "type": "usage_limit_reached",
+                    "code": "usage_limit_reached",
+                },
+                "failover_disposition": "usage_limit_reached",
+                "terminal_reset": {
+                    "resets_at": int(time.time()) + 1200,
+                },
             },
         )
 
@@ -30346,7 +30593,7 @@ class TestOpenAIPassthroughRoute:
             return_value=False,
         ), patch(
             "litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth.select_and_bind_direct_codex_oauth_inventory",
-            new=AsyncMock(side_effect=[*bindings, no_candidate_exc]),
+            new=AsyncMock(side_effect=[*bindings, exhausted_selection_exc]),
         ) as mock_bind, patch.object(
             llm_passthrough_endpoints.BaseOpenAIPassThroughHandler,
             "_base_openai_pass_through_handler",
@@ -30491,7 +30738,7 @@ class TestOpenAIPassthroughRoute:
             return_value="basic",
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._should_use_direct_codex_oauth_inventory",
-            return_value=False,
+            return_value=True,
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_oa_xai_request_body",
             return_value=False,

@@ -166,9 +166,9 @@ def test_chatgpt_codex_quota_terminal_shape_uses_stock_codes_and_verified_reset(
             "error": {
                 "type": "usage_limit_reached",
                 "message": "sensitive upstream account text",
-                "resets_at": reset_at,
                 "plan_type": "private-plan-detail",
-            }
+            },
+            "quota": {"resets_at": reset_at},
         },
     )
 
@@ -177,7 +177,8 @@ def test_chatgpt_codex_quota_terminal_shape_uses_stock_codes_and_verified_reset(
     assert retry_after == reset_at - int(now_epoch)
     assert detail["error"]["type"] == "usage_limit_reached"
     assert detail["error"]["code"] == "usage_limit_reached"
-    assert detail["error"]["resets_at"] == reset_at
+    assert detail["terminal_reset"]["resets_at"] == reset_at
+    assert "resets_at" not in detail["error"]
     assert detail["failover_disposition"] == "usage_limit_reached"
     assert "sensitive upstream account text" not in json.dumps(detail)
     assert "private-plan-detail" not in json.dumps(detail)
@@ -187,13 +188,13 @@ def test_chatgpt_codex_quota_terminal_shape_uses_stock_codes_and_verified_reset(
         upstream_payload={
             "error": {
                 "type": "usage_limit_reached",
-                "resets_at": int(now_epoch) - 30,
-            }
+            },
+            "quota": {"resets_at": int(now_epoch) - 30},
         },
     )
     assert expired is not None
     expired_detail, expired_retry_after = expired
-    assert "resets_at" not in expired_detail["error"]
+    assert "terminal_reset" not in expired_detail
     assert expired_retry_after is None
 
 

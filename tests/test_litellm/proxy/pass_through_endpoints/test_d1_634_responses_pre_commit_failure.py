@@ -1730,10 +1730,38 @@ def test_pre_commit_failure_http_exception_is_503_with_retry_after():
 
 
 def test_provider_quota_pre_commit_http_exception_is_failover_bound():
+    reset_at = int(time.time()) + 900
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
         is_direct_codex_usage_limit_error,
     )
 
+    failure = PassThroughStreamingHandler._build_responses_pre_commit_failure(
+        error_payload={
+            "error": {
+                "type": "rate_limit_error",
+                "code": "insufficient_quota",
+                "message": "sensitive upstream quota details",
+            },
+            "quota": {"resets_at": reset_at},
+        },
+        event_type="error",
+    )
+
+    assert failure.error_code == "usage_limit_reached"
+    assert failure.error_type == "usage_limit_reached"
+    assert failure.message == "The managed Codex account usage limit has been reached."
+
+    http_exc = failure.as_http_exception()
+
+    assert http_exc.status_code == 429
+    assert http_exc.detail["error"]["code"] == "usage_limit_reached"
+    assert http_exc.detail["terminal_reset"]["resets_at"] == reset_at
+    assert 1 <= int(http_exc.headers["Retry-After"]) <= 900
+    assert "sensitive upstream quota details" not in str(http_exc.detail)
+    assert is_direct_codex_usage_limit_error(http_exc) is True
+
+
+def test_provider_quota_pre_commit_failure_without_reset_has_no_reset_header():
     failure = ResponsesStreamPreCommitFailure(
         error_class="usage_limit_reached",
         classification="usage_limit_reached",
@@ -1748,7 +1776,89 @@ def test_provider_quota_pre_commit_http_exception_is_failover_bound():
 
     assert http_exc.status_code == 429
     assert http_exc.detail["failover_disposition"] == "usage_limit_reached"
-    assert is_direct_codex_usage_limit_error(http_exc) is True
+    assert http_exc.headers is None
+
+
+@pytest.mark.asyncio
+async def test_precommit_quota_reset_survives_proxy_exception_wrapper(monkeypatch):
+    import sys
+    from types import ModuleType
+
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+    from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+        pass_through_request,
+    )
+
+    reset_at = int(time.time()) + 900
+    failure = PassThroughStreamingHandler._build_responses_pre_commit_failure(
+        error_payload={
+            "error": {
+                "type": "rate_limit_error",
+                "code": "insufficient_quota",
+                "message": "private provider quota text",
+            },
+            "quota": {"resets_at": reset_at},
+        },
+        event_type="error",
+    )
+    http_exception = failure.as_http_exception()
+    body = {"model": "gpt-5.4", "input": "hello"}
+    request = _responses_request(body)
+    request.is_disconnected = AsyncMock(return_value=False)
+    logging_obj = MagicMock()
+    logging_obj.pre_call_hook = AsyncMock(return_value=body)
+    logging_obj.post_call_failure_hook = AsyncMock(return_value=None)
+    proxy_server_module = ModuleType("litellm.proxy.proxy_server")
+    proxy_server_module.proxy_logging_obj = logging_obj
+    proxy_server_module.general_settings = {}
+    monkeypatch.setitem(sys.modules, "litellm.proxy.proxy_server", proxy_server_module)
+
+    async def raise_precommit_failure(**_kwargs):
+        raise http_exception
+
+    monkeypatch.setattr(
+        pte,
+        "_execute_passthrough_pre_first_byte_with_hidden_retries",
+        raise_precommit_failure,
+    )
+    monkeypatch.setattr(
+        pte,
+        "_read_request_body",
+        AsyncMock(return_value=body),
+    )
+    monkeypatch.setattr(pte, "_aawm_session_owner_pre_send_guard", AsyncMock())
+    _stub_session_owner_lease(monkeypatch, sa)
+    monkeypatch.setattr(
+        pte,
+        "get_async_httpx_client",
+        lambda *_args, **_kwargs: SimpleNamespace(client=MagicMock()),
+    )
+    monkeypatch.setattr(
+        pte.ProxyBaseLLMRequestProcessing,
+        "get_custom_headers",
+        lambda *_args, **_kwargs: {},
+    )
+
+    with pytest.raises(ProxyException) as raised:
+        await pass_through_request(
+            request=request,
+            target="https://chatgpt.com/backend-api/codex/responses",
+            custom_headers={},
+            user_api_key_dict=MagicMock(),
+            custom_body=body,
+            custom_llm_provider="openai",
+            stream=False,
+        )
+
+    assert raised.value.detail["terminal_reset"]["resets_at"] == reset_at
+    assert raised.value.detail["error"]["message"] == (
+        "The managed Codex account usage limit has been reached."
+    )
+    assert "private provider quota text" not in str(raised.value.detail)
+    assert raised.value.upstream_headers["Retry-After"] in {"899", "900"}
 
 
 @pytest.mark.asyncio

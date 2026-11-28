@@ -293,7 +293,6 @@ from .streaming_handler import (
     _RESPONSES_TRANSIENT_STREAM_CLASSES,
 )
 from .aawm_adapter_runtime.codex_terminal_errors import (
-    codex_usage_limit_error,
     codex_verified_reset_at,
 )
 from .aawm_alias_routing.pre_commit_retry import (
@@ -1231,15 +1230,21 @@ def _build_chatgpt_codex_usage_limit_detail(
         return None
 
     now_epoch = time.time()
-    reset_at = codex_verified_reset_at(upstream_error, now_epoch=now_epoch)
+    reset_at = codex_verified_reset_at(upstream_payload, now_epoch=now_epoch)
     retry_after_seconds = (
         max(1, reset_at - int(now_epoch)) if reset_at is not None else None
     )
     structured_detail = {
-        "error": codex_usage_limit_error(upstream_error, now_epoch=now_epoch),
+        "error": {
+            "message": "The managed Codex account usage limit has been reached.",
+            "type": "usage_limit_reached",
+            "code": "usage_limit_reached",
+        },
         "retry_after_seconds": retry_after_seconds,
         "failover_disposition": "usage_limit_reached",
     }
+    if reset_at is not None:
+        structured_detail["terminal_reset"] = {"resets_at": reset_at}
     return structured_detail, retry_after_seconds
 
 

@@ -33,11 +33,6 @@ from litellm.llms.chatgpt.common_utils import (
     get_chatgpt_default_headers,
 )
 from litellm.proxy.common_utils.http_parsing_utils import _safe_get_request_headers
-from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_terminal_errors import (
-    codex_account_failure,
-    codex_usage_limit_error,
-    codex_verified_reset_at,
-)
 from litellm.utils import get_model_info
 from litellm.secret_managers.codex_oauth_inventory import (
     CodexOAuthCredentialRecord,
@@ -1804,6 +1799,10 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     machinery. Returns ``(selected_auth, selection_state, metadata_body)``.
     """
     from litellm.integrations.aawm_session_history.waits import get_request_wait_call_id
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_terminal_errors import (
+        codex_account_failure,
+        codex_verified_reset_at,
+    )
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_context import (
         _AUTO_AGENT_REQUEST_CALL_ID_STATE_KEY,
     )
@@ -2324,6 +2323,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
             failure_record = {
                 "provider": candidate.get("provider"),
                 "route_family": candidate.get("route_family"),
+                "aawm_selected_account_provider": "codex_oauth",
                 "account_label": candidate.get("codex_oauth_account_label"),
                 "reason": state.get("skip_reason"),
                 "error_class": state.get("error_class"),
@@ -2352,16 +2352,20 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
             & {"sign-in required", "credential unavailable", "account unavailable"}
         )
         if confirmed_quota_only:
-            quota_error = codex_usage_limit_error(terminal_reset or {})
+            reset_at = codex_verified_reset_at(terminal_reset or {})
             detail: dict[str, Any] = {
-                "error": quota_error,
+                "error": {
+                    "type": "usage_limit_reached",
+                    "code": "usage_limit_reached",
+                },
                 "failover_disposition": "usage_limit_reached",
                 "terminal_account_failures": terminal_account_failures,
                 "attempted_provider_call": False,
                 "provider_returned": False,
                 "failure_phase": "direct_inventory_selection",
             }
-            reset_at = codex_verified_reset_at(terminal_reset or {})
+            if reset_at is not None:
+                detail["terminal_reset"] = {"resets_at": reset_at}
             headers = (
                 {"Retry-After": str(max(1, reset_at - int(time.time())))}
                 if reset_at is not None

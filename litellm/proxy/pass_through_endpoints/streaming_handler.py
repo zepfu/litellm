@@ -6,6 +6,7 @@ import json
 import os
 import struct
 import tempfile
+import time
 import traceback
 from datetime import datetime, timezone
 from collections.abc import Mapping
@@ -72,6 +73,7 @@ from .llm_provider_handlers.vertex_passthrough_logging_handler import (
 from .aawm_alias_routing.audit_persist import _emit_aawm_terminal_error
 from .aawm_adapter_runtime.codex_terminal_errors import (
     codex_sse_usage_limit_error,
+    codex_verified_reset_at,
     is_chatgpt_codex_responses_upstream,
 )
 from .aawm_adapter_runtime.deferred_success import DeferredPassthroughSuccess
@@ -265,6 +267,10 @@ class ResponsesStreamPreCommitFailure(Exception):
                 "retryable": retryable,
             }
         }
+        if self.error_class == "usage_limit_reached":
+            reset_at = codex_verified_reset_at(self.error_payload)
+            if reset_at is not None:
+                self.detail["terminal_reset"] = {"resets_at": reset_at}
         super().__init__(self.message)
 
     def as_http_exception(self):
@@ -279,7 +285,14 @@ class ResponsesStreamPreCommitFailure(Exception):
         else:
             status_code = fastapi_status.HTTP_502_BAD_GATEWAY
         headers = None
-        if self.retryable or self.pre_commit_retry_exhausted:
+        if (
+            self.retryable
+            or self.pre_commit_retry_exhausted
+            or (
+                self.error_class == "usage_limit_reached"
+                and isinstance(self.detail.get("terminal_reset"), dict)
+            )
+        ):
             retry_after = self.retry_after_seconds
             if retry_after is None or retry_after <= 0:
                 retry_after = RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS
@@ -2501,7 +2514,17 @@ class PassThroughStreamingHandler:
             error_type = extracted_type
         if extracted_message:
             sanitized_message = extracted_message
-        if error_class == "token_invalidated":
+        if error_class == "usage_limit_reached":
+            reset_at = codex_verified_reset_at(error_payload)
+            error_code = "usage_limit_reached"
+            error_type = "usage_limit_reached"
+            status_code = 429
+            sanitized_message = (
+                "The managed Codex account usage limit has been reached."
+            )
+            if reset_at is not None:
+                retry_after_seconds = max(1, reset_at - int(time.time()))
+        elif error_class == "token_invalidated":
             status_code = 401
         elif error_class == "openai_responses_unpersisted_item_not_found":
             status_code = 400

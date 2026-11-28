@@ -4208,7 +4208,10 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             in {status.HTTP_429_TOO_MANY_REQUESTS, status.HTTP_503_SERVICE_UNAVAILABLE}
             and isinstance(error, dict)
             and error.get("code")
-            == "aawm_codex_oauth_direct_inventory_unavailable"
+            in {
+                "aawm_codex_oauth_direct_inventory_unavailable",
+                "usage_limit_reached",
+            }
         ):
             retry_attempt_record["failover_decision"] = "terminal"
             retry_attempt_record["terminal_reason"] = (
@@ -6807,8 +6810,26 @@ async def openai_proxy_route(  # noqa: PLR0915
     direct_zai_coding_plan_request = direct_zai_coding_plan_model is not None and (
         use_direct_codex_oauth_inventory or _request_uses_codex_native_auth(request)
     )
-    if direct_zai_coding_plan_request:
+    if (
+        is_oa_xai_request
+        or is_grok_native_oauth_request
+        or is_codex_auto_agent_alias_request
+        or direct_zai_coding_plan_request
+    ):
         use_direct_codex_oauth_inventory = False
+    direct_codex_terminal_route = use_direct_codex_oauth_inventory and (
+        _aawm_codex_oauth._direct_codex_oauth_concrete_model_name(
+            request_body.get("model")
+        )
+        is not None
+        or (
+            _aawm_codex_oauth._clean_codex_auth_value(
+                request_body.get("model")
+            )
+            is None
+            and _request_uses_codex_native_auth(request)
+        )
+    )
     openai_api_key: Optional[str] = None
     forward_headers = False
     extra_headers: Optional[dict[str, str]] = None
@@ -6836,7 +6857,7 @@ async def openai_proxy_route(  # noqa: PLR0915
                 request=request,
                 endpoint=endpoint,
                 exc=exc,
-                direct_codex=True,
+                direct_codex=direct_codex_terminal_route,
                 codex_alias=False,
             )
             if terminal_response is not None:
@@ -7102,7 +7123,7 @@ async def openai_proxy_route(  # noqa: PLR0915
                     request=request,
                     endpoint=endpoint,
                     exc=exc,
-                    direct_codex=use_direct_codex_oauth_inventory,
+                    direct_codex=direct_codex_terminal_route,
                     codex_alias=is_codex_auto_agent_alias_request,
                     selection=direct_codex_selection_state,
                     error_class=direct_account_error_class,
@@ -7130,7 +7151,7 @@ async def openai_proxy_route(  # noqa: PLR0915
                     request=request,
                     endpoint=endpoint,
                     exc=exc,
-                    direct_codex=True,
+                    direct_codex=direct_codex_terminal_route,
                     codex_alias=is_codex_auto_agent_alias_request,
                     selection=direct_codex_selection_state,
                     error_class=direct_account_error_class,
@@ -7321,6 +7342,36 @@ def _codex_responses_terminal_response(
                 }
                 for item in prior_outcomes
                 if isinstance(item, dict)
+            )
+        selected_account = getattr(
+            request.state,
+            "aawm_codex_oauth_selected_account",
+            None,
+        )
+        exc_detail = getattr(exc, "detail", None)
+        exc_error = (
+            exc_detail.get("error")
+            if isinstance(exc_detail, dict)
+            else None
+        )
+        if (
+            isinstance(selected_account, dict)
+            and isinstance(exc_error, dict)
+            and exc_error.get("code")
+            == "aawm_codex_auto_agent_candidate_unavailable"
+        ):
+            account_records.append(
+                {
+                    "provider": "openai",
+                    "route_family": "codex_responses",
+                    "aawm_selected_account_provider": "codex_oauth",
+                    "account_label": selected_account.get("account_label"),
+                    "error_class": "credential_unavailable",
+                    "upstream_status_code": (
+                        getattr(exc, "status_code", None)
+                        or getattr(exc, "code", None)
+                    ),
+                }
             )
         candidate = selection.get("candidate") if isinstance(selection, dict) else None
         if isinstance(candidate, dict) and error_class:
