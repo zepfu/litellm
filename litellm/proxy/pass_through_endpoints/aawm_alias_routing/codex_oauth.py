@@ -617,11 +617,11 @@ def _load_locked_codex_oauth_headers_for_record_sync(
     request: Request,
     record: CodexOAuthCredentialRecord,
 ) -> CodexOAuthRequestAuth:
-    """Acquire the writer lock and read one credential without blocking async."""
+    """Read one credential under the shared advisory lock used with its writer."""
     from litellm.secret_managers.credential_file_lock import credential_file_lock
 
     _invalidate_codex_oauth_request_snapshot(request, record)
-    with credential_file_lock(record.lock_path):
+    with credential_file_lock(record.lock_path, shared=True):
         return _load_codex_oauth_headers_for_record_sync(request, record)
 
 

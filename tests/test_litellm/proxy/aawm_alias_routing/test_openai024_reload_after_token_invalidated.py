@@ -90,6 +90,7 @@ def deployed_credential(
 ) -> dict[str, Any]:
     auth_path = tmp_path / f"{_ACCOUNT_LABEL}.json"
     lock_path = tmp_path / f"{_ACCOUNT_LABEL}.lock"
+    lock_path.touch(mode=0o600)
     _write_auth(auth_path, expires_at=int(time.time()) + 3600)
     account_hash = codex_oauth_account_identity_hash(_ACCOUNT_ID)
     monkeypatch.setenv(
@@ -114,6 +115,7 @@ def deployed_credential(
     )
     return {
         "auth_path": auth_path,
+        "lock_path": lock_path,
         "account_hash": account_hash,
         "lane_key": codex_oauth._codex_oauth_account_lane_key(
             account_label=_ACCOUNT_LABEL, account_hash=account_hash
@@ -145,6 +147,7 @@ async def test_reload_returns_changed_credential(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from collections import OrderedDict
+    from litellm.secret_managers.credential_file_lock import credential_file_lock
 
     monkeypatch.setattr(codex_oauth_inventory, "_REJECTED_ACCESS_TOKENS", OrderedDict())
     request = _request()
@@ -161,14 +164,13 @@ async def test_reload_returns_changed_credential(
         expires_at=int(time.time()) + 7200,
     )
 
-    refreshed = (
-        await codex_oauth.reload_codex_oauth_credential_after_token_invalidated(
+    with credential_file_lock(deployed_credential["lock_path"], shared=True):
+        refreshed = await codex_oauth.reload_codex_oauth_credential_after_token_invalidated(
             request,
             account_label=_ACCOUNT_LABEL,
             expected_account_hash=deployed_credential["account_hash"],
             expected_lane_key=deployed_credential["lane_key"],
         )
-    )
 
     assert refreshed is not None
     assert refreshed.account_label == _ACCOUNT_LABEL

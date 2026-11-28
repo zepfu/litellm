@@ -20,12 +20,12 @@ except ImportError:  # pragma: no cover - non-POSIX
 
 
 class CredentialFileLockError(RuntimeError):
-    """Raised when exclusive credential-writer locking is unavailable."""
+    """Raised when credential locking is unavailable."""
 
 
 @contextmanager
-def credential_file_lock(lock_path: Optional[Path]) -> Iterator[None]:
-    """Exclusive advisory flock around credential read/write sections.
+def credential_file_lock(lock_path: Optional[Path], *, shared: bool = False) -> Iterator[None]:
+    """Take an exclusive writer lock or share an existing lock for a read.
 
     Acquisition is nonblocking and fail-closed. A competing writer or a
     platform without ``fcntl`` must not permit an unlocked credential write.
@@ -36,8 +36,9 @@ def credential_file_lock(lock_path: Optional[Path]) -> Iterator[None]:
 
     lock_path = Path(lock_path)
     try:
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        handle = lock_path.open("a+", encoding="utf-8")
+        if not shared:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("r" if shared else "a+", encoding="utf-8")
     except OSError as exc:
         raise CredentialFileLockError(
             "Credential file lock could not be opened."
@@ -54,7 +55,8 @@ def credential_file_lock(lock_path: Optional[Path]) -> Iterator[None]:
                 "Nonblocking credential file locking is unavailable."
             )
         try:
-            _fcntl.flock(handle.fileno(), _fcntl.LOCK_EX | lock_nonblocking)
+            lock_mode = _fcntl.LOCK_SH if shared else _fcntl.LOCK_EX
+            _fcntl.flock(handle.fileno(), lock_mode | lock_nonblocking)
             locked = True
         except BlockingIOError as exc:
             raise CredentialFileLockError(
