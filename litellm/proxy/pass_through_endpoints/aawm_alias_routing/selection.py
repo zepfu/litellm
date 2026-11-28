@@ -1577,7 +1577,17 @@ def _plan_codex_oauth_account_failover(
         and attempt_record.get("attempted_provider_call") is True
         and attempt_record.get("provider_returned") is True
     )
-    if not account_exhaustion_confirmed and not credential_rejected:
+    credential_rejected_before_dispatch = (
+        error_class == "token_invalidated"
+        and has_continuation_state
+        and account_failover_replay_safe
+        and selection.get("failure_phase") == "pre_dispatch_credential_rejected"
+        and attempt_record.get("admission_decision") == "credential_rejected"
+        and attempt_record.get("admission_account_hash") == account_hash
+        and attempt_record.get("attempted_provider_call") is False
+        and attempt_record.get("provider_returned") is False
+    )
+    if not (account_exhaustion_confirmed or credential_rejected or credential_rejected_before_dispatch):
         provider_capacity_rotation = (
             allow_provider_capacity_rotation
             and error_class
@@ -3545,7 +3555,10 @@ async def _hydrate_codex_oauth_quota_observations(
 async def _refresh_alpha_codex_paid_credit_evidence(
     request: Request, context: dict[str, Any]
 ) -> Optional[dict[str, Any]]:
-    from .codex_oauth import poll_alpha_codex_weekly_paid_credits
+    from .codex_oauth import (
+        codex_oauth_pre_dispatch_auth_failure_phase,
+        poll_alpha_codex_weekly_paid_credits,
+    )
 
     weekly = context["quota_evidence"]["weekly"]
     if (
@@ -3563,11 +3576,11 @@ async def _refresh_alpha_codex_paid_credit_evidence(
             account_label=candidate["codex_oauth_account_label"],
             account_hash=candidate["codex_oauth_account_hash"],
         )
-    except HTTPException:
+    except HTTPException as exc:
         context.update(
             auth_status="degraded",
             skip_reason="auth_degraded",
-            failure_phase="pre_dispatch_auth",
+            failure_phase=codex_oauth_pre_dispatch_auth_failure_phase(exc),
             attempted_provider_call=False,
         )
         return None
@@ -3704,6 +3717,7 @@ async def _resolve_codex_oauth_account_candidate_contexts(
         _validated_codex_account_display,
         _codex_oauth_account_lane_key,
         _load_codex_oauth_headers_for_record,
+        codex_oauth_pre_dispatch_auth_failure_phase,
     )
     from litellm.secret_managers.codex_oauth_inventory import (
         CodexOAuthInventoryError,
@@ -3822,12 +3836,12 @@ async def _resolve_codex_oauth_account_candidate_contexts(
                 request,
                 record,
             )
-        except HTTPException:
+        except HTTPException as exc:
             context.update(
                 {
                     "auth_status": "degraded",
                     "skip_reason": "auth_degraded",
-                    "failure_phase": "pre_dispatch_auth",
+                    "failure_phase": codex_oauth_pre_dispatch_auth_failure_phase(exc),
                     "attempted_provider_call": False,
                 }
             )

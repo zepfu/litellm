@@ -1007,6 +1007,10 @@ observing worker excludes that access token even if its expiry is in the
 future. A newer token for the same pinned identity is eligible immediately.
 Recovery may reload that account once, then use another account when replay
 is safe under the existing session ownership rules.
+A direct Responses continuation can also switch accounts when the owner
+account's token was already rejected before the generation request, provided
+the client carries replay-safe history and the inventory allows account
+interchange.
 
 The validated inventory exposes
 `codex_oauth_inventory_generation`: a full SHA-256 digest of its canonical

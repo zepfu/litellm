@@ -228,6 +228,16 @@ class CodexOAuthRequestAuth:
     account_display: str = CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY
 
 
+class KnownRejectedCodexOAuthCredential(HTTPException):
+    """The account identity matched, but OpenAI already rejected this token."""
+
+
+def codex_oauth_pre_dispatch_auth_failure_phase(error: HTTPException) -> str:
+    if isinstance(error, KnownRejectedCodexOAuthCredential):
+        return "pre_dispatch_credential_rejected"
+    return "pre_dispatch_auth"
+
+
 @dataclass(frozen=True)
 class CodexOAuthAffinityContinuation:
     """Request-local authenticated continuation state without the raw token."""
@@ -513,6 +523,27 @@ def _codex_oauth_credential_snapshot_is_valid(
     return time.time() < credential.expires_at - 60
 
 
+def _validate_codex_oauth_request_credential(
+    credential: CodexOAuthCredentialSnapshot,
+) -> None:
+    if _codex_oauth_credential_snapshot_is_valid(credential):
+        return
+    error = (
+        KnownRejectedCodexOAuthCredential
+        if codex_oauth_access_token_rejected(credential.access_token)
+        else HTTPException
+    )
+    raise error(
+        status_code=500,
+        detail=(
+            f"Codex OAuth credential '{credential.record.label}' "
+            f"(account_hash={credential.account_hash}) is expired or invalid. "
+            "The provider-status sidecar owns Codex auth refresh; confirm the "
+            "configured account can be refreshed."
+        ),
+    )
+
+
 async def _load_codex_oauth_headers_for_record(
     request: Request,
     record: CodexOAuthCredentialRecord,
@@ -530,17 +561,7 @@ async def _load_codex_oauth_headers_for_record(
             snapshots[snapshot_key] = exc
             raise HTTPException(status_code=500, detail=str(exc)) from None
         snapshots[snapshot_key] = credential
-    if not _codex_oauth_credential_snapshot_is_valid(credential):
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                f"Codex OAuth credential '{record.label}' "
-                f"(account_hash={credential.account_hash}) is expired or "
-                "invalid. The "
-                "provider-status sidecar owns Codex auth refresh; confirm the "
-                "configured account can be refreshed."
-            ),
-        )
+    _validate_codex_oauth_request_credential(credential)
 
     headers = _safe_get_request_headers(request)
     assert _get_request_header_or_passthrough_alias is not None
@@ -583,17 +604,7 @@ def _load_codex_oauth_headers_for_record_sync(
             snapshots[snapshot_key] = exc
             raise HTTPException(status_code=500, detail=str(exc)) from None
         snapshots[snapshot_key] = credential
-    if not _codex_oauth_credential_snapshot_is_valid(credential):
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                f"Codex OAuth credential '{record.label}' "
-                f"(account_hash={credential.account_hash}) is expired or "
-                "invalid. The "
-                "provider-status sidecar owns Codex auth refresh; confirm the "
-                "configured account can be refreshed."
-            ),
-        )
+    _validate_codex_oauth_request_credential(credential)
 
     headers = _safe_get_request_headers(request)
     assert _get_request_header_or_passthrough_alias is not None
@@ -684,7 +695,9 @@ async def poll_alpha_codex_weekly_paid_credits(
                 error = rejection.get("error") if isinstance(rejection, Mapping) else None
                 if isinstance(error, Mapping) and error.get("code") in CODEX_OAUTH_REJECTION_CODES:
                     record_codex_oauth_rejection(fingerprint)
-                    raise HTTPException(status_code=401, detail="Codex usage rejected the selected credential.")
+                    raise KnownRejectedCodexOAuthCredential(
+                        status_code=401, detail="Codex usage rejected the selected credential."
+                    )
         except (httpx.HTTPError, asyncio.TimeoutError, ValueError):
             pass
         _alpha_codex_usage_cache.set_cache(
@@ -1746,12 +1759,12 @@ async def _resolve_model_less_direct_codex_oauth_contexts(
         }
         try:
             loaded = await _load_codex_oauth_headers_for_record(request, record)
-        except HTTPException:
+        except HTTPException as exc:
             context.update(
                 {
                     "auth_status": "degraded",
                     "skip_reason": "auth_degraded",
-                    "failure_phase": "pre_dispatch_auth",
+                    "failure_phase": codex_oauth_pre_dispatch_auth_failure_phase(exc),
                     "attempted_provider_call": False,
                 }
             )
@@ -2150,6 +2163,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                     state
                     for state in selection_states
                     if state.get("skip_reason") == "quota_exhausted"
+                    or state.get("failure_phase") == "pre_dispatch_credential_rejected"
                 ),
                 None,
             )
@@ -2162,28 +2176,29 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
         if replay_safe_preselection_failover:
             pinned_candidate = pinned_state.get("candidate")
             if isinstance(pinned_candidate, dict):
+                rejected_credential = pinned_state.get("failure_phase") == "pre_dispatch_credential_rejected"
                 attempt_record = {
                     "failure_phase": "direct_inventory_selection",
                     "attempted_provider_call": False,
                     "provider_returned": False,
-                    "admission_decision": "confirmed_exhausted",
+                    "admission_decision": "credential_rejected" if rejected_credential else "confirmed_exhausted",
                     "admission_account_hash": pinned_candidate.get(
                         "codex_oauth_account_hash"
                     ),
                     "quota_windows": pinned_state.get("quota_exhausted_windows"),
-                    "error_code": "quota_exhausted",
+                    "error_code": "credential_previously_rejected" if rejected_credential else "quota_exhausted",
                 }
                 planned = _selection._plan_codex_oauth_account_failover(
                     request,
                     candidate=pinned_candidate,
                     selection=pinned_state,
                     attempt_record=attempt_record,
-                    error_class="usage_limit_reached",
+                    error_class="token_invalidated" if rejected_credential else "usage_limit_reached",
                     has_continuation_state=True,
                     has_previous_response_id=bool(body.get("previous_response_id")),
                     has_account_bound_state=has_account_bound_state,
                     account_failover_replay_safe=True,
-                    provider_status_code=429,
+                    provider_status_code=None if rejected_credential else 429,
                 )
                 if planned:
                     setattr(

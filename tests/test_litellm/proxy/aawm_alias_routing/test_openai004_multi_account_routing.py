@@ -3975,8 +3975,12 @@ async def test_direct_responses_fails_closed_when_interchangeable_session_owner_
 
 
 @pytest.mark.asyncio
-async def test_direct_responses_moves_replay_safe_interchangeable_owner_after_quota_exhaustion(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("local_reason", "provider_bound"),
+    [("quota_exhausted", False), ("credential_rejected", False), ("credential_rejected", True)],
+)
+async def test_direct_responses_moves_only_replay_safe_owner_after_confirmed_local_rejection(
+    monkeypatch: pytest.MonkeyPatch, local_reason: str, provider_bound: bool,
 ) -> None:
     loaded = _patch_direct_inventory_auth(
         monkeypatch,
@@ -3985,8 +3989,21 @@ async def test_direct_responses_moves_replay_safe_interchangeable_owner_after_qu
     request = _direct_request()
     body = {
         "model": "gpt-5.3-codex",
-        "input": "continue",
+        "input": [{"type": "function_call_output", "call_id": "call_probe", "output": "Recorded."}],
     }
+    if provider_bound:
+        body["previous_response_id"] = "resp_bound"
+
+    if local_reason == "credential_rejected":
+        load_auth = codex_oauth._load_codex_oauth_headers_for_record
+
+        async def _load_for_account(req, record):
+            if record.label == "account2":
+                loaded.append(record.label)
+                raise codex_oauth.KnownRejectedCodexOAuthCredential(status_code=500)
+            return await load_auth(req, record)
+
+        monkeypatch.setattr(codex_oauth, "_load_codex_oauth_headers_for_record", _load_for_account)
 
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
         session_affinity as sa,
@@ -4011,8 +4028,8 @@ async def test_direct_responses_moves_replay_safe_interchangeable_owner_after_qu
                 reset_at=now + timedelta(hours=2),
                 quota_period="five_hour",
                 window_minutes=300,
-                exhausted=True,
-                remaining_pct=0.0,
+                exhausted=local_reason == "quota_exhausted",
+                remaining_pct=0.0 if local_reason == "quota_exhausted" else 50.0,
             ),
             _quota_observation(
                 account_hash="hash-account-1",
@@ -4026,6 +4043,13 @@ async def test_direct_responses_moves_replay_safe_interchangeable_owner_after_qu
         ]
     )
     try:
+        if provider_bound:
+            with pytest.raises(HTTPException) as blocked:
+                await codex_oauth.select_and_bind_direct_codex_oauth_inventory(request, request_body=body)
+            assert blocked.value.status_code == 503
+            assert blocked.value.detail["alternate_accounts_considered"] is False
+            assert set(loaded) == {"account2"}
+            return
         selected_auth, selection, _metadata_body = (
             await codex_oauth.select_and_bind_direct_codex_oauth_inventory(
                 request,
@@ -4039,6 +4063,8 @@ async def test_direct_responses_moves_replay_safe_interchangeable_owner_after_qu
     assert selection["selection_reason"] == "codex_oauth_account_failover"
     assert selection["failover_ordinal"] == 1
     assert selection["prior_account_outcome"]["account_label"] == "account2"
+    assert selection["prior_account_outcome"]["failure_origin"] == "local_admission"
+    assert selection["prior_account_outcome"]["provider_returned"] is False
     assert set(loaded) == {"account1", "account2"}
     pending = getattr(
         request.state,
