@@ -3667,6 +3667,7 @@ class PassThroughStreamingHandler:
                 capture_diagnostics=capture_diagnostics,
             )
             responses_terminal_seen = False
+            responses_terminal_emitted = False
             responses_substantive_seen = False
             failure_evidence_captured = False
             held_responses_done_suffix = b""
@@ -3825,6 +3826,13 @@ class PassThroughStreamingHandler:
                 downstream_byte_count += len(chunk)
                 _mark_first_emitted_chunk()
 
+            def _mark_responses_terminal_emitted(
+                events: List[ParsedResponsesEvent],
+            ) -> None:
+                nonlocal responses_terminal_emitted
+                if any(event.event_type in PassThroughStreamingHandler._RESPONSES_TERMINAL_EVENTS for event in events):
+                    responses_terminal_emitted = True
+
             def _consume_responses_event(
                 parsed_event: ParsedResponsesEvent,
             ) -> Optional[ResponsesStreamPreCommitFailure]:
@@ -3929,6 +3937,17 @@ class PassThroughStreamingHandler:
                         recovery_failure = candidate_failure
                         break
                     if parsed_event.forward_event is None:
+                        continue
+                    if (
+                        responses_terminal_emitted
+                        or any(
+                            event.event_type in PassThroughStreamingHandler._RESPONSES_TERMINAL_EVENTS
+                            for event in delivered_events
+                        )
+                    ) and not parsed_event.is_done_marker:
+                        # Once the public stream has a terminal, later provider
+                        # frames are audit input only. A trailing error frame can
+                        # otherwise produce a second synthetic response.failed.
                         continue
                     if eof and (
                         not parsed_event.separator or parsed_event.is_malformed
@@ -4152,9 +4171,20 @@ class PassThroughStreamingHandler:
 
             def _build_postcommit_responses_failure_terminal(
                 failure: ResponsesStreamPreCommitFailure,
+                *,
+                terminal_already_forwarded: bool = False,
             ) -> List[bytes]:
                 nonlocal held_responses_done_suffix
                 nonlocal responses_sse_event_buffer, responses_terminal_seen
+                if terminal_already_forwarded:
+                    # The source terminal already owns public and accounting
+                    # state. Ignore trailing errors and only complete the frame.
+                    responses_sse_event_buffer = b""
+                    responses_terminal_seen = True
+                    _mark_responses_terminal_pending()
+                    if held_responses_done_suffix:
+                        return []
+                    return [b"data: [DONE]\n\n"]
                 failure_context = _build_postcommit_responses_failure_context(
                     failure
                 )
@@ -4164,9 +4194,9 @@ class PassThroughStreamingHandler:
                 metadata.update(failure_context)
                 metadata["aawm_stream_interrupted"] = True
                 metadata["aawm_route_rollup_turn_suppressed"] = True
-                held_responses_done_suffix = b""
                 responses_sse_event_buffer = b""
                 responses_terminal_seen = True
+                held_responses_done_suffix = b""
                 terminal_chunks, _terminal_payload = (
                     PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
                         endpoint_type=endpoint_type,
@@ -4440,10 +4470,14 @@ class PassThroughStreamingHandler:
                             and bool(complete_chunk)
                         )
                     ):
+                        terminal_already_forwarded = responses_terminal_emitted or any(
+                            event.event_type in PassThroughStreamingHandler._RESPONSES_TERMINAL_EVENTS
+                            for event in delivered_events
+                        )
                         complete_chunk = _split_and_hold_responses_done(
                             complete_chunk,
                             delivered_events,
-                            drop_done=True,
+                            drop_done=not terminal_already_forwarded,
                         )
                         if complete_chunk:
                             _record_responses_wire_chunk(complete_chunk)
@@ -4451,11 +4485,11 @@ class PassThroughStreamingHandler:
                                 first_downstream=first_emitted_at is not None
                                 and downstream_chunk_count == 1
                             )
+                            _mark_responses_terminal_emitted(delivered_events)
                             yield complete_chunk
-                        terminal_chunks = (
-                            _build_postcommit_responses_failure_terminal(
-                                recovery_failure
-                            )
+                        terminal_chunks = _build_postcommit_responses_failure_terminal(
+                            recovery_failure,
+                            terminal_already_forwarded=terminal_already_forwarded,
                         )
                         for terminal_chunk in terminal_chunks:
                             _record_responses_wire_chunk(terminal_chunk)
@@ -4517,6 +4551,7 @@ class PassThroughStreamingHandler:
                                 first_downstream=first_emitted_at is not None
                                 and downstream_chunk_count == 1
                             )
+                            _mark_responses_terminal_emitted(delivered_events)
                             yield complete_chunk
                         terminal_chunks, _terminal_payload = (
                             PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
@@ -4551,6 +4586,7 @@ class PassThroughStreamingHandler:
                             and downstream_chunk_count == 1
                         )
                         _mark_responses_terminal_pending()
+                        _mark_responses_terminal_emitted(delivered_events)
                         yield complete_chunk
                         if held_responses_done_suffix:
                             _record_responses_wire_chunk(held_responses_done_suffix)
@@ -4567,6 +4603,7 @@ class PassThroughStreamingHandler:
                         first_downstream=first_emitted_at is not None
                         and downstream_chunk_count == 1
                     )
+                    _mark_responses_terminal_emitted(delivered_events)
                     yield complete_chunk
                     continue
 
@@ -4669,10 +4706,14 @@ class PassThroughStreamingHandler:
                         and bool(eof_chunk)
                     )
                 ):
+                    terminal_already_forwarded = responses_terminal_emitted or any(
+                        event.event_type in PassThroughStreamingHandler._RESPONSES_TERMINAL_EVENTS
+                        for event in eof_delivered_events
+                    )
                     eof_chunk = _split_and_hold_responses_done(
                         eof_chunk,
                         eof_delivered_events,
-                        drop_done=True,
+                        drop_done=not terminal_already_forwarded,
                     )
                     if eof_chunk:
                         _record_responses_wire_chunk(eof_chunk)
@@ -4680,11 +4721,11 @@ class PassThroughStreamingHandler:
                             first_downstream=first_emitted_at is not None
                             and downstream_chunk_count == 1
                         )
+                        _mark_responses_terminal_emitted(eof_delivered_events)
                         yield eof_chunk
-                    terminal_chunks = (
-                        _build_postcommit_responses_failure_terminal(
-                            eof_recovery_failure
-                        )
+                    terminal_chunks = _build_postcommit_responses_failure_terminal(
+                        eof_recovery_failure,
+                        terminal_already_forwarded=terminal_already_forwarded,
                     )
                 elif _is_unemitted_capacity_failure(
                     eof_recovery_failure, eof_chunk
@@ -4703,6 +4744,7 @@ class PassThroughStreamingHandler:
                             first_downstream=first_emitted_at is not None
                             and downstream_chunk_count == 1
                         )
+                        _mark_responses_terminal_emitted(eof_delivered_events)
                         yield eof_chunk
                     synthetic_terminal = _classify_responses_tracking()
                     if synthetic_terminal is not None:

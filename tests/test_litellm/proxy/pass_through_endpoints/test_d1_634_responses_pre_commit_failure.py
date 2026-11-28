@@ -1484,14 +1484,12 @@ async def test_chunk_processor_terminalizes_committed_capacity_error_once():
     )
     assert b'"code":"server_overloaded"' in rendered
     assert b'"delta":"visible"' in rendered
-    assert success_handler_kwargs["litellm_params"]["metadata"]["error_class"] == (
-        "server_overloaded"
-    )
+    assert success_handler_kwargs["litellm_params"]["metadata"]["error_class"] == ("server_overloaded")
     finalized.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_chunk_processor_sanitizes_started_codex_quota_terminal_once():
+async def test_chunk_processor_sanitizes_and_deduplicates_started_codex_quota_terminal():
     reset_at = int(time.time()) + 1800
     response = _FakeUpstreamStream(
         [
@@ -1530,6 +1528,17 @@ async def test_chunk_processor_sanitizes_started_codex_quota_terminal_once():
                         },
                     },
                 },
+            )
+            + _sse(
+                "error",
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "server_error",
+                        "code": "server_overloaded",
+                        "message": "sensitive trailing provider details",
+                    },
+                },
             ),
         ]
     )
@@ -1566,12 +1575,15 @@ async def test_chunk_processor_sanitizes_started_codex_quota_terminal_once():
 
     rendered = b"".join(bytes(chunk) for chunk in emitted)
     assert rendered.count(b"event: response.failed") == 1
+    assert rendered.count(b"data: [DONE]") == 1
     assert b"sensitive upstream account response" not in rendered
-    assert b'"type":"usage_limit_reached"' in rendered
-    assert b'"code":"usage_limit_reached"' in rendered
+    assert b"sensitive trailing provider details" not in rendered
+    assert b'"type":"insufficient_quota"' in rendered
+    assert b'"code":"insufficient_quota"' in rendered
     assert f'"resets_at":{reset_at}'.encode() in rendered
     assert b"quota window resets at" in rendered
     assert b"already visible" in rendered
+    assert b'"code":"server_overloaded"' not in rendered
     finalize.assert_called_once()
 
 

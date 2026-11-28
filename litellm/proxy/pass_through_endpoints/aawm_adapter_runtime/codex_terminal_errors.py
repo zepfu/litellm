@@ -155,12 +155,15 @@ def codex_sse_usage_limit_error(
     *,
     now_epoch: float | None = None,
 ) -> dict[str, Any] | None:
-    """Sanitize an explicit Codex quota event and add human-readable reset guidance."""
+    """Sanitize an explicit Codex SSE quota event for stock-client retry handling."""
     code = str(error.get("code") or "").strip().lower()
     error_type = str(error.get("type") or "").strip().lower()
     if code not in _CODEX_QUOTA_CODES and error_type not in _CODEX_QUOTA_CODES:
         return None
-    return codex_usage_limit_error(error, now_epoch=now_epoch)
+    sanitized = codex_usage_limit_error(error, now_epoch=now_epoch)
+    sanitized["type"] = "insufficient_quota"
+    sanitized["code"] = "insufficient_quota"
+    return sanitized
 
 
 def _safe_label(value: Any) -> str | None:
