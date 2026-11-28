@@ -9095,6 +9095,63 @@ def test_codex_live_overall_weekly_window_prefers_singular_rate_limit() -> None:
     assert rows[0]["raw_provider_fields"]["reset_at"] == "2026-08-15T12:00:00Z"
 
 
+@pytest.mark.parametrize("spend_blocked", [False, True])
+def test_codex_weekly_admission_consumes_polled_paid_credit_state(spend_blocked, monkeypatch) -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import admission, selection
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import AliasRoutingStateManager
+
+    config = _codex_reset_credit_poll_config(apply=False)
+    record = config.codex_oauth_inventory.records[0]
+    now = datetime.now(timezone.utc)
+    reset = now + timedelta(days=1)
+    rows, _ = loop._build_codex_quota_rate_limit_observations(
+        config,
+        record=record,
+        observed_at=now,
+        response_body={
+            "rate_limit": {
+                "allowed": False,
+                "primary_window": {
+                    "used_percent": 100,
+                    "limit_window_seconds": 604800,
+                    "reset_at": int(reset.timestamp()),
+                },
+            },
+            "credits": {
+                "has_credits": True,
+                "unlimited": False,
+                "balance": "28975.8714965000",
+                "overage_limit_reached": False,
+            },
+            "spend_control": {"reached": spend_blocked, "individual_limit": None},
+        },
+    )
+    observation = selection._codex_oauth_quota_observation_from_row(
+        {**rows[0], "expected_reset_at": reset}
+    )
+    manager = AliasRoutingStateManager()
+    manager.record_normalized_quota_observations([observation])
+    context = {
+        "candidate": {
+            "provider": "openai",
+            "model": "gpt-6.2-sol",
+            "codex_oauth_account_label": record.label,
+            "codex_oauth_account_hash": record.expected_account_hash,
+        }
+    }
+    monkeypatch.setattr(selection, "alias_routing_state", manager)
+    selection._capture_codex_oauth_quota_evidence([context])
+    admitted = selection._attach_normalized_quota_state(
+        {**context, "codex_oauth_quota_evidence": context["quota_evidence"]}
+    )
+    assert admitted["quota_remaining_pct"] == 0
+    assert admitted.get("skip_reason") == ("quota_exhausted" if spend_blocked else None)
+    lane_observation = admission.resolve_lane_quota_observation(
+        candidate=context["candidate"], selection=admitted, state_manager=manager
+    )
+    assert bool(admission._select_confirmed_exhaustion_observation(lane_observation)) is spend_blocked
+
+
 def test_codex_live_spark_windows_keep_durable_family_identity() -> None:
     config = _codex_reset_credit_poll_config(apply=False)
     record = config.codex_oauth_inventory.records[0]

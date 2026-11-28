@@ -210,11 +210,17 @@ class CapacityRecoveryOwner:
                 self.last_decision = prior_decision
                 return prior_decision
         capacity = self._is_capacity(observation)
+        credential_rejected = (
+            observation.provider_returned is True
+            and observation.status_code == 401
+            and observation.error_class == "token_invalidated"
+            and observation.retryable
+        )
         veto = self._wire_veto(observation)
         if (
             veto == "provider_execution_possible"
             and observation.provider_returned is True
-            and capacity
+            and (capacity or credential_rejected)
         ):
             # Dispatch capability is provisional until the provider either
             # rejects the request or emits an effect-bearing event.
@@ -232,7 +238,9 @@ class CapacityRecoveryOwner:
             action, reason = CapacityRecoveryAction.REPLAY_VETO, "provider_outcome_unknown"
         elif not observation.ledger_valid:
             action, reason = CapacityRecoveryAction.REPLAY_VETO, "invalid_ledger"
-        elif observation.continuation and not observation.portable_account_failover:
+        elif observation.continuation and not (
+            observation.portable_account_failover or credential_rejected
+        ):
             action, reason = CapacityRecoveryAction.REPLAY_VETO, "continuation_replay_forbidden"
         elif veto is not None:
             action, reason = CapacityRecoveryAction.REPLAY_VETO, f"wire_{veto}"

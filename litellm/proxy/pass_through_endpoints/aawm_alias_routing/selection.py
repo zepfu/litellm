@@ -1571,7 +1571,13 @@ def _plan_codex_oauth_account_failover(
         error_class=error_class,
         provider_status_code=provider_status_code,
     )
-    if not account_exhaustion_confirmed:
+    credential_rejected = (
+        error_class == "token_invalidated"
+        and provider_status_code == 401
+        and attempt_record.get("attempted_provider_call") is True
+        and attempt_record.get("provider_returned") is True
+    )
+    if not account_exhaustion_confirmed and not credential_rejected:
         provider_capacity_rotation = (
             allow_provider_capacity_rotation
             and error_class
@@ -1606,6 +1612,18 @@ def _plan_codex_oauth_account_failover(
         "outcome": error_class,
         "failure_phase": attempt_record.get("failure_phase"),
         "attempted_provider_call": attempt_record.get("attempted_provider_call"),
+        "failure_origin": (
+            "local_admission"
+            if attempt_record.get("attempted_provider_call") is False
+            else "upstream"
+            if attempt_record.get("provider_returned") is True
+            else attempt_record.get("failure_origin")
+        ),
+        "provider_returned": attempt_record.get("provider_returned"),
+        "provider_status_code": (
+            provider_status_code if attempt_record.get("provider_returned") is True else None
+        ),
+        "error_code": attempt_record.get("error_code"),
     }
     for field in (
         "quota_snapshot_age_seconds",
@@ -3505,6 +3523,7 @@ def _codex_oauth_quota_observation_from_row(
         "status": freshness or None,
         "exhausted": exhausted,
         "source": values.get("source"),
+        "evidence": evidence,
     }
 
 

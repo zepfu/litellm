@@ -39,6 +39,7 @@ from litellm.secret_managers.codex_oauth_inventory import (
     CodexOAuthCredentialError,
     CodexOAuthIdentityMismatchError,
     build_codex_oauth_credential_snapshot,
+    codex_oauth_access_token_rejected,
     get_codex_oauth_token_expiry,
     get_codex_oauth_token_issued_lifetime,
     read_codex_oauth_auth_payload,
@@ -539,6 +540,7 @@ def inspect_codex_oauth_refresh_eligibility(
     try:
         if credential_record is not None:
             snapshot = (snapshot_reader or read_codex_oauth_snapshot_sync)(credential_record)
+            access_token = snapshot.access_token
             expires_at = snapshot.expires_at
             (
                 issued_lifetime_seconds,
@@ -561,6 +563,22 @@ def inspect_codex_oauth_refresh_eligibility(
                 buffer_seconds=buffer_seconds,
             )
             expires_at = _get_token_expiry(token_data)
+        if codex_oauth_access_token_rejected(access_token):
+            return _eligibility_summary(
+                observed_at=observed_at,
+                expires_at=datetime.fromtimestamp(expires_at, timezone.utc) if expires_at is not None else None,
+                refresh_due_at=observed_at,
+                next_refresh_check_at=observed_at + timedelta(seconds=max(1.0, poll_interval_seconds)),
+                eligible=True,
+                credential_health="revoked",
+                usable=False,
+                error_class="CredentialRevokedError",
+                error_message="OpenAI rejected the Codex OAuth access token.",
+                issued_lifetime_seconds=issued_lifetime_seconds,
+                refresh_threshold_seconds=threshold_seconds,
+                refresh_threshold_source=threshold_source,
+                refresh_threshold_degraded=threshold_degraded,
+            )
         if expires_at is None:
             return _eligibility_summary(
                 observed_at=observed_at,
@@ -880,7 +898,7 @@ def _token_needs_refresh(
     the passed ``buffer_seconds`` when no lifetime metadata is available.
     """
     access_token = _clean_string(token_data.get("access_token"))
-    if access_token is None:
+    if access_token is None or codex_oauth_access_token_rejected(access_token):
         return True
     expires_at = shared_expires_at if shared_expires_at is not None else _get_token_expiry(token_data)
     if expires_at is None:

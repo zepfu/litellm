@@ -107,6 +107,10 @@ from litellm.secret_managers.grok_oidc_auth_path import (
     resolve_grok_oidc_auth_path,
 )
 from litellm.secret_managers.codex_oauth_inventory import (
+    CODEX_OAUTH_REJECTION_CODES,
+    codex_oauth_access_token_fingerprint,
+    codex_oauth_access_token_rejected,
+    record_codex_oauth_rejection,
     CODEX_OAUTH_ACCOUNT_HASH_LENGTH,
     CODEX_OAUTH_INVENTORY_ENV,
     CodexOAuthCredentialRecord,
@@ -8129,8 +8133,19 @@ def _fetch_codex_endpoint_payload(
                 response_body = response.read().decode("utf-8")
         except urllib_error.HTTPError as exc:
             last_status_code = exc.code
+            error_body = exc.read().decode("utf-8", errors="replace")
+            if exc.code == 401:
+                try:
+                    error_payload = json.loads(error_body)
+                except ValueError:
+                    error_payload = None
+                error = error_payload.get("error") if isinstance(error_payload, dict) else None
+                if isinstance(error, dict) and error.get("code") in CODEX_OAUTH_REJECTION_CODES:
+                    record_codex_oauth_rejection(
+                        codex_oauth_access_token_fingerprint(auth_context["access_token"])
+                    )
             last_error_hint = codex_oauth_refresh._extract_oauth_error_hint(
-                exc.read().decode("utf-8", errors="replace")
+                error_body
             )
             last_error_message = _codex_reset_credit_poll_failure_message(
                 status_code=last_status_code,
@@ -8846,6 +8861,28 @@ def _normalize_codex_quota_rate_limit_source(
     return normalized
 
 
+def _codex_paid_credit_observation(response_body: Mapping[str, Any]) -> dict[str, Any]:
+    credits = response_body.get("credits")
+    spend_control = response_body.get("spend_control")
+    if not isinstance(credits, Mapping):
+        return {}
+    fields: dict[str, Any] = {
+        key: credits[key]
+        for key in ("has_credits", "unlimited", "overage_limit_reached")
+        if isinstance(credits.get(key), bool)
+    }
+    if _codex_quota_number(credits.get("balance")) is not None:
+        fields["balance"] = str(credits["balance"])
+    if isinstance(spend_control, Mapping):
+        if isinstance(spend_control.get("reached"), bool):
+            fields["spend_control_reached"] = spend_control["reached"]
+        if "individual_limit" in spend_control:
+            limit = spend_control["individual_limit"]
+            if limit is None or _codex_quota_number(limit) is not None:
+                fields["individual_limit"] = limit
+    return fields
+
+
 def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
     config: ProviderStatusLoopConfig,
     *,
@@ -8872,6 +8909,7 @@ def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
     quota_periods: Dict[str, Optional[str]] = {}
     period_states: Dict[str, str] = {}
     upstream_model_present = False
+    paid_credits = _codex_paid_credit_observation(response_body)
     for source in sources:
         rate_limits = _normalize_codex_quota_rate_limit_source(source)
         quota_family = str(rate_limits.get("_codex_quota_family") or "overall").strip().lower()
@@ -8928,6 +8966,8 @@ def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
             if source_model is not None:
                 raw_provider_fields["upstream_model"] = source_model
             evidence = dict(row.get("evidence") or {})
+            if quota_family == "overall" and paid_credits:
+                evidence["codex_paid_credits"] = paid_credits
             evidence.update(
                 {
                     "signals": ["codex_native_quota_poll"],
@@ -14677,7 +14717,7 @@ def _effective_oauth_credential_health(
     if result_class == "expired":
         return "expired"
     inspected_health = _redacted_summary_field(eligibility.get("credential_health"))
-    if inspected_health in {"malformed", "degraded"}:
+    if inspected_health in {"malformed", "degraded", "revoked"}:
         return inspected_health
     if result_class in {"refresh_due", "refresh_failed"}:
         return "degraded"
@@ -15700,6 +15740,16 @@ def _inspect_codex_inventory_record_health(
     try:
         if snapshot is None:
             snapshot = _get_sidecar_cycle_codex_snapshot(record)
+        if codex_oauth_access_token_rejected(snapshot.access_token):
+            return {
+                "attempted": True,
+                "health_status": "revoked",
+                "account_label": record.label,
+                "account_hash": record.expected_account_hash,
+                "expires_at": None,
+                "error_class": "CredentialRevokedError",
+                "error_message": f"OpenAI rejected the Codex OAuth credential for '{record.label}'.",
+            }
         expires_at = snapshot.expires_at
         if expires_at is None:
             return {

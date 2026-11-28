@@ -6003,6 +6003,10 @@ async def test_openai_proxy_route_direct_token_invalidated_retries_next_account(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_direct_inventory_auth(monkeypatch)
+    monkeypatch.setattr(session_affinity, "get_session_owner_record", AsyncMock(return_value=(None, "cache-key", None)))
+    monkeypatch.setattr(codex_oauth_inventory, "_REJECTED_ACCESS_TOKENS", codex_oauth_inventory.OrderedDict())
+    reload = AsyncMock(return_value=None)
+    monkeypatch.setattr(codex_oauth, "reload_codex_oauth_credential_after_token_invalidated", reload)
     request = _direct_request()
     body = {"model": "gpt-5.6-sol", "input": "hello"}
     provider_accounts: list[str] = []
@@ -6014,7 +6018,11 @@ async def test_openai_proxy_route_direct_token_invalidated_retries_next_account(
         authorization = (kwargs.get("extra_headers") or {}).get("Authorization")
         provider_accounts.append(authorization)
         if authorization == "Bearer server-token-account1":
-            raise _token_invalidated_error()
+            rejection = HTTPException(
+                status_code=401, detail=json.dumps({"error": {"code": "token_revoked"}})
+            )
+            rejection._aawm_provider_returned = True
+            raise rejection
         return Response(content=b"ok", status_code=200)
 
     publish = AsyncMock()
@@ -6049,9 +6057,14 @@ async def test_openai_proxy_route_direct_token_invalidated_retries_next_account(
         "Bearer server-token-account1",
         "Bearer server-token-account2",
     ]
+    reload.assert_awaited_once()
+    assert codex_oauth_inventory.codex_oauth_access_token_rejected("server-token-account1")
+    assert not codex_oauth_inventory.codex_oauth_access_token_rejected("server-token-account2")
     outcome = attempt_records._auto_agent_alias_request_outcome_state(request)
     failed_attempt, recovered_attempt = outcome["attempts"]
     assert failed_attempt["replay_safety"] == "replay_safe"
+    assert failed_attempt["provider_returned"] is True
+    assert failed_attempt["error_code"] == "token_revoked"
     assert failed_attempt["credential_reload_outcome"] == (
         "unchanged_already_reloaded"
     )

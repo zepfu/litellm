@@ -3245,7 +3245,8 @@ class TestPassThroughRequestRetryableFailures:
         assert streaming_logger_calls == []
 
     @pytest.mark.asyncio
-    async def test_streaming_session_owner_redispatch_emits_one_terminal_error(self):
+    @pytest.mark.parametrize("error_code", ["token_invalidated", "token_revoked"])
+    async def test_streaming_session_owner_redispatch_emits_one_terminal_error(self, error_code):
         target_url = "https://chatgpt.com/backend-api/codex/responses"
         metadata = {}
         success_handler_kwargs = {"litellm_params": {"metadata": metadata}}
@@ -3254,12 +3255,14 @@ class TestPassThroughRequestRetryableFailures:
                 "type": "error",
                 "error": {
                     "type": "invalid_request_error",
-                    "code": "token_invalidated",
+                    "code": error_code,
                     "message": "token invalidated",
                 },
             },
             event_type="error",
         )
+        assert failure.status_code == 401
+        assert failure.error_code == error_code
         logging_obj = MagicMock()
         logging_obj.async_failure_handler = AsyncMock()
 

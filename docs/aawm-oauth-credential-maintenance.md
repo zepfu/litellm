@@ -503,6 +503,10 @@ same read-only consumer and single-writer directory boundary.
 
 - Normal token refresh stays under the record's own lock and publishes back to
   the same auth path. The stable label and expected account hash do not change.
+- Enroll a dedicated ChatGPT sign-in grant for each inventory record. Sign in
+  with a separate Codex home, validate the upstream account hash, then publish
+  under the record's lock. The provider-status sidecar refreshes the enrolled
+  grant. Native Codex sessions use their own login grant.
 - For an intentional upstream identity replacement, disable that label first,
   publish the replacement to that label's path, update only its externally
   supplied expected hash, verify the rendered inventory, and then re-enable it.
@@ -530,6 +534,11 @@ unavailable or unsupported, not that the credential is terminal. Routing fails
 open and does not require a fixed five-hour or seven-day scheduled window;
 response-derived OpenAI rate-limit telemetry remains the available quota signal
 when scheduled polling lacks windows.
+
+The live usage poll also stores paid-credit balance and restrictions separately
+from reset-credit inventory. A current observation with usable paid credits
+keeps the overall Codex account eligible when its weekly included allowance
+reaches zero. A provider refusal still applies to the attempted account.
 
 When `LITELLM_CODEX_OAUTH_INVENTORY` is configured, all provider-status Codex
 refresh, passive-health, and reset-credit/quota work uses only those inventory
@@ -988,6 +997,12 @@ Locked and post-refresh reads verify the generation before reuse or
 replacement. Optional workers retain their originating cycle's snapshot set
 until they finish, even when the scheduler starts another cycle. Failed loads
 remain pinned for that cycle and are retried in the next cycle.
+
+When OpenAI returns `token_revoked` or `token_invalidated` with HTTP 401, the
+observing worker excludes that access token even if its expiry is in the
+future. A newer token for the same pinned identity is eligible immediately.
+Recovery may reload that account once, then use another account when replay
+is safe under the existing session ownership rules.
 
 The validated inventory exposes
 `codex_oauth_inventory_generation`: a full SHA-256 digest of its canonical

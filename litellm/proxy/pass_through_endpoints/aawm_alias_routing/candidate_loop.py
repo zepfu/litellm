@@ -1829,7 +1829,8 @@ async def handle_alias_route(  # noqa: PLR0915
                 provider_returned=provider_returned,
                 status_code=status_code,
                 error_class=error_class,
-                retryable=bool(getattr(failure_exc, "retryable", False)),
+                retryable=bool(getattr(failure_exc, "retryable", False))
+                or (error_class == "token_invalidated" and provider_returned is True and status_code == 401),
                 commitment=get_request_openai_wire_commitment(request),
                 continuation=_provider_owned_continuation(),
                 cancelled=False,
@@ -5344,6 +5345,17 @@ async def handle_alias_route(  # noqa: PLR0915
                         )
                     if early_pre_commit_error_class is None:
                         early_pre_commit_error_class = fresh_codex_auth_error_class
+                    if (
+                        early_pre_commit_error_class == "token_invalidated"
+                        and attempted_provider_call
+                        and (
+                            getattr(probe_failure_exc, "_aawm_provider_returned", False) is True
+                            or getattr(probe_failure_exc, "provider_returned", False) is True
+                        )
+                    ):
+                        _codex_oauth_mod.record_codex_oauth_token_rejection(
+                            request, str(candidate.get("codex_oauth_account_label") or "")
+                        )
                     # A provider-confirmed pre-commit capacity rejection may
                     # cross the provisional dispatch latch, but that decision
                     # must happen before retry planning.  A late-only check

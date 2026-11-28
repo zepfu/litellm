@@ -613,11 +613,7 @@ def update_direct_openai_managed_failure_attempt(
         exc=exc,
         error_class=error_class,
         cooldown_seconds=cooldown_seconds,
-        cooldown_scope=(
-            "candidate"
-            if error_class in {"token_invalidated", "usage_limit_reached"}
-            else "none"
-        ),
+        cooldown_scope="candidate" if error_class == "usage_limit_reached" else "none",
         alias_model=_direct_alias_model(request_body, selection),
         candidate=candidate,
         attempted_provider_call=attempted_provider_call,

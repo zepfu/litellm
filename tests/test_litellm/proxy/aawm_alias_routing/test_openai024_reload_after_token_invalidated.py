@@ -16,9 +16,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from fastapi import HTTPException
 from starlette.requests import Request
 
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import codex_oauth
+from litellm.secret_managers import codex_oauth_inventory
 from litellm.secret_managers.codex_oauth_inventory import (
     CODEX_OAUTH_INVENTORY_ENV,
     codex_oauth_account_identity_hash,
@@ -140,12 +142,19 @@ def _recovery_state(request: Request) -> dict[str, Any]:
 
 async def test_reload_returns_changed_credential(
     deployed_credential: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from collections import OrderedDict
+
+    monkeypatch.setattr(codex_oauth_inventory, "_REJECTED_ACCESS_TOKENS", OrderedDict())
     request = _request()
     dispatched = await _dispatch(request)
     dispatched_fingerprint = codex_oauth._codex_oauth_auth_fingerprint(
         dispatched
     )
+    codex_oauth.record_codex_oauth_token_rejection(request, _ACCOUNT_LABEL)
+    with pytest.raises(HTTPException, match="expired or invalid"):
+        await _dispatch(_request())
 
     _write_auth(
         deployed_credential["auth_path"],
@@ -170,6 +179,7 @@ async def test_reload_returns_changed_credential(
     state = _recovery_state(request)
     assert state["fingerprints"][_ACCOUNT_LABEL] == refreshed_fingerprint
     assert state["reloaded"] == {_ACCOUNT_LABEL}
+    assert (await _dispatch(_request())).account_hash == dispatched.account_hash
 
 
 async def test_reload_returns_none_when_credential_unchanged(

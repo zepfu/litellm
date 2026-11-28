@@ -39,9 +39,13 @@ from litellm.secret_managers.codex_oauth_inventory import (
     CodexOAuthInventory,
     CodexOAuthInventoryError,
     CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY,
+    CODEX_OAUTH_REJECTION_CODES,
+    codex_oauth_access_token_fingerprint,
+    codex_oauth_access_token_rejected,
     load_codex_oauth_inventory,
     read_codex_oauth_snapshot,
     read_codex_oauth_snapshot_sync,
+    record_codex_oauth_rejection,
 )
 
 _ORIGINAL_LOAD_CODEX_OAUTH_INVENTORY = load_codex_oauth_inventory
@@ -496,6 +500,8 @@ def _codex_oauth_responses_target_url() -> str:
 def _codex_oauth_credential_snapshot_is_valid(
     credential: CodexOAuthCredentialSnapshot,
 ) -> bool:
+    if codex_oauth_access_token_rejected(credential.access_token):
+        return False
     if credential.expires_at is None:
         return True
     return time.time() < credential.expires_at - 60
@@ -698,16 +704,24 @@ async def _load_local_codex_auth_headers(request: Request) -> dict[str, str]:
 
 # ---------------------------------------------------------------------------
 # OPENAI-024: token_invalidated recovery. Auth invalidation is not capacity:
-# it never applies a cooldown. Dispatched-token fingerprints are request-local
-# and secret-safe (SHA-256 over header items, never the token itself).
+# it never applies a quota cooldown. Only the access token that was rejected
+# is excluded, so an atomic credential rotation is immediately eligible.
 # ---------------------------------------------------------------------------
 
 _CODEX_OAUTH_INVALIDATION_RECOVERY_STATE_ATTR = "aawm_codex_oauth_invalidation_recovery"
 
 
 def _codex_oauth_auth_fingerprint(auth: "CodexOAuthRequestAuth") -> str:
-    material = json.dumps(sorted(auth.headers.items()), separators=(",", ":"))
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return codex_oauth_access_token_fingerprint(auth.headers.get("Authorization", "").removeprefix("Bearer "))
+
+
+def record_codex_oauth_token_rejection(request: Request, account_label: str) -> None:
+    """Remember a provider rejection of this worker's dispatched credential."""
+    state = _get_codex_oauth_invalidation_recovery_state(request)
+    fingerprint = state["fingerprints"].get(account_label)
+    if fingerprint is None:
+        return
+    record_codex_oauth_rejection(fingerprint)
 
 
 def _get_codex_oauth_invalidation_recovery_state(
@@ -2105,7 +2119,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                         "codex_oauth_account_hash"
                     ),
                     "quota_windows": pinned_state.get("quota_exhausted_windows"),
-                    "error_code": "usage_limit_reached",
+                    "error_code": "quota_exhausted",
                 }
                 planned = _selection._plan_codex_oauth_account_failover(
                     request,
@@ -2230,14 +2244,18 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                 "Alternate accounts were intentionally not considered because "
                 "this continuation is pinned and non-portable."
             )
+        credentials_unavailable = bool(selection_states) and all(
+            state.get("skip_reason") == "auth_degraded" for state in selection_states
+        )
         detail: dict[str, Any] = {
             "error": {
                 "message": unavailable_message,
-                "type": "rate_limit_error",
+                "type": "service_unavailable" if credentials_unavailable else "rate_limit_error",
                 "code": "aawm_codex_oauth_direct_inventory_unavailable",
             },
             "skipped_candidates": diagnostic_skipped,
             "attempted_provider_call": False,
+            "provider_returned": False,
             "failure_phase": "direct_inventory_selection",
         }
         if planned_portable_failover:
@@ -2279,7 +2297,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                     },
                 }
             )
-        raise HTTPException(status_code=429, detail=detail)
+        raise HTTPException(status_code=503 if credentials_unavailable else 429, detail=detail)
 
     candidate = dict(selected_state["candidate"])
     bound = _bind_codex_oauth_candidate_to_request(request, candidate)
@@ -2380,7 +2398,15 @@ def _direct_codex_error_detail(exc: Exception) -> dict[str, Any]:
     detail = getattr(exc, "detail", None)
     if isinstance(detail, dict):
         return detail
-    message = getattr(exc, "message", None)
+    if isinstance(exc, httpx.HTTPStatusError):
+        try:
+            if len(exc.response.content) > 65_536:
+                return {}
+            body = exc.response.json()
+        except (ValueError, httpx.ResponseNotRead):
+            return {}
+        return body if isinstance(body, dict) else {}
+    message = detail if isinstance(detail, str) else getattr(exc, "message", None)
     if not isinstance(message, str) or len(message) > 65_536:
         return {}
     for parser in (json.loads, ast.literal_eval):
@@ -2419,6 +2445,8 @@ def is_direct_codex_usage_limit_error(exc: Exception) -> bool:
 def is_direct_codex_token_invalidated_error(exc: Exception) -> bool:
     """Return whether trusted Codex upstream invalidated the selected token."""
     status_code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    if isinstance(exc, httpx.HTTPStatusError):
+        status_code = exc.response.status_code
     try:
         parsed_status_code = int(status_code)
     except (TypeError, ValueError):
@@ -2427,7 +2455,7 @@ def is_direct_codex_token_invalidated_error(exc: Exception) -> bool:
     if parsed_status_code != 401 or not detail:
         return False
     error = detail.get("error")
-    return bool(isinstance(error, dict) and error.get("code") == "token_invalidated")
+    return bool(isinstance(error, dict) and error.get("code") in CODEX_OAUTH_REJECTION_CODES)
 
 
 def direct_codex_usage_limit_retry_after_seconds(

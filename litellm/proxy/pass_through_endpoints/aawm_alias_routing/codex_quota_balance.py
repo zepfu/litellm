@@ -61,7 +61,9 @@ def _window(row: Mapping[str, Any], *, now: float, horizon: float) -> dict[str, 
         reset_at <= observed_at or reset_at - observed_at > _PERIOD_MINUTES[period] * 60
     ):
         reason = "invalid_reset_window"
-    return {
+    evidence = row.get("evidence")
+    paid_credits = evidence.get("codex_paid_credits") if isinstance(evidence, Mapping) else None
+    window = {
         "quota_period": period,
         "window_minutes": minutes,
         "remaining_pct": remaining,
@@ -87,6 +89,9 @@ def _window(row: Mapping[str, Any], *, now: float, horizon: float) -> dict[str, 
         ),
         "unusable_reason": reason,
     }
+    if isinstance(paid_credits, Mapping):
+        window["paid_credits"] = dict(paid_credits)
+    return window
 
 
 def account_evidence(
@@ -136,6 +141,7 @@ def account_evidence(
                 "expected_reset_at",
                 "status",
                 "window_minutes",
+                "paid_credits",
             )
         ):
             if window["exhausted"] and not previous["exhausted"]:
@@ -145,6 +151,30 @@ def account_evidence(
             previous["unusable_reason"] = "conflicting_current_windows"
     windows = list(latest.values())
     weekly = latest.get((POLL_SOURCE, family or "", "seven_day"))
+    paid_credits = None
+    if (
+        family == "overall"
+        and weekly is not None
+        and weekly["unusable_reason"] is None
+        and weekly["status"] == "fresh"
+        and weekly["observation_age_seconds"] <= horizon
+        and weekly["expected_reset_at"] > now
+        and isinstance(weekly.get("paid_credits"), dict)
+    ):
+        paid_credits = dict(weekly["paid_credits"])
+        paid_credits["usable"] = (
+            paid_credits.get("overage_limit_reached") is False
+            and paid_credits.get("spend_control_reached") is False
+            and (
+                paid_credits.get("unlimited") is True
+                or (
+                    paid_credits.get("has_credits") is True
+                    and (_number(paid_credits.get("balance")) or 0) > 0
+                )
+            )
+        )
+        if paid_credits["usable"]:
+            weekly["exhausted"] = False
     missing_reason = (
         "unknown_quota_family"
         if family is None
@@ -159,6 +189,7 @@ def account_evidence(
         "quota_family": family,
         "validity_horizon_seconds": horizon,
         "weekly": weekly,
+        "paid_credits": paid_credits,
         "unusable_reason": (
             weekly["unusable_reason"] if weekly is not None else missing_reason
         ),

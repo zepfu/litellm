@@ -3647,7 +3647,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
     )
     candidate = selection.get("candidate") or {}
     portable_account_failover = bool(
-        is_usage_limit
+        (is_usage_limit or (is_token_invalidated and provider_returned))
         and account_failover_replay_safe
         and not authenticated_token_pin
         and candidate.get("codex_oauth_credential_affinity")
@@ -3670,7 +3670,8 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             provider_returned=provider_returned,
             status_code=provider_status_code,
             error_class=error_class,
-            retryable=bool(getattr(exc, "retryable", False)),
+            retryable=bool(getattr(exc, "retryable", False))
+            or (is_token_invalidated and provider_returned and provider_status_code == 401),
             commitment=wire_commitment,
             continuation=has_continuation_state
             or bool(request_body.get("previous_response_id")),
@@ -7010,6 +7011,14 @@ async def openai_proxy_route(  # noqa: PLR0915
                 direct_account_error_class = "usage_limit_reached"
             elif _aawm_codex_oauth.is_direct_codex_token_invalidated_error(exc):
                 direct_account_error_class = "token_invalidated"
+                if (
+                    use_direct_codex_oauth_inventory
+                    and provider_returned
+                    and isinstance(candidate, dict)
+                ):
+                    _aawm_codex_oauth.record_codex_oauth_token_rejection(
+                        request, str(candidate.get("codex_oauth_account_label") or "")
+                    )
             elif (
                 use_direct_codex_oauth_inventory
                 and attempted_provider_call

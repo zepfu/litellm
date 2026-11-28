@@ -1897,7 +1897,7 @@ class PassThroughStreamingHandler:
                 "transient_upstream",
                 True,
             )
-        if error_code == "token_invalidated":
+        if error_code in {"token_invalidated", "token_revoked"}:
             return "token_invalidated", "token_invalidated", False
         if PassThroughStreamingHandler._is_responses_unpersisted_item_not_found_payload(
             error_payload

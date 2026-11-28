@@ -17,6 +17,7 @@ import os
 import re
 import stat
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +30,9 @@ CODEX_OAUTH_ACCOUNT_HASH_LENGTH = 12
 CODEX_OAUTH_AUTH_FILE_MODE = 0o600
 CODEX_OAUTH_AUTH_FILE_MAX_BYTES = 1_048_576
 CODEX_OAUTH_SNAPSHOT_CACHE_MAX_ENTRIES = 128
+CODEX_OAUTH_REJECTION_CODES = ("token_invalidated", "token_revoked")
+_REJECTED_ACCESS_TOKENS: OrderedDict[str, None] = OrderedDict()
+_REJECTED_ACCESS_TOKENS_LOCK = threading.Lock()
 CODEX_OAUTH_ACCOUNT_ENABLE_FILE_ENV = "AAWM_CODEX_OAUTH_ACCOUNT_ENABLE_FILE"
 CODEX_OAUTH_INVENTORY_GENERATION_LENGTH = hashlib.sha256().digest_size * 2
 _TRUE_ENABLE_VALUES = frozenset({"1", "true", "yes", "on"})
@@ -268,6 +272,25 @@ async def read_codex_oauth_snapshot(
 ) -> CodexOAuthCredentialSnapshot:
     """Read credential facts without blocking the async request thread."""
     return await asyncio.to_thread(read_codex_oauth_snapshot_sync, record)
+
+
+def codex_oauth_access_token_fingerprint(access_token: str) -> str:
+    return hashlib.sha256(access_token.encode("utf-8")).hexdigest()
+
+
+def record_codex_oauth_rejection(fingerprint: str) -> None:
+    """Exclude only the rejected access token, never its replacement."""
+    with _REJECTED_ACCESS_TOKENS_LOCK:
+        _REJECTED_ACCESS_TOKENS[fingerprint] = None
+        _REJECTED_ACCESS_TOKENS.move_to_end(fingerprint)
+        if len(_REJECTED_ACCESS_TOKENS) > 256:
+            _REJECTED_ACCESS_TOKENS.popitem(last=False)
+
+
+def codex_oauth_access_token_rejected(access_token: str) -> bool:
+    fingerprint = codex_oauth_access_token_fingerprint(access_token)
+    with _REJECTED_ACCESS_TOKENS_LOCK:
+        return fingerprint in _REJECTED_ACCESS_TOKENS
 
 
 def codex_oauth_account_identity_hash(account_id: Any) -> str:
