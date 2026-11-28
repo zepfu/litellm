@@ -31110,7 +31110,6 @@ class TestOpenAIPassthroughRoute:
             None,
             None,
         ]
-        candidates = []
         skipped = []
         for index, cause in enumerate(causes):
             provider = "xai" if non_managed_candidate and index == 1 else "openai"
@@ -31130,14 +31129,13 @@ class TestOpenAIPassthroughRoute:
                 "resolved_alias": "basic",
                 "cooldown_identity_tag": "alias:basic:openai:gpt-5.6-sol:codex_responses",
                 "selection_receipt": receipt,
-                "account_priority": index + 10,
+                "account_priority": 10,
                 "account_weight": 1.0,
                 "credential_affinity": "interchangeable",
                 "selection_strategy": "priority",
                 "codex_oauth_inventory_generation": generation,
                 "reason": reason,
             }
-            candidates.append(candidate)
             skipped.append(
                 {
                     **candidate,
@@ -31150,6 +31148,12 @@ class TestOpenAIPassthroughRoute:
                     "auth_status": "degraded" if cause == "auth_degraded" else "healthy",
                 }
             )
+        candidates = (
+            llm_passthrough_endpoints._aawm_selection._redact_auto_agent_account_identity(
+                skipped,
+                redact_cooldown_keys=True,
+            )
+        )
         request.state.aawm_alias_terminal_skipped_candidates = skipped
         reset_at = int(time.time()) + 900
         selector_error = HTTPException(

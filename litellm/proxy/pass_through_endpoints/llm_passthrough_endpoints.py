@@ -7435,18 +7435,15 @@ def _codex_alias_selection_route_flags(
         ):
             return False, False
 
-        identity_fields = (
-            "provider",
-            "model",
-            "route_family",
-            "selection_receipt",
-            "codex_oauth_inventory_generation",
-            "account_priority",
-            "reason",
+        public_skipped = _aawm_selection._redact_auto_agent_account_identity(
+            skipped,
+            redact_cooldown_keys=True,
         )
-        used_skipped: set[int] = set()
+        if candidates != public_skipped:
+            return False, False
+
         candidate_failures: list[dict[str, Any]] = []
-        for candidate in candidates:
+        for candidate, skipped_record in zip(candidates, skipped):
             if (
                 not isinstance(candidate, dict)
                 or str(candidate.get("provider") or "").strip().lower()
@@ -7462,31 +7459,17 @@ def _codex_alias_selection_route_flags(
             ):
                 return False, False
 
-            matching_rows: list[tuple[int, dict[str, Any]]] = []
-            for index, skipped_record in enumerate(skipped):
-                if (
-                    index in used_skipped
-                    or not isinstance(skipped_record, dict)
-                    or not _is_managed_codex_oauth_account_record(skipped_record)
-                    or _codex_account_failure(skipped_record) is None
-                    or any(
-                        candidate.get(field) != skipped_record.get(field)
-                        for field in identity_fields
-                    )
-                ):
-                    continue
-                matching_rows.append((index, skipped_record))
-            if len(matching_rows) != 1:
+            if (
+                not isinstance(skipped_record, dict)
+                or not _is_managed_codex_oauth_account_record(skipped_record)
+            ):
                 return False, False
-
-            index, skipped_record = matching_rows[0]
-            used_skipped.add(index)
             failure = _codex_account_failure(skipped_record)
             if failure is None:
                 return False, False
             candidate_failures.append(failure)
 
-        if len(used_skipped) != len(skipped) or not candidate_failures:
+        if not candidate_failures:
             return False, False
         quota_only = all(
             failure.get("cause") == "quota exhausted"
