@@ -179,17 +179,19 @@ def _record_no_io_skipped_selection(
 def _codex_auto_agent_terminal_retry_after_headers(
     *,
     alias_family: str,
-    candidate: Any,
+    selected_candidate: Any,
     last_attempt: Any,
     exc: Exception,
 ) -> Optional[dict[str, str]]:
     """Preserve only a proven upstream Codex alias throttle's Retry-After."""
+    # The selected candidate may be newer than the row which produced the
+    # terminal error. Use route identity from the attempt carrying evidence.
+    _ = selected_candidate
     if not (
         alias_family == "codex_auto_agent"
-        and isinstance(candidate, Mapping)
-        and candidate.get("provider") == "openai"
-        and candidate.get("route_family") == "codex_responses"
         and isinstance(last_attempt, Mapping)
+        and last_attempt.get("provider") == "openai"
+        and last_attempt.get("route_family") == "codex_responses"
         and last_attempt.get("attempted_provider_call") is True
         and last_attempt.get("error_class") == "rate_limited"
         and last_attempt.get("error_status_code") == 429
@@ -3112,7 +3114,7 @@ async def handle_alias_route(  # noqa: PLR0915
             )
             terminal_headers = _codex_auto_agent_terminal_retry_after_headers(
                 alias_family=alias_family,
-                candidate=candidate,
+                selected_candidate=candidate,
                 last_attempt=last_attempt,
                 exc=exc,
             )

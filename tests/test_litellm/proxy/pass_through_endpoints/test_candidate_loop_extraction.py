@@ -733,11 +733,17 @@ async def test_candidate_loop_provider_429_exhaustion_redispatches_without_killi
         assert provider_calls
 
 
-def test_codex_alias_terminal_throttle_preserves_only_proven_upstream_retry_after() -> None:
+def test_codex_alias_terminal_throttle_preserves_only_proven_upstream_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from email.utils import formatdate
+
     import httpx
 
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
         attempt_records,
+        selection,
     )
 
     candidate = {
@@ -779,7 +785,10 @@ def test_codex_alias_terminal_throttle_preserves_only_proven_upstream_retry_afte
         response=upstream_response,
     )
     upstream_error.__cause__ = provider_status_error
-    attempt: dict[str, Any] = {"attempted_provider_call": True}
+    attempt: dict[str, Any] = selection._codex_auto_agent_candidate_public_shape(
+        candidate
+    )
+    attempt["attempted_provider_call"] = True
     attempt_records._update_codex_auto_agent_retryable_attempt_record(
         attempt_record=attempt,
         exc=upstream_error,
@@ -799,15 +808,51 @@ def test_codex_alias_terminal_throttle_preserves_only_proven_upstream_retry_afte
     assert attempt["failure_source"] == "provider_response"
     assert attempt["error_type"] == "rate_limit_error"
     assert attempt["error_code"] == "rate_limit_exceeded"
+
+    stale_selected_candidate = {
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "route_family": "anthropic_messages",
+    }
     assert candidate_loop._codex_auto_agent_terminal_retry_after_headers(
         alias_family="codex_auto_agent",
-        candidate=candidate,
+        selected_candidate=stale_selected_candidate,
         last_attempt=attempt,
         exc=upstream_error,
     ) == {"Retry-After": "17"}
+
+    mismatched_attempt = {
+        **attempt,
+        "provider": "anthropic",
+        "route_family": "anthropic_messages",
+    }
     assert candidate_loop._codex_auto_agent_terminal_retry_after_headers(
-        alias_family="other_alias",
-        candidate=candidate,
+        alias_family="codex_auto_agent",
+        selected_candidate=candidate,
+        last_attempt=mismatched_attempt,
+        exc=upstream_error,
+    ) is None
+
+    fixed_now = 1_900_000_000.0
+    monkeypatch.setattr(pte.time, "time", lambda: fixed_now)
+    upstream_error.upstream_headers = {
+        "Retry-After": formatdate(fixed_now + 120, usegmt=True),
+        "X-Provider-Secret": "synthetic-secret",
+    }
+    assert candidate_loop._codex_auto_agent_terminal_retry_after_headers(
+        alias_family="codex_auto_agent",
+        selected_candidate=stale_selected_candidate,
+        last_attempt=attempt,
+        exc=upstream_error,
+    ) == {"Retry-After": "120"}
+
+    upstream_error.upstream_headers["Retry-After"] = formatdate(
+        fixed_now - 120,
+        usegmt=True,
+    )
+    assert candidate_loop._codex_auto_agent_terminal_retry_after_headers(
+        alias_family="codex_auto_agent",
+        selected_candidate=stale_selected_candidate,
         last_attempt=attempt,
         exc=upstream_error,
     ) is None

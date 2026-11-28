@@ -1311,11 +1311,25 @@ def _get_passthrough_terminal_wire_headers(exc: Exception) -> Dict[str, str]:
 
 
 def _sanitize_passthrough_terminal_retry_after(value: Any) -> Optional[str]:
-    """Return one bounded numeric Retry-After value, or omit invalid input."""
+    """Return one bounded Retry-After delta, including valid HTTP-dates."""
     try:
         retry_after_seconds = float(str(value).strip())
     except (TypeError, ValueError):
-        return None
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            error_signals,
+        )
+
+        retry_after_seconds = (
+            error_signals._parse_alibaba_token_plan_retry_after_wait_seconds(
+                {"Retry-After": value},
+                now_epoch=time.time(),
+                max_cooldown_seconds=(
+                    _PASSTHROUGH_TERMINAL_RETRY_AFTER_MAX_SECONDS
+                ),
+            )
+        )
+        if retry_after_seconds is None:
+            return None
     if not isfinite(retry_after_seconds) or retry_after_seconds < 0:
         return None
     bounded_retry_after = min(
