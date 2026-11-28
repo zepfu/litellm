@@ -1302,20 +1302,29 @@ def _get_passthrough_terminal_wire_headers(exc: Exception) -> Dict[str, str]:
         for header_name, header_value in header_items():
             if str(header_name).lower() != "retry-after":
                 continue
-            try:
-                retry_after_seconds = float(str(header_value).strip())
-            except (TypeError, ValueError):
-                continue
-            if not isfinite(retry_after_seconds) or retry_after_seconds < 0:
-                continue
-            bounded_retry_after = min(
-                retry_after_seconds,
-                _PASSTHROUGH_TERMINAL_RETRY_AFTER_MAX_SECONDS,
+            retry_after_header = _sanitize_passthrough_terminal_retry_after(
+                header_value
             )
-            if bounded_retry_after == int(bounded_retry_after):
-                return {"Retry-After": str(int(bounded_retry_after))}
-            return {"Retry-After": str(bounded_retry_after)}
+            if retry_after_header is not None:
+                return {"Retry-After": retry_after_header}
     return fallback
+
+
+def _sanitize_passthrough_terminal_retry_after(value: Any) -> Optional[str]:
+    """Return one bounded numeric Retry-After value, or omit invalid input."""
+    try:
+        retry_after_seconds = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if not isfinite(retry_after_seconds) or retry_after_seconds < 0:
+        return None
+    bounded_retry_after = min(
+        retry_after_seconds,
+        _PASSTHROUGH_TERMINAL_RETRY_AFTER_MAX_SECONDS,
+    )
+    if bounded_retry_after == int(bounded_retry_after):
+        return str(int(bounded_retry_after))
+    return str(bounded_retry_after)
 
 
 def _mark_passthrough_capacity_exception_terminal(

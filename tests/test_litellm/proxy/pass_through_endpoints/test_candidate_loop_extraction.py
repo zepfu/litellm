@@ -733,6 +733,86 @@ async def test_candidate_loop_provider_429_exhaustion_redispatches_without_killi
         assert provider_calls
 
 
+def test_codex_alias_terminal_throttle_preserves_only_proven_upstream_retry_after() -> None:
+    import httpx
+
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        attempt_records,
+    )
+
+    candidate = {
+        "provider": "openai",
+        "model": "gpt-5.6-sol",
+        "route_family": "codex_responses",
+    }
+    upstream_response = httpx.Response(
+        429,
+        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+        headers={
+            "Retry-After": "17",
+            "X-Provider-Secret": "synthetic-secret",
+        },
+        json={
+            "error": {
+                "type": "rate_limit_error",
+                "code": "rate_limit_exceeded",
+                "message": "Synthetic request throttle.",
+            }
+        },
+    )
+    upstream_error = ProxyException(
+        message="upstream returned HTTP 429",
+        type="rate_limit_error",
+        param=None,
+        code=429,
+    )
+    upstream_error.status_code = 429
+    upstream_error.detail = upstream_response.content
+    upstream_error.response = upstream_response
+    upstream_error.upstream_headers = dict(upstream_response.headers)
+    upstream_error.attempted_provider_call = True
+    upstream_error._aawm_provider_returned = True
+
+    provider_status_error = httpx.HTTPStatusError(
+        "upstream HTTP 429",
+        request=upstream_response.request,
+        response=upstream_response,
+    )
+    upstream_error.__cause__ = provider_status_error
+    attempt: dict[str, Any] = {"attempted_provider_call": True}
+    attempt_records._update_codex_auto_agent_retryable_attempt_record(
+        attempt_record=attempt,
+        exc=upstream_error,
+        error_class="rate_limited",
+        cooldown_seconds=0.0,
+        cooldown_scope="none",
+        alias_model="basic",
+        candidate=candidate,
+        attempted_provider_call=True,
+        provider_returned=True,
+    )
+
+    assert attempt["attempted_provider_call"] is True
+    assert attempt["provider_status_code"] == 429
+    assert attempt["failure_origin"] == "upstream"
+    assert attempt["provider_failure_class"] == "rate_limit"
+    assert attempt["failure_source"] == "provider_response"
+    assert attempt["error_type"] == "rate_limit_error"
+    assert attempt["error_code"] == "rate_limit_exceeded"
+    assert candidate_loop._codex_auto_agent_terminal_retry_after_headers(
+        alias_family="codex_auto_agent",
+        candidate=candidate,
+        last_attempt=attempt,
+        exc=upstream_error,
+    ) == {"Retry-After": "17"}
+    assert candidate_loop._codex_auto_agent_terminal_retry_after_headers(
+        alias_family="other_alias",
+        candidate=candidate,
+        last_attempt=attempt,
+        exc=upstream_error,
+    ) is None
+
+
 @pytest.mark.asyncio
 async def test_candidate_loop_records_non_failover_admission_denial_before_raise(
     monkeypatch: pytest.MonkeyPatch,

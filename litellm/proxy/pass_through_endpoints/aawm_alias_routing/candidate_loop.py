@@ -176,6 +176,53 @@ def _record_no_io_skipped_selection(
     attempt_record.setdefault("attempted_provider_call", False)
 
 
+def _codex_auto_agent_terminal_retry_after_headers(
+    *,
+    alias_family: str,
+    candidate: Any,
+    last_attempt: Any,
+    exc: Exception,
+) -> Optional[dict[str, str]]:
+    """Preserve only a proven upstream Codex alias throttle's Retry-After."""
+    if not (
+        alias_family == "codex_auto_agent"
+        and isinstance(candidate, Mapping)
+        and candidate.get("provider") == "openai"
+        and candidate.get("route_family") == "codex_responses"
+        and isinstance(last_attempt, Mapping)
+        and last_attempt.get("attempted_provider_call") is True
+        and last_attempt.get("error_class") == "rate_limited"
+        and last_attempt.get("error_status_code") == 429
+        and last_attempt.get("provider_status_code") == 429
+        and last_attempt.get("failure_origin") == "upstream"
+        and last_attempt.get("provider_failure_class") == "rate_limit"
+        and last_attempt.get("failure_source") == "provider_response"
+        and str(last_attempt.get("error_type") or "").strip().lower()
+        == "rate_limit_error"
+        and str(last_attempt.get("error_code") or "").strip().lower()
+        == "rate_limit_exceeded"
+    ):
+        return None
+
+    upstream_headers = _error_signals._extract_adapter_upstream_headers(exc)
+    retry_after_value = _error_signals._get_adapter_header_value(
+        upstream_headers,
+        "Retry-After",
+    )
+    from litellm.proxy.pass_through_endpoints import (
+        pass_through_endpoints as _passthrough_helpers,
+    )
+
+    retry_after_header = (
+        _passthrough_helpers._sanitize_passthrough_terminal_retry_after(
+            retry_after_value
+        )
+    )
+    if retry_after_header is None:
+        return None
+    return {"Retry-After": retry_after_header}
+
+
 def _admission_identities_are_independent(
     denied: Any,
     *,
@@ -3063,6 +3110,12 @@ async def handle_alias_route(  # noqa: PLR0915
                 exc,
                 status_code=_extract_adapter_exception_status_code(exc),
             )
+            terminal_headers = _codex_auto_agent_terminal_retry_after_headers(
+                alias_family=alias_family,
+                candidate=candidate,
+                last_attempt=last_attempt,
+                exc=exc,
+            )
             terminal_exc = HTTPException(
                 status_code=terminal_status_code,
                 detail={
@@ -3072,6 +3125,7 @@ async def handle_alias_route(  # noqa: PLR0915
                         "code": "all_candidates_unavailable",
                     }
                 },
+                headers=terminal_headers,
             )
         if cursor_sanitized_proto_structure is not None:
             terminal_detail = getattr(terminal_exc, "detail", None)
