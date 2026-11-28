@@ -4199,7 +4199,8 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
         detail = selection_exc.detail
         error = detail.get("error") if isinstance(detail, dict) else None
         if (
-            selection_exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+            selection_exc.status_code
+            in {status.HTTP_429_TOO_MANY_REQUESTS, status.HTTP_503_SERVICE_UNAVAILABLE}
             and isinstance(error, dict)
             and error.get("code")
             == "aawm_codex_oauth_direct_inventory_unavailable"

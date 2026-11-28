@@ -6018,9 +6018,10 @@ async def test_openai_proxy_route_direct_token_invalidated_retries_next_account(
         authorization = (kwargs.get("extra_headers") or {}).get("Authorization")
         provider_accounts.append(authorization)
         if authorization == "Bearer server-token-account1":
-            rejection = HTTPException(
-                status_code=401, detail=json.dumps({"error": {"code": "token_revoked"}})
-            )
+            upstream_body = json.dumps(
+                {"error": {"code": "token_revoked"}, "status": 401}, indent=2
+            ).encode()
+            rejection = HTTPException(status_code=401, detail=repr(upstream_body))
             rejection._aawm_provider_returned = True
             raise rejection
         return Response(content=b"ok", status_code=200)

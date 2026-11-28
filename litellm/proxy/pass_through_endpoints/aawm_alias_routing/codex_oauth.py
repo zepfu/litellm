@@ -2406,12 +2406,14 @@ def _direct_codex_error_detail(exc: Exception) -> dict[str, Any]:
         except (ValueError, httpx.ResponseNotRead):
             return {}
         return body if isinstance(body, dict) else {}
-    message = detail if isinstance(detail, str) else getattr(exc, "message", None)
-    if not isinstance(message, str) or len(message) > 65_536:
+    message = detail if isinstance(detail, (str, bytes)) else getattr(exc, "message", None)
+    if not isinstance(message, (str, bytes)) or len(message) > 65_536:
         return {}
     for parser in (json.loads, ast.literal_eval):
         try:
             parsed = parser(message)
+            if isinstance(parsed, bytes):
+                parsed = json.loads(parsed)
         except (TypeError, ValueError, SyntaxError):
             continue
         if isinstance(parsed, dict):
