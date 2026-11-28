@@ -3363,6 +3363,94 @@ class TestPassThroughRequestRetryableFailures:
         assert streaming_logger_calls == []
 
     @pytest.mark.asyncio
+    async def test_post_open_codex_token_failure_reaches_consumer_with_managed_route(
+        self, monkeypatch
+    ):
+        target_url = "https://chatgpt.com/backend-api/codex/responses"
+        created_event = (
+            b'event: response.created\ndata: {"type":"response.created",'
+            b'"response":{"id":"resp_token_invalidated"}}\n\n'
+        )
+        failed_event = (
+            b'event: response.failed\ndata: {"type":"response.failed",'
+            b'"response":{"id":"resp_token_invalidated","status":"failed",'
+            b'"error":{"type":"invalid_request_error",'
+            b'"code":"token_invalidated","message":"private token detail"}}}\n\n'
+        )
+
+        class _EventStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield created_event
+                yield failed_event
+
+            async def aclose(self):
+                return None
+
+        builder_calls = []
+        original_builder = PassThroughStreamingHandler._build_responses_pre_commit_failure
+
+        def _capture_builder(**kwargs):
+            failure = original_builder(**kwargs)
+            builder_calls.append(
+                (
+                    kwargs.get("event_type"),
+                    kwargs.get("codex_managed_route"),
+                    failure.error_class,
+                )
+            )
+            return failure
+
+        async def _noop_streaming_log(**_kwargs):
+            return None
+
+        monkeypatch.setattr(
+            PassThroughStreamingHandler,
+            "_build_responses_pre_commit_failure",
+            staticmethod(_capture_builder),
+        )
+        monkeypatch.setattr(
+            PassThroughStreamingHandler,
+            "_route_streaming_logging_to_handler",
+            _noop_streaming_log,
+        )
+        logging_obj = MagicMock()
+        logging_obj.async_failure_handler = AsyncMock()
+        logging_obj.async_success_handler = AsyncMock()
+        response = httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=_EventStream(),
+        )
+
+        chunks = [
+            chunk
+            async for chunk in PassThroughStreamingHandler.chunk_processor(
+                response=response,
+                request_body={"model": "gpt-5.4-mini", "stream": True},
+                litellm_logging_obj=logging_obj,
+                endpoint_type=EndpointType.OPENAI,
+                start_time=datetime.now(),
+                passthrough_success_handler_obj=MagicMock(),
+                url_route=target_url,
+                custom_llm_provider="openai",
+                success_handler_kwargs={"litellm_params": {"metadata": {}}},
+                error_log_context={
+                    "source": "pass_through_endpoint",
+                    "endpoint": "/openai_passthrough/v1/responses",
+                    "upstream_url": target_url,
+                    "provider": "openai",
+                    "model": "gpt-5.4-mini",
+                    "route_family": "codex_responses",
+                },
+            )
+        ]
+
+        rendered = b"".join(chunks)
+        assert b"event: response.created" in rendered
+        assert b"event: response.failed" in rendered
+        assert builder_calls == [("response.failed", True, "token_invalidated")]
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("error_code", ["token_invalidated", "token_revoked"])
     async def test_streaming_session_owner_redispatch_emits_one_terminal_error(self, error_code):
         target_url = "https://chatgpt.com/backend-api/codex/responses"
@@ -30991,6 +31079,123 @@ class TestOpenAIPassthroughRoute:
         )
 
         assert response is None
+
+    @pytest.mark.parametrize(
+        ("causes", "non_managed_candidate", "expected_status"),
+        [
+            (("quota_exhausted", "quota_exhausted"), False, 429),
+            (("auth_degraded", "quota_exhausted"), False, 503),
+            (("quota_exhausted", "quota_exhausted"), True, None),
+        ],
+    )
+    def test_openai094_alias_selection_cooling_down_uses_complete_managed_candidates(
+        self, causes, non_managed_candidate, expected_status
+    ):
+        request = self._openai006_request()
+        outcome = llm_passthrough_endpoints._aawm_attempt_records._auto_agent_alias_request_outcome_state(
+            request
+        )
+        outcome["attempts"] = []
+        generation = "606be8b2e8c25547385fac17c38c3be36ef7ec029014a52ff265c76d539d8fbd"
+        receipt = [
+            "3f5c39c02443248a7118bc23552afd05731410575601c5479d614934d466391e",
+            "basic",
+            ["basic"],
+            "openai",
+            "gpt-5.6-sol",
+            "codex_responses",
+            "alias:basic:openai:gpt-5.6-sol:codex_responses",
+            100,
+            False,
+            None,
+            None,
+        ]
+        candidates = []
+        skipped = []
+        for index, cause in enumerate(causes):
+            provider = "xai" if non_managed_candidate and index == 1 else "openai"
+            route_family = (
+                "codex_grok_native_responses_adapter"
+                if provider == "xai"
+                else "codex_responses"
+            )
+            account_label = f"account-{index + 1}"
+            reason = cause
+            candidate = {
+                "provider": provider,
+                "model": "gpt-5.6-sol",
+                "route_family": route_family,
+                "selection_priority": 100,
+                "last_resort": False,
+                "resolved_alias": "basic",
+                "cooldown_identity_tag": "alias:basic:openai:gpt-5.6-sol:codex_responses",
+                "selection_receipt": receipt,
+                "account_priority": index + 10,
+                "account_weight": 1.0,
+                "credential_affinity": "interchangeable",
+                "selection_strategy": "priority",
+                "codex_oauth_inventory_generation": generation,
+                "reason": reason,
+            }
+            candidates.append(candidate)
+            skipped.append(
+                {
+                    **candidate,
+                    "account_label": account_label,
+                    "account_hash": f"SECRET_ACCOUNT_HASH_{index + 1}",
+                    "account_lane": f"codex-oauth:{account_label}",
+                    "cooldown_key": f"openai:gpt-5.6-sol:codex-oauth:{account_label}",
+                    "attempted_provider_call": False,
+                    "provider_returned": False,
+                    "auth_status": "degraded" if cause == "auth_degraded" else "healthy",
+                }
+            )
+        request.state.aawm_alias_terminal_skipped_candidates = skipped
+        reset_at = int(time.time()) + 900
+        selector_error = HTTPException(
+            status_code=429,
+            detail={
+                "error": {
+                    "type": "rate_limit_error",
+                    "code": "aawm_codex_auto_agent_all_candidates_cooling_down",
+                    "message": "All Codex auto-agent alias candidates are currently cooled down or unavailable.",
+                },
+                "alias_model": "basic",
+                "route_family": "codex_responses",
+                "failure_phase": "alias_selection_cooling_down",
+                "attempted_provider_call": False,
+                "provider_returned": False,
+                "status_code": 429,
+                "candidates": candidates,
+                "terminal_reset": {"resets_at": reset_at},
+            },
+        )
+
+        response = llm_passthrough_endpoints._codex_responses_terminal_response(
+            request=request,
+            endpoint="v1/responses",
+            exc=selector_error,
+            direct_codex=False,
+            codex_alias=True,
+        )
+
+        if expected_status is None:
+            assert response is None
+            return
+        assert response is not None
+        assert response.status_code == expected_status
+        wire = response.body.decode("utf-8")
+        assert "SECRET_ACCOUNT_HASH" not in wire
+        payload = json.loads(wire)
+        if expected_status == 429:
+            assert payload["error"]["type"] == "usage_limit_reached"
+            assert payload["error"]["code"] == "usage_limit_reached"
+            assert payload["error"]["resets_at"] == reset_at
+        else:
+            assert payload["error"]["type"] == "service_unavailable"
+            failures = {item["label"]: item for item in payload["error"]["accounts"]}
+            assert failures["account-1"]["cause"] == "credential unavailable"
+            assert failures["account-2"]["cause"] == "quota exhausted"
 
     @pytest.mark.asyncio
     async def test_openai006_continuation_generic_401_fails_closed(

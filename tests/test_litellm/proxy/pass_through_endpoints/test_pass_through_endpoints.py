@@ -223,6 +223,61 @@ def test_chatgpt_codex_quota_terminal_shape_uses_stock_codes_and_verified_reset(
     assert expired_retry_after is None
 
 
+def test_codex_terminal_reset_is_not_copied_to_quota_account_failures():
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_terminal_errors import (
+        codex_terminal_json_response,
+    )
+
+    now_epoch = 1_800_000_000
+    aggregate_reset = now_epoch + 900
+    account_reset = now_epoch + 1200
+    response = codex_terminal_json_response(
+        HTTPException(
+            status_code=429,
+            detail={
+                "error": {
+                    "type": "rate_limit_error",
+                    "code": "aawm_codex_auto_agent_all_candidates_cooling_down",
+                }
+            },
+        ),
+        account_failure_records=[
+            {
+                "provider": "openai",
+                "route_family": "codex_responses",
+                "account_label": "account-no-reset",
+                "error_class": "usage_limit_reached",
+            },
+            {
+                "provider": "openai",
+                "route_family": "codex_responses",
+                "account_label": "account-own-reset",
+                "error_class": "usage_limit_reached",
+                "resets_at": account_reset,
+            },
+            {
+                "provider": "openai",
+                "route_family": "codex_responses",
+                "account_label": "account-auth",
+                "error_class": "auth_degraded",
+            },
+        ],
+        codex_terminal_route_confirmed=True,
+        additional_terminal_detail={
+            "terminal_reset": {"resets_at": aggregate_reset}
+        },
+        now_epoch=now_epoch,
+    )
+
+    assert response is not None
+    assert response.status_code == 503
+    accounts = {
+        item["label"]: item for item in json.loads(response.body)["error"]["accounts"]
+    }
+    assert "resets_at" not in accounts["account-no-reset"]
+    assert accounts["account-own-reset"]["resets_at"] == account_reset
+
+
 def test_request_shape_422_modelinput_enrichment_is_sanitized_and_fingerprinted():
     secret_prompt = "SUPER_SECRET_MODELINPUT_PROMPT"
     secret_token = "sk-leaked-modelinput-token"

@@ -3904,6 +3904,9 @@ class PassThroughStreamingHandler:
                         PassThroughStreamingHandler._build_responses_pre_commit_failure(
                             error_payload=extracted_error,
                             event_type=parsed_event.event_type,
+                            codex_managed_route=is_chatgpt_codex_responses_upstream(
+                                url_route
+                            ),
                         )
                     )
                     if (

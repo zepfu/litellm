@@ -360,23 +360,6 @@ def _is_confirmed_quota(detail: Mapping[str, Any], failures: list[dict[str, Any]
     )
 
 
-def _apply_additional_terminal_reset(
-    failures: list[dict[str, Any]],
-    terminal_detail: Mapping[str, Any],
-    *,
-    now_epoch: float,
-) -> None:
-    reset_at = codex_verified_reset_at(terminal_detail, now_epoch=now_epoch)
-    if reset_at is None:
-        return
-    for failure in failures:
-        if (
-            failure.get("cause") == "quota exhausted"
-            and not isinstance(failure.get("resets_at"), int)
-        ):
-            failure["resets_at"] = reset_at
-
-
 def _retry_after_seconds(exc: Any, *, now_epoch: float) -> int | None:
     response = getattr(exc, "response", None)
     for headers in (
@@ -441,7 +424,6 @@ def codex_terminal_json_response(
         terminal_detail.get("candidates"),
         terminal_detail.get("attempts"),
     )
-    _apply_additional_terminal_reset(failures, terminal_detail, now_epoch=now)
     causes = {str(item.get("cause")) for item in failures}
     has_auth_failure = bool(causes & {"sign-in required", "credential unavailable", "account unavailable"})
     is_mixed = has_auth_failure and len(causes) > 1

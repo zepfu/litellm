@@ -7340,10 +7340,11 @@ def _direct_codex_terminal_route_flags(
     terminal_detail: dict[str, Any] | None,
 ) -> tuple[bool, bool]:
     status_code = _aawm_error_signals._extract_adapter_exception_status_code(exc)
-    _error_type, error_code = (
+    error_type, error_code = (
         _aawm_error_signals._extract_codex_auto_agent_error_type_and_code(exc)
     )
     normalized_error_class = str(error_class or "").strip().lower()
+    normalized_error_type = str(error_type or "").strip().lower()
     normalized_error_code = str(error_code or "").strip().lower()
     terminal_error_classes = {
         "usage_limit_reached",
@@ -7393,6 +7394,7 @@ def _direct_codex_terminal_route_flags(
         }
         and (
             normalized_error_class in terminal_error_classes
+            or normalized_error_type in terminal_error_codes
             or normalized_error_code in terminal_error_codes
             or has_terminal_selection_failure
         )
@@ -7402,13 +7404,98 @@ def _direct_codex_terminal_route_flags(
     return True, terminal_route_confirmed
 
 
-def _codex_alias_selection_route_flags(exc: Exception) -> tuple[bool, bool]:
+def _codex_alias_selection_route_flags(
+    exc: Exception,
+    *,
+    request_local_skipped_candidates: list[Any] | None = None,
+) -> tuple[bool, bool]:
     status_code = _aawm_error_signals._extract_adapter_exception_status_code(exc)
     _error_type, error_code = (
         _aawm_error_signals._extract_codex_auto_agent_error_type_and_code(exc)
     )
+    detail = getattr(exc, "detail", None)
+    normalized_error_code = str(error_code or "").strip().lower()
+    if normalized_error_code == "aawm_codex_auto_agent_all_candidates_cooling_down":
+        if (
+            status_code != status.HTTP_429_TOO_MANY_REQUESTS
+            or not isinstance(detail, dict)
+            or detail.get("route_family") != "codex_responses"
+            or detail.get("failure_phase") != "alias_selection_cooling_down"
+            or detail.get("attempted_provider_call") is not False
+            or detail.get("provider_returned") is not False
+        ):
+            return False, False
+        candidates = detail.get("candidates")
+        skipped = request_local_skipped_candidates
+        if (
+            not isinstance(candidates, list)
+            or not candidates
+            or not isinstance(skipped, list)
+            or len(candidates) != len(skipped)
+        ):
+            return False, False
+
+        identity_fields = (
+            "provider",
+            "model",
+            "route_family",
+            "selection_receipt",
+            "codex_oauth_inventory_generation",
+            "account_priority",
+            "reason",
+        )
+        used_skipped: set[int] = set()
+        candidate_failures: list[dict[str, Any]] = []
+        for candidate in candidates:
+            if (
+                not isinstance(candidate, dict)
+                or str(candidate.get("provider") or "").strip().lower()
+                not in {"openai", "codex", "codex_oauth"}
+                or candidate.get("route_family") != "codex_responses"
+                or not isinstance(candidate.get("model"), str)
+                or not candidate["model"].strip()
+                or not candidate.get("selection_receipt")
+                or not candidate.get("codex_oauth_inventory_generation")
+                or candidate.get("account_priority") is None
+                or not isinstance(candidate.get("reason"), str)
+                or not candidate["reason"].strip()
+            ):
+                return False, False
+
+            matching_rows: list[tuple[int, dict[str, Any]]] = []
+            for index, skipped_record in enumerate(skipped):
+                if (
+                    index in used_skipped
+                    or not isinstance(skipped_record, dict)
+                    or not _is_managed_codex_oauth_account_record(skipped_record)
+                    or _codex_account_failure(skipped_record) is None
+                    or any(
+                        candidate.get(field) != skipped_record.get(field)
+                        for field in identity_fields
+                    )
+                ):
+                    continue
+                matching_rows.append((index, skipped_record))
+            if len(matching_rows) != 1:
+                return False, False
+
+            index, skipped_record = matching_rows[0]
+            used_skipped.add(index)
+            failure = _codex_account_failure(skipped_record)
+            if failure is None:
+                return False, False
+            candidate_failures.append(failure)
+
+        if len(used_skipped) != len(skipped) or not candidate_failures:
+            return False, False
+        quota_only = all(
+            failure.get("cause") == "quota exhausted"
+            for failure in candidate_failures
+        )
+        return quota_only, True
+
     if (
-        str(error_code or "").strip().lower()
+        normalized_error_code
         not in {
             "aawm_codex_auto_agent_candidate_unavailable",
             "aawm_codex_oauth_direct_inventory_unavailable",
@@ -7421,7 +7508,6 @@ def _codex_alias_selection_route_flags(exc: Exception) -> tuple[bool, bool]:
         }
     ):
         return False, False
-    detail = getattr(exc, "detail", None)
     failures = (
         detail.get("terminal_account_failures")
         if isinstance(detail, dict)
@@ -7450,6 +7536,7 @@ def _codex_terminal_route_flags(
     terminal_attempt: dict[str, Any] | None,
     error_class: str | None,
     terminal_detail: dict[str, Any] | None,
+    request_local_skipped_candidates: list[Any] | None = None,
 ) -> tuple[bool, bool]:
     if direct_codex:
         return _direct_codex_terminal_route_flags(
@@ -7464,7 +7551,10 @@ def _codex_terminal_route_flags(
     )
     if terminal_attempt is None:
         selection_quota_confirmed, selection_terminal_confirmed = (
-            _codex_alias_selection_route_flags(exc)
+            _codex_alias_selection_route_flags(
+                exc,
+                request_local_skipped_candidates=request_local_skipped_candidates,
+            )
         )
         return (
             selection_quota_confirmed,
@@ -7513,6 +7603,14 @@ def _codex_responses_terminal_response(
                 ),
                 None,
             )
+    skipped = getattr(
+        request.state,
+        "aawm_alias_terminal_skipped_candidates",
+        None,
+    )
+    request_local_skipped_candidates = (
+        skipped if isinstance(skipped, list) else None
+    )
     (
         codex_quota_route_confirmed,
         codex_terminal_route_confirmed,
@@ -7523,6 +7621,7 @@ def _codex_responses_terminal_response(
         terminal_attempt=terminal_attempt,
         error_class=error_class,
         terminal_detail=terminal_detail,
+        request_local_skipped_candidates=request_local_skipped_candidates,
     )
 
     if direct_codex:
@@ -7591,11 +7690,6 @@ def _codex_responses_terminal_response(
                 }
             )
 
-    skipped = getattr(
-        request.state,
-        "aawm_alias_terminal_skipped_candidates",
-        None,
-    )
     if isinstance(skipped, list):
         account_records.extend(skipped)
 
