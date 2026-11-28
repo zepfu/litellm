@@ -42,7 +42,7 @@ from fastapi import (
     WebSocket,
     status as fastapi_status,
 )
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.websockets import WebSocketState
 from typing_extensions import TypeGuard  # noqa: F401 - Wave 6F facade host binding
 
@@ -460,6 +460,11 @@ from .aawm_alias_routing import runtime_memory as _aawm_runtime_memory
 from .aawm_adapter_runtime import alias_candidate_dispatch as _aawm_alias_candidate_dispatch
 from .aawm_adapter_runtime import anthropic_auto_agent_route as _aawm_anthropic_auto_agent_route
 from .aawm_adapter_runtime import codex_auto_agent_route as _aawm_codex_auto_agent_route
+from .aawm_adapter_runtime.codex_terminal_errors import (
+    codex_account_failure as _codex_account_failure,
+    codex_terminal_json_response as _codex_terminal_json_response,
+    is_managed_codex_oauth_account_record as _is_managed_codex_oauth_account_record,
+)
 from .aawm_adapter_runtime import model_resolution as _aawm_adapter_model_resolution
 from . import aawm_adapter_runtime as _aawm_adapter_runtime
 from .aawm_adapter_runtime import anthropic_adapter_calls as _aawm_anthropic_adapter_calls  # noqa: F401 - Wave 6F integration import
@@ -6817,14 +6822,26 @@ async def openai_proxy_route(  # noqa: PLR0915
     elif use_direct_codex_oauth_inventory:
         # OPENAI-006: bind inventory before handler fallthrough so D1-612 and
         # upstream auth never depend on inbound client bearer / account ids.
-        (
-            selected_auth,
-            direct_codex_selection_state,
-            _metadata_body,
-        ) = await _aawm_codex_oauth.select_and_bind_direct_codex_oauth_inventory(
-            request,
-            request_body=request_body,
-        )
+        try:
+            (
+                selected_auth,
+                direct_codex_selection_state,
+                _metadata_body,
+            ) = await _aawm_codex_oauth.select_and_bind_direct_codex_oauth_inventory(
+                request,
+                request_body=request_body,
+            )
+        except HTTPException as exc:
+            terminal_response = _codex_responses_terminal_response(
+                request=request,
+                endpoint=endpoint,
+                exc=exc,
+                direct_codex=True,
+                codex_alias=False,
+            )
+            if terminal_response is not None:
+                return terminal_response
+            raise
         base_target_url = os.getenv("CHATGPT_API_BASE") or CHATGPT_API_BASE
         extra_headers = dict(selected_auth.headers)
         forward_headers = False
@@ -7081,6 +7098,17 @@ async def openai_proxy_route(  # noqa: PLR0915
                 or direct_codex_selection_state is None
                 or direct_account_error_class is None
             ):
+                terminal_response = _codex_responses_terminal_response(
+                    request=request,
+                    endpoint=endpoint,
+                    exc=exc,
+                    direct_codex=use_direct_codex_oauth_inventory,
+                    codex_alias=is_codex_auto_agent_alias_request,
+                    selection=direct_codex_selection_state,
+                    error_class=direct_account_error_class,
+                )
+                if terminal_response is not None:
+                    return terminal_response
                 raise
             retry = await _retry_direct_codex_oauth_after_account_failure(
                 request=request,
@@ -7098,6 +7126,17 @@ async def openai_proxy_route(  # noqa: PLR0915
                     request_body,
                     selection=direct_codex_selection_state,
                 )
+                terminal_response = _codex_responses_terminal_response(
+                    request=request,
+                    endpoint=endpoint,
+                    exc=exc,
+                    direct_codex=True,
+                    codex_alias=is_codex_auto_agent_alias_request,
+                    selection=direct_codex_selection_state,
+                    error_class=direct_account_error_class,
+                )
+                if terminal_response is not None:
+                    return terminal_response
                 raise
             retry_auth, direct_codex_selection_state = retry
             selected_auth = retry_auth
@@ -7220,6 +7259,113 @@ _CODEX_AUTO_AGENT_ROUTE_RUNTIME = (
         ),
     )
 )
+
+
+def _codex_responses_terminal_response(
+    *,
+    request: Request,
+    endpoint: str,
+    exc: Exception,
+    direct_codex: bool,
+    codex_alias: bool,
+    selection: dict[str, Any] | None = None,
+    error_class: str | None = None,
+) -> JSONResponse | None:
+    if not _is_openai_responses_endpoint(endpoint) or not (
+        direct_codex or codex_alias
+    ):
+        return None
+
+    account_records: list[Any] = []
+    codex_quota_route_confirmed = direct_codex
+    outcome = _aawm_attempt_records._auto_agent_alias_request_outcome_state(
+        request
+    )
+    attempts = outcome.get("attempts")
+    if isinstance(attempts, list):
+        account_records.extend(attempts)
+        if codex_alias and not direct_codex:
+            terminal_attempt = next(
+                (
+                    item
+                    for item in reversed(attempts)
+                    if isinstance(item, dict)
+                    and item.get("request_outcome") == "failed"
+                ),
+                None,
+            )
+            codex_quota_route_confirmed = bool(
+                isinstance(terminal_attempt, dict)
+                and terminal_attempt.get("attempted_provider_call") is True
+                and terminal_attempt.get("provider_returned") is True
+                and _is_managed_codex_oauth_account_record(terminal_attempt)
+            )
+
+    if direct_codex:
+        failover_context = getattr(
+            request.state,
+            "aawm_codex_oauth_request_local_failover_context",
+            None,
+        )
+        prior_outcomes = (
+            failover_context.get("prior_account_outcomes")
+            if isinstance(failover_context, dict)
+            else None
+        )
+        if isinstance(prior_outcomes, list):
+            account_records.extend(
+                {
+                    "provider": "openai",
+                    "route_family": "codex_responses",
+                    **item,
+                }
+                for item in prior_outcomes
+                if isinstance(item, dict)
+            )
+        candidate = selection.get("candidate") if isinstance(selection, dict) else None
+        if isinstance(candidate, dict) and error_class:
+            account_records.append(
+                {
+                    "provider": candidate.get("provider"),
+                    "route_family": candidate.get("route_family"),
+                    "account_label": candidate.get("codex_oauth_account_label"),
+                    "error_class": error_class,
+                    "upstream_status_code": (
+                        getattr(exc, "status_code", None)
+                        or getattr(exc, "code", None)
+                    ),
+                }
+            )
+
+    skipped = getattr(
+        request.state,
+        "aawm_alias_terminal_skipped_candidates",
+        None,
+    )
+    if isinstance(skipped, list):
+        account_records.extend(skipped)
+        if (
+            codex_alias
+            and not direct_codex
+            and not codex_quota_route_confirmed
+            and not attempts
+            and skipped
+        ):
+            codex_quota_route_confirmed = all(
+                isinstance(record, dict)
+                and _is_managed_codex_oauth_account_record(record)
+                and (failure := _codex_account_failure(record)) is not None
+                and failure.get("cause") == "quota exhausted"
+                for record in skipped
+            )
+
+    return _codex_terminal_json_response(
+        exc,
+        account_failure_records=account_records,
+        codex_quota_route_confirmed=codex_quota_route_confirmed,
+    )
+
+
 _handle_codex_auto_agent_alias_route = partial(
     _aawm_codex_auto_agent_route.handle_codex_auto_agent_alias_route,
     _CODEX_AUTO_AGENT_ROUTE_RUNTIME,

@@ -70,6 +70,10 @@ from .llm_provider_handlers.vertex_passthrough_logging_handler import (
     VertexPassthroughLoggingHandler,
 )
 from .aawm_alias_routing.audit_persist import _emit_aawm_terminal_error
+from .aawm_adapter_runtime.codex_terminal_errors import (
+    codex_sse_usage_limit_error,
+    is_chatgpt_codex_responses_upstream,
+)
 from .aawm_adapter_runtime.deferred_success import DeferredPassthroughSuccess
 from .aawm_adapter_runtime.openai_responses_events import (
     ParsedResponsesEvent,
@@ -3891,6 +3895,7 @@ class PassThroughStreamingHandler:
             ]:
                 nonlocal responses_terminal_seen
                 delivered_event_chunks: list[bytes] = []
+                delivered_emissions: list[Any] = []
                 delivered_events: list[ParsedResponsesEvent] = []
                 recovery_failure: Optional[ResponsesStreamPreCommitFailure] = None
                 for parsed_event in parsed_events:
@@ -3906,7 +3911,36 @@ class PassThroughStreamingHandler:
                         not parsed_event.separator or parsed_event.is_malformed
                     ):
                         continue
-                    delivered_event_chunks.append(parsed_event.forward_event)
+                    emission = parsed_event.emission()
+                    if (
+                        is_chatgpt_codex_responses_upstream(url_route)
+                        and parsed_event.event_type == "response.failed"
+                        and isinstance(parsed_event.payload, dict)
+                    ):
+                        response_payload = parsed_event.payload.get("response")
+                        provider_error = (
+                            response_payload.get("error")
+                            if isinstance(response_payload, dict)
+                            else None
+                        )
+                        if isinstance(provider_error, dict):
+                            codex_quota_error = codex_sse_usage_limit_error(
+                                provider_error
+                            )
+                            if codex_quota_error is not None:
+                                transformed_response = {
+                                    **response_payload,
+                                    "error": codex_quota_error,
+                                }
+                                transformed_payload = {
+                                    **parsed_event.payload,
+                                    "response": transformed_response,
+                                }
+                                emission = parsed_event.emission(
+                                    payload=transformed_payload
+                                )
+                    delivered_event_chunks.append(emission.wire_bytes)
+                    delivered_emissions.append(emission)
                     delivered_events.append(parsed_event)
                     if parsed_event.event_type in (
                         PassThroughStreamingHandler._RESPONSES_TERMINAL_EVENTS
@@ -3915,9 +3949,9 @@ class PassThroughStreamingHandler:
 
                 if not delivered_event_chunks:
                     return b"", delivered_events, recovery_failure
-                complete_chunk = attach_responses_events(
+                complete_chunk = attach_responses_emissions(
                     b"".join(delivered_event_chunks),
-                    delivered_events,
+                    delivered_emissions,
                 )
                 complete_chunk = PassThroughStreamingHandler._stamp_encrypted_reasoning_in_responses_sse_chunk(
                     complete_chunk,
@@ -5717,6 +5751,11 @@ class PassThroughStreamingHandler:
                 "Streaming response interrupted after first byte due to upstream read "
                 f"timeout: {exc}"
             )
+        if is_chatgpt_codex_responses_upstream(url_route):
+            codex_quota_error = codex_sse_usage_limit_error(error_payload)
+            if codex_quota_error is not None:
+                error_payload = codex_quota_error
+                message = str(codex_quota_error["message"])
         error_payload.setdefault("type", "proxy_stream_terminal_error")
         error_payload.setdefault(
             "code",

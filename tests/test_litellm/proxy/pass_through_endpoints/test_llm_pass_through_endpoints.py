@@ -40,6 +40,9 @@ from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_passthrough_handler import (
     build_runtime_from_host as build_openai_passthrough_handler_runtime,
 )
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_terminal_errors import (
+    codex_terminal_json_response,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     config_compiler as aawm_alias_config_compiler,
 )
@@ -209,6 +212,51 @@ from litellm.proxy.pass_through_endpoints.streaming_handler import (
 )
 from litellm.proxy._types import ProxyException
 from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
+
+
+def test_codex_terminal_auth_and_throttle_shapes_are_actionable_and_reliable():
+    auth_response = codex_terminal_json_response(
+        HTTPException(
+            status_code=401,
+            detail={"error": {"type": "authentication_error", "message": "private text"}},
+        ),
+        account_failure_records=[
+            {
+                "provider": "openai",
+                "route_family": "codex_responses",
+                "account_label": "codex-account",
+                "error_class": "token_invalidated",
+            }
+        ],
+    )
+    assert auth_response is not None
+    assert auth_response.status_code == 503
+    auth_body = json.loads(auth_response.body)
+    assert "codex-account" in auth_body["error"]["message"]
+    assert "sign-in is required" in auth_body["error"]["message"]
+    assert "private text" not in auth_response.body.decode("utf-8")
+
+    throttle_response = codex_terminal_json_response(
+        HTTPException(
+            status_code=429,
+            detail={
+                "error": {
+                    "type": "rate_limit_error",
+                    "code": "rate_limit_exceeded",
+                    "message": "private upstream throttle text",
+                }
+            },
+            headers={"Retry-After": "17"},
+        )
+    )
+    assert throttle_response is not None
+    assert throttle_response.status_code == 429
+    assert throttle_response.headers["Retry-After"] == "17"
+    throttle_body = json.loads(throttle_response.body)
+    assert throttle_body["error"]["code"] == "rate_limit_exceeded"
+    assert "private upstream throttle text" not in throttle_response.body.decode(
+        "utf-8"
+    )
 from litellm.types.utils import StandardPassThroughResponseObject
 from litellm.types.passthrough_endpoints.vertex_ai import VertexPassThroughCredentials
 from litellm.llms.anthropic.experimental_pass_through.adapters.streaming_iterator import (
@@ -29916,7 +29964,7 @@ class TestOpenAIPassthroughRoute:
         mock_persist.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_openai006_fresh_direct_generic_401_retries_next_account(
+    async def test_openai006_fresh_direct_generic_401_returns_safe_503(
         self, monkeypatch
     ):
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
@@ -30044,20 +30092,16 @@ class TestOpenAIPassthroughRoute:
                 user_api_key_dict=object(),  # type: ignore[arg-type]
             )
 
-        assert response.status_code == 200
-        assert attempts == ["Bearer account1", "Bearer account2"]
-        assert mock_bind.await_count == 2
-        assert binder_failover_states == [
-            ((), frozenset()),
-            (
-                ("hash-account-1",),
-                frozenset(
-                    {
-                        "openai:gpt-5.6-sol:codex-oauth:account1:hash-account-1"
-                    }
-                ),
-            ),
-        ]
+        assert response.status_code == 503
+        terminal = json.loads(response.body)
+        assert terminal["error"]["type"] == "service_unavailable"
+        assert "account1" in terminal["error"]["message"]
+        assert "sign-in is required" in terminal["error"]["message"]
+        assert "sign in again" in terminal["error"]["message"]
+        assert "generic provider auth failure" not in response.body.decode()
+        assert attempts == ["Bearer account1"]
+        assert mock_bind.await_count == 1
+        assert binder_failover_states == [((), frozenset())]
         mock_publish.assert_not_called()
         mock_persist.assert_not_awaited()
 
@@ -30133,6 +30177,8 @@ class TestOpenAIPassthroughRoute:
                     param=None,
                     code=429,
                 )
+                exc.attempted_provider_call = True
+                exc._aawm_provider_returned = True
                 raise exc
             return Response(content=b"ok", status_code=200)
 
@@ -30253,6 +30299,9 @@ class TestOpenAIPassthroughRoute:
                 "terminal": True,
             },
         )
+        for provider_exc in (first_exc, second_exc, terminal_exc):
+            provider_exc.attempted_provider_call = True
+            provider_exc._aawm_provider_returned = True
         no_candidate_exc = HTTPException(
             status_code=429,
             detail={
@@ -30311,13 +30360,12 @@ class TestOpenAIPassthroughRoute:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._persist_codex_cooldown_durable",
             new=AsyncMock(),
         ) as mock_persist:
-            with pytest.raises(HTTPException) as exc_info:
-                await openai_proxy_route(
-                    endpoint="v1/responses",
-                    request=request,
-                    fastapi_response=Response(),
-                    user_api_key_dict=object(),  # type: ignore[arg-type]
-                )
+            response = await openai_proxy_route(
+                endpoint="v1/responses",
+                request=request,
+                fastapi_response=Response(),
+                user_api_key_dict=object(),  # type: ignore[arg-type]
+            )
 
         assert attempts == [
             "Bearer account1",
@@ -30325,8 +30373,13 @@ class TestOpenAIPassthroughRoute:
             "Bearer account3",
         ]
         assert mock_bind.await_count == 4
-        assert exc_info.value is terminal_exc
-        assert exc_info.value.detail.get("account") == "account3"
+        assert response.status_code == 429
+        terminal_payload = json.loads(response.body)
+        assert terminal_payload["error"]["type"] == "usage_limit_reached"
+        assert terminal_payload["error"]["code"] == "usage_limit_reached"
+        assert terminal_payload["error"]["resets_at"] > int(time.time())
+        assert response.headers.get("Retry-After")
+        assert "account3" not in response.body.decode("utf-8")
         assert calls[0]["endpoint"] == "v1/responses"
         assert calls[1]["endpoint"] == "v1/responses"
         assert calls[2]["endpoint"] == "v1/responses"
@@ -30392,6 +30445,204 @@ class TestOpenAIPassthroughRoute:
             ]
             == 600.0
         )
+
+    @pytest.mark.asyncio
+    async def test_openai094_alias_mixed_codex_oauth_failures_return_safe_503(self):
+        body = {"model": "basic", "input": "hello"}
+        request = self._openai006_request()
+        request.state.aawm_alias_terminal_skipped_candidates = [
+            {
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+                "route_family": "codex_responses",
+                "codex_oauth_account_label": "account-auth",
+                "codex_oauth_account_hash": "SECRET_ACCOUNT_HASH",
+                "reason": "auth_degraded",
+            },
+            {
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+                "route_family": "codex_responses",
+                "codex_oauth_account_label": "account-quota",
+                "codex_oauth_account_hash": "SECRET_QUOTA_HASH",
+                "reason": "quota_exhausted",
+            },
+        ]
+        provider_error = HTTPException(
+            status_code=429,
+            detail={
+                "error": {
+                    "type": "rate_limit_error",
+                    "code": "usage_limit_reached",
+                    "message": "private upstream account details",
+                }
+            },
+        )
+        provider_error._aawm_provider_returned = True
+
+        async def _fake_base(**_kwargs):
+            raise provider_error
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_alias_model",
+            return_value="basic",
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._should_use_direct_codex_oauth_inventory",
+            return_value=False,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_oa_xai_request_body",
+            return_value=False,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_grok_native_oauth_request_body",
+            return_value=False,
+        ), patch.object(
+            llm_passthrough_endpoints.BaseOpenAIPassThroughHandler,
+            "_base_openai_pass_through_handler",
+            new=_fake_base,
+        ):
+            response = await llm_passthrough_endpoints.openai_proxy_route(
+                endpoint="v1/responses",
+                request=request,
+                fastapi_response=Response(),
+                user_api_key_dict=object(),  # type: ignore[arg-type]
+            )
+
+        assert response.status_code == 503
+        wire = response.body.decode("utf-8")
+        payload = json.loads(wire)
+        error = payload["error"]
+        assert error["type"] == "service_unavailable"
+        assert "account-auth" in error["message"]
+        assert "sign in again" in error["message"]
+        assert "account-quota" in error["message"]
+        assert "usage limit reached" in error["message"]
+        assert "SECRET_ACCOUNT_HASH" not in wire
+        assert "SECRET_QUOTA_HASH" not in wire
+        assert "private upstream account details" not in wire
+
+    @pytest.mark.asyncio
+    async def test_openai094_alias_quota_terminal_preserves_stock_codex_shape(self):
+        reset_at = int(time.time()) + 300
+        body = {"model": "basic", "input": "hello"}
+        request = self._openai006_request()
+        request.state.aawm_alias_terminal_skipped_candidates = [
+            {
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+                "route_family": "codex_responses",
+                "codex_oauth_account_label": "account-quota",
+                "codex_oauth_account_hash": "SECRET_QUOTA_HASH",
+                "error_class": "usage_limit_reached",
+                "resets_at": reset_at,
+            }
+        ]
+        provider_error = HTTPException(
+            status_code=429,
+            detail={
+                "error": {
+                    "type": "rate_limit_error",
+                    "code": "usage_limit_reached",
+                    "message": "private upstream account details",
+                },
+                "quota": {"resets_at": reset_at},
+                "failover_disposition": "usage_limit_reached",
+            },
+            headers={"Retry-After": "300"},
+        )
+
+        async def _fake_base(**_kwargs):
+            raise provider_error
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_alias_model",
+            return_value="basic",
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._should_use_direct_codex_oauth_inventory",
+            return_value=False,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_oa_xai_request_body",
+            return_value=False,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_grok_native_oauth_request_body",
+            return_value=False,
+        ), patch.object(
+            llm_passthrough_endpoints.BaseOpenAIPassThroughHandler,
+            "_base_openai_pass_through_handler",
+            new=_fake_base,
+        ):
+            response = await llm_passthrough_endpoints.openai_proxy_route(
+                endpoint="v1/responses",
+                request=request,
+                fastapi_response=Response(),
+                user_api_key_dict=object(),  # type: ignore[arg-type]
+            )
+
+        assert response.status_code == 429
+        payload = json.loads(response.body)
+        assert payload["error"]["type"] == "usage_limit_reached"
+        assert payload["error"]["code"] == "usage_limit_reached"
+        assert payload["error"]["resets_at"] == reset_at
+        assert response.headers["Retry-After"] == "300"
+        wire = response.body.decode("utf-8")
+        assert "account-quota" not in wire
+        assert "SECRET_QUOTA_HASH" not in wire
+        assert "private upstream account details" not in wire
+
+    def test_openai094_alias_non_codex_terminal_quota_is_not_shaped_as_codex(self):
+        request = self._openai006_request()
+        outcome = llm_passthrough_endpoints._aawm_attempt_records._auto_agent_alias_request_outcome_state(request)
+        outcome["attempts"] = [
+            {
+                "provider": "xai",
+                "model": "grok-4.5",
+                "route_family": "codex_grok_native_responses_adapter",
+                "error_class": "usage_limit_reached",
+                "attempted_provider_call": True,
+                "provider_returned": True,
+                "request_outcome": "failed",
+            }
+        ]
+        request.state.aawm_alias_terminal_skipped_candidates = [
+            {
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+                "route_family": "codex_responses",
+                "codex_oauth_account_label": "account-quota",
+                "reason": "quota_exhausted",
+            },
+            {
+                "provider": "xai",
+                "model": "grok-4.5",
+                "route_family": "codex_grok_native_responses_adapter",
+                "reason": "cooldown",
+            },
+        ]
+        provider_error = HTTPException(
+            status_code=429,
+            detail={
+                "error": {
+                    "type": "rate_limit_error",
+                    "code": "usage_limit_reached",
+                    "message": "private provider quota detail",
+                }
+            },
+        )
+
+        response = llm_passthrough_endpoints._codex_responses_terminal_response(
+            request=request,
+            endpoint="v1/responses",
+            exc=provider_error,
+            direct_codex=False,
+            codex_alias=True,
+        )
+
+        assert response is None
 
     @pytest.mark.asyncio
     async def test_openai006_continuation_generic_401_fails_closed(
@@ -30558,15 +30809,16 @@ class TestOpenAIPassthroughRoute:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._persist_codex_cooldown_durable",
             new=AsyncMock(),
         ):
-            with pytest.raises(HTTPException) as exc_info:
-                await openai_proxy_route(
-                    endpoint="v1/responses",
-                    request=request,
-                    fastapi_response=Response(),
-                    user_api_key_dict=object(),  # type: ignore[arg-type]
-                )
+            response = await openai_proxy_route(
+                endpoint="v1/responses",
+                request=request,
+                fastapi_response=Response(),
+                user_api_key_dict=object(),  # type: ignore[arg-type]
+            )
 
-        assert exc_info.value.status_code == 429
+        assert response.status_code == 429
+        assert json.loads(response.body)["error"]["type"] == "usage_limit_reached"
+        assert json.loads(response.body)["error"]["code"] == "usage_limit_reached"
         assert mock_bind.await_count == 1
 
     @pytest.mark.asyncio

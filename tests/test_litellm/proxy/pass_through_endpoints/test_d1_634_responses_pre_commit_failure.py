@@ -1490,6 +1490,91 @@ async def test_chunk_processor_terminalizes_committed_capacity_error_once():
     finalized.assert_called_once()
 
 
+@pytest.mark.asyncio
+async def test_chunk_processor_sanitizes_started_codex_quota_terminal_once():
+    reset_at = int(time.time()) + 1800
+    response = _FakeUpstreamStream(
+        [
+            _sse(
+                "response.created",
+                {
+                    "type": "response.created",
+                    "response": {
+                        "id": "resp_quota",
+                        "status": "in_progress",
+                        "model": "gpt-5.4",
+                        "output": [],
+                    },
+                },
+            ),
+            _sse(
+                "response.output_text.delta",
+                {
+                    "type": "response.output_text.delta",
+                    "item_id": "msg_quota",
+                    "delta": "already visible",
+                },
+            ),
+            _sse(
+                "response.failed",
+                {
+                    "type": "response.failed",
+                    "response": {
+                        "id": "resp_quota",
+                        "status": "failed",
+                        "error": {
+                            "type": "rate_limit_error",
+                            "code": "usage_limit_reached",
+                            "message": "sensitive upstream account response",
+                            "resets_at": reset_at,
+                        },
+                    },
+                },
+            ),
+        ]
+    )
+    logging_obj = MagicMock()
+    logging_obj.model_call_details = {}
+    success_handler_kwargs = _route_kwargs()
+    finalize = AsyncMock()
+
+    with patch.object(
+        PassThroughStreamingHandler,
+        "_route_streaming_logging_to_handler",
+        new=finalize,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.emit_aawm_route_status_event"
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.record_aawm_route_rollup"
+    ):
+        emitted = [
+            chunk
+            async for chunk in PassThroughStreamingHandler.chunk_processor(
+                response=response,
+                request_body={"model": "gpt-5.4", "stream": True},
+                litellm_logging_obj=logging_obj,
+                endpoint_type=EndpointType.OPENAI,
+                start_time=datetime.now(),
+                passthrough_success_handler_obj=MagicMock(
+                    spec=PassThroughEndpointLogging
+                ),
+                url_route="https://chatgpt.com/backend-api/codex/responses",
+                custom_llm_provider="openai",
+                success_handler_kwargs=success_handler_kwargs,
+            )
+        ]
+
+    rendered = b"".join(bytes(chunk) for chunk in emitted)
+    assert rendered.count(b"event: response.failed") == 1
+    assert b"sensitive upstream account response" not in rendered
+    assert b'"type":"usage_limit_reached"' in rendered
+    assert b'"code":"usage_limit_reached"' in rendered
+    assert f'"resets_at":{reset_at}'.encode() in rendered
+    assert b"quota window resets at" in rendered
+    assert b"already visible" in rendered
+    finalize.assert_called_once()
+
+
 def test_no_replay_after_substantive_output():
     chunks = [
         _sse(

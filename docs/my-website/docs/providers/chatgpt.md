@@ -124,6 +124,24 @@ permission from the quota exemption.
 The exemption does not approve commands; Codex's built-in reviewer still makes
 the approval decision. Local admission does not guarantee provider availability.
 
+### Terminal Responses errors
+
+Managed Codex OAuth Responses errors preserve the distinction between quota,
+credentials, and request throttling:
+
+- Confirmed account quota exhaustion returns HTTP 429 with
+  `error.type` and `error.code` set to `usage_limit_reached`. A verified future
+  reset is included as `error.resets_at` and as `Retry-After` guidance when
+  available.
+- Sign-in or unavailable-credential failures return HTTP 503 with an
+  actionable message. When account failures have different causes, the message
+  names each safe configured account label and cause.
+- Genuine request throttling remains HTTP 429 and preserves a valid supplied
+  `Retry-After` header.
+- If a quota failure arrives after a Responses stream has started, LiteLLM
+  emits one `response.failed` event with the quota code and any verified reset
+  guidance in its message.
+
 ### Environment Variables
 
 - `CHATGPT_TOKEN_DIR`: Custom token storage directory

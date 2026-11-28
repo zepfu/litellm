@@ -33,6 +33,11 @@ from litellm.llms.chatgpt.common_utils import (
     get_chatgpt_default_headers,
 )
 from litellm.proxy.common_utils.http_parsing_utils import _safe_get_request_headers
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_terminal_errors import (
+    codex_account_failure,
+    codex_usage_limit_error,
+    codex_verified_reset_at,
+)
 from litellm.utils import get_model_info
 from litellm.secret_managers.codex_oauth_inventory import (
     CodexOAuthCredentialRecord,
@@ -2311,24 +2316,78 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                 "Alternate accounts were intentionally not considered because "
                 "this continuation is pinned and non-portable."
             )
-        credentials_unavailable = bool(selection_states) and all(
-            state.get("skip_reason") == "auth_degraded" for state in selection_states
+        terminal_account_failures: list[dict[str, Any]] = []
+        for state in selection_states:
+            candidate = state.get("candidate")
+            if not isinstance(candidate, Mapping):
+                continue
+            failure_record = {
+                "provider": candidate.get("provider"),
+                "route_family": candidate.get("route_family"),
+                "account_label": candidate.get("codex_oauth_account_label"),
+                "reason": state.get("skip_reason"),
+                "error_class": state.get("error_class"),
+                "error_code": state.get("error_code"),
+                "upstream_status_code": state.get("upstream_status_code"),
+                "quota_windows": state.get("quota_exhausted_windows"),
+            }
+            if codex_account_failure(failure_record) is not None:
+                terminal_account_failures.append(failure_record)
+        failure_causes = {
+            failure["cause"]
+            for failure in (
+                codex_account_failure(record)
+                for record in terminal_account_failures
+            )
+            if failure is not None
+        }
+        terminal_reset = _selection._build_codex_oauth_terminal_reset_information(
+            selection_states
         )
-        detail: dict[str, Any] = {
+        confirmed_quota_only = bool(terminal_account_failures) and failure_causes == {
+            "quota exhausted"
+        }
+        credentials_unavailable = bool(
+            failure_causes
+            & {"sign-in required", "credential unavailable", "account unavailable"}
+        )
+        if confirmed_quota_only:
+            quota_error = codex_usage_limit_error(terminal_reset or {})
+            detail: dict[str, Any] = {
+                "error": quota_error,
+                "failover_disposition": "usage_limit_reached",
+                "terminal_account_failures": terminal_account_failures,
+                "attempted_provider_call": False,
+                "provider_returned": False,
+                "failure_phase": "direct_inventory_selection",
+            }
+            reset_at = codex_verified_reset_at(terminal_reset or {})
+            headers = (
+                {"Retry-After": str(max(1, reset_at - int(time.time())))}
+                if reset_at is not None
+                else None
+            )
+            raise HTTPException(
+                status_code=429,
+                detail=detail,
+                headers=headers,
+            )
+
+        detail = {
             "error": {
                 "message": unavailable_message,
                 "type": "service_unavailable" if credentials_unavailable else "rate_limit_error",
                 "code": "aawm_codex_oauth_direct_inventory_unavailable",
             },
             "skipped_candidates": diagnostic_skipped,
+            "terminal_account_failures": terminal_account_failures,
             "attempted_provider_call": False,
             "provider_returned": False,
             "failure_phase": "direct_inventory_selection",
         }
+        if terminal_reset is not None:
+            detail["terminal_reset"] = terminal_reset
         if planned_portable_failover:
-            terminal_reset = _selection._build_codex_oauth_terminal_reset_information(states)
-            if terminal_reset is not None:
-                detail["terminal_reset"] = terminal_reset
             detail.update(
                 {
                     "selection_reason": "codex_oauth_account_failover",
@@ -2337,7 +2396,6 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                 }
             )
         elif affinity is not None and affinity_selection_reason is not None:
-            terminal_reset = _selection._build_codex_oauth_terminal_reset_information(states)
             if terminal_reset is not None:
                 redacted_terminal_reset = _redact_codex_oauth_terminal_reset(terminal_reset)
                 if redacted_terminal_reset is not None:

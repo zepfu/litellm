@@ -292,6 +292,10 @@ from .streaming_handler import (
     _RESPONSES_TRANSIENT_CAPACITY_CLASSES,
     _RESPONSES_TRANSIENT_STREAM_CLASSES,
 )
+from .aawm_adapter_runtime.codex_terminal_errors import (
+    codex_usage_limit_error,
+    codex_verified_reset_at,
+)
 from .aawm_alias_routing.pre_commit_retry import (
     ClientDisconnectedCancellation,
     OpenAIAlphaCapacityRetryCoordinator,
@@ -1200,14 +1204,11 @@ def _coerce_positive_int(value: Any) -> Optional[int]:
 def _chatgpt_codex_usage_limit_retry_after_seconds(
     error_block: dict[str, Any],
 ) -> Optional[int]:
-    resets_in_seconds = _coerce_positive_int(error_block.get("resets_in_seconds"))
-    if resets_in_seconds is not None:
-        return resets_in_seconds
-
-    resets_at = _coerce_positive_int(error_block.get("resets_at"))
-    if resets_at is None:
+    now_epoch = time.time()
+    reset_at = codex_verified_reset_at(error_block, now_epoch=now_epoch)
+    if reset_at is None:
         return None
-    return max(1, int(resets_at - time.time()))
+    return max(1, reset_at - int(now_epoch))
 
 
 def _build_chatgpt_codex_usage_limit_detail(
@@ -1229,27 +1230,13 @@ def _build_chatgpt_codex_usage_limit_detail(
     if upstream_error.get("type") != "usage_limit_reached":
         return None
 
-    retry_after_seconds = _chatgpt_codex_usage_limit_retry_after_seconds(upstream_error)
+    now_epoch = time.time()
+    reset_at = codex_verified_reset_at(upstream_error, now_epoch=now_epoch)
+    retry_after_seconds = (
+        max(1, reset_at - int(now_epoch)) if reset_at is not None else None
+    )
     structured_detail = {
-        "error": {
-            "message": (
-                "ChatGPT Codex usage limit has been reached for the upstream "
-                "account. Treat this as quota exhaustion, not transient high "
-                "demand."
-            ),
-            "type": "rate_limit_error",
-            "code": "usage_limit_reached",
-            "upstream_type": upstream_error.get("type"),
-            "upstream_message": upstream_error.get("message"),
-        },
-        "upstream_status_code": error.response.status_code,
-        "upstream_url": str(error.request.url),
-        "quota": {
-            "plan_type": upstream_error.get("plan_type"),
-            "resets_at": upstream_error.get("resets_at"),
-            "resets_in_seconds": upstream_error.get("resets_in_seconds"),
-            "eligible_promo": upstream_error.get("eligible_promo"),
-        },
+        "error": codex_usage_limit_error(upstream_error, now_epoch=now_epoch),
         "retry_after_seconds": retry_after_seconds,
         "failover_disposition": "usage_limit_reached",
     }

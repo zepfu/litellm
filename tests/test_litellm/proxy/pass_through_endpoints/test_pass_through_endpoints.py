@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import sys
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from io import BytesIO
@@ -50,6 +51,7 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     _build_passthrough_request_shape_summary,
     build_aawm_route_access_log_line,
     _build_passthrough_request_shape_failure_request_payload,
+    _build_chatgpt_codex_usage_limit_detail,
     _build_passthrough_error_log_context,
     _classify_passthrough_request_shape_deserialization_422,
     _direct_capture_xai_passthrough_failure,
@@ -143,6 +145,56 @@ def _build_aawm_route_log_user_api_key_dict(
         budget_reset_at=None,
         metadata={},
     )
+
+
+def test_chatgpt_codex_quota_terminal_shape_uses_stock_codes_and_verified_reset():
+    now_epoch = time.time()
+    reset_at = int(now_epoch) + 900
+    request = httpx.Request(
+        "POST", "https://chatgpt.com/backend-api/codex/responses"
+    )
+    response = httpx.Response(
+        429,
+        request=request,
+        headers={"Retry-After": "900"},
+    )
+    error = httpx.HTTPStatusError("quota", request=request, response=response)
+
+    shaped = _build_chatgpt_codex_usage_limit_detail(
+        error=error,
+        upstream_payload={
+            "error": {
+                "type": "usage_limit_reached",
+                "message": "sensitive upstream account text",
+                "resets_at": reset_at,
+                "plan_type": "private-plan-detail",
+            }
+        },
+    )
+
+    assert shaped is not None
+    detail, retry_after = shaped
+    assert retry_after == reset_at - int(now_epoch)
+    assert detail["error"]["type"] == "usage_limit_reached"
+    assert detail["error"]["code"] == "usage_limit_reached"
+    assert detail["error"]["resets_at"] == reset_at
+    assert detail["failover_disposition"] == "usage_limit_reached"
+    assert "sensitive upstream account text" not in json.dumps(detail)
+    assert "private-plan-detail" not in json.dumps(detail)
+
+    expired = _build_chatgpt_codex_usage_limit_detail(
+        error=error,
+        upstream_payload={
+            "error": {
+                "type": "usage_limit_reached",
+                "resets_at": int(now_epoch) - 30,
+            }
+        },
+    )
+    assert expired is not None
+    expired_detail, expired_retry_after = expired
+    assert "resets_at" not in expired_detail["error"]
+    assert expired_retry_after is None
 
 
 def test_request_shape_422_modelinput_enrichment_is_sanitized_and_fingerprinted():
